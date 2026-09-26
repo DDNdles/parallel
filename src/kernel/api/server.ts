@@ -15,6 +15,14 @@ const MIME: Record<string, string> = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
 };
 
+const UI_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'ui');
+
+/** 入口 html 的 mtime：前端拿它发现自己跑的是不是上次构建的旧界面（站内换页不会重新下载 JS） */
+function uiBuildStamp(): number {
+  const index = join(UI_ROOT, 'index.html');
+  return existsSync(index) ? Math.round(statSync(index).mtimeMs) : 0;
+}
+
 /**
  * REST API + 静态 UI + 事件 WS。
  * 鉴权：除静态文件外，全部 /api 与 /ws 需要 uiToken（header X-Auth-Token / ?token=）。
@@ -22,7 +30,7 @@ const MIME: Record<string, string> = {
  */
 export function startApiServer(kernel: Kernel): Promise<ReturnType<typeof createServer>> {
   const { ui } = kernel.config.config;
-  const uiRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'ui');
+  const uiRoot = UI_ROOT;
 
   const server = createServer((req, res) => {
     void handle(kernel, uiRoot, req, res).catch((e) => {
@@ -260,6 +268,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         errors: kernel.errors.list().filter((e) => e.level === 'error').length,
         masterIds: kernel.config.config.masterIds,
         uptimeMs: Math.round(process.uptime() * 1000),
+        // 入口 html 的落盘时间：桌面端拿它判断"标签页里跑的还是上次构建的旧界面"
+        uiBuild: uiBuildStamp(),
       });
     }
 
@@ -785,19 +795,25 @@ function serveStatic(root: string, path: string, res: ServerResponse): void {
   if (!existsSync(file) || statSync(file).isDirectory()) {
     // SPA fallback
     const index = join(root, 'index.html');
-    if (existsSync(index)) {
-      res.writeHead(200, { 'content-type': MIME['.html'] });
-      createReadStream(index).pipe(res);
-      return;
-    }
+    if (existsSync(index)) { sendHtml(res, index); return; }
     res.writeHead(404); res.end('UI 未找到（ui/index.html 缺失）');
     return;
   }
+  if (extname(file) === '.html') { sendHtml(res, file); return; }
   const type = MIME[extname(file)] ?? 'application/octet-stream';
-  // HTML 不缓存（避免前端更新后浏览器拿到旧入口）；带内容哈希的 _next 资源长缓存
+  // 带内容哈希的 _next 资源长缓存；其余不缓存
   const cache = file.includes('_next') ? 'public, max-age=31536000, immutable' : 'no-cache';
   res.writeHead(200, { 'content-type': type, 'cache-control': cache });
   createReadStream(file).pipe(res);
+}
+
+/** HTML 不缓存，并把这份产物的落盘时间注进页面：前端据此发现"我跑的是旧构建" */
+function sendHtml(res: ServerResponse, file: string): void {
+  const stamp = Math.round(statSync(file).mtimeMs);
+  const tag = `<script>window.__UI_BUILD__=${stamp}</script>`;
+  const html = readFileSync(file, 'utf8').replace('<head>', '<head>' + tag);
+  res.writeHead(200, { 'content-type': MIME['.html'], 'cache-control': 'no-cache' });
+  res.end(html.includes('__UI_BUILD__') ? html : tag + html);
 }
 
 function readBody(req: IncomingMessage): Promise<any> {

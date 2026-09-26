@@ -90,6 +90,9 @@ export default function App() {
   const [pageCmd, setPageCmd] = useState<PageCmd>({ page: '', kind: '', n: 0 });
   const [state, setState] = useState<AppState | null>(null);
   const [errBadge, setErrBadge] = useState(0);
+  /** 磁盘上的 ui/ 比本页加载的那份新：顶栏亮一颗「界面已更新」，由用户点 */
+  const [staleBuild, setStaleBuild] = useState(false);
+  const buildRef = useRef(typeof window === 'undefined' ? '' : String((window as { __UI_BUILD__?: number }).__UI_BUILD__ ?? ''));
   const bootedRef = useRef(false);
   const draggingRef = useRef(false);
 
@@ -139,7 +142,13 @@ export default function App() {
     }
   }, []);
   const updateErrBadge = useCallback(async () => {
-    try { setErrBadge((await get('/api/state')).errors ?? 0); } catch { /* ignore */ }
+    try {
+      const s = await get('/api/state');
+      setErrBadge(s.errors ?? 0);
+      // 站内换页不会重新下载 JS：构建换了就亮一颗钮，点一下才刷新（绝不在用户输入时自己跳）
+      const b = String(s.uiBuild ?? '');
+      if (buildRef.current && b && b !== buildRef.current) setStaleBuild(true);
+    } catch { /* ignore */ }
   }, []);
 
   const enterApp = useCallback(() => {
@@ -148,6 +157,7 @@ export default function App() {
     setEntered(true);
     connectWS();
     refreshStatus();
+    void updateErrBadge();
     if (!intervalsRef.current) {
       intervalsRef.current = true;
       setInterval(refreshStatus, 10000);
@@ -237,6 +247,10 @@ export default function App() {
         <header className="topbar">
           <span className="tb-title">{def.name}</span>
           <span className="tb-flex" />
+          {staleBuild && (
+            <button className="chip" id="btn-reload" title="界面已重新构建（站内换页不会重新下载 JS），点这里刷新才拿到新版"
+              onClick={() => location.reload()}>界面已更新</button>
+          )}
           {page === 'chats' && (
             <button
               className={'chip icon-chip' + (workOpen ? ' on' : '')}
