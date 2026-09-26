@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo
+ui/
+
+# 运行期数据：密钥、QQ 登录态、聊天与记忆库，绝不入库
+data/
+
+# 下架的插件留档（只在本机保留）
+plugins-off/
+
+# 调研中间产物与日志
+.research/
+*.log
+
+.DS_Store
