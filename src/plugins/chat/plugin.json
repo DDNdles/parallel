@@ -1,0 +1,35 @@
+{
+  "id": "chat",
+  "name": "角色化聊天",
+  "version": "1.0.0",
+  "description": "bot 的立身之本：人格五插槽（人设卡/世界书/few-shot/状态注入/记忆融合）+ 好感度系统。人格即插件，当前人格 CETACEA_MOLI（whale-girl）。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "keywords": [
+    "chat",
+    "persona",
+    "affection"
+  ],
+  "category": "persona",
+  "trust": "builtin",
+  "permissions": [
+    "memory.read",
+    "memory.write"
+  ],
+  "personas": [
+    "whale-girl"
+  ],
+  "locked": true,
+  "core": true,
+  "defaultGroupState": "off",
+  "userConfig": {
+    "affectionEnabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "启用好感度系统"
+    }
+  },
+  "hidden": true
+}

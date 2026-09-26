@@ -1,0 +1,10 @@
+{
+  "id": "poem-daily",
+  "name": "每日推荐诗歌",
+  "version": "0.1.0",
+  "description": "内置唐宋名篇语料，每日轮换推荐一首，附一句碎碎念。todo 骨架（内置语料起步即可）。",
+  "category": "fun",
+  "trust": "builtin",
+  "permissions": ["schedule"],
+  "defaultGroupState": "off"
+}

@@ -1,0 +1,10 @@
+{
+  "id": "link-parser",
+  "name": "链接解析",
+  "version": "0.1.0",
+  "description": "识别消息中的 B 站视频 / 小红书链接并解析摘要。todo 骨架：B 站公开接口最小可用；小红书反爬强，仅识别+提示。",
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": ["network"],
+  "defaultGroupState": "off"
+}

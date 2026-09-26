@@ -1,0 +1,22 @@
+{
+  "id": "sandbox",
+  "name": "沙箱",
+  "version": "1.0.0",
+  "description": "每个会话独立的轻沙箱：LLM 可读写会话内文件（防路径穿越）、运行 Python/JS 简单脚本（超时/输出截断/资源配额）、把沙箱内文件发给用户。临时文件按 TTL 自动清理。",
+  "category": "system",
+  "trust": "builtin",
+  "permissions": [
+    "fs.sandbox",
+    "sandbox.exec"
+  ],
+  "core": true,
+  "defaultGroupState": "off",
+  "userConfig": {
+    "defaultTimeoutMs": {
+      "type": "number",
+      "default": 15000,
+      "description": "脚本默认超时（毫秒）"
+    }
+  },
+  "hidden": true
+}

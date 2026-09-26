@@ -1,0 +1,21 @@
+{
+  "id": "work",
+  "name": "工作模式",
+  "version": "3.0.0",
+  "description": "work 是 chat 的子代理（双模型架构）：chat 模型可经 delegate_to_work 工具把任务交给 work 模型，管理员也可用 /work <任务> 直接触发。work 模型在沙箱里跑 agent loop（常驻 Python 会话、浏览器、shell、文件），完成后结论回到 chat 模型转述给用户。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": [
+    "fs.sandbox",
+    "sandbox.exec",
+    "container",
+    "work.delegate"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {},
+  "hidden": true
+}

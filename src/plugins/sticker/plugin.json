@@ -1,0 +1,10 @@
+{
+  "id": "sticker",
+  "name": "表情包",
+  "version": "0.1.0",
+  "description": "群级表情包库：收图建库（回复图片+/表情 收 名字）、按名搜索、随机发。LLM 可调用 send_sticker 在聊天中发图。",
+  "category": "fun",
+  "trust": "builtin",
+  "permissions": [],
+  "defaultGroupState": "off"
+}

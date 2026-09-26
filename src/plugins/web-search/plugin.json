@@ -1,0 +1,26 @@
+{
+  "id": "web-search",
+  "name": "网络搜索",
+  "version": "1.0.0",
+  "description": "经 Tavily API 联网搜索（Tavily MCP 的等价 REST 封装）。未配置 API Key 时自检提示。",
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": [
+    "network"
+  ],
+  "defaultGroupState": "off",
+  "userConfig": {
+    "apiKey": {
+      "type": "string",
+      "default": "",
+      "description": "Tavily API Key（tavily.com 免费申请）",
+      "secret": true
+    },
+    "maxResults": {
+      "type": "number",
+      "default": 3,
+      "description": "返回结果条数上限"
+    }
+  },
+  "hidden": true
+}

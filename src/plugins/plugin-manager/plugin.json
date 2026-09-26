@@ -1,0 +1,12 @@
+{
+  "id": "plugin-manager",
+  "name": "插件管理",
+  "version": "1.0.0",
+  "description": "聊天内插件管理入口：/插件 开启|关闭|详情|列表|重载|全局默认，/帮助 命令面板，/状态 自检。分群开关的 QQ 侧入口。",
+  "category": "system",
+  "trust": "builtin",
+  "permissions": [],
+  "core": true,
+  "defaultGroupState": "on",
+  "hidden": true
+}
