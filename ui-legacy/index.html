@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>parallel · QQ bot harness</title>
+  <script>
+    // 防闪烁：渲染前同步应用主题
+    document.documentElement.dataset.theme = localStorage.getItem('parallel_theme') === 'light' ? 'light' : 'dark';
+  </script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="login" class="login-overlay hidden">
+    <div class="login-box" id="login-box">
+      <div class="login-brand">parallel <b>console</b></div>
+
+      <!-- 视图：账号卡（协议端已登录 / 有历史账号） -->
+      <div id="login-view-account" class="login-view hidden">
+        <img id="login-avatar" class="login-avatar" alt="QQ 头像" src="">
+        <div id="login-nick" class="login-nick">--</div>
+        <div id="login-qq" class="login-qq mono">--</div>
+        <div id="login-state" class="login-state"></div>
+        <button id="login-enter" class="login-btn">进入控制台</button>
+        <label class="login-auto"><input type="checkbox" id="login-auto-chk"><span>自动登录，下次直接进入</span></label>
+        <button id="login-switch" class="login-ghost">扫码登录其他账号</button>
+      </div>
+
+      <!-- 视图：协议端接入引导（SnowLuma 托管 → QQ 客户端登录） -->
+      <div id="login-view-qrcode" class="login-view hidden">
+        <div class="login-title">接入 QQ</div>
+        <div class="login-sub">SnowLuma 协议端 · hook 本机 QQNT 客户端 · 无签名 token</div>
+        <div class="login-qr-frame" id="login-qr-frame">
+          <img id="login-qr-img" alt="登录二维码" src="" class="hidden">
+          <div id="login-qr-tip" class="login-qr-tip">正在启动协议端…</div>
+        </div>
+        <div id="login-qr-status" class="login-state"></div>
+        <button id="login-qr-back" class="login-ghost">返回</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <aside class="sidebar">
+      <div class="logo">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-word">parallel</span>
+        <button class="collapse-btn" id="btn-collapse" title="折叠侧栏" aria-label="折叠侧栏">☰</button>
+      </div>
+      <nav id="nav" aria-label="主导航"></nav>
+      <div class="sidebar-foot">
+        <div id="ws-dot" class="dot dot-off" role="img" aria-label="事件流连接状态"></div><span>事件流</span>
+        <span class="flex"></span>
+        <span id="foot-plugins" class="mono"></span>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <span class="tb-title" id="tb-title">控制台</span>
+        <span class="tb-flex"></span>
+        <div class="model-picker" id="model-picker">
+          <button class="mp-btn" id="mp-btn" aria-haspopup="listbox" aria-expanded="false"><span id="mp-label">模型</span><span class="caret">▾</span></button>
+          <div class="mp-menu hidden" id="mp-menu" role="listbox"></div>
+        </div>
+        <span class="chip" id="chip-adapter"><span class="dot dot-off" aria-hidden="true"></span><span id="chip-adapter-text">协议端</span></span>
+        <span class="chip" id="chip-usage">Token 0</span>
+        <button class="chip icon-chip" id="btn-theme" title="切换主题"></button>
+      </header>
+      <section class="content" id="content"></section>
+    </main>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

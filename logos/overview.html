@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>parallel · 20 logo concepts</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #0d0d0d; font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; padding: 26px; width: 1560px; }
+  h1 { color: #fff; font-size: 15px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+  .sub { color: #777; font-size: 12px; margin: 4px 0 20px; }
+  .sec { color: #bbb; font-size: 12px; font-weight: 600; letter-spacing: .08em; margin: 18px 0 10px; text-transform: uppercase; }
+  .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+  .cell { border-radius: 12px; overflow: hidden; border: 1px solid #2a2a2a; background: #161616; }
+  .cap { color: #9a9a9a; font-size: 10.5px; padding: 6px 9px; }
+  .cap b { color: #d8d8d8; font-weight: 600; }
+  .pane { display: flex; align-items: center; justify-content: center; height: 120px; background: #181818; color: #f2f2f2; }
+  .pane.lt { background: #f6f6f5; color: #212121; }
+  .pane img { height: 112px; width: auto; background: #fff; }
+  svg { display: block; }
+  .mark { width: 40px; height: 40px; }
+  .lockup { display: flex; align-items: center; gap: 11px; }
+  .word { font-weight: 700; font-size: 21px; }
+</style>
+</head>
+<body>
+<h1>parallel — 20 logo concepts</h1>
+<div class="sub">主题：bot 与人类 QQ 的平行交错 · Codex 黑白双主题 · 图标 + 字标 · 1–10 手绘矢量（含深浅两版），11–19 gemini 生成</div>
+<div class="sec">A · 手绘矢量（可无损缩放，直接可用于产品）</div>
+<div class="grid" id="svgGrid"></div>
+<div class="sec">B · gemini 生成（概念图，选定后可矢量化）</div>
+<div class="grid" id="aiGrid"></div>
+
+<script>
+const S = 'fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"';
+const marks = {
+  // 01 编织：两条带子交叉两次，断口分上下（真正的 braid）
+  weave: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M6 16C14 16 14 32 22 32c5 0 6.6-4.6 7.2-7"/>
+    <path d="M30.8 23c.6-2.4 2.6-7 7.2-7h4"/>
+    <path d="M6 32c4.2 0 6.2-3.6 7.6-6.4"/>
+    <path d="M16.4 23.6C18 20 20 16 22 16c8 0 8 16 16 16h4"/></g></svg>`,
+  // 02 换轨：双车道中段平滑互换（S 形大弯，区别于 01 的紧交叉）
+  swap: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M6 15h7c7 0 7 18 14 18h15"/>
+    <path d="M6 33h7c7 0 7-18 14-18h15"/>
+    <circle cx="40" cy="15" r="1.8" fill="currentColor" stroke="none"/>
+    <circle cx="40" cy="33" r="1.8" fill="currentColor" stroke="none"/></g></svg>`,
+  symbol: `<svg class="mark" viewBox="0 0 48 48"><g ${S}><rect x="6" y="6" width="36" height="36" rx="10"/>
+    <path d="M19.5 31.5l5.5-15"/><path d="M27.5 31.5l5.5-15"/></g></svg>`,
+  // 04 双气泡：两枚错开不重叠的对话气泡，各带小尾巴
+  bubbles: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <rect x="4" y="8" width="21" height="15" rx="5"/>
+    <path d="M11 23v6l7-6"/>
+    <rect x="23" y="25" width="21" height="15" rx="5"/>
+    <path d="M37 25v-6l-7 6"/></g></svg>`,
+  // 05 字母 P：平行双竖笔立杆，碗只接右笔
+  letterP: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M14 40V10"/><path d="M20 40V10"/>
+    <path d="M20 10h4a8 8 0 0 1 0 16h-4"/></g></svg>`,
+  arrows: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M8 18h30"/><path d="M31 12l7 6-7 6"/><path d="M40 30H10"/><path d="M17 24l-7 6 7 6"/></g></svg>`,
+  waves: `<svg class="mark" viewBox="0 0 48 48"><g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round">
+    <path d="M5 19c4-7 8-7 12 0s8 7 12 0 8-7 12 0"/><path d="M5 29c4 7 8 7 12 0s8-7 12 0 8 7 12 0"/></g></svg>`,
+  // 08 道岔：两条平行直轨 + 一条斜向联络线（带端点），是“换轨节点”不是 X
+  rail: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M5 16h38"/><path d="M5 32h38"/>
+    <path d="M17 16l14 16"/>
+    <circle cx="17" cy="16" r="2" fill="currentColor" stroke="none"/>
+    <circle cx="31" cy="32" r="2" fill="currentColor" stroke="none"/></g></svg>`,
+  braces: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M17 10l-9 14 9 14"/><path d="M31 10l9 14-9 14"/>
+    <path d="M22 17v14M26 17v14" stroke-width="3"/></g></svg>`,
+  // 10 双带无穷：同一无穷符号内外两圈线
+  infinity: `<svg class="mark" viewBox="0 0 48 48"><g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15 18c-5 0-8 2.7-8 6s3 6 8 6c7 0 9-12 18-12 5 0 8 2.7 8 6s-3 6-8 6c-9 0-11-12-18-12z"/>
+    <g transform="translate(24 24) scale(0.52) translate(-24 -24)" stroke-width="3.6">
+      <path d="M15 18c-5 0-8 2.7-8 6s3 6 8 6c7 0 9-12 18-12 5 0 8 2.7 8 6s-3 6-8 6c-9 0-11-12-18-12z"/></g></g></svg>`,
+};
+const svgConcepts = [
+  ['01 交织', 'weave'], ['02 换轨', 'swap'], ['03 平行符 ∥', 'symbol'], ['04 双气泡', 'bubbles'], ['05 字母 P', 'letterP'],
+  ['06 对向车道', 'arrows'], ['07 相位波', 'waves'], ['08 道岔交汇', 'rail'], ['09 终端括号', 'braces'], ['10 双带无穷', 'infinity'],
+];
+const g = document.getElementById('svgGrid');
+for (const [name, key] of svgConcepts) {
+  const c = document.createElement('div');
+  c.className = 'cell';
+  c.innerHTML = `<div class="pane"><div class="lockup">${marks[key]}<span class="word">parallel</span></div></div><div class="cap"><b>${name}</b></div>`;
+  g.appendChild(c);
+}
+const ai = [
+  ['11 负空间 P 牌', 'g01-negative-space-P', ''], ['12 编织结', 'g02-braid-knot', ''], ['13 回声字标', 'g03-echo-wordmark', ''],
+  ['14 双气泡对话', 'g04-duo-bubbles', ''], ['15 等距双车道', 'g05-isometric-lanes', '（字标错，概念可用）'], ['16 圆徽平行弦', 'g06-circle-chords', '（字标错，概念可用）'],
+  ['17 终端括号', 'g07-terminal-brackets', ''], ['18 无穷双带', 'g08-infinity-ribbon', ''], ['19 消失点双轨', 'g09-vanishing-tracks', '（字标错，概念可用）'],
+];
+const a = document.getElementById('aiGrid');
+for (const [name, file, note] of ai) {
+  const c = document.createElement('div');
+  c.className = 'cell';
+  c.innerHTML = `<div class="pane"><img src="../gemini/${file}.png" alt="${name}"></div><div class="cap"><b>${name}</b>${note}</div>`;
+  a.appendChild(c);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>parallel · logo concepts</title>
+<style>
+  :root { --dark:#212121; --darker:#181818; --light:#f6f6f5; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #0d0d0d; font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; padding: 28px; }
+  h1 { color: #fff; font-size: 15px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 4px; }
+  .sub { color: #777; font-size: 12px; margin-bottom: 22px; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .cell { border-radius: 14px; overflow: hidden; border: 1px solid #2a2a2a; }
+  .cell .name { color: #9a9a9a; font-size: 11px; padding: 7px 12px; background: #161616; display: flex; justify-content: space-between; gap: 10px; }
+  .cell .name b { color: #d0d0d0; font-weight: 600; white-space: nowrap; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; }
+  .pane { display: flex; align-items: center; justify-content: center; height: 112px; }
+  .pane.dk { background: var(--darker); color: #f2f2f2; }
+  .pane.lt { background: var(--light); color: var(--dark); }
+  svg { display: block; }
+  .mark { width: 46px; height: 46px; }
+  .lockup { display: flex; align-items: center; gap: 13px; }
+  .word { font-weight: 700; font-size: 24px; letter-spacing: .005em; }
+</style>
+</head>
+<body>
+<h1>parallel — logo concepts</h1>
+<div class="sub">主题：bot 与人类 QQ 的平行交错 · 双车道 / 交织 / 换轨 · Codex 黑白双主题 · 每个概念含图标 + 字标</div>
+<div class="grid" id="grid"></div>
+
+<script>
+const S = 'fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"';
+const marks = {
+  // 01 交织：两条平行线中央上下交叠，断口表现“谁在上谁在下”
+  weave: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M6 18h10c8 0 8 14 16 14h10"/>
+    <path d="M6 32h9c3.4 0 4.9-1.8 6.3-4.4"/>
+    <path d="M26.7 24.4c1.4-2.6 2.9-4.4 6.3-4.4h9"/>
+  </g></svg>`,
+  // 02 换轨：双车道中段平滑互换，端点圆点为会话标记
+  swap: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M6 16h8c5 0 5 16 10 16h12"/>
+    <path d="M6 32h8c5 0 5-16 10-16h12"/>
+    <circle cx="39" cy="16" r="1.7" fill="currentColor" stroke="none"/>
+    <circle cx="39" cy="32" r="1.7" fill="currentColor" stroke="none"/>
+  </g></svg>`,
+  // 03 平行符：数学平行号 ∥ 收进圆角牌
+  symbol: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <rect x="6" y="6" width="36" height="36" rx="10"/>
+    <path d="M19.5 31.5l5.5-15"/><path d="M27.5 31.5l5.5-15"/>
+  </g></svg>`,
+  // 04 双气泡：人类与 bot 的两枚对话气泡，一上一下平行存在
+  bubbles: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <rect x="5" y="8" width="25" height="17" rx="5.5"/>
+    <path d="M13 25v6l6-6"/>
+    <rect x="18" y="23" width="25" height="17" rx="5.5"/>
+    <path d="M35 23v-6l6 6" transform="translate(0,0)"/>
+  </g></svg>`,
+  // 05 字母 P：P 由两条平行竖笔立起
+  letterP: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M14 40V12"/><path d="M21 40V12"/>
+    <path d="M14 12h9a8 8 0 0 1 0 16h-9"/>
+  </g></svg>`,
+  // 06 对向车道：上行与下行各占一道，互不越线
+  arrows: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M8 18h30"/><path d="M31 12l7 6-7 6"/>
+    <path d="M40 30H10"/><path d="M17 24l-7 6 7 6"/>
+  </g></svg>`,
+  // 07 相位波：同频两条波，相位差 π —— 平行而不同步
+  waves: `<svg class="mark" viewBox="0 0 48 48"><g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round">
+    <path d="M5 19c4-7 8-7 12 0s8 7 12 0 8-7 12 0"/>
+    <path d="M5 29c4 7 8 7 12 0s8-7 12 0 8 7 12 0"/>
+  </g></svg>`,
+  // 08 道岔交汇：双轨交叉，中心一枚实心节点
+  rail: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M6 16h11l14 16h11"/>
+    <path d="M6 32h11l14-16h11"/>
+    <circle cx="24" cy="24" r="3" fill="currentColor" stroke="none"/>
+  </g></svg>`,
+  // 09 终端括号：⟨ ⟩ 之间的平行双线，终端气质
+  braces: `<svg class="mark" viewBox="0 0 48 48"><g ${S}>
+    <path d="M17 10l-9 14 9 14"/>
+    <path d="M31 10l9 14-9 14"/>
+    <path d="M22 17v14M26 17v14" stroke-width="3"/>
+  </g></svg>`,
+  // 10 双带无穷：∞ 由内外两条平行带子拧成，循环交错
+  infinity: `<svg class="mark" viewBox="0 0 48 48"><g fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15 18c-5 0-8 2.7-8 6s3 6 8 6c7 0 9-12 18-12 5 0 8 2.7 8 6s-3 6-8 6c-9 0-11-12-18-12z"/>
+    <path d="M16 21.5c-2.8 0-4.2 1.2-4.2 2.5s1.4 2.5 4.2 2.5c4.6 0 6-7.5 12-7.5 2.8 0 4.2 1.2 4.2 2.5s-1.4 2.5-4.2 2.5c-6 0-7.4-7.5-12-7.5z"/>
+  </g></svg>`,
+};
+const concepts = [
+  ['01 · 交织', 'weave', '两条平行线中央上下交叠，断口即“交错”'],
+  ['02 · 换轨', 'swap', '双车道中段平滑互换，端点圆点为会话标记'],
+  ['03 · 平行符', 'symbol', '数学平行号 ∥ 收进圆角牌'],
+  ['04 · 双气泡', 'bubbles', '人类与 bot 的两枚对话气泡，平行存在'],
+  ['05 · 字母 P', 'letterP', 'P 由两条平行竖笔立起'],
+  ['06 · 对向车道', 'arrows', '上行与下行各占一道，互不越线'],
+  ['07 · 相位波', 'waves', '同频两条波，相位差 π——平行不同步'],
+  ['08 · 道岔交汇', 'rail', '双轨交叉处一枚实心节点，交错有锚'],
+  ['09 · 终端括号', 'braces', '⟨ ⟩ 之间的平行双线，终端气质'],
+  ['10 · 双带无穷', 'infinity', '∞ 由两条平行带子拧成，循环交错'],
+];
+const grid = document.getElementById('grid');
+for (const [name, key, desc] of concepts) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  cell.innerHTML = `
+    <div class="name"><b>${name}</b><span>${desc}</span></div>
+    <div class="pair">
+      <div class="pane dk"><div class="lockup">${marks[key]}<span class="word">parallel</span></div></div>
+      <div class="pane lt"><div class="lockup">${marks[key]}<span class="word">parallel</span></div></div>
+    </div>`;
+  grid.appendChild(cell);
+}
+</script>
+</body>
+</html>
