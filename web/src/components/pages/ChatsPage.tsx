@@ -160,6 +160,8 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
   // 模型（chat + work）：进入页面拉一次，切完再拉，菜单里点开时也刷新
   const loadModels = useCallback(() => { get('/api/providers').then(setModels).catch(() => {}); }, []);
   useEffect(loadModels, [loadModels]);
+  /** 换链首没写进去就在菜单里报一行，别让人以为已经换了 */
+  const [chainErr, setChainErr] = useState('');
 
   // 插入光标：文字由文本层显示、光标是文本层里的内联元素（自己占一格，把后面的字挤开）。
   // 这里只做两件事：把光标位（选区起点）与焦点态同步给文本层，以及把 textarea 的滚动位移带过去。
@@ -220,8 +222,8 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
       .map((e) => ({ provider: e.provider, model: e.model }));
     try {
       await post('/api/providers/chain', { kind, entries });
-      const it = list[idx];
-    } catch { /* 失败不弹提示 */ }
+      setChainErr('');
+    } catch (e) { setChainErr(`未生效：${(e as Error)?.message ?? String(e)}`); }
     loadModels();
   }, [models, loadModels]);
 
@@ -229,7 +231,8 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
   const followChat = useCallback(async () => {
     try {
       await post('/api/providers/chain', { kind: 'work', entries: [] });
-    } catch { /* 失败不弹提示 */ }
+      setChainErr('');
+    } catch (e) { setChainErr(`未生效：${(e as Error)?.message ?? String(e)}`); }
     loadModels();
   }, [loadModels]);
 
@@ -682,6 +685,7 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
                           <span>管理模型</span>
                           <span className="rt"><Icon name="chevron" size={12} /></span>
                         </button>
+                        {chainErr && <div className="mset-err">{chainErr}</div>}
                       </>
                     )}
                   </div>

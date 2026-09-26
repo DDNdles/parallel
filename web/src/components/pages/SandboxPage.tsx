@@ -34,6 +34,8 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [view, setView] = useState<View | null>(null);
   const [err, setErr] = useState('');
+  /** 限额弹窗里的写入失败就地报红（弹窗盖着页面，用 err 看不见） */
+  const [limitsErr, setLimitsErr] = useState('');
 
   const reload = useCallback(() => {
     get('/api/sandbox')
@@ -180,11 +182,13 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
                 await post('/api/sandbox/config', cfg);
                 await post('/api/plugins/sandbox/config', { values: { defaultTimeoutMs: timeoutMs } });
                 await post('/api/plugins/sandbox/global-default', { enabled: sbGlobal });
+                setLimitsErr('');
                 setLimits(false);
-              } catch { /* 失败不弹提示 */ }
+              } catch (e) { setLimitsErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
             }}>保存</button>
             <span className="plg-hint">沙箱无网络、无凭据，路径穿越由内核拦截</span>
           </div>
+          {limitsErr && <div className="mset-err">{limitsErr}</div>}
         </Modal>
       )}
 

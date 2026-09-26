@@ -8,6 +8,7 @@ import { Icon } from '@/components/Icon';
 import { BrandInput } from '@/components/BrandInput';
 import { Modal, Field } from '@/components/Modal';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
+import { useSave } from '@/lib/useSave';
 
 interface ModelCfg {
   id: string; contextWindow?: number; maxOutput?: number; inputTypes?: string[];
@@ -63,6 +64,8 @@ export default function ModelsPage({ onChanged, cmd }: {
   const [addingProvider, setAddingProvider] = useState(false);
   const [modelDlg, setModelDlg] = useState<{ provider: Provider; edit?: ModelCfg } | null>(null);
   const [picking, setPicking] = useState<'chat' | 'work' | null>(null);
+  /** 供应商/链/模型的写入失败统一就地报红 */
+  const { err, setErr, fail } = useSave();
 
   const reload = useCallback(() => {
     get('/api/providers').then((d: Resp) => {
@@ -80,19 +83,21 @@ export default function ModelsPage({ onChanged, cmd }: {
   const save = useCallback(async (id: string, patch: Record<string, unknown>) => {
     try {
       await post(`/api/providers/${id}`, patch);
+      setErr('');
       reload();
       onChanged();
-    } catch { /* 失败不弹提示 */ }
-  }, [reload, onChanged]);
+    } catch (e) { fail(e); }
+  }, [reload, onChanged, setErr, fail]);
 
   /** 整条链一次写回（拖动排序 / 增删都走这里，落盘即时生效） */
   const commitChain = useCallback(async (kind: 'chat' | 'work', entries: ChainRef[]) => {
     try {
       await post('/api/providers/chain', { kind, entries });
+      setErr('');
       reload();
       onChanged();
-    } catch { /* 失败不弹提示 */ }
-  }, [reload, onChanged]);
+    } catch (e) { fail(e); }
+  }, [reload, onChanged, setErr, fail]);
 
   if (!data) return <div className="muted" style={{ padding: 30 }}>加载中…</div>;
   /** 只列被链引用的 + 用户自己建的；未分配的内置项不占地方（要用得先添加成自定义供应商） */
@@ -126,12 +131,12 @@ export default function ModelsPage({ onChanged, cmd }: {
 
         {cur ? (
           <ProviderDetail
-            key={cur.id} p={cur} resp={data} models={models}
+            key={cur.id} p={cur} resp={data} models={models} err={err}
             onSave={save}
             onRemove={(id) => {
               post(`/api/providers/${id}/remove`, {})
-                .then(() => { setSel(''); reload(); onChanged(); })
-                .catch(() => {});
+                .then(() => { setErr(''); setSel(''); reload(); onChanged(); })
+                .catch(fail);
             }}
             onAddModel={() => setModelDlg({ provider: cur })}
             onEditModel={(m) => setModelDlg({ provider: cur, edit: m })}
@@ -150,13 +155,12 @@ export default function ModelsPage({ onChanged, cmd }: {
         <ProviderForm
           onClose={() => setAddingProvider(false)}
           onSubmit={async (v) => {
-            try {
-              const r = await post('/api/providers/create', v);
-              setAddingProvider(false);
-              if (r.id) setSel(r.id);
-              reload();
-              onChanged();
-            } catch { /* 失败不弹提示 */ }
+            const r = await post('/api/providers/create', v);
+            setErr('');
+            setAddingProvider(false);
+            if (r.id) setSel(r.id);
+            reload();
+            onChanged();
           }}
         />
       )}
@@ -297,8 +301,8 @@ function ChainPicker({ kind, providers, existing, onClose, onAdd }: {
   );
 }
 
-function ProviderDetail({ p, resp, models, onSave, onRemove, onSaveModels, onAddModel, onEditModel }: {
-  p: Provider; resp: Resp; models: ModelCfg[];
+function ProviderDetail({ p, resp, models, err, onSave, onRemove, onSaveModels, onAddModel, onEditModel }: {
+  p: Provider; resp: Resp; models: ModelCfg[]; err: string;
   onSave: (id: string, patch: Record<string, unknown>) => void;
   onRemove: (id: string) => void;
   onSaveModels: (list: ModelCfg[]) => void;
@@ -355,6 +359,7 @@ function ProviderDetail({ p, resp, models, onSave, onRemove, onSaveModels, onAdd
           )}
         </div>
       </div>
+      {err && <div className="mset-err">{err}</div>}
 
       <Field label="连接方式">
         <ProtoPicker value={protocol} onPick={(v) => onSave(p.id, { protocol: v })} />
@@ -679,7 +684,7 @@ function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus, i
 /** 添加供应商里的一条模型行：uid 只当稳定 key（模型 id 可被编辑改） */
 interface Row { uid: number; m: ModelCfg }
 
-function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v: NewProvider) => void }) {
+function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v: NewProvider) => Promise<void> | void }) {
   const [v, setV] = useState({ label: '', baseUrl: '', protocol: 'openai-compatible', apiKey: '' });
   const [rows, setRows] = useState<Row[]>([]);        // 一开始没有模型行，填完卡片才落一行
   const [editing, setEditing] = useState<number | 'new' | null>(null);
@@ -723,7 +728,8 @@ function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v
     if (!v.label.trim()) { setErr('请填写供应商名称'); return; }
     if (v.baseUrl.trim() && !/^https?:\/\//.test(v.baseUrl.trim())) { setErr('Base URL 需以 http(s):// 开头'); return; }
     setErr('');
-    onSubmit({ label: v.label.trim(), baseUrl: v.baseUrl.trim(), protocol: v.protocol, apiKey: v.apiKey, models: rows.map((r) => r.m) });
+    Promise.resolve(onSubmit({ label: v.label.trim(), baseUrl: v.baseUrl.trim(), protocol: v.protocol, apiKey: v.apiKey, models: rows.map((r) => r.m) }))
+      .catch((e) => setErr(`未保存：${(e as Error)?.message ?? String(e)}`));
   };
 
   return (

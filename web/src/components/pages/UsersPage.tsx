@@ -7,6 +7,7 @@ import { Icon } from '@/components/Icon';
 import { BrandInput } from '@/components/BrandInput';
 import { Modal, Field, Switch } from '@/components/Modal';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
+import { useSave } from '@/lib/useSave';
 
 interface U { userId: string; nickname: string; affection: number | null; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
 interface UsersApi { users: U[]; masterIds: string[]; extraAdminIds: string[] }
@@ -29,6 +30,9 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [ops, setOps] = useState<{ user: string; rows: Op[] }>({ user: '', rows: [] });
   const [q, setQ] = useState('');
+  /** 本页写入失败就地报红（详情区共用同一条） */
+  const sv = useSave();
+  const { err, setErr, fail } = sv;
   const fileRef = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(() => {
@@ -59,10 +63,11 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
   const importJson = useCallback(async (f: File) => {
     try {
       await post('/api/memory/import', JSON.parse(await f.text()));
+      setErr('');
       reload();
       loadDetail(sel, q);
-    } catch { /* 失败不弹提示 */ }
-  }, [reload, loadDetail, sel, q]);
+    } catch (e) { fail(e); }
+  }, [reload, loadDetail, sel, q, setErr, fail]);
 
   usePageCmd('users', cmd, (kind) => {
     if (kind === 'roles') setRoles((v) => !v);
@@ -76,8 +81,11 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
 
   const forget = async () => {
     if (!confirm(`确认清空 ${sel} 的全部记忆？`)) return;
-    await post(`/api/memory/user/${sel}/forget`);
-    setQ(''); setDetail(null); setOps({ user: '', rows: [] }); reload();
+    try {
+      await post(`/api/memory/user/${sel}/forget`);
+      setErr('');
+      setQ(''); setDetail(null); setOps({ user: '', rows: [] }); reload();
+    } catch (e) { fail(e); }
   };
 
   return (
@@ -102,7 +110,7 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
 
         {cur && (
           <UserDetail key={cur.userId} u={cur} detail={detail} ops={ops.user === cur.userId ? ops.rows : []} q={q} onQ={setQ}
-            onChanged={reload} onReload={() => loadDetail(cur.userId, q)} onForget={forget} />
+            sv={sv} onChanged={reload} onReload={() => loadDetail(cur.userId, q)} onForget={forget} />
         )}
       </div>
 
@@ -113,10 +121,12 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
   );
 }
 
-function UserDetail({ u, detail, ops, q, onQ, onChanged, onReload, onForget }: {
+function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget }: {
   u: U; detail: Detail | null; ops: Op[]; q: string; onQ: (s: string) => void;
+  sv: ReturnType<typeof useSave>;
   onChanged: () => void; onReload: () => void; onForget: () => void;
 }) {
+  const { err, setErr, fail } = sv;
   const [menu, setMenu] = useState(false);
   const [busy, setBusy] = useState(false);
   const [qin, setQin] = useState(q);
@@ -127,23 +137,23 @@ function UserDetail({ u, detail, ops, q, onQ, onChanged, onReload, onForget }: {
 
   const block = async (to: boolean) => {
     setBusy(true);
-    try { await post(`/api/users/${u.userId}/block`, { blocked: to }); onChanged(); onReload(); }
-    catch { /* 失败不弹提示 */ }
+    try { await post(`/api/users/${u.userId}/block`, { blocked: to }); setErr(''); onChanged(); onReload(); }
+    catch (e) { fail(e); }
     finally { setBusy(false); }
   };
   const saveFact = async (f: Fact, content: string) => {
-    try { await post('/api/memory/fact', { userId: u.userId, id: f.id, content }); onReload(); }
-    catch { /* 失败不弹提示 */ }
+    try { await post('/api/memory/fact', { userId: u.userId, id: f.id, content }); setErr(''); onReload(); }
+    catch (e) { fail(e); }
   };
   const delFact = async (f: Fact) => {
-    try { await post('/api/memory/fact', { userId: u.userId, id: f.id }); onReload(); }
-    catch { /* 失败不弹提示 */ }
+    try { await post('/api/memory/fact', { userId: u.userId, id: f.id }); setErr(''); onReload(); }
+    catch (e) { fail(e); }
   };
   const addFact = async () => {
     const content = draft.trim();
     if (!content) return;
-    try { await post(`/api/memory/user/${u.userId}`, { content }); setDraft(''); setAdding(false); onReload(); }
-    catch { /* 失败不弹提示 */ }
+    try { await post(`/api/memory/user/${u.userId}`, { content }); setErr(''); setDraft(''); setAdding(false); onReload(); }
+    catch (e) { fail(e); }
   };
 
   return (
@@ -171,6 +181,8 @@ function UserDetail({ u, detail, ops, q, onQ, onChanged, onReload, onForget }: {
           </div>
         </div>
       </div>
+
+      {err && <div className="mset-err">{err}</div>}
 
       <div className="mset-meta">
         {u.isMaster && <span className="tag accent">主人</span>}
@@ -259,12 +271,14 @@ const parse = (s: string) => s.split(/[,，\s]+/).map((x) => x.trim()).filter(Bo
 function RolesModal({ data, onClose, onChanged }: { data: UsersApi; onClose: () => void; onChanged: () => void }) {
   const [masters, setMasters] = useState(data.masterIds.join(','));
   const [admins, setAdmins] = useState(data.extraAdminIds.join(','));
+  const [err, setErr] = useState('');
   const save = async () => {
     try {
       await post('/api/users', { masterIds: parse(masters), extraAdminIds: parse(admins) });
+      setErr('');
       onClose();
       onChanged();
-    } catch { /* 失败不弹提示 */ }
+    } catch (e) { setErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
   return (
     <Modal title="权限名单" onClose={onClose}>
@@ -278,6 +292,7 @@ function RolesModal({ data, onClose, onChanged }: { data: UsersApi; onClose: () 
         <button className="btn primary" onClick={save}>保存</button>
         <button className="mset-link" onClick={onClose}>取消</button>
       </div>
+      {err && <div className="mset-err">{err}</div>}
     </Modal>
   );
 }

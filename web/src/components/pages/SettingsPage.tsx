@@ -2,6 +2,7 @@
 /** 设置：左分节导航（QQ 接入 / 模型 / 搜索 / 风控 / 好感度）+ 右表单；协议端选择与可用性检测都在「QQ 接入」里 */
 import { useCallback, useEffect, useState } from 'react';
 import { get, post, fmtTime } from '@/lib/api';
+import { useSave } from '@/lib/useSave';
 import { BrandInput } from '@/components/BrandInput';
 import { PillSelect, type PillOpt } from '@/components/PillSelect';
 import { Icon } from '@/components/Icon';
@@ -69,6 +70,8 @@ export default function SettingsPage() {
   const [wake, setWake] = useState('');
   /** 已从插件页挪走的几项能力：好感度（chat）、联网搜索（web-search）——含各自的全局默认 */
   const [plug, setPlug] = useState<{ chat: PlugCfg; web: PlugCfg } | null>(null);
+  /** 本页所有写入失败都在这里就地报红 */
+  const { err, setErr, save, run, fail } = useSave();
 
   const loadPlug = useCallback(() => {
     Promise.all([
@@ -79,9 +82,9 @@ export default function SettingsPage() {
     }).catch(() => {});
   }, []);
   const savePlug = (id: string, values: Record<string, unknown>) =>
-    post(`/api/plugins/${id}/config`, { values }).then(loadPlug).catch(() => {});
+    run(() => post(`/api/plugins/${id}/config`, { values }), loadPlug);
   const saveGlobal = (id: string, enabled: boolean) =>
-    post(`/api/plugins/${id}/global-default`, { enabled }).then(loadPlug).catch(() => {});
+    run(() => post(`/api/plugins/${id}/global-default`, { enabled }), loadPlug);
 
   const refreshInfo = useCallback(async () => {
     try {
@@ -134,22 +137,24 @@ export default function SettingsPage() {
     if (!confirm(`切换到 ${name}？当前协议端会被停掉，QQ 登录要重新来一次。`)) return;
     try {
       await post('/api/login/protocol', { flavor: to });
+      setErr('');
       void loadCfg();     // 换端后两端各自的配置项（模式 / QQ 路径）都要重新对齐
-    } catch { /* 失败不弹提示 */ }
+    } catch (e) { fail(e); }
   };
-  /** 换接入方式要重启才生效（模式决定 LLBot 的启动参数） */
+  /** 换接入方式要重启才生效（模式决定 LLBot 的启动参数）；写成功才改本地，免得弹回后看不出来没存 */
   const pickMode = async (m: 'pmhq' | 'direct') => {
-    setMode(m);
     try {
       await post('/api/config', { onebot: { llbot: { mode: m } } });
+      setMode(m);
+      setErr('');
       await post('/api/login/end/restart');
       refreshInfo();
       void runCheck();
-    } catch { /* 失败不弹提示 */ }
+    } catch (e) { fail(e); }
   };
- const saveRisk = async (body: Record<string, unknown>) => {
-    try { await post('/api/config', { risk: body }); }
-    catch { /* 失败不弹提示 */ }
+  const saveRisk = async (body: Record<string, unknown>) => {
+    try { await post('/api/config', { risk: body }); setErr(''); }
+    catch (e) { fail(e); }
   };
 
   return (
@@ -172,6 +177,7 @@ export default function SettingsPage() {
             <span className="mset-dic"><Icon name={SECTIONS.find((s) => s.v === sec)!.icon} size={17} /></span>
             <h2 className="mset-dtitle">{SECTIONS.find((s) => s.v === sec)!.t}</h2>
           </div>
+          {err && <div className="mset-err">{err}</div>}
 
           {sec === 'onebot' && (
             <>
@@ -216,15 +222,15 @@ export default function SettingsPage() {
                 <BrandInput className="mono" value={qq} placeholder="QQ 号" spellCheck={false}
                   onChange={(e) => setQq(e.target.value)}
                   onBlur={async () => {
-                    try { await post('/api/config', { expectedQq: qq.trim() }); refreshInfo(); void runCheck(); }
-                    catch { /* 失败不弹提示 */ }
+                    try { await post('/api/config', { expectedQq: qq.trim() }); setErr(''); refreshInfo(); void runCheck(); }
+                    catch (e) { fail(e); }
                   }} />
               </div>
 
               <div className="set-row">
                 <button className="btn" onClick={async () => {
-                  try { await post('/api/login/end/restart'); refreshInfo(); void runCheck(); }
-                  catch { /* 失败不弹提示 */ }
+                  try { await post('/api/login/end/restart'); setErr(''); refreshInfo(); void runCheck(); }
+                  catch (e) { setErr(`重启协议端失败：${(e as Error)?.message ?? String(e)}`); }
                 }}>重启协议端</button>
                 <button className="btn" onClick={() => window.open(end?.webuiUrl ?? '', '_blank')}>打开控制台</button>
               </div>
@@ -238,8 +244,7 @@ export default function SettingsPage() {
                   onChange={(v) => patch({ llm: { ...c.llm, failoverThreshold: v } })} />
               </div>
               <div className="set-row" style={{ marginTop: 14 }}>
-                <button className="btn primary" onClick={() => post('/api/config', { llm: { failoverThreshold: c.llm.failoverThreshold } })
-                  .catch(() => {})}>保存</button>
+                <button className="btn primary" onClick={() => save('/api/config', { llm: { failoverThreshold: c.llm.failoverThreshold } })}>保存</button>
               </div>
             </>
           )}
@@ -254,8 +259,10 @@ export default function SettingsPage() {
                     onChange={(e) => setTavily(e.target.value)}
                     onBlur={() => {
                       const key = webKey.trim();
-                      setTavily(null);
-                      if (key !== storedKey) void savePlug('web-search', { apiKey: key }); // 清空 = 删掉这把 key
+                      if (key === storedKey) { setTavily(null); return; }
+                      // 写成功才放弃本地输入；失败就留着用户填的内容 + 就地报红，别静默弹回旧值
+                      run(() => post('/api/plugins/web-search/config', { values: { apiKey: key } }),
+                        () => { setTavily(null); loadPlug(); });
                     }} />
                   <button className="mset-ibtn in" title={showKey ? '隐藏密钥' : '显示密钥'} onClick={() => setShowKey((v) => !v)}>
                     <Icon name={showKey ? 'eyeOff' : 'eye'} size={15} />
@@ -364,8 +371,7 @@ export default function SettingsPage() {
                 {c.persona.affection.stages.map((s) => <span key={s.min} className="tag mono">{s.min}+ {s.label}</span>)}
               </div>
               <div className="set-row" style={{ marginTop: 14 }}>
-                <button className="btn primary" onClick={() => post('/api/config', { persona: c.persona })
-                  .catch(() => {})}>保存</button>
+                <button className="btn primary" onClick={() => save('/api/config', { persona: c.persona })}>保存</button>
               </div>
             </>
           )}

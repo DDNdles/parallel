@@ -113,7 +113,7 @@ function PersonaDetail({ persona, pluginId, isDefault }: { persona: Persona; plu
     try {
       await post('/api/personas/edit', { personaId: persona.id, file, content });
       setErr('');
-    } catch { /* 失败不弹提示 */ }
+    } catch (e) { setErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
   return (
     <section className="mset-detail">

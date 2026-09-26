@@ -89,6 +89,8 @@ export default function PluginsPage({ cmd }: { cmd?: PageCmd }) {
 function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[]; onChanged: () => void }) {
   const [menu, setMenu] = useState(false);
   const [cfg, setCfg] = useState<Record<string, unknown> | null>(null);
+  /** 本页写入失败就地报红（全站不用 toast） */
+  const [saveErr, setSaveErr] = useState('');
   const keys = Object.keys(p.userConfigSchema ?? {});
 
   useEffect(() => {
@@ -101,8 +103,8 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
   }, [p.id, keys.length]);
 
   const run = (fn: () => Promise<unknown>) => async () => {
-    try { await fn(); setTimeout(onChanged, 300); }
-    catch { /* 失败不弹提示 */ }
+    try { await fn(); setSaveErr(''); setTimeout(onChanged, 300); }
+    catch (e) { setSaveErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
   /** 单项写入：内核落库后会自己重载插件 */
   const saveOne = (k: string, v: unknown) => run(() => post(`/api/plugins/${p.id}/config`, { values: { [k]: v } }));
@@ -149,6 +151,8 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
           </div>
         </div>
       </div>
+
+      {saveErr && <div className="mset-err">{saveErr}</div>}
 
       {p.description && <p className="plg-desc">{p.description}</p>}
 
@@ -266,12 +270,14 @@ function MatrixModal({ plugins, chats, onClose, onChanged }: {
   plugins: PluginInfo[]; chats: string[]; onClose: () => void; onChanged: () => void;
 }) {
   const rows = plugins.filter((p) => !p.core);
+  const [saveErr, setSaveErr] = useState('');
   const flip = async (pid: string, chatId: string, enabled: boolean) => {
-    try { await post(`/api/plugins/${pid}/group-state`, { chatId, enabled }); onChanged(); }
-    catch { /* 失败不弹提示 */ }
+    try { await post(`/api/plugins/${pid}/group-state`, { chatId, enabled }); setSaveErr(''); onChanged(); }
+    catch (e) { setSaveErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
   return (
     <Modal title="分群开关矩阵" wide onClose={onClose}>
+      {saveErr && <div className="mset-err">{saveErr}</div>}
       {!chats.length ? (
         <div className="mset-group-e">还没有任何群的开关记录。在群内让管理员发送 /插件 开启 &lt;id&gt;，或等该群来一条消息。</div>
       ) : (
