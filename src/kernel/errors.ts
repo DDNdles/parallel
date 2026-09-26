@@ -32,7 +32,7 @@ const SUGGESTIONS: Partial<Record<ErrorCategory, string>> = {
 };
 
 /**
- * 报错中心（报告 05 §4）：统一记录、聚合计数、建议动作、QQ 侧节流通知主人。
+ * 报错中心：统一记录、聚合计数、建议动作、QQ 侧节流通知主人。
  */
 export class ErrorCenter {
   private records = new Map<string, ErrorRecord>();

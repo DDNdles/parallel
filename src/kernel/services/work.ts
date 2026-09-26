@@ -10,7 +10,7 @@ import { newId, nowMs, truncate } from '../util/misc.ts';
 import { busEvents } from '../bus.ts';
 
 /**
- * WorkRunner（报告 10 §7）：chat 模型 → work 模型的委派执行器。
+ * WorkRunner：chat 模型 → work 模型的委派执行器。
  *
  * 职责边界：
  *  - 用 **work 模型链**（llm.workChain，空则跟随 llm.chatChain）跑一个独立的 agent loop；

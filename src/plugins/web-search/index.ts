@@ -1,11 +1,11 @@
 import type { PluginContext } from '../../kernel/types.ts';
 
 // ============================================================
-// web-search —— Tavily 搜索（报告 06 §4.2）
+// web-search —— Tavily 搜索
 // 报告允许"工具或等价封装"：此处为 Tavily REST API 的直接封装（无需 npx/MCP 子进程），
 // 行为与 tavily-mcp 的 search 工具一致。插件同时演示 mcpServers 声明方式见 examples。
 //
-// 对齐 Kimi Chat 工具面（报告 08 §1.3，用户指定映射）：
+// 对齐 Kimi Chat 工具面（用户指定映射）：
 // - web_search ↔ Kimi web_search：带 time_range（时效）/search_depth（深度）参数，走 Tavily
 // - web_fetch   ↔ Kimi browser_visit 的"读网页正文"用途：直接 HTTP GET 抓取 + 正文抽取，
 //                 不经第三方搜索 API（Tavily 只管搜索，抓网页没必要花额度）

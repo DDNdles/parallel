@@ -4,7 +4,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, statSy
 import type { PluginContext } from '../../kernel/types.ts';
 
 // ============================================================
-// sticker —— 表情包发送/搜索/建库（报告 06 §4.7）
+// sticker —— 表情包发送/搜索/建库
 // 群级库：data/stickers/<chatKey>/ 存图，插件 state 存索引。
 // 收图：回复一张图片 + 「/表情 收 名字」；发送：/表情 名字；搜索：/表情 搜 关键词；
 // 随机：/表情 随机；删除（管理员）：/表情 删 名字。LLM 工具：send_sticker。

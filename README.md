@@ -88,8 +88,5 @@ examples/             示例插件（自建模板，含 MCP server 示例）
 web/                  桌面端源码（Next.js 15 静态导出）
 ui/                   桌面端产物（`npm run build` 生成，不入库）
 test/                 单测 + E2E（模拟协议端）
-docs/                 插件开发指南 / 部署与降险 / 架构与验收对照
-data/                 运行时数据（config.json / secrets.json / parallel.db / sandbox/ / sessions/ / plugins/）
+data/                 运行时数据（config.json / secrets.json / parallel.db / sandbox/ / sessions/ / plugins/），不入库
 ```
-
-详细文档：[插件开发指南](docs/插件开发指南.md) · [部署与降险](docs/部署与降险.md) · [架构与验收对照](docs/架构与验收对照.md)

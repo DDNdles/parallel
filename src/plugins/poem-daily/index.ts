@@ -2,7 +2,7 @@ import type { PluginContext } from '../../kernel/types.ts';
 import { todayKey } from '../../kernel/util/misc.ts';
 
 // ============================================================
-// poem-daily —— 每日推荐诗歌（todo 骨架，报告 06 §4.8）
+// poem-daily —— 每日推荐诗歌（todo 骨架）
 // 内置语料起步；TODO: 今日诗词 API 接入、300 篇完整语料、定时推送
 // ============================================================
 

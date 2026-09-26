@@ -131,7 +131,7 @@ export class Pipeline {
     // ---- 命令分发 ----
     const cmdText = text.startsWith('/') ? text.slice(1) : text.startsWith('／') ? text.slice(1) : null;
     if (cmdText !== null) {
-      // /work 是“任务触发器”：/work <任务描述> 交给 work 模型执行，再由 chat 模型转述给用户（报告 10 §7）
+      // /work 是“任务触发器”：/work <任务描述> 交给 work 模型执行，再由 chat 模型转述给用户
       const workMatch = cmdText.match(/^work(?:\s+([\s\S]+))?$/);
       if (workMatch) {
         const task = (workMatch[1] ?? '').trim();

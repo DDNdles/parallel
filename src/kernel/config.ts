@@ -198,7 +198,7 @@ export function defaultSecrets(): Secrets {
 }
 
 /**
- * 单一配置源（报告 05 §5）：config.json + secrets.json，全部写操作原子化，
+ * 单一配置源：config.json + secrets.json，全部写操作原子化，
  * schema 校验失败拒绝写入并报 ErrorCenter。
  */
 export class ConfigStore {

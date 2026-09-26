@@ -2,7 +2,7 @@ import type { PluginContext } from '../../kernel/types.ts';
 import { todayKey } from '../../kernel/util/misc.ts';
 
 // ============================================================
-// mc-daily —— MC 每日推荐（todo 骨架，报告 06 §4.5）
+// mc-daily —— MC 每日推荐（todo 骨架）
 // 数据源：Modrinth 公开 API（无需 key）。用 daily_items 表记录已推荐项避免重复。
 // TODO: 加载器/版本过滤参数、CurseForge 备源、封面图发送
 // ============================================================

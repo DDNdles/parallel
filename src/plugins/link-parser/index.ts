@@ -1,7 +1,7 @@
 import type { PluginContext } from '../../kernel/types.ts';
 
 // ============================================================
-// link-parser —— B 站/小红书链接解析（todo 骨架，报告 06 §4.3）
+// link-parser —— B 站/小红书链接解析（todo 骨架）
 // B 站：使用无需登录的公开接口（api.bilibili.com/x/web-interface/view）。
 // 小红书：无稳定公开 API（反爬强），v1 只做识别+提示（TODO: v2 接解析服务）。
 // ============================================================

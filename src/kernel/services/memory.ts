@@ -9,7 +9,7 @@ import type { MemoryOp, UserFact, UserProfile } from '../types.ts';
 const QUIET_ATTRS = new Set(['affection', 'affection_daily', 'affection_last_ts', 'mood']);
 
 /**
- * 用户记忆服务（报告 05 §2）：按 QQ 号记忆，SQLite + FTS5(trigram) 检索。
+ * 用户记忆服务：按 QQ 号记忆，SQLite + FTS5(trigram) 检索。
  * 预留 memoryBackend 切换位（mem0 等适配器实现同一接口即可替换）。
  */
 export class MemoryService {

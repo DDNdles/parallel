@@ -2,7 +2,7 @@ import type { PluginContext } from '../../kernel/types.ts';
 import { todayKey } from '../../kernel/util/misc.ts';
 
 // ============================================================
-// daily-question —— 每日一题（todo 骨架，报告 06 §4.4）
+// daily-question —— 每日一题（todo 骨架）
 // 默认被动：/今日一题 命令触发。主动推送需主人开启（schedule 权限 + proactive 开关）。
 // TODO: 接入 LeetCode 每日一题公开接口 / 更大题库；晚间公布答案的独立任务
 // ============================================================

@@ -6,7 +6,7 @@ import type { ChatRef } from '../types.ts';
 import { nowMs } from '../util/misc.ts';
 
 /**
- * 会话容器管理器（报告 10 §4/§5）：为每个会话维持两类常驻容器。
+ * 会话容器管理器：为每个会话维持两类常驻容器。
  *
  *  compute：--network none 的 Python 会话容器（常驻 ipykernel，变量跨调用保留）
  *  browser：有网的浏览器容器（常驻 Chromium，登录态/页面跨调用保留）
