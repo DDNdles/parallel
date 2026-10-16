@@ -51,6 +51,8 @@ export interface NecessityScore {
   score: number;
   detail: string;
   pressureScore: number;
+  /** likelihood 模式把旧公式降级成特征用：这里给出各分项原值 */
+  parts: { relevance: number; content: number; pressure: number; presence: number };
 }
 
 /** 剥掉引用、媒体占位、合并转发、@ 提及，只留用户当前发言主体 */
@@ -203,7 +205,7 @@ export function scoreReplyNecessity(input: NecessityInput, botName = ''): Necess
   if (penalty !== 0) parts.push(`存在感=-${penalty}(5min=${input.recentSelfReplies}/${input.recentWindowMessages})`);
   parts.push(`频率=${freq.toFixed(3)}`, `倍率=${factor.toFixed(2)}`);
 
-  return { score, detail: parts.join(' '), pressureScore: pressure };
+  return { score, detail: parts.join(' '), pressureScore: pressure, parts: { relevance, content: content.score, pressure, presence: penalty } };
 }
 
 /**

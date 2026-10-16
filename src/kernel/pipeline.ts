@@ -12,9 +12,14 @@ import type { Db } from './db.ts';
 import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
 import { scriptFormatText, SILENT_MARKER, isSilentScene } from './humanlike/script.ts';
+
+/** 圈内黑话（表达学习）的 hook 面；可选依赖——没接（测试/降级）就整个旁路 */
+interface JargonHook {
+  observe(event: ChatEvent): void;
+  sections(chat: import('./types.ts').ChatRef): string | null;
+}
 import { AGENCY_REASON_ZH } from './humanlike/agency.ts';
 import { todayKey, newId } from './util/misc.ts';
-import { FORWARD_PROMPT_IMAGES } from './util/forward.ts';
 import { inboundModelText } from './util/modeltext.ts';
 import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem } from './prompt-sections.ts';
 import { composeContinueTask, type PendingAsk } from './work-prompt.ts';
@@ -59,15 +64,12 @@ export function attachmentsOf(event: ChatEvent): MessageAttachment[] {
     push(kind, f ? { url: f.url, file: f.sandboxPath } : s.data,
       String(f?.name ?? s.data.voice_name ?? s.data.file ?? '') || undefined);
   }
-  // 记录里的媒体按扩展名分回三类；音频/视频**各自**只给一条（prepareMedia 每样只取第一条，多给是浪费）
-  let imgLeft = FORWARD_PROMPT_IMAGES, audioLeft = 1, videoLeft = 1;
+  // 记录里的媒体按扩展名分回三类。补传口径 = 下载口径：适配器取回时已按 FORWARD_MAX_NODE_IMAGES /
+  // FORWARD_MAX_NODE_MEDIA 守住预算，这里照单全收、不再二次砍（砍过就会"下了图却不给模型看"）
   for (const n of event.forward?.nodes ?? []) {
     for (const f of n.files ?? []) {
       const mime = mimeOf(f.name) ?? '';
       const kind = mime.startsWith('audio/') ? 'audio' : mime.startsWith('video/') ? 'video' : 'image';
-      if (kind === 'image') { if (imgLeft <= 0) continue; imgLeft--; }
-      else if (kind === 'audio') { if (audioLeft <= 0) continue; audioLeft--; }
-      else { if (videoLeft <= 0) continue; videoLeft--; }
       push(kind, f.url ? { file: f.sandboxPath, url: f.url } : { file: f.sandboxPath }, f.name);
     }
   }
@@ -83,12 +85,10 @@ export function isSilentReply(reply: string): boolean {
   return isSilentScene(reply);
 }
 
-/** 把一批被合并的消息渲染成模型看到的用户输入 */
+/** 把一批被合并的消息渲染成模型看到的用户输入（说话人前缀统一走 modelTextOf，见下） */
 function renderBatch(events: ChatEvent[]): string {
   if (events.length === 1) return modelTextOf(events[0]);
-  return events
-    .map((e) => `${e.nickname || e.userId}：${modelTextOf(e)}`)
-    .join('\n');
+  return events.map(modelTextOf).join('\n');
 }
 
 /**
@@ -97,7 +97,44 @@ function renderBatch(events: ChatEvent[]): string {
  * 模型那边必须读到内容，否则群友递过来一份记录它等于什么都没看见。
  */
 function modelTextOf(event: ChatEvent): string {
-  return inboundModelText({ text: event.text, replyTo: event.replyTo, forward: event.forward });
+  // 群聊把说话人放进正文：昵称优先、无昵称给 QQ 号——模型本来拿不到账号（ChatMessage 不存昵称），
+  // 这是它「群里谁在说话」的唯一来源；私聊对面是谁 system 已写明，不画蛇添足。
+  return inboundModelText({
+    text: event.text,
+    replyTo: event.replyTo,
+    forward: event.forward,
+    nickname: event.type === 'group' ? (event.nickname || event.userId) : undefined,
+  });
+}
+
+/**
+ * 上下文窗口的梳理点对齐（tumbling 网格，2026-10-16 用户裁定②）：
+ * 起点只在整格边界上动——两次梳理之间消息只增不减，供应商前缀缓存跨轮复用；
+ * 跨格那一刻整段裁一次。实际覆盖 = 起点（≤ now - N 分钟）到 now，在 N~2N 分钟之间。
+ * 网格以 epoch 起算、全体会话共用一把尺子，无需按群错峰。
+ */
+export function windowAnchorTs(nowMs: number, minutes: number): number {
+  const span = Math.max(1, Math.round(minutes)) * 60_000;
+  return Math.max(0, Math.floor((Math.max(0, nowMs) - span) / span) * span);
+}
+
+/** 「本轮媒体补传」分节里的媒体名（与 chainStreamFn 的 warn 用同一套中文写法） */
+const MEDIA_KIND_ZH: Record<MessageAttachment['kind'], string> = { image: '图片', audio: '语音', video: '视频' };
+
+/**
+ * 一条来源的媒体清单：「HH:MM 昵称或号码：图片×n / 语音×n / 视频×n」；这条来源没有媒体就返回 undefined。
+ * 只有窗口内的历史消息拿不到作者（ChatMessage 不带昵称），调用方按"更早的消息"标注。
+ */
+function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachment[] | undefined): string | undefined {
+  const count: Record<MessageAttachment['kind'], number> = { image: 0, audio: 0, video: 0 };
+  for (const a of atts ?? []) count[a.kind]++;
+  const parts = (['image', 'audio', 'video'] as const)
+    .filter((k) => count[k] > 0)
+    .map((k) => `${MEDIA_KIND_ZH[k]}×${count[k]}`);
+  if (!parts.length) return undefined;
+  const d = ts ? new Date(ts) : undefined;
+  const hhmm = d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '--:--';
+  return `${hhmm} ${who}：${parts.join(' / ')}`;
 }
 
 /**
@@ -140,6 +177,7 @@ export class Pipeline {
     private groupTitle: (chatId: string) => string,
     private selfNickname: () => string,
     private selfId: () => string,
+    private jargon?: JargonHook,
   ) {}
 
   // ---------------------------------------------------------------- 入站
@@ -289,6 +327,13 @@ export class Pipeline {
       return;
     }
 
+    // 圈内黑话（表达学习）：本群高频词的频次记账在这边走（判定是异步侧端，不阻塞回话）
+    if (this.jargon) {
+      for (const e of allowed) {
+        try { this.jargon.observe(e); } catch { /* 挖词失败不影响消息主流程 */ }
+      }
+    }
+
     const role = this.resolveRole(event);
     event.role = role;
     const text = event.text.trim();
@@ -331,7 +376,8 @@ export class Pipeline {
     }
 
     // ---- Agent 对话轮（多用户消息合并进来时，把它们一起交给模型） ----
-    await this.agentTurn(event, role, chatKey, { userText: renderBatch(allowed) });
+    // 整批事件一起带进去：文本由 renderBatch 拼，媒体按各自的来源聚合（附件要跟着批次走，不能只看 carrier）
+    await this.agentTurn(event, role, chatKey, { userText: renderBatch(allowed), batch: allowed });
   }
 
   // ---------------- 命令 ----------------
@@ -482,6 +528,8 @@ export class Pipeline {
       userText?: string;
       /** 主动发言轮：允许模型用沉默标记保持安静，且不往历史里塞一条假用户消息 */
       proactive?: boolean;
+      /** 本轮合并进来的整批事件（媒体按各自的来源聚合；不给就按 carrier 单事件取） */
+      batch?: ChatEvent[];
     },
   ): Promise<void> {
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
@@ -527,6 +575,49 @@ export class Pipeline {
         { order: 300, title: 'trust-boundary', text: TRUST_BOUNDARY_TEXT },
         { order: 400, title: 'context-continuity', text: CONTEXT_CONTINUITY_TEXT },
       ];
+      // ---- 上下文时间窗（storage.contextMinutes）：模型只看得到窗口内的消息 ----
+      // 更早的消息并没有丢：它们仍在历史缓存与会话日志里，由 search_history / recall_facts 现查。
+      // 缓存口径（2026-10-16 用户裁定②）：窗口起点**对齐梳理点**（tumbling 网格）——
+      //   两次梳理之间消息只增不减，供应商前缀缓存才吃得动；跨格那一刻整段裁一次，
+      //   实际覆盖在 N~2N 分钟之间。语义与"严格每轮 N 分钟"不同，这是用户点头换来的。
+      const minutes = Math.max(1, Math.round(Number(this.config.config.storage.contextMinutes) || 5));
+      const span = Math.max(1, minutes) * 60_000;
+      const sinceTs = windowAnchorTs(Date.now(), minutes);
+      const windowHistory = this.history.snapshot(chat, sinceTs);
+      if (!opts?.relay) {
+        systemSections.push({
+          order: 405, title: 'context-window',
+          text: [
+            `# 上下文时限`,
+            `- 你看得到最近这段会话的记录（按 ${minutes} 分钟的窗口对齐梳理点裁剪，实际覆盖最近 ${minutes}~${minutes * 2} 分钟）。`,
+            `- 更早的消息不在上下文里（当时的图片、语音、视频也不会出现）；只有非常久远的话题才可能需要回查。`,
+            `- 回话前先掂量现有信息够不够：不够就用 search_history（翻本会话更早的原文）或 recall_facts（翻这位用户的长期记忆）查了再答；一轮之内查完就回，别连环查。`,
+            `- 不要向用户提「时限、上下文、梳理、检索记录」这类内部词，查到就自然接上话。`,
+          ].join('\n'),
+        });
+      }
+      // ---- 本轮批次的媒体：整批事件一起算 ----
+      // 合并轮里 carrier 只是最后那条，只看它会把前面几条的图/语音一起吞掉（事件少时等价于旧行为）。
+      const batch = opts?.batch ?? [];
+      const batchMedia = batch.map((e) => ({ e, atts: attachmentsOf(e) }));
+      const turnAttachments = batch.length ? batchMedia.flatMap((x) => x.atts) : attachmentsOf(event);
+      // 本轮媒体补传：说清"这一发请求里带了哪些媒体、分别长在哪条消息上"。
+      // 图片由播种区按消息归位；语音/视频块统一补在最新那条用户消息上——两件事都交代清楚，模型才找得到。
+      const mediaLines = [
+        ...batchMedia.map((x) => mediaLineOf(x.e.nickname || x.e.userId, x.e.ts, x.atts)),
+        // 窗口内的历史消息：ChatMessage 不带作者（只有 role/正文/时刻），按"更早的消息"标注
+        ...windowHistory.map((m) => mediaLineOf('更早的消息', m.ts, m.attachments)),
+      ].filter((l): l is string => !!l);
+      if (mediaLines.length) {
+        systemSections.push({
+          order: 475, title: 'media-handoff',
+          text: [
+            `# 本轮媒体补传`,
+            ...mediaLines.map((l) => `- ${l}`),
+            `图片长在各自那条消息上；语音/视频块统一附在最新那条用户消息上。`,
+          ].join('\n'),
+        });
+      }
       // 剧本体（HDSI 的 <say> authored actions）：写小说、只有 <say> 里的台词进 QQ。
       // 「说几条、多长、什么时候分条」也由这一段讲清楚（MaiBot 的 replyStyle 已随输出侧一起删除）。
       // 转述轮不加：那轮要的是把工作结果讲清楚，不是演戏。
@@ -541,6 +632,11 @@ export class Pipeline {
       // 转述轮同样不加：那轮不演戏。
       if (!opts?.relay) {
         systemSections.push(...this.humanlike.sceneSections(chat));
+      }
+      // 圈内黑话（472）：本群学来的词与含意，帮 bot 听懂对方；转述轮同样不加。
+      if (!opts?.relay) {
+        const jargonSection = this.jargon?.sections(chat);
+        if (jargonSection) systemSections.push({ order: 472, title: 'jargon', text: jargonSection });
       }
       // 有一件活停在这位管理员这里（work 停下来提问了）：让她知道，并在主人随口回答时提醒他走 /work。
       // 只说给管理员听：这问题只有他能定，普通成员看到也只是噪声。
@@ -591,12 +687,12 @@ export class Pipeline {
           : (opts?.userText ?? modelTextOf(event));
 
       let messages = [
-        ...this.history.snapshot(chat),
+        ...windowHistory,
         { role: 'user' as const, content: userText },
       ];
       let ctx: LLMRequestContext = {
         chat, event, system, systemSections, messages, tools,
-        attachments: attachmentsOf(event),
+        attachments: turnAttachments,
       };
 
       // beforeLLM 钩子（人格插件五插槽注入点）
@@ -611,8 +707,9 @@ export class Pipeline {
         }
       }
 
-      // 主动发言轮不往历史里塞这条"假用户消息"（它不是任何人的发言）
-      if (!opts?.proactive) this.history.pushUser(chat, userText);
+      // 主动发言轮不往历史里塞这条"假用户消息"（它不是任何人的发言）。
+      // 附件跟着入账：窗口内的历史消息要能重放"这条当时带了图/语音/视频"。
+      if (!opts?.proactive) this.history.pushUser(chat, userText, ctx.attachments);
 
       const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 

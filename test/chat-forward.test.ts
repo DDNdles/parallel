@@ -11,7 +11,7 @@ import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
 import {
   FORWARD_MAX_DEPTH, FORWARD_MAX_NODE_IMAGES, FORWARD_MAX_NODE_MEDIA, FORWARD_MAX_NODES,
-  FORWARD_PROMPT_IMAGES, FORWARD_PROMPT_NODES, forwardTotal, renderForward,
+  forwardTotal, renderForward,
 } from '../src/kernel/util/forward.ts';
 import type { ChatEvent, ForwardRecord } from '../src/kernel/types.ts';
 
@@ -115,19 +115,27 @@ after(async () => {
 
 // ---------------- 渲染层（纯函数）先钉住取舍 ----------------
 
-test('renderForward：昵称打头逐条展开，超限的部分只报数目', () => {
-  const rec: ForwardRecord = {
-    id: RES_ID, title: '', dropped: 0, failed: false,
-    nodes: manyNodes(FORWARD_PROMPT_NODES + 3).map((n, i) => ({
-      nickname: `群友${i + 1}`, userId: '1', text: `第 ${i + 1} 条`, ts: 1_760_000_000_000,
-    })),
-  };
-  const out = renderForward(rec);
+test('renderForward：昵称打头逐条展开，进模型那边不再另设窗口', () => {
+  // 46 条 > 旧的「进模型只给 40 条」那一档：补传口径 = 下载口径，下载预算内的都要展开
+  const nodes = manyNodes(46).map((n, i) => ({
+    nickname: `群友${i + 1}`, userId: '1', text: `第 ${i + 1} 条`, ts: 1_760_000_000_000,
+  }));
+  const out = renderForward({ id: RES_ID, title: '', dropped: 0, failed: false, nodes });
   assert.ok(out.startsWith('【聊天记录·共'), out.slice(0, 40));
   assert.ok(out.includes('群友1：第 1 条'), '第一条要展开');
-  assert.ok(out.includes(`群友${FORWARD_PROMPT_NODES}：第 ${FORWARD_PROMPT_NODES} 条`), '窗口内的最后一条也要展开');
-  assert.ok(!out.includes(`群友${FORWARD_PROMPT_NODES + 1}：`), '超出模型窗口的不展开');
-  assert.ok(out.includes(`（其余 ${rec.nodes.length - FORWARD_PROMPT_NODES} 条未展开）`), '要说清后面还有多少');
+  assert.ok(out.includes('群友46：第 46 条'), '下载预算内的最后一条也要展开');
+  assert.ok(!out.includes('未展开'), '没被截断就不许出现「其余 N 条未展开」');
+  assert.ok(out.includes('共 46 条'), '总数要说清');
+});
+
+test('renderForward：只有真被截断（老日志超过 FORWARD_MAX_NODES）才说「其余 N 条未展开」', () => {
+  const nodes = manyNodes(FORWARD_MAX_NODES + 3).map((n, i) => ({
+    nickname: `群友${i + 1}`, userId: '1', text: `第 ${i + 1} 条`, ts: 1_760_000_000_000,
+  }));
+  const out = renderForward({ id: RES_ID, title: '', dropped: 0, failed: false, nodes });
+  assert.ok(out.includes(`群友${FORWARD_MAX_NODES}：第 ${FORWARD_MAX_NODES} 条`), '上限内最后一条要展开');
+  assert.ok(!out.includes(`群友${FORWARD_MAX_NODES + 1}：`), '超出上限的不展开');
+  assert.ok(out.includes(`（其余 ${nodes.length - FORWARD_MAX_NODES} 条未展开）`), '真截断了才说还有多少条');
 });
 
 test('renderForward：空记录不给模型任何正文，dropped 算进总数', () => {
@@ -159,7 +167,7 @@ test('记录里的图算进本轮附件：模型看得见图，不只是看见"�
   assert.deepEqual(attachmentsOf({ segments: [], text: '', forward: { id: 'x', title: '', nodes: [], dropped: 0, failed: true } } as unknown as ChatEvent), []);
 });
 
-test('记录里的语音/视频按扩展名归回 audio/video 附件（各只给一条，多给对端也用不上）', () => {
+test('记录里的语音/视频按扩展名归回 audio/video 附件：下载预算内的全部带上', () => {
   const mk = (name: string) => ({ name, rel: `inbox/${name}`, sandboxPath: `C:/sb/inbox/${name}`, size: 1 });
   const ev = {
     segments: [], text: '',
@@ -174,10 +182,11 @@ test('记录里的语音/视频按扩展名归回 audio/video 附件（各只给
     },
   } as unknown as ChatEvent;
   const got = attachmentsOf(ev).map((a) => `${a.kind}:${a.name}`).sort();
-  assert.deepEqual(got, ['audio:v1.silk', 'image:p.jpg', 'video:m.mp4'], JSON.stringify(got));
+  // 补传口径 = 下载口径：不再"各只给一条"，下载了几条就带几条（条数已由 FORWARD_MAX_NODE_MEDIA 在适配器那头守住）
+  assert.deepEqual(got, ['audio:v1.silk', 'audio:v2.silk', 'image:p.jpg', 'video:m.mp4'], JSON.stringify(got));
 });
 
-test('记录里几十张图：进模型的只取前 FORWARD_PROMPT_IMAGES 张（显示那边仍是 20 张）', () => {
+test('记录里几十张图：下载预算内的全部交给模型，进模型那边不再二次砍', () => {
   const files = Array.from({ length: FORWARD_MAX_NODE_IMAGES }, (_, i) => ({
     name: `i${i}.png`, rel: `inbox/i${i}.png`, sandboxPath: `C:/sb/inbox/i${i}.png`, size: 1,
   }));
@@ -189,8 +198,9 @@ test('记录里几十张图：进模型的只取前 FORWARD_PROMPT_IMAGES 张（
     },
   } as unknown as ChatEvent;
   const atts = attachmentsOf(ev);
-  assert.equal(atts.length, FORWARD_PROMPT_IMAGES, `只该给模型 ${FORWARD_PROMPT_IMAGES} 张，实得 ${atts.length}`);
-  assert.equal(atts[0].path, 'C:/sb/inbox/i0.png', '按记录顺序取最前面几张');
+  assert.equal(atts.length, FORWARD_MAX_NODE_IMAGES, `下载了多少张就该给模型多少张，实得 ${atts.length}`);
+  assert.equal(atts[0].path, 'C:/sb/inbox/i0.png', '按记录顺序，一张不少');
+  assert.equal(atts[atts.length - 1].path, `C:/sb/inbox/i${FORWARD_MAX_NODE_IMAGES - 1}.png`, '最后一张也在');
 });
 
 test('聊天记录：按 resId 现取节点，正文与昵称都落进会话日志', async () => {

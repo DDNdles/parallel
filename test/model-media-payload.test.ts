@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, before, after, beforeEach } from 'node:test';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,6 +18,11 @@ import { MockOneBot } from './helpers/mock-onebot.ts';
  *    —— 记录里的图同样被丢掉。
  * 所以这里用假端点顶替模型（照 scripts/dump-payloads.mjs 那套），把 OpenAI 兼容报文里的
  * 内容块逐类钉住：image_url / input_audio / video_url，以及"模型页没声明就不该出现"。
+ *
+ * 2026-10-16 再加一层：图片**按消息归位**（窗口内每条历史消息的图长在它自己那条上，本轮的图长在最新那条），
+ * 音视频（pi-ai 的 content 块里没有这两类）统一补在最新那条 user 的尾部；补传口径 = 下载口径，
+ * 记录里的媒体不再二次砍。窗口内的历史（连同它带的媒体）每轮都会跟着再送一遍，
+ * 所以钉精确块数的用例各用各的干净群，别让上一个用例的历史混进计数。
  */
 const GROUP = 671;
 const MEMBER = 20001;
@@ -155,18 +160,36 @@ after(async () => {
   try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* Temp 目录系统会回收 */ }
 });
 
-const send = (messageId: number, extraSegments: any[]) => mock.sendGroupMessage({
-  groupId: GROUP, userId: MEMBER, text: '', atMe: true, nickname: '小明', messageId, extraSegments,
+const send = (messageId: number, extraSegments: any[], group: string = GROUP) => mock.sendGroupMessage({
+  groupId: Number(group), userId: MEMBER, text: '', atMe: true, nickname: '小明', messageId, extraSegments,
 });
 
+/**
+ * 每个用例一个干净群：上下文时间窗内的历史（连同它带的图/语音/视频）会被这一轮重新带上，
+ * 同一个群里连着跑，前一个用例的媒体会混进后一个用例的计数。
+ */
+let groupSeq = 700;
+function freshGroup(): string {
+  const g = String(groupSeq++);
+  kernel.container.setGroupState('chat', g, true, String(MASTER));
+  return g;
+}
+/** 造一条本机媒体文件：真实路径当附件用（窗口内历史、无 URL 的视频都靠它，见下面两个用例） */
+const localFile = (name: string, buf: Buffer) => {
+  const p = join(dataDir, name);
+  writeFileSync(p, buf);
+  return p;
+};
+
 test('顶层图片/语音/视频：真出现在发出去的请求体里（image_url + input_audio + video_url）', async () => {
+  const G = freshGroup();
   const since = seen.length;
   send(70001, [
     { type: 'text', data: { text: '这张图、这段语音、这个视频都给你' } },
     { type: 'image', data: { file: 'pic.png', url: URL_OF('pic.png') } },
     { type: 'record', data: { file: 'voice.wav', url: URL_OF('voice.wav') } },
     { type: 'video', data: { file: 'clip.mp4', url: URL_OF('clip.mp4') } },
-  ]);
+  ], G);
   const blocks = lastUserBlocks(await nextBody(since, '带三种媒体的请求'));
 
   const imgs = has(blocks, 'image_url');
@@ -184,11 +207,15 @@ test('顶层图片/语音/视频：真出现在发出去的请求体里（image_
 
   // 三类媒体都挂在"真人那句"上：设定不再占 user 轮（toPiMessages 把它摘进 system）
   assert.match(textOf(blocks), /这张图、这段语音、这个视频都给你/, '媒体要挂在含真人正文的那条 user 上');
+  // 图片 prepend 在正文之前、音视频补在最后一条 user 的尾部（pi-ai 的 content 块里没有这两类）
+  assert.deepEqual(blocks.map((b) => b?.type), ['image_url', 'text', 'input_audio', 'video_url'],
+    `块序：图在前、音视频在尾：${JSON.stringify(blocks.map((b) => b?.type))}`);
 });
 
 test('人格设定不再占 user 轮：三条设定进 system，最后一条 user 是真人那句', async () => {
+  const G = freshGroup();
   const since = seen.length;
-  send(70010, [{ type: 'text', data: { text: '你还记得我是谁吗' } }]);
+  send(70010, [{ type: 'text', data: { text: '你还记得我是谁吗' } }], G);
   const body = await nextBody(since, '纯文本那一发');
   const users = (body?.messages ?? []).filter((m: any) => m?.role === 'user');
   const last = users[users.length - 1];
@@ -198,31 +225,43 @@ test('人格设定不再占 user 轮：三条设定进 system，最后一条 use
   assert.match(sys, /【人格强化/, '它要落在 system 里');
 });
 
-test('聊天记录里的图与视频：跟着记录正文一起进这一发请求', async () => {
+test('聊天记录里的图与音视频：下载预算内的全部跟着记录一起进这一发请求', async () => {
+  // 12 张图 / 2 条语音 / 2 条视频：旧口径在这一档只给模型 8 张图、各 1 条音视频，
+  // 现在补传口径 = 下载口径（条数已由适配器的 FORWARD_MAX_NODE_IMAGES / _MEDIA 守住），这里不再二次砍
+  const G = freshGroup();
+  const IMGS = 12;
+  const nodeOf = (seg: any, i: number) => ({
+    content: [seg],
+    sender: { nickname: `群友${i}`, user_id: 21000 + i }, time: 1_760_000_000,
+    message_format: 'array', message_type: 'group',
+  });
   mock.setReply('get_forward_msg', {
     messages: [
-      {
-        content: [{ type: 'text', data: { text: '看这张' } }, { type: 'image', data: { file: 'pic.png', url: URL_OF('pic.png') } }],
-        sender: { nickname: '小明', user_id: MEMBER }, time: 1_760_000_000, message_format: 'array', message_type: 'group',
-      },
-      {
-        content: [{ type: 'video', data: { resource_id: 'res-clip', temp_url: URL_OF('clip.mp4') } }],
-        sender: { nickname: '小红', user_id: 20002 }, time: 1_760_000_001, message_format: 'array', message_type: 'group',
-      },
+      ...Array.from({ length: IMGS }, (_, i) => nodeOf(
+        { type: 'image', data: { file: 'pic.png', url: URL_OF('pic.png') } }, i)),
+      nodeOf({ type: 'record', data: { file: 'voice.wav', url: URL_OF('voice.wav') } }, 90),
+      nodeOf({ type: 'record', data: { file: 'voice.wav', url: URL_OF('voice.wav') } }, 91),
+      // 视频段只给 resource_id + temp_url（LLBot 的 OB11 序列化就是这个形状）
+      nodeOf({ type: 'video', data: { resource_id: 'res-c1', temp_url: URL_OF('clip.mp4') } }, 92),
+      nodeOf({ type: 'video', data: { resource_id: 'res-c2', temp_url: URL_OF('clip.mp4') } }, 93),
     ],
   });
   const since = seen.length;
-  send(70002, [{ type: 'text', data: { text: '昨天那堆记录' } }, { type: 'forward', data: { id: RES_ID } }]);
+  send(70002, [{ type: 'text', data: { text: '昨天那堆记录' } }, { type: 'forward', data: { id: RES_ID } }], G);
   const body = await nextBody(since, '带记录媒体的请求');
   const blocks = lastUserBlocks(body);
 
   assert.ok(allUserText(body).includes('【聊天记录'), '记录正文要展开进用户消息');
-  assert.equal(has(blocks, 'image_url').length, 1, JSON.stringify(blocks.map((b) => b?.type)));
-  assert.equal(has(blocks, 'video_url').length, 1);
-  assert.equal(has(blocks, 'input_audio').length, 0, '这条记录里没有语音');
+  const types = JSON.stringify(blocks.map((b) => b?.type));
+  assert.equal(has(blocks, 'image_url').length, IMGS, `下载了多少张图就给模型多少张：${types}`);
+  assert.equal(has(blocks, 'input_audio').length, 2, `两条语音都要送：${types}`);
+  assert.equal(has(blocks, 'video_url').length, 2, `两条视频都要送：${types}`);
+  assert.deepEqual(has(blocks, 'video_url').map((b) => String(b.video_url?.url ?? '')), [URL_OF('clip.mp4'), URL_OF('clip.mp4')],
+    '记录里的视频带公网 URL，照旧递 URL 不在本机代读');
 });
 
 test('模型页那行没声明输入类型：媒体不进请求，且在报错中心留下话（不静默当没听见）', async () => {
+  const G = freshGroup();
   const models = (kernel.config.config.providers as Record<string, any>).stub.models as any[];
   models[0].inputTypes = ['text'];
   try {
@@ -231,21 +270,26 @@ test('模型页那行没声明输入类型：媒体不进请求，且在报错�
       { type: 'text', data: { text: '再听一次' } },
       { type: 'image', data: { file: 'pic.png', url: URL_OF('pic.png') } },
       { type: 'record', data: { file: 'voice.wav', url: URL_OF('voice.wav') } },
-    ]);
+    ], G);
     const blocks = lastUserBlocks(await nextBody(since, '文本-only 的那一发'));
     assert.deepEqual(blocks.map((b) => b?.type), ['text'], JSON.stringify(blocks));
-    await until(() => kernel.errors.list().some((e) => e.category === 'provider' && /没勾选图片、音频/.test(e.message)),
-      5000, '报错中心那条 warn');
+    // 拦下它们的是两处、各留一条：图片在播种区按链首模型的输入类型拦（pi-ai 的 content 块里它才存在），
+    // 音视频在 chainStreamFn 按同一张筛子拦
+    await until(() => kernel.errors.list().some((e) => e.category === 'provider' && /链上模型不收图片/.test(e.message)),
+      5000, '图片被拦下那条 warn');
+    await until(() => kernel.errors.list().some((e) => e.category === 'provider' && /没勾选音频/.test(e.message)),
+      5000, '音视频被拦下那条 warn');
   } finally {
     models[0].inputTypes = ['text', 'image', 'audio', 'video'];
   }
 });
 
 test('语音容器不是浏览器/对端都认的 wav 时：转得动就转，转不动如实报，不塞个假块', async () => {
+  const G = freshGroup();
   // 假端点给的是 PNG 字节冒充 .silk：没有 ffmpeg 能解它，块就不该出现（正文仍留 [语音]）
   mock.setReply('get_record', { url: URL_OF('pic.png') });
   const since = seen.length;
-  send(70004, [{ type: 'record', data: { file: 'bad.silk' } }]);
+  send(70004, [{ type: 'record', data: { file: 'bad.silk' } }], G);
   const blocks = lastUserBlocks(await nextBody(since, '语音那条请求'));
   const auds = has(blocks, 'input_audio');
   if (auds.length) {
@@ -255,4 +299,90 @@ test('语音容器不是浏览器/对端都认的 wav 时：转得动就转，�
     assert.ok(/语音/.test(JSON.stringify(kernel.errors.list().map((e) => e.message))), '转不动要在报错中心留话');
   }
   assert.ok(!JSON.stringify(blocks).includes('bad.silk'), '不要把协议端的文件号当成内容塞进去');
+});
+
+// ---------------- 上下文时间窗：窗口内历史媒体按消息归位，窗口外的不出现 ----------------
+
+const chatOf = (groupId: string) => ({ platform: 'qq', type: 'group' as const, chatId: groupId });
+
+/** system 里的这两个新分节（405 只在普通轮注入；475 只要有媒体就注入——下面两个用例都是普通轮） */
+const systemText = (body: any) => (body?.messages ?? []).filter((m: any) => m?.role === 'system')
+  .map((m: any) => String(m.content ?? '')).join('\n');
+
+test('窗口内历史消息带的图：落在它自己那条消息上；音视频按口径补在最新那条 user 尾部', async () => {
+  const G = freshGroup();
+  const chat = chatOf(G);
+  // 造一条窗口内的历史：真人上一句就带着图与语音（pushUser 带附件，正是 pipeline 入账时的形状）
+  kernel.history.pushUser(chat, '这是我前面发的那张图', [
+    { kind: 'image', path: localFile('hist-window.png', PNG), name: 'hist-window.png', mime: 'image/png' },
+    { kind: 'audio', path: localFile('hist-window.wav', WAV), name: 'hist-window.wav', mime: 'audio/wav' },
+  ]);
+
+  const since = seen.length;
+  send(71001, [{ type: 'text', data: { text: '接着说' } }], G);
+  const body = await nextBody(since, '带窗口历史的请求');
+  const users = (body?.messages ?? []).filter((m: any) => m?.role === 'user');
+
+  // 历史那条：图长在它自己那条 content 上（不是最新那条）
+  const hist = users.find((m: any) => Array.isArray(m.content) && textOf(m.content).includes('这是我前面发的那张图'));
+  assert.ok(hist, `窗口内的历史消息要在请求体里：${JSON.stringify(users.map((m: any) => textOf(Array.isArray(m.content) ? m.content : [])))}`);
+  const histTypes = hist.content.map((b: any) => b?.type);
+  const histImgs = has(hist.content, 'image_url');
+  assert.equal(histImgs.length, 1, `历史那条自己的图要归位到它这条上：${JSON.stringify(histTypes)}`);
+  assert.match(String(histImgs[0].image_url?.url ?? ''), /^data:image\/png;base64,/, '本机文件要读成 data URL');
+  assert.equal(has(hist.content, 'input_audio').length, 0, '语音不挂在历史那条上（pi-ai 的 content 块里没有音频）');
+
+  // 本轮最新那条：正文在、图不在；历史里的语音补在这条的尾部
+  const blocks = lastUserBlocks(body);
+  assert.match(textOf(blocks), /接着说/);
+  assert.equal(has(blocks, 'image_url').length, 0, `本轮没带图，最新那条 user 上就不该有图：${JSON.stringify(blocks.map((b) => b?.type))}`);
+  assert.equal(has(blocks, 'input_audio').length, 1, '窗口内历史的语音要补在最新那条 user 上');
+
+  // 「本轮媒体补传」要说清这一发带了什么、长在哪：历史拿不到作者，按"更早的消息"标注
+  const sys = systemText(body);
+  assert.match(sys, /# 本轮媒体补传/, '475 分节要交代这一发的媒体清单');
+  assert.match(sys, /更早的消息：图片×1 \/ 语音×1/, '窗口内历史那条的媒体要列出来');
+  assert.match(sys, /# 上下文时限/, '405 分节要说明只看得到窗口内的消息');
+  assert.match(sys, /按 \d+ 分钟的窗口对齐梳理点裁剪/);
+});
+
+test('窗口外的历史消息不进请求体：它带的图也不出现', async () => {
+  const G = freshGroup();
+  const chat = chatOf(G);
+  kernel.history.pushUser(chat, '这是很久以前那张图', [
+    { kind: 'image', path: localFile('hist-old.png', PNG), name: 'hist-old.png', mime: 'image/png' },
+  ]);
+  // pushUser 只盖"现在"：造一条窗口外的记录得把 ts 挪到 30 分钟前（窗口默认 5 分钟）
+  const old = kernel.history.get(chat).find((m) => m.content === '这是很久以前那张图');
+  assert.ok(old, '历史里要有这条');
+  old.ts = Date.now() - 30 * 60_000;
+
+  const since = seen.length;
+  send(71002, [{ type: 'text', data: { text: '现在说点别的' } }], G);
+  const body = await nextBody(since, '窗口外历史那一发');
+  assert.ok(!allUserText(body).includes('这是很久以前那张图'), '窗口外的正文不许出现在请求体里');
+  const allBlocks = (body?.messages ?? []).filter((m: any) => m?.role === 'user')
+    .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
+  assert.equal(has(allBlocks, 'image_url').length, 0, '窗口外那条带的图也不许进请求体');
+});
+
+// ---------------- 视频：没有公网 URL 时的内联兜底 ----------------
+
+test('视频没有公网 URL、只有本机文件且 ≤20MB：读成 base64 内联，不是丢掉', async () => {
+  const G = freshGroup();
+  // 段里的 file 直接给本机路径（existsSync 命中）：适配器不去问协议端、也不下载，
+  // 正好造出"只有本机文件、没有公网 URL"那种视频
+  const local = localFile('local-clip.mp4', MP4);
+  const since = seen.length;
+  send(71003, [
+    { type: 'text', data: { text: '这个视频看看' } },
+    { type: 'video', data: { file: local } },
+  ], G);
+  const blocks = lastUserBlocks(await nextBody(since, '本机视频那一发'));
+  const vids = has(blocks, 'video_url');
+  assert.equal(vids.length, 1, `本机视频要内联送出：${JSON.stringify(blocks.map((b) => b?.type))}`);
+  const url = String(vids[0].video_url?.url ?? '');
+  assert.match(url, /^data:video\/mp4;base64,/, '没有 URL 就内联成 data URL');
+  assert.ok(Buffer.from(url.slice('data:video/mp4;base64,'.length), 'base64').equals(MP4),
+    '内联的就是本机那份文件本身（不许递对端取不到的本机路径）');
 });

@@ -20,7 +20,7 @@ interface Humanlike {
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
   timing: {
-    replyTriggerMode: 'necessity' | 'frequency';
+    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
     pendingThreshold: number; necessityThreshold: number;
     talkValue: number; privateTalkValue: number;
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
@@ -77,6 +77,7 @@ interface EndStatus {
 interface PlugCfg { values: Record<string, unknown>; globalDefault: boolean }
 
 const TRIGGERS: PillOpt[] = [
+  { v: 'likelihood', t: '拟合概率' },
   { v: 'necessity', t: '必要性' },
   { v: 'frequency', t: '频率' },
 ];
@@ -400,7 +401,7 @@ export default function SettingsPage() {
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-field">
                 <PillSelect align="left" value={h.timing.replyTriggerMode} options={TRIGGERS} label="触发方式"
-                  onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'necessity' | 'frequency' } }, true)} />
+                  onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'necessity' | 'frequency' } }, true)} />
               </div>
               <div className="set-grid">
                 <Num label="触发所需积压条数" hint="频率模式的开口门槛，默认 12" value={h.timing.pendingThreshold}

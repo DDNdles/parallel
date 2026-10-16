@@ -14,6 +14,9 @@ export class Db {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL;');
+    // busy_timeout 兜底：内核自身单连接不撞库，但外物（sqlite3 CLI、备份工具）碰库时
+    // 等它 5 秒而不是立刻 SQLITE_BUSY —— 调研里 MaiBot 的 1s 超时静默丢消息是反面教材
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.migrate();
   }
 
@@ -149,9 +152,19 @@ export class Db {
         value TEXT
       );
 
+      -- 圈内黑话（表达学习，humanlike/jargon.ts）：每 (群, 词) 学到的含意与频次阶梯进度
+      CREATE TABLE IF NOT EXISTS jargon (
+        term TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        count INTEGER DEFAULT 0,
+        rung INTEGER DEFAULT 0,
+        meaning TEXT DEFAULT '',
+        ts INTEGER,
+        PRIMARY KEY (chat_id, term)
+      );
+
       -- work 子代理任务运行记录（桌面端「工作」页 + 审计）
-      CREATE TABLE IF NOT EXISTS work_runs (
-        id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS work_runs (        id TEXT PRIMARY KEY,
         chat_key TEXT NOT NULL,
         task TEXT NOT NULL,
         model TEXT,

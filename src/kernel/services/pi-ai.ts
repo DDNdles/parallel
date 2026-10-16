@@ -17,9 +17,10 @@
 //  - thinking 增量不进 content：parallel 的 content 是给用户看的正文，思考走 events/日志。
 //  - usage：promptTokens = input + cacheRead（两家的 prompt_tokens 含缓存命中），
 //    cacheHitTokens = cacheRead、cacheMissTokens = input；保持 prompt >= cacheHit 这条不变式。
-//  - 附件：图片走 pi-ai 的 ImageContent（它原生支持）；**音频/视频 pi-ai 的 content 块里没有**，
-//    所以在它的 `onPayload` 扩展点上直接补进请求体（见 injectMedia）。只补它认的三种线格式，
-//    Anthropic Messages 没有音频/视频块，遇到就记 warn 跳过——不硬塞、不静默丢。
+//  - 附件：图片走 pi-ai 的 ImageContent（它原生支持），在 `toPiMessages` 里**按消息归位**
+//    （每条消息自己的图挂在自己那条上，读盘/取 URL 转 base64 都在那一步）；**音频/视频 pi-ai 的
+//    content 块里没有**，所以在它的 `onPayload` 扩展点上直接补进请求体（见 injectMedia）。
+//    只补它认的三种线格式，Anthropic Messages 没有音频/视频块，遇到就记 warn 跳过——不硬塞、不静默丢。
 //  - Gemini 原生那一档（google-generative-ai）：pi-ai 底下是 @google/genai SDK，
 //    它把 `model.baseUrl` 当"已含版本段"用（自己拼 `/models/<id>:streamGenerateContent?alt=sse`、
 //    key 走 `x-goog-api-key` 头），所以 baseUrl 必须先过 geminiApiBase 归一，多一段 /models 就 404。
@@ -27,7 +28,7 @@
 //    回传的原始字符串（如 OpenAI 的 tool_calls）不同；调用方只当不透明标记，别按字符串比对。
 // ============================================================
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import type { ChatMessage, LLMChatRequest, LLMResponse, LLMUsage, MessageAttachment, ToolCall, ToolDef } from '../types.ts';
 import { fetchBuffer, findFfmpeg, toWavFile } from './media.ts';
 
@@ -161,18 +162,37 @@ function toPiModel(pie: any, o: PiChatOptions, api: string): any {
  *  中途出现的 system（人格插件那几条设定）**不折成 user 轮**：Gemini 的 contents 只认 user/model，
  *  而当 user 发出去会让模型把内设读成对面念给它的话（实测它回过「你怎么又在念这串奇怪的咒语啊」）。
  *  三种线格式唯一的共同落点是 system 末尾，所以这里把它们摘出来交回调用方拼进 systemPrompt。
- *  agent loop 与插件直连共用这一份，别在调用方各写一遍。 */
-export function toPiMessages(messages: ChatMessage[], model: { id: string; provider: string }, api: string): { messages: any[]; extraSystem: string } {
+ *  agent loop 与插件直连共用这一份，别在调用方各写一遍。
+ *
+ *  `opt.attachmentsFor(i)`：第 i 条**输入消息自己的**附件（窗口内历史按消息归位；本轮那些属于最后一条）。
+ *  其中的**图片**在这里读成 pi-ai 原生的 ImageContent 块、PREPEND 到该条 content 最前——
+ *  每张图长在它当时那条消息上，模型才知道"哪句话配的哪张图"。
+ *  音频/视频没有 pi-ai 的 content 块可放，由调用方收起来走 onPayload（见 chainStreamFn 与 injectMedia）。
+ *  时间戳取消息自带的 `ts`（上下文时间窗筛的也是同一个值），老条目没有 ts 才盖 now。 */
+export async function toPiMessages(
+  messages: ChatMessage[],
+  model: { id: string; provider: string },
+  api: string,
+  opt?: { attachmentsFor?: (i: number) => MessageAttachment[] | undefined },
+): Promise<{ messages: any[]; extraSystem: string; failedImages: number }> {
   const out: any[] = [];
   const lifted: string[] = [];
-  const now = Date.now();
-  for (const m of messages) {
+  let failedImages = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
     if (m.role === 'system') {
       if (m.content?.trim()) lifted.push(m.content.trim());
       continue;
     }
     if (m.role === 'user') {
-      out.push({ role: 'user', content: [{ type: 'text', text: m.content }], timestamp: now });
+      const images: any[] = [];
+      const own = opt?.attachmentsFor?.(i);
+      if (own?.length) {
+        const loaded = await loadImages(own);
+        images.push(...loaded.images);
+        failedImages += loaded.failed;
+      }
+      out.push({ role: 'user', content: [...images, { type: 'text', text: m.content }], timestamp: m.ts ?? Date.now() });
       continue;
     }
     if (m.role === 'tool') {
@@ -182,7 +202,7 @@ export function toPiMessages(messages: ChatMessage[], model: { id: string; provi
         toolName: m.name ?? '',
         content: [{ type: 'text', text: m.content }],
         isError: false,
-        timestamp: now,
+        timestamp: m.ts ?? Date.now(),
       });
       continue;
     }
@@ -207,10 +227,10 @@ export function toPiMessages(messages: ChatMessage[], model: { id: string; provi
       model: model.id,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: m.tool_calls?.length ? 'toolUse' : 'stop',
-      timestamp: now,
+      timestamp: m.ts ?? Date.now(),
     });
   }
-  return { messages: out, extraSystem: lifted.join('\n\n') };
+  return { messages: out, extraSystem: lifted.join('\n\n'), failedImages };
 }
 
 /** 图片附件 → pi-ai 的 ImageContent；data URL 拆成 base64 + mimeType。读不动的记一条待报。 */
@@ -254,6 +274,7 @@ function audioFormatOf(mime: string): 'wav' | 'mp3' | undefined {
  * 每一轮工具往返都重发一遍。
  * 「最后一条 user」就是本轮真人那句：人格插件的设定由 toPiMessages 摘进 system，不再占 user 轮，
  * 所以图片与 injectMedia 补进去的音视频块都落在同一条真人消息上。
+ * 只有插件直连（chatViaPiAi）走这条路；agent loop 主链路的图由 toPiMessages 的 attachmentsFor 按消息归位。
  */
 export function withImages(messages: any[], images: any[]): any[] {
   const i = messages.map((m: any) => m?.role).lastIndexOf('user');
@@ -265,9 +286,14 @@ export function withImages(messages: any[], images: any[]): any[] {
 
 export interface PreparedMedia {
   images: any[];
-  /** 补进请求体的块（按各家线格式成形，见 audioBlock/videoBlock），以及补不进去的原因 */
+  /** 音频块（按各家线格式成形，见 audioBlock）——**数组**：窗口内可能带多条语音，逐条送 */
+  audios: Record<string, unknown>[];
+  /** 视频块（见下面的视频口径）——同上，逐条送 */
+  videos: Record<string, unknown>[];
+  /** @deprecated 兼容别名：= audios[0] / videos[0]（老调用方只认单块）；新代码一律用数组 */
   audio?: Record<string, unknown>;
   video?: Record<string, unknown>;
+  /** 补不进去的那部分及原因 */
   skipped: string[];
 }
 
@@ -277,11 +303,33 @@ function audioBlock(api: string, b64: string, format: 'wav' | 'mp3'): Record<str
   return { type: 'input_audio', input_audio: { data: b64, format } };
 }
 
+/** 视频内联上限（字节）：只有本机文件时才读盘转 base64。
+ *  20MB 是两头的夹缝——Gemini 的请求体上限与 token 体积都不允许把大视频塞进一发请求，
+ *  而 QQ 视频动辄几十 MB；超过这一档就按"读不动"跳过（有公网 URL 的照旧递 URL，由对端自己去取）。 */
+const VIDEO_INLINE_MAX_BYTES = 20 * 1024 * 1024;
+const VIDEO_INLINE_MAX_MB = VIDEO_INLINE_MAX_BYTES / 1024 / 1024;
+
+const isHttpUrl = (u?: string): u is string => !!u && /^https?:\/\//.test(u);
+
+/** 视频只有本机文件时读成 base64（≤20MB 才读）；读不动返回 null，由调用方如实跳过、不静默丢 */
+async function loadVideoInline(a: MessageAttachment): Promise<{ b64: string; mime: string } | null> {
+  if (!a.path) return null;
+  try {
+    const st = statSync(a.path);
+    if (!st.isFile() || st.size > VIDEO_INLINE_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+  const buf = await loadBuffer(a);
+  if (!buf) return null;
+  return { b64: buf.toString('base64'), mime: a.mime ?? 'video/mp4' };
+}
+
 /**
  * 准备本轮附件：
- *  - 图片 → pi-ai 原生的 ImageContent 块（挂到最后一条 user 消息上）
- *  - 音频 → 读成 base64，容器对端不收时用 ffmpeg 转 16k 单声道 wav；转不动就跳过并说明原因
- *  - 视频 → 只带 url（本机不代读大文件）
+ *  - 图片 → pi-ai 原生的 ImageContent 块（由调用方挂到对应消息上；播种区的归位由 agentloop 决定）
+ *  - 音频 → 逐条读成 base64，容器对端不收时用 ffmpeg 转 16k 单声道 wav；转不动就跳过并说明原因
+ *  - 视频 → 优先公网 URL；只有本机文件且 ≤20MB 才读成 base64 内联，否则跳过并说明原因
  * `api` 决定能补哪些：Anthropic Messages 两者都没有块，直接进 skipped。
  */
 export async function prepareMedia(o: { attachments?: MessageAttachment[]; api: string }): Promise<PreparedMedia> {
@@ -289,20 +337,28 @@ export async function prepareMedia(o: { attachments?: MessageAttachment[]; api: 
   const skipped: string[] = [];
   if (failed) skipped.push(`${failed} 张图片读不动（路径/URL 取不到）`);
 
-  const audio = o.attachments?.find((a) => a.kind === 'audio');
-  const video = o.attachments?.find((a) => a.kind === 'video');
-  const out: PreparedMedia = { images, skipped };
+  const audios = (o.attachments ?? []).filter((a) => a.kind === 'audio');
+  const videos = (o.attachments ?? []).filter((a) => a.kind === 'video');
+  const out: PreparedMedia = { images, audios: [], videos: [], skipped };
+  const done = (): PreparedMedia => {
+    // 兼容别名：等于数组第一条（老调用方只认单块）。多条的场合下它只是"第一条"，别拿它当全部。
+    if (out.audios[0]) out.audio = out.audios[0];
+    if (out.videos[0]) out.video = out.videos[0];
+    return out;
+  };
 
   if (o.api === 'anthropic-messages') {
-    if (audio) skipped.push('Anthropic Messages 没有音频输入块');
-    if (video) skipped.push('Anthropic Messages 没有视频输入块');
-    return out;
+    if (audios.length) skipped.push('Anthropic Messages 没有音频输入块');
+    if (videos.length) skipped.push('Anthropic Messages 没有视频输入块');
+    return done();
   }
 
-  if (audio) {
+  for (const audio of audios) {
+    // 语音逐条处理：容器对端认就直接读盘，不认就交给 ffmpeg 转 wav（toWavFile 自带缓存，重复转同一份只转一次）
     const mime = audio.mime ?? '';
     let format = audioFormatOf(mime);
     let b64: string | null = null;
+    let why = `语音读取失败（${mime || '未知容器'}）`;
     if (format) {
       b64 = await loadBase64(audio);
     } else if (findFfmpeg()) {
@@ -310,29 +366,41 @@ export async function prepareMedia(o: { attachments?: MessageAttachment[]; api: 
       try {
         const buf = await loadBuffer(audio);
         if (buf) { b64 = readFileSync(await toWavFile(buf, mime)).toString('base64'); format = 'wav'; }
-      } catch { /* 落到下面的跳过分支 */ }
+        else why = `语音转不了（${mime || '未知容器'}，源文件也读不到）`;
+      } catch {
+        why = `语音转不了（${mime || '未知容器'}，ffmpeg 没转出来）`;
+      }
     } else {
-      skipped.push(`语音是 ${mime || '未知'} 容器，对端不收且本机没有 ffmpeg，转不了`);
+      why = `语音是 ${mime || '未知'} 容器，对端不收且本机没有 ffmpeg，转不了`;
     }
-    if (b64 && format) out.audio = audioBlock(o.api, b64, format);
-    else if (!out.skipped.length) skipped.push(`语音读取失败（${mime || '未知容器'}）`);
+    if (b64 && format) out.audios.push(audioBlock(o.api, b64, format));
+    else skipped.push(why);
   }
 
-  if (video) {
+  for (const video of videos) {
     if (o.api === 'openai-completions') {
-      const url = video.url ?? (video.path ? `file://${video.path}` : undefined);
-      if (url) out.video = { type: 'video_url', video_url: { url } };
-      else skipped.push('视频既没有可取的 URL 也没有本机路径');
+      // 公网 URL 优先（对端自己去取）；只有 file:// 或本机路径时读 base64 内联成 data URL
+      if (isHttpUrl(video.url)) {
+        out.videos.push({ type: 'video_url', video_url: { url: video.url } });
+        continue;
+      }
+      const inl = await loadVideoInline(video);
+      if (inl) out.videos.push({ type: 'video_url', video_url: { url: `data:${inl.mime};base64,${inl.b64}` } });
+      else skipped.push(`视频读不动（没有公网 URL，本机文件缺失或超过 ${VIDEO_INLINE_MAX_MB}MB）`);
     } else if (o.api === GOOGLE_API) {
-      // Gemini 认 fileData.fileUri：公网 URL 或 Files API 上传件的 /files/xxx。本机文件不代读，
-      // 与 OpenAI 那档「视频只带 url」的口径保持一致（语音才代读，因为它小且非要转码不可）。
-      if (video.url) out.video = { fileData: { fileUri: video.url, mimeType: video.mime ?? 'video/mp4' } };
-      else skipped.push('视频只有本机路径：Gemini 原生线格式要公网 URL（或 Files API 上传件），内核不代读大文件');
+      // Gemini 认 fileData.fileUri（公网 URL 或 Files API 上传件的 /files/xxx）；只有本机文件时才读内联
+      if (isHttpUrl(video.url)) {
+        out.videos.push({ fileData: { fileUri: video.url, mimeType: video.mime ?? 'video/mp4' } });
+        continue;
+      }
+      const inl = await loadVideoInline(video);
+      if (inl) out.videos.push({ inlineData: { mimeType: inl.mime, data: inl.b64 } });
+      else skipped.push(`视频只有本机文件且读不动（Gemini 原生线格式要公网 URL；本机文件缺失或超过 ${VIDEO_INLINE_MAX_MB}MB）`);
     } else {
       skipped.push('OpenAI Responses 没有视频输入块');
     }
   }
-  return out;
+  return done();
 }
 
 /**
@@ -341,7 +409,7 @@ export async function prepareMedia(o: { attachments?: MessageAttachment[]; api: 
  * 我们只在自己知道的那三种线格式上、往最后一条 user 消息里追加它没有的块类型。
  */
 export function injectMedia(payload: any, api: string, media: PreparedMedia): any {
-  const extra = [media.audio, media.video].filter(Boolean) as Record<string, unknown>[];
+  const extra = [...media.audios, ...media.videos];
   if (!extra.length || !payload || typeof payload !== 'object') return payload;
   const p = payload as Record<string, any>;
   try {
@@ -425,7 +493,7 @@ export async function chatViaPiAi(o: PiChatOptions): Promise<LLMResponse> {
   // 中途的 system（人格插件那几条设定）由 toPiMessages 摘出来接到**末尾**——占一条 user 轮会被模型当成对方说的话。
   const sys = o.req.messages[0]?.role === 'system' ? o.req.messages[0].content : '';
   const rest = o.req.messages[0]?.role === 'system' ? o.req.messages.slice(1) : o.req.messages;
-  const seeded = toPiMessages(rest, { id: o.model.id, provider: o.providerId }, meta.api);
+  const seeded = await toPiMessages(rest, { id: o.model.id, provider: o.providerId }, meta.api);
   const context = {
     systemPrompt: seeded.extraSystem ? `${sys}\n\n${seeded.extraSystem}` : sys,
     messages: seeded.messages,

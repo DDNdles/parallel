@@ -12,6 +12,7 @@ import { DEFAULT_RHYTHM, type RhythmConfig } from './rhythm.ts';
 import { DEFAULT_ALTER, type AlterConfig } from './alter.ts';
 import { DEFAULT_AGENCY, type AgencyConfig } from './agency.ts';
 import { DEFAULT_SCHEDULE, type ScheduleConfig } from './schedule.ts';
+import type { JargonConfig } from './jargon.ts';
 
 export type { OutgoingConfig } from './delivery.ts';
 export type { BackoffConfig, TalkRule, TalkValueConfig } from './frequency.ts';
@@ -19,13 +20,18 @@ export type { RhythmConfig } from './rhythm.ts';
 export type { AlterConfig, AlterOffset, AlterState } from './alter.ts';
 export type { AgencyConfig, AgencyWindow, ProactiveContactCandidate, AgencyCapacity } from './agency.ts';
 export type { ScheduleConfig, SchedulePlan, ScheduleRule, ScheduleException } from './schedule.ts';
+export type { JargonConfig } from './jargon.ts';
 
 export interface TimingConfig {
-  /** necessity = 综合内容/积压/存在感决定要不要开口；frequency = 只看攒了多少条 */
-  replyTriggerMode: 'necessity' | 'frequency';
+  /**
+   * likelihood = 开口概率（日志拟合回归 + 每会话动态门控，MaiBot 2026-10 主线路线，默认）；
+   * necessity = 综合内容/积压/存在感打分的旧启发式（MaiBot 已退役，留作对照）；
+   * frequency = 只看攒了多少条。
+   */
+  replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
   /** 攒够几条就进 agent loop（frequency 模式的门槛；necessity 模式下是压力分的单位） */
   pendingThreshold: number;
-  /** necessity 模式的分数门槛 */
+  /** necessity 模式的分数门槛（likelihood 模式下不参与判定） */
   necessityThreshold: number;
   talkValue: number;
   privateTalkValue: number;
@@ -52,6 +58,8 @@ export interface HumanlikeConfig {
   script: {
     enable: boolean;
   };
+  /** 圈内黑话（表达学习，jargon.ts）：挖本群高频词 → 反事实判定 → prompt 参考节 */
+  jargon: JargonConfig;
   timing: TimingConfig;
   /** 出站投递（HDSI `runtime`）：分隔标记切分、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
@@ -84,8 +92,9 @@ export interface HumanlikeConfig {
 
 export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   script: { enable: true },
+  jargon: { enable: true },
   timing: {
-    replyTriggerMode: 'necessity',
+    replyTriggerMode: 'likelihood',
     pendingThreshold: 12,
     necessityThreshold: 80,
     talkValue: 1,
@@ -117,6 +126,6 @@ export interface TriggerBatch {
   /** 目标会话（主动发言轮没有事件，只有这个） */
   chat: import('../types.ts').ChatRef;
   events: import('../types.ts').ChatEvent[];
-  reason: 'at' | 'mention' | 'necessity' | 'frequency' | 'idle' | 'proactive';
+  reason: 'at' | 'mention' | 'likelihood' | 'necessity' | 'frequency' | 'idle' | 'proactive';
   detail: string;
 }

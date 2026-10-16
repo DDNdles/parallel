@@ -3,7 +3,7 @@ import { appendFileSync, readFileSync, existsSync, statSync, readdirSync } from 
 import { ensureDir } from './util/fsutil.ts';
 import { newId, nowMs } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
-import type { ChatEvent, ForwardRecord } from './types.ts';
+import type { ChatEvent, ForwardRecord, MessageAttachment } from './types.ts';
 import type { Bus } from './bus.ts';
 import { busEvents } from './bus.ts';
 
@@ -61,6 +61,54 @@ export function localDay(ts: number): string {
 /** 只有真正显示在会话流里的行才算进日轨 */
 const DAY_COUNTED = new Set(['message_in', 'message_out']);
 
+/** 按扩展名猜媒体类型；猜不出来返回 undefined，由线格式按 kind 兜底。
+ *  与 `pipeline.ts` 顶部是同一张表——这里**复制**一份而不是 import pipeline：
+ *  pipeline 反过来 import 本模块，引过去就是环依赖。改表时两边一起改。 */
+function mimeOf(hint: string): string | undefined {
+  const ext = (hint.split('?')[0].match(/\.([a-z0-9]+)$/i)?.[1] ?? '').toLowerCase();
+  return ({
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+    wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac',
+    amr: 'audio/amr', slk: 'audio/silk', silk: 'audio/silk', m4a: 'audio/mp4', aac: 'audio/aac',
+    webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
+    mp4: 'video/mp4', mov: 'video/quicktime',
+  } as Record<string, string>)[ext];
+}
+
+/**
+ * 落账文件（`data.files` / 记录节点的 `files`）→ 可重放的附件。
+ *
+ * 与 `pipeline.attachmentsOf` 同一条底线：**url 与 path 都没有的不产出**。
+ * 那种记录在模型侧读不出任何东西，塞进上下文只会让下游多报一条"读不动"；
+ * 旧日志里顶层文件没有 sandboxPath（那时没存），于是自然退化成"没有附件"，不留空占位。
+ */
+function fileAttachment(raw: unknown): MessageAttachment | null {
+  const f = (typeof raw === 'string' ? { name: raw } : raw) as
+    { name?: unknown; rel?: unknown; sandboxPath?: unknown; url?: unknown } | undefined;
+  if (!f || typeof f !== 'object') return null;
+  const name = String(f.name ?? '') || undefined;
+  const path = String(f.sandboxPath ?? '') || undefined;
+  const url = /^https?:\/\//.test(String(f.url ?? '')) ? String(f.url) : undefined;
+  if (!path && !url) return null;
+  // QQ 的下载地址是 `.../download?appid=...`，扩展名只在文件名上，所以按 名字→路径→URL 依次猜（同 pipeline）
+  const mime = [name, path, url].map((v) => (v ? mimeOf(v) : undefined)).find((m) => m !== undefined);
+  const kind: MessageAttachment['kind'] =
+    mime?.startsWith('audio/') ? 'audio' : mime?.startsWith('video/') ? 'video' : 'image';
+  return { kind, path, url, name, mime };
+}
+
+/** 一条入站消息带的全部媒体：顶层文件在前，聊天记录里各节点的图/语音/视频跟在后面 */
+function inboundAttachments(d: { files?: unknown; forward?: ForwardRecord } | undefined): MessageAttachment[] {
+  const out: MessageAttachment[] = [];
+  const add = (raw: unknown) => {
+    const a = fileAttachment(raw);
+    if (a) out.push(a);
+  };
+  if (Array.isArray(d?.files)) for (const f of d.files) add(f);
+  for (const n of d?.forward?.nodes ?? []) for (const f of n.files ?? []) add(f);
+  return out;
+}
+
 export class SessionLog {
   private buffers = new Map<string, SessionLogEntry[]>();
   /** 每个会话当前的活动叶子（下一条的 parentId）。磁盘是严格追加的，所以重启后从最后一行接上。 */
@@ -71,7 +119,7 @@ export class SessionLog {
   readonly dir: string;
   private tailSize = 300;
 
-  constructor(dataDir: string, private bus: Bus) {
+  constructor(dataDir: string, private bus: Bus, private onError?: (message: string) => void) {
     this.dir = join(dataDir, 'sessions');
     ensureDir(this.dir);
   }
@@ -98,7 +146,10 @@ export class SessionLog {
     if (buf.length > this.tailSize) buf.splice(0, buf.length - this.tailSize);
     try {
       appendFileSync(join(this.dir, key + '.jsonl'), JSON.stringify(full) + '\n', 'utf-8');
-    } catch { /* 磁盘异常不阻塞消息流 */ }
+    } catch (e) {
+      // 磁盘异常不阻塞消息流，但"连账都丢了没人知道"不行：报错中心按错误文本去重
+      this.onError?.(`会话日志写盘失败（${(e as Error).message}）：这条消息没落账，磁盘可能已满或被其他程序占用。`);
+    }
     this.bus.emit('session.log', full);
     if (entry.type === 'message_out' || entry.type === 'message_in' || entry.type === 'error') {
       this.bus.emit(busEvents.chatEvent + '.logged', full);
@@ -152,22 +203,44 @@ export class SessionLog {
    *  - 只收 firstKeptEntryId 之后（含）的 message_in/message_out；
    *  - 没有任何 compaction 时就是整条分支的消息。
    * 冷启动（重启后）走这里，所以压缩过的历史不会因为重启又变回全文。
+   *
+   * 每条都带回落账时的 `ts`；入站的还重建 `attachments`（顶层文件 + 记录节点的媒体）——
+   * 调用方（HistoryStore）要靠它们做时间窗过滤与窗口内媒体重放，丢了这两样等于重启即失忆。
    */
-  project(chatId: string, chatType: string, limit = 400): { messages: { role: 'user' | 'assistant'; content: string }[]; summary?: string } {
+  project(chatId: string, chatType: string, limit = 400): {
+    messages: { role: 'user' | 'assistant'; content: string; ts?: number; attachments?: MessageAttachment[] }[];
+    summary?: string;
+  } {
     const branch = this.branch(chatId, chatType, limit * 2);
     const lastCut = [...branch].reverse().find((e) => e.type === 'compaction');
     const startIdx = lastCut
       ? (lastCut.firstKeptEntryId ? branch.findIndex((e) => e.id === lastCut.firstKeptEntryId) : branch.indexOf(lastCut) + 1)
       : 0;
     const from = startIdx < 0 ? branch.length : startIdx;
-    const messages: { role: 'user' | 'assistant'; content: string }[] = [];
+    const messages: { role: 'user' | 'assistant'; content: string; ts?: number; attachments?: MessageAttachment[] }[] = [];
     for (const e of branch.slice(from)) {
       if (e.type === 'message_in' && e.role === 'user' && e.text) {
-        // 落账的 text 是"给人看"的（界面靠它 + data 画引用块与记录卡），给模型要现净化一遍
-        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord } | undefined;
-        messages.push({ role: 'user', content: inboundModelText({ text: e.text, replyTo: d?.replyTo, forward: d?.forward }) });
+        // 落账的 text 是"给人看"的（界面靠它 + data 画引用块与记录卡），给模型要现净化一遍。
+        // 群聊再把说话人拼进正文（昵称优先，无昵称给 QQ 号）——与 pipeline 的当前轮同一口径；
+        // 私聊不带名，对面是谁 system 里已写明。
+        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[] } | undefined;
+        const m: { role: 'user'; content: string; ts?: number; attachments?: MessageAttachment[] } = {
+          role: 'user',
+          content: inboundModelText({
+            text: e.text,
+            replyTo: d?.replyTo,
+            forward: d?.forward,
+            nickname: chatType === 'group' ? (e.nickname || String(e.userId ?? '') || undefined) : undefined,
+          }),
+        };
+        if (Number.isFinite(e.ts)) m.ts = e.ts;
+        const atts = inboundAttachments(d);
+        if (atts.length) m.attachments = atts;
+        messages.push(m);
       } else if (e.type === 'message_out' && e.role === 'assistant' && e.text) {
-        messages.push({ role: 'assistant', content: e.text });
+        const m: { role: 'assistant'; content: string; ts?: number } = { role: 'assistant', content: e.text };
+        if (Number.isFinite(e.ts)) m.ts = e.ts;
+        messages.push(m);
       }
     }
     return { messages: messages.slice(-limit), summary: lastCut?.summary };
@@ -308,8 +381,10 @@ export class SessionLog {
         // 存协议端消息号：引用段只带这个号，下次有人引用时按它查回原文（见 findByMessageId）
         messageId: event.messageId,
         replyTo: event.replyTo,
-        // 存 rel 而不是只有名字：重名落盘会加 _1，名字对不上真实文件，桌面端就没法取图
-        files: event.files?.map((f) => ({ name: f.name, rel: f.rel, size: f.size })),
+        // 存 rel 而不是只有名字：重名落盘会加 _1，名字对不上真实文件，桌面端就没法取图。
+        // sandboxPath 也一起存：重启后重建历史要靠它把窗口内的图/语音/视频交回模型
+        //（url 带 rkey 且几小时过期，不能存；记录节点那份早就这么存了，这里对齐）
+        files: event.files?.map((f) => ({ name: f.name, rel: f.rel, sandboxPath: f.sandboxPath, size: f.size })),
         // 聊天记录（合并转发）：段里只有 resId，节点是适配器现取回来的，不存就只有一行占位。
         // 附件只留 name/rel/size：那份临时 URL 带 rkey 且几小时就过期，不该躺在会话日志里。
         forward: event.forward && {

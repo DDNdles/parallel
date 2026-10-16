@@ -24,6 +24,12 @@ import { AgentLoop, HistoryStore } from './agentloop.ts';
 import { Pipeline, roleAtLeastRole } from './pipeline.ts';
 import { HumanlikeService } from './humanlike/index.ts';
 import { ALTER_ANALYSIS_SYSTEM, buildAlterPrompt, parseAlterAnalysis } from './humanlike/alter.ts';
+import {
+  JargonService,
+  JARGON_SYSTEM,
+  buildJargonPrompt,
+  parseJargonReply,
+} from './humanlike/jargon.ts';
 import type { HumanlikeConfig } from './humanlike/types.ts';
 import { OneBot11Adapter } from './adapters/onebot11.ts';
 import { startApiServer } from './api/server.ts';
@@ -80,6 +86,7 @@ export class Kernel {
   agentLoop: AgentLoop;
   history: HistoryStore;
   humanlike: HumanlikeService;
+  jargon?: JargonService;
   pipeline: Pipeline;
   adapter: OneBot11Adapter;
   dataDir: string;
@@ -105,7 +112,9 @@ export class Kernel {
     this.config = new ConfigStore(this.dataDir, this.bus, this.errors);
     if (opts.port) this.config.config.ui.port = opts.port;
 
-    this.sessionLog = new SessionLog(this.dataDir, this.bus);
+    this.sessionLog = new SessionLog(this.dataDir, this.bus, (msg) => {
+      this.errors.record('warn', 'storage', msg);
+    });
     this.scheduler = new Scheduler(this.bus, (pluginId) => !!this.config.config.risk.proactive[pluginId]);
     this.memory = new MemoryService(this.db, this.bus, this.errors);
     this.sandbox = new SandboxService(this.dataDir, this.db, this.config, this.errors);
@@ -167,6 +176,30 @@ export class Kernel {
       sessionLog: this.sessionLog,
       bus: this.bus,
       errors: this.errors,
+      // likelihood 模型的权重与样本池（开口拟合回归），跟 data/ 一起走
+      modelFile: join(this.dataDir, 'gate-model.json'),
+    });
+    // 圈内黑话（表达学习）：侧端反事实判定走 chat 链，失败就当没这回事
+    this.jargon = new JargonService({
+      db: this.db,
+      errors: this.errors,
+      config: () => this.config.config.humanlike.jargon as { enable: boolean },
+      infer: async ({ term, count, contexts }) => {
+        try {
+          const resp = await this.llm.chat(
+            {
+              model: '',
+              messages: [
+                { role: 'system', content: JARGON_SYSTEM },
+                { role: 'user', content: buildJargonPrompt({ term, count, contexts }) },
+              ],
+              stream: false,
+            },
+            { chatId: '', chain: 'chat' },
+          );
+          return parseJargonReply(resp.content ?? '');
+        } catch { return null; }
+      },
     });
     this.adapter = new OneBot11Adapter(
       this.config, this.errors, this.bus, this.sandbox,
@@ -186,6 +219,7 @@ export class Kernel {
       (chatId) => this.adapter.groupName(chatId) || `群${chatId}`,
       () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
       () => (this.adapter?.status() as { selfId?: string } | undefined)?.selfId ?? '',
+      this.jargon,
     );
 
     // 配置限速热更新

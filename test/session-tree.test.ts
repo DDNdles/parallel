@@ -49,14 +49,14 @@ test('project：没有 compression 时就是整条分支的消息', () => {
   const d = dir();
   try {
     const log = new SessionLog(d, new Bus());
-    log.append('100', 'group', { type: 'message_in', role: 'user', text: '问题' });
-    log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '回答' });
+    const e1 = log.append('100', 'group', { type: 'message_in', role: 'user', text: '问题' });
+    const e2 = log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '回答' });
     log.append('100', 'group', { type: 'tool_call', role: 'tool', text: 'sandbox_read' });
 
     const p = log.project('100', 'group');
     assert.deepEqual(p.messages, [
-      { role: 'user', content: '问题' },
-      { role: 'assistant', content: '回答' },
+      { role: 'user', content: '问题', ts: e1.ts },
+      { role: 'assistant', content: '回答', ts: e2.ts },
     ], '工具行不进模型上下文');
     assert.equal(p.summary, undefined);
   } finally {
@@ -71,14 +71,14 @@ test('project：有 compression 后只给摘要 + 其后的消息', () => {
     log.append('100', 'group', { type: 'message_in', role: 'user', text: '很早的问题' });
     log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '很早的回答' });
     log.appendCompaction('100', 'group', { summary: '## 目标\n早前聊过 X', firstKeptEntryId: null, tokensBefore: 12_345 });
-    log.append('100', 'group', { type: 'message_in', role: 'user', text: '之后的问题' });
-    log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '之后的回答' });
+    const e1 = log.append('100', 'group', { type: 'message_in', role: 'user', text: '之后的问题' });
+    const e2 = log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '之后的回答' });
 
     const p = log.project('100', 'group');
     assert.equal(p.summary, '## 目标\n早前聊过 X', '摘要要回给调用方');
     assert.deepEqual(p.messages, [
-      { role: 'user', content: '之后的问题' },
-      { role: 'assistant', content: '之后的回答' },
+      { role: 'user', content: '之后的问题', ts: e1.ts },
+      { role: 'assistant', content: '之后的回答', ts: e2.ts },
     ], '压缩之前的历史不再进上下文');
   } finally {
     rmSync(d, { recursive: true, force: true });

@@ -12,6 +12,11 @@ import { renderForward } from './forward.ts';
  */
 export interface InboundBits {
   text: string;
+  /**
+   * 说话人（群聊才传：昵称优先，无昵称给 QQ 号）。私聊不传——对面是谁 system 里已写明，
+   * 每条都挂名字反而白吃 token。给模型的历史与当前轮都走 这里，同一口径见 pipeline / sessionlog 两个调用点。
+   */
+  nickname?: string;
   replyTo?: { nickname?: string; userId?: string; text?: string } | null;
   forward?: ForwardRecord | null;
 }
@@ -37,5 +42,9 @@ export function inboundModelText(b: InboundBits): string {
   const body = b.forward && !b.forward.failed ? renderForward(b.forward) : '';
   if (body) text = `${text.replace(/\[聊天记录\]/g, '').trim()}\n${body}`;
 
-  return text.trim();
+  const out = text.trim();
+  if (!out) return out;
+  const nick = String(b.nickname ?? '').trim();
+  // 群聊里「谁说的」只能靠这个前缀：配好名的消息流就是模型的群身份感知
+  return nick ? `${nick}：${out}` : out;
 }

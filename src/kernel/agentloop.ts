@@ -15,7 +15,7 @@
 // bus 事件与 LoopEvent 的种类、时点也保持原样——插件与桌面端不需要知道自己换了内核。
 // ============================================================
 
-import type { ChatMessage, LLMRequestContext, ToolContext, ToolDef, ChatRef, ToolMeta } from './types.ts';
+import type { ChatMessage, LLMRequestContext, ToolContext, ToolDef, ChatRef, ToolMeta, MessageAttachment } from './types.ts';
 import { composeSystem } from './types.ts';
 import type { LlmService, ModelChainKind } from './services/llm.ts';
 import type { SessionLog } from './sessionlog.ts';
@@ -53,6 +53,10 @@ interface RunCapture {
   /** 收尾工具是否表示"活干完了"（pi-agent-core 自己也会据此早停，这里只为 LoopEvent 记一笔） */
   settled: boolean;
 }
+
+/** 音频/视频进请求体的条数上限：它们没有 pi-ai 的 content 块，只能整批补在最后一条 user 上，
+ *  几十条一起塞会把请求体顶到对端拒收（图片按消息分流，不受这个上限约束）。 */
+const MEDIA_CAP = { audio: 8, video: 4 } as const;
 
 export class AgentLoop {
   constructor(
@@ -112,7 +116,68 @@ export class AgentLoop {
 
     // ---- 历史：ctx.messages 的最后一条就是本轮用户发言，交给 Agent 自己接着跑 ----
     // 中途的 system（人格插件那几条设定）在这里摘出来接到 system 末尾，不占 user 轮（见 toPiMessages 的说明）
-    const seeded = toPiMessages(ctx.messages, { id: chainModelId(this.config, ctx), provider: '' }, '');
+    //
+    // 媒体按消息归位：窗口内每条历史消息的附件跟着它自己那条走（图 → 该条 content 里最前的那块），
+    // 本轮的 ctx.attachments 属于最后那条（本轮真人输入）。音频/视频 pi-ai 的 content 块里没有，
+    // 只能收成一个数组交给走链流函数，由它在请求体的最后一条 user 上补块。
+    const msgs = ctx.messages;
+    const lastUser = msgs.map((m) => m.role).lastIndexOf('user');
+    const attsAt = (i: number): MessageAttachment[] => {
+      const own = msgs[i]?.attachments ?? [];
+      return i === lastUser ? [...own, ...(ctx.attachments ?? [])] : own;
+    };
+    /** 被丢的媒体要点名"是哪条消息上的"（报错中心里只说"有一张图"等于没说） */
+    const labelAt = (i: number): string => {
+      if (i === lastUser) return '本轮最新那条消息';
+      const ts = msgs[i]?.ts;
+      const d = ts ? new Date(ts) : undefined;
+      const hhmm = d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '';
+      return hhmm ? `${hhmm} 那条消息` : `窗口内第 ${i + 1} 条消息`;
+    };
+    // 图片能不能进这一轮：看链首模型在模型页登记的「输入类型」——与 chainStreamFn 的筛子同一条规则
+    // （那行没登记就不筛；登记了不含 image 就不 seed）。不 seed 要如实报一条，别让 bot"装作没看见图"。
+    const headTypes = this.chainHeadInputTypes(chain);
+    const imageAllowed = headTypes ? headTypes.has('image') : true;
+    const imageCount = msgs.reduce((n, _m, i) => n + attsAt(i).filter((a) => a.kind === 'image').length, 0);
+    if (!imageAllowed && imageCount) {
+      this.errors.record('warn', 'provider', `链上模型不收图片（模型页那行没勾「图片」），本轮 ${imageCount} 张图片没送出`, { chatId: chat.chatId });
+    }
+    const seeded = await toPiMessages(
+      msgs,
+      { id: chainModelId(this.config, ctx), provider: '' },
+      '',
+      {
+        attachmentsFor: (i) => {
+          const imgs = imageAllowed ? attsAt(i).filter((a) => a.kind === 'image') : [];
+          return imgs.length ? imgs : undefined;
+        },
+      },
+    );
+    if (seeded.failedImages) {
+      this.errors.record('warn', 'provider', `窗口内 ${seeded.failedImages} 张图片读不动（路径/URL 取不到），这一轮没送出`, { chatId: chat.chatId });
+    }
+    // 音频/视频收成一个数组（当前批次 + 窗口内历史），上限 audio ≤ 8 / video ≤ 4；
+    // 超出的如实报掉——静默丢媒体正是"bot 装作没听见语音"那类 bug 藏久的原因。
+    const media: MessageAttachment[] = [];
+    const droppedMedia: string[] = [];
+    let audioN = 0;
+    let videoN = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      for (const a of attsAt(i)) {
+        if (a.kind === 'image') continue;
+        if (a.kind === 'audio') {
+          if (audioN >= MEDIA_CAP.audio) { droppedMedia.push(`${labelAt(i)}的语音`); continue; }
+          audioN++;
+        } else {
+          if (videoN >= MEDIA_CAP.video) { droppedMedia.push(`${labelAt(i)}的视频`); continue; }
+          videoN++;
+        }
+        media.push(a);
+      }
+    }
+    if (droppedMedia.length) {
+      this.errors.record('warn', 'provider', `语音最多 ${MEDIA_CAP.audio} 条、视频最多 ${MEDIA_CAP.video} 条，超出的没送出：${droppedMedia.join('、')}`, { chatId: chat.chatId });
+    }
     const history = seeded.messages;
     const modelStub = await pie.piModelFor({
       providerId: '', protocol: 'openai-compatible', baseUrl: '',
@@ -127,8 +192,9 @@ export class AgentLoop {
         // 只播种历史；system 由 Agent 自己按 systemPrompt + tools 生成（否则会重复一条）
         messages: history as never,
       },
-      // 模型请求经内核的走链流函数：保住"一个模型挂了自动换下一个"
-      streamFn: this.llm.chainStreamFn(chain, { attachments: ctx.attachments, chatId: chat.chatId }) as never,
+      // 模型请求经内核的走链流函数：保住"一个模型挂了自动换下一个"。
+      // 这里只交音频/视频（图片已按消息归位到种子上下文里，不再走这条补块的路）。
+      streamFn: this.llm.chainStreamFn(chain, { attachments: media, chatId: chat.chatId }) as never,
       getApiKey: (pid: string) => this.config.getProviderKey(pid),
       // 我们塞进去的都是标准消息，这里只挡掉未知角色（pi-agent-core 允许自定义类型）
       convertToLlm: (msgs: any[]) => msgs.filter((m) => ['system', 'user', 'assistant', 'toolResult'].includes(m?.role)),
@@ -308,6 +374,20 @@ export class AgentLoop {
   }
 
   /**
+   * 链首模型登记的输入类型（模型页 `providers.<id>.models[]` 那行的 inputTypes）。
+   * 与 chainStreamFn 的筛子是**同一条规则**：那行没在模型页登记过就不筛；
+   * 登记了但没写 inputTypes，等同"什么都不收"（旧配置多半没勾，图片就会被拦下并留一条 warn）。
+   */
+  private chainHeadInputTypes(chain: ModelChainKind): Set<string> | undefined {
+    const head = this.llm.chainConfig(chain)[0];
+    if (!head) return undefined;
+    const mcfg = ((this.config.config.providers as Record<string, any>)[head.provider]?.models as any[] | undefined)
+      ?.find((m) => m?.id === head.model);
+    if (!mcfg) return undefined;
+    return new Set((Array.isArray(mcfg.inputTypes) ? mcfg.inputTypes : []).map(String));
+  }
+
+  /**
    * 压一次：把待摘要前缀交给工作链的模型生成结构化摘要，返回「摘要 + 保留段」的新消息表。
    * 失败时返回 null（宁可上下文偏大，也不能把历史弄丢）。
    */
@@ -419,21 +499,30 @@ export class HistoryStore {
     return h;
   }
 
-  pushUser(chat: ChatRef, text: string): void {
+  /** `attachments` 只带这条消息里真有的媒体；没有就不落这个键（老条目因此天然没有附件，不留空占位） */
+  pushUser(chat: ChatRef, text: string, attachments?: MessageAttachment[]): void {
     const h = this.get(chat);
-    h.push({ role: 'user', content: text });
+    const msg: ChatMessage = { role: 'user', content: text, ts: Date.now() };
+    if (attachments?.length) msg.attachments = attachments;
+    h.push(msg);
     this.trim(h);
   }
 
   pushAssistant(chat: ChatRef, text: string): void {
     const h = this.get(chat);
-    h.push({ role: 'assistant', content: text });
+    h.push({ role: 'assistant', content: text, ts: Date.now() });
     this.trim(h);
   }
 
-  /** 取快照（调用方不得修改） */
-  snapshot(chat: ChatRef): ChatMessage[] {
-    return [...this.get(chat)];
+  /**
+   * 取快照（调用方不得修改）。
+   * 给了 `sinceTs` 就只保留上下文时间窗内的条目：带上 ts 的按 `ts >= sinceTs` 筛，
+   * **没有 ts 的保守保留**（字段缺失不该被当成"太旧"而把内容吞掉）。
+   */
+  snapshot(chat: ChatRef, sinceTs?: number): ChatMessage[] {
+    const h = this.get(chat);
+    if (sinceTs === undefined) return [...h];
+    return h.filter((m) => m.ts === undefined || m.ts >= sinceTs);
   }
 
   private trim(h: ChatMessage[]): void {
@@ -449,7 +538,13 @@ export class HistoryStore {
    */
   private rebuild(chat: ChatRef): ChatMessage[] {
     const { messages, summary } = this.sessionLog.project(chat.chatId, chat.type, this.limit * 2);
-    const out: ChatMessage[] = messages.map((m) => ({ role: m.role, content: m.content }));
+    const out: ChatMessage[] = messages.map((m) => {
+      const msg: ChatMessage = { role: m.role, content: m.content };
+      // ts 与附件都要跟着回来：重启后冷启动的时间窗过滤与窗口内媒体重放全靠它们
+      if (m.ts !== undefined) msg.ts = m.ts;
+      if (m.attachments?.length) msg.attachments = m.attachments;
+      return msg;
+    });
     if (summary) out.unshift(summaryMessage(summary));
     while (out.length > this.limit) out.shift();
     while (out.length && out[0].role === 'assistant') out.shift();

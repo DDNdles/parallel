@@ -33,7 +33,10 @@ export function chatLabelOf(type: 'group' | 'private', chatId: string, groupTitl
   return type === 'group' ? `QQ 群聊「${groupTitle}」(${chatId})` : `QQ 私聊(${chatId})`;
 }
 
-/** chat 轮的身份节（内核 main system） */
+/** chat 轮的身份节（内核 main system）。
+ *  缓存口径：这里只放**跨轮稳定的**内容（全局身份 / 会话标签 / 风格）——
+ *  供应商的前缀缓存从 system 第一个字节开始断，本轮触发者是谁属于每轮都变的信息，
+ *  交给 order 457「对方是谁」那节去说，别在头部当缓存搅拌器。 */
 export function chatIdentitySystem(opts: {
   type: 'group' | 'private';
   chatId: string;
@@ -44,7 +47,7 @@ export function chatIdentitySystem(opts: {
 }): string {
   return [
     `你是蓝色大肥鱼，运行在 parallel（一个 harness 形态的 QQ 机器人内核）上。`,
-    `当前会话：${chatLabelOf(opts.type, opts.chatId, opts.groupTitle)}。当前用户：${opts.nickname || opts.userId}（QQ ${opts.userId}，权限等级 ${opts.role}）。`,
+    `当前会话：${chatLabelOf(opts.type, opts.chatId, opts.groupTitle)}。`,
     CHAT_STYLE_TEXT,
   ].join('\n');
 }

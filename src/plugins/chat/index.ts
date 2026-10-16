@@ -404,8 +404,11 @@ export function setup(ctx: PluginContext): void {
     const canon = persona.canon.canon;
 
     // Canon：初始设定（剧情起点，只由人写）
+    // —— 缓存裁量（2026-10-16 用户裁定①）：大块**跨轮稳定**的设定节全部排进 200~280，
+    //    全部每轮变大块（lore 命中/对方是谁/本轮媒体等）留在 450+；供应商的前缀缓存
+    //    遇变即断，稳定大块排在变量节后面就永远吃不到命中。
     sections.push({
-      order: 1000,
+      order: 200,
       title: 'script',
       text: [
         `# 剧本：${persona.canon.name}`,
@@ -419,7 +422,7 @@ export function setup(ctx: PluginContext): void {
     // Perspective：独立于 Canon 的个体价值观（HDSI 的"外壳人格层"）
     if (persona.canon.perspective?.trim()) {
       sections.push({
-        order: 1040,
+        order: 210,
         title: 'perspective',
         text: `# 她看世界的方式\n${persona.canon.perspective.trim()}`,
       });
@@ -429,37 +432,14 @@ export function setup(ctx: PluginContext): void {
     const own = overlayOf(persona.id).filter((e) => e.layer !== 'relationship' || !e.targetId || e.targetId === userId);
     if (own.length) {
       sections.push({
-        order: 1050,
+        order: 220,
         title: 'overlay',
         text: '# 长期演化（已经稳定形成的变化，按既定事实对待）\n'
           + own.map((e) => `- [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`).join('\n'),
       });
     }
 
-    // Lore：关键词命中的世界事实（常驻 + 命中）
-    const recentText = [req.event.text, ...req.messages.slice(-8).map((m) => m.content)].join('\n');
-    const matched = persona.canon.lore
-      .filter((e) => e.constant || e.keys.some((k) => recentText.toLowerCase().includes(k.toLowerCase())))
-      .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
-    if (matched.length) {
-      sections.push({
-        order: 1100,
-        title: 'lorebook',
-        text: '# 世界事实（相关背景）\n' + matched.map((e) => `- ${e.content}`).join('\n'),
-      });
-    }
-
-    // L5 状态注入：这一轮对面是谁（身份与权限）
-    sections.push({
-      order: 1200,
-      title: 'speaker-role',
-      text: [
-        `# 对方是谁（本次发言的用户 ${req.event.nickname || userId}）`,
-        `- 权限等级：${role === 'owner' ? 'owner（bot 的主人）' : role === 'admin' ? 'admin（群管理员）' : 'member（普通成员）'}${role === 'owner' ? '。这是你的主人，可以切换人格与管理插件。' : ''}`,
-      ].join('\n'),
-    });
-
-    // L4 记忆融合
+    // L4 记忆融合（250，稳定区：只在事实增删时会破坏缓存）
     const facts = ctx.memory.topFacts(userId, Number((ctx.config as any)?.persona?.memoryFactsTopK ?? 5));
     const memoryLines = [
       '# 关于该用户的记忆',
@@ -469,30 +449,62 @@ export function setup(ctx: PluginContext): void {
       `对话中得知值得长期记住的事实时，调用 remember_fact；对方明确要求被忘记时，先口头确认再调用 forget_me。`,
       `你眼前只有最近几分钟的消息。对方提到「上次、以前、说好了的」而眼下对不上时，先调 recall_facts 查长期记忆、search_history 翻本会话旧记录，查清楚了再回话。`,
     ];
-    sections.push({ order: 1300, title: 'memory', text: memoryLines.join('\n').trim() });
+    sections.push({ order: 250, title: 'memory', text: memoryLines.join('\n').trim() });
 
-    // Voice：语气样例。样例本身写成"小说片段"（旁白 + <say> 台词），
-    // 模型才学得到剧本体的写法，而不是学出一堆括号动作描写。
-    const messages: ChatMessage[] = [];
+    // Voice：说话方式 + 语气样例 + 尾部强化（260~280，全部稳定）。
+    // 用户 2026-10-16 明令：语气样例**不能以上下文（user/assistant 假对话）的形式进请求**，
+    // 必须在 system 里告诉它"这是语气样例"——模型才有机会既没把它们当真对话，也吃得到稳定前缀。
+    // 样例保留「旁白 + <say> 台词」的小说片段原文（剧本体写法示范，不是散文体）。
     const voice = persona.canon.voice;
     if (voice.style?.trim()) {
-      messages.push({ role: 'system', content: `（说话方式：${voice.style.trim()}）` });
+      sections.push({ order: 260, title: 'voice-style', text: `（说话方式：${voice.style.trim()}）` });
     }
     if (voice.examples?.length) {
-      messages.push({ role: 'system', content: '（以下是你过往对话的片段，供参考语气与写法，不要照抄内容）' });
-      for (const ex of voice.examples.slice(0, 6)) {
-        messages.push({ role: 'user', content: ex.user });
-        messages.push({ role: 'assistant', content: ex.assistant });
-      }
+      sections.push({
+        order: 270,
+        title: 'voice-examples',
+        text: [
+          `# 语气样例（不是正在进行的对话）`,
+          `下面每一对是「群友这样说 → 你怎么回」的**示范**，供你学口吻和"是否分条/分几条"的感觉；它们不是发生过的对话，内容也别照抄。`,
+          ...voice.examples.slice(0, 6).map((ex) => `【对方说】${ex.user}\n【你回】${ex.assistant}`),
+        ].join('\n'),
+      });
     }
-    // 历史
-    messages.push(...req.messages);
-    // 尾部强化
     if (voice.post_history?.trim()) {
-      messages.push({ role: 'system', content: voice.post_history });
+      sections.push({
+        order: 280,
+        title: 'post-history',
+        text: voice.post_history.trim(),
+      });
     }
 
-    return { ...req, messages };
+    // 变量区（≥450，每一轮都可能变的前置排完，稳定前缀吃到这一节为止）：
+
+    // Lore：关键词命中的世界事实（常驻 + 命中）——按轮命中，是变量
+    const recentText = [req.event.text, ...req.messages.slice(-8).map((m) => m.content)].join('\n');
+    const matched = persona.canon.lore
+      .filter((e) => e.constant || e.keys.some((k) => recentText.toLowerCase().includes(k.toLowerCase())))
+      .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+    if (matched.length) {
+      sections.push({
+        order: 473,
+        title: 'lorebook',
+        text: '# 世界事实（相关背景）\n' + matched.map((e) => `- ${e.content}`).join('\n'),
+      });
+    }
+
+    // L5 状态注入：这一轮对面是谁（身份与权限）——每轮变，457
+    sections.push({
+      order: 457,
+      title: 'speaker-role',
+      text: [
+        `# 对方是谁（本次发言的用户 ${req.event.nickname || userId}）`,
+        `- 权限等级：${role === 'owner' ? 'owner（bot 的主人）' : role === 'admin' ? 'admin（群管理员）' : 'member（普通成员）'}${role === 'owner' ? '。这是你的主人，可以切换人格与管理插件。' : ''}`,
+      ].join('\n'),
+    });
+
+    // 消息数组回归干净：没有 few-shot 假对话、没有中途 system 尾巴（toPiMessages 那套摘尾部逻辑不再需要）
+    return { ...req, messages: [...req.messages] };
   };
 
   // ---------- afterLLM：L6 输出校验插槽 ----------

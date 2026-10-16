@@ -496,7 +496,7 @@ test('配置：DEFAULT_CONFIG.humanlike 与 DEFAULT_HUMANLIKE 逐字段一致（
   const a = JSON.parse(JSON.stringify(DEFAULT_CONFIG.humanlike));
   const b = JSON.parse(JSON.stringify(DEFAULT_HUMANLIKE));
   assert.deepEqual(a, b);
-  assert.equal(DEFAULT_CONFIG.humanlike.timing.replyTriggerMode, 'necessity', '默认走必要性触发');
+  assert.equal(DEFAULT_CONFIG.humanlike.timing.replyTriggerMode, 'likelihood', '默认走拟合概率触发（2026-10-16 换路线）');
   assert.equal(DEFAULT_CONFIG.humanlike.proactive.enable, false, '主动发言默认关（风控）');
   assert.equal(DEFAULT_CONFIG.humanlike.outgoing.typingCharactersPerSecond, 8);
 });

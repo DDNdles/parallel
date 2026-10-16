@@ -21,6 +21,16 @@ import {
   presencePenalty,
   scoreReplyNecessity,
 } from './necessity.ts';
+import {
+  DEFAULT_GATE_WEIGHTS,
+  fitWeights,
+  nextGateThreshold,
+  replyLikelihood,
+  gateSampleOf,
+  type GateFeatures,
+  type GateSample,
+  type GateWeights,
+} from './likelihood.ts';
 import { backoffBypassed, idleBackoffSeconds, talkValueFor } from './frequency.ts';
 import { normalizeVisibleContent, splitOutgoingMessage, typingDelayMs } from './delivery.ts';
 import { isSilentScene, readAuthoredActions, splitBubbles } from './script.ts';
@@ -34,6 +44,7 @@ import {
   type HumanlikeConfig,
   type TriggerBatch,
 } from './types.ts';
+import { readJson, atomicWriteJson } from '../util/fsutil.ts';
 
 interface ChatState {
   buffer: ChatEvent[];
@@ -65,9 +76,20 @@ interface ChatState {
   schedule: SchedulePlan;
   /** 上一次主动开口的时间（HDSI 用最小间隔挡频繁主动） */
   lastProactiveAt: number;
+  /** likelihood 模式：本会话的开口阈值，随最近 20 分钟的实际开口率自适应 */
+  gateThreshold: number;
+  /** likelihood 模式：最近 20 分钟的评估/开口记录（阈值控制器用） */
+  gateDecisions: { at: number; spoke: boolean }[];
 }
 
 const INTERVAL_SAMPLE = 20;
+/** 拟合闭环的最小样本量：首次与之后每满 80 条新样本重训一次 */
+const GATE_FIT_MIN_ROWS = 80;
+const GATE_FIT_BATCH = 80;
+/** 样本池上限（连同权重的 JSON 约 130KB） */
+const GATE_ROW_CAP = 1200;
+/** likelihood 模式的开口阈值初值 */
+const GATE_THRESHOLD_INIT = 0.5;
 
 export interface HumanlikeServiceOptions {
   config: () => HumanlikeConfig;
@@ -80,6 +102,11 @@ export interface HumanlikeServiceOptions {
   errors: ErrorCenter;
   /** 打字节奏与抖动在测试里要能关掉 */
   now?: () => number;
+  /**
+   * likelihood 模型的落盘位置（`data/gate-model.json`）。不传就只跑内存，
+   * 冷启动从先验开始 —— 测试与 dump 场景用这个口。
+   */
+  modelFile?: string;
   /**
    * 侧端氛围分析（HDSI 的 Alter 分析任务）。命中阈值时异步跑一次，**不阻塞可见回复**；
    * 回来之后写进氛围参考，之后几轮注入。拿不到（没接模型 / 失败）就当没这回事。
@@ -95,9 +122,22 @@ export class HumanlikeService {
   private states = new Map<string, ChatState>();
   private disposed = false;
   private readonly now: () => number;
+  /** likelihood 权重（冷启动先验，随样本重训后更新） */
+  private gateWeights: GateWeights = { ...DEFAULT_GATE_WEIGHTS, w: [...DEFAULT_GATE_WEIGHTS.w] };
+  /** 训练样本池（环形，只入不出；随权重一起落盘，冷启动不从头学） */
+  private gateRows: GateSample[] = [];
+  private lastFitRows = 0;
 
   constructor(private opts: HumanlikeServiceOptions) {
     this.now = opts.now ?? Date.now;
+    if (opts.modelFile) {
+      const m = readJson<{ v?: number; weights?: GateWeights; rows?: GateSample[] }>(opts.modelFile, {});
+      if (m.weights && Number.isFinite(m.weights.bias) && Array.isArray(m.weights.w) && m.weights.w.length === DEFAULT_GATE_WEIGHTS.w.length) {
+        this.gateWeights = m.weights;
+        this.gateRows = Array.isArray(m.rows) ? m.rows.slice(-GATE_ROW_CAP) : [];
+        this.lastFitRows = this.gateRows.length;
+      }
+    }
   }
 
   get config(): HumanlikeConfig {
@@ -121,6 +161,7 @@ export class HumanlikeService {
         focused: false,
         rhythmSigs: [], rhythmExhausted: 0,
         alter: createAlterState(), schedule: emptyPlan(), lastProactiveAt: 0,
+        gateThreshold: GATE_THRESHOLD_INIT, gateDecisions: [],
       };
       this.states.set(k, s);
     }
@@ -287,17 +328,37 @@ export class HumanlikeService {
 
     const mode = cfg.timing.replyTriggerMode;
     const threshold = mode === 'frequency' ? Number.POSITIVE_INFINITY : cfg.timing.necessityThreshold;
+    // likelihood 模式：旧启发式各分项降级为特征，拼出开口概率；旧 necessity 直接比分数
+    const likelihood = mode === 'likelihood'
+      ? (() => {
+          const feats: GateFeatures = {
+            relevance: scored.parts.relevance,
+            content: scored.parts.content,
+            pressure: scored.parts.pressure,
+            presence: scored.parts.presence,
+            comp: comp.reached ? 1 : 0,
+            freq: frequency,
+            pending,
+            idleRatio: avgInterval > 0 ? Math.min(1, idleSeconds / avgInterval) : 0,
+          };
+          return { feats, p: replyLikelihood(feats, this.gateWeights) };
+        })()
+      : null;
     const mainGate = mode === 'frequency'
       ? pending >= cfg.timing.pendingThreshold
-      : scored.score >= threshold;
+      : likelihood
+        ? likelihood.p >= st.gateThreshold
+        : scored.score >= threshold;
 
     let reason: TriggerBatch['reason'] | null = null;
     let detail = '';
     if (mainGate) {
-      reason = mode === 'frequency' ? 'frequency' : 'necessity';
+      reason = likelihood ? 'likelihood' : mode === 'frequency' ? 'frequency' : 'necessity';
       detail = mode === 'frequency'
         ? `pending=${pending} >= ${cfg.timing.pendingThreshold}`
-        : scored.detail;
+        : likelihood
+          ? `P=${likelihood.p.toFixed(2)} ≥ ${st.gateThreshold.toFixed(2)}｜${scored.detail}`
+          : scored.detail;
     } else if (comp.reached) {
       reason = 'idle';
       detail = `${comp.detail}｜必要性 ${scored.detail}`;
@@ -313,8 +374,13 @@ export class HumanlikeService {
       this.opts.sessionLog.append(carrier.chatId, carrier.type, {
         type: 'gate', role: 'system',
         text: `开口（${reason}）：${detail}`,
-        data: { reason, detail, score: scored.score, pending, frequency },
+        data: {
+          reason, detail, score: scored.score, pending, frequency,
+          ...(likelihood ? { p: Number(likelihood.p.toFixed(3)), gate: Number(st.gateThreshold.toFixed(3)) } : {}),
+        },
       });
+      // 开口也要给样本池记 y=1，并让阈值控制器抬头（说过头了自动收敛）
+      if (likelihood) this.recordGate(st, now, true, likelihood.feats);
       this.opts.trigger({ chat, events, reason, detail });
       return;
     }
@@ -330,8 +396,11 @@ export class HumanlikeService {
         comp.delaySeconds > 0 ? comp.delaySeconds * 1000 : Number.POSITIVE_INFINITY,
       ) || 1000,
     );
+    if (likelihood) this.recordGate(st, now, false, likelihood.feats);
     this.armRecheck(carrier, st, delay);
-    this.logWait(carrier, st, `不说：${scored.detail}｜${comp.detail}`);
+    this.logWait(carrier, st, likelihood
+      ? `不说：P=${likelihood.p.toFixed(2)} < ${st.gateThreshold.toFixed(2)}｜${scored.detail}`
+      : `不说：${scored.detail}｜${comp.detail}`);
   }
 
   private armRecheck(carrier: ChatEvent, st: ChatState, delayMs: number): void {
@@ -352,6 +421,71 @@ export class HumanlikeService {
     this.opts.sessionLog.append(carrier.chatId, carrier.type, {
       type: 'gate', role: 'system', text, data: { decision: 'wait' },
     });
+  }
+
+  // ------------------------------------------------------------ 拟合闭环（likelihood 模式）
+
+  /**
+   * 一次 likelihood 评估的记账：样本池 + 阈值控制器。
+   * 阈值只在「沉默」一侧收放：开口方向靠控制器看窗口里的开口次数（说过头就在下一次评估时上抬），
+   * 窗口径「最近 20 分钟」——刚好压得住热群，也放得开冷群。
+   */
+  private recordGate(st: ChatState, now: number, spoke: boolean, feats: GateFeatures): void {
+    st.gateDecisions.push({ at: now, spoke });
+    const cut = now - 20 * 60_000;
+    while (st.gateDecisions.length && st.gateDecisions[0].at < cut) st.gateDecisions.shift();
+
+    this.gateRows.push(gateSampleOf(feats, spoke ? 1 : 0));
+    if (this.gateRows.length > GATE_ROW_CAP) this.gateRows.splice(0, this.gateRows.length - GATE_ROW_CAP);
+    this.maybeFit();
+
+    if (!spoke) {
+      const win = this.gateWindowOf(st, now);
+      const adj = nextGateThreshold(st.gateThreshold, win);
+      if (adj.changed) st.gateThreshold = adj.next;
+    }
+  }
+
+  private gateWindowOf(st: ChatState, now: number): { evaluations: number; spoke: number } {
+    const cut = now - 20 * 60_000;
+    let evaluations = 0, spoke = 0;
+    for (const d of st.gateDecisions) {
+      if (d.at < cut) continue;
+      evaluations++;
+      if (d.spoke) spoke++;
+    }
+    return { evaluations, spoke };
+  }
+
+  /** 攒够了整批新样本就重训一次，权重落盘（下一轮评估用新权重） */
+  private maybeFit(): void {
+    if (this.gateRows.length - this.lastFitRows >= GATE_FIT_BATCH) {
+      this.gateWeights = fitWeights(this.gateRows, DEFAULT_GATE_WEIGHTS);
+      this.lastFitRows = this.gateRows.length;
+      this.saveGateModel();
+      return;
+    }
+    // 没到重训量级也要定期存样本池：冷启动接得上上一轮的学头
+    if (this.gateRows.length - this.lastSavedRows >= 40) this.saveGateModel();
+  }
+
+  private lastSavedRows = 0;
+
+  private saveGateModel(): void {
+    if (!this.opts.modelFile) return;
+    this.lastSavedRows = this.gateRows.length;
+    try {
+      atomicWriteJson(this.opts.modelFile, {
+        v: 1,
+        weights: this.gateWeights,
+        rows: this.gateRows,
+      }, { rotate: false });
+    } catch { /* 落盘失败只影响下次冷启动的起点，不值得打断说话 */ }
+  }
+
+  /** likelihood 模型快照（调试/测试/未来状态页用；不给运行路径） */
+  gateModelSnapshot(): { bias: number; w: number[]; rows: number } {
+    return { bias: this.gateWeights.bias, w: [...this.gateWeights.w], rows: this.gateRows.length };
   }
 
   // ------------------------------------------------------------ 主动发言（没人说话也开口）

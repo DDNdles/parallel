@@ -336,6 +336,10 @@ export interface ChatMessage {
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
+  /** 这条消息的入账时刻（毫秒）。上下文时间窗（storage.contextMinutes）按它筛历史快照 */
+  ts?: number;
+  /** 这条消息带的媒体（图/语音/视频）：窗口内重放历史时与文本一起交回模型 */
+  attachments?: MessageAttachment[];
 }
 
 export interface ToolCall {

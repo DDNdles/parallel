@@ -45,26 +45,49 @@ test('inboundModelText：聊天记录展开，取不到时留着占位', () => {
   assert.equal(inboundModelText({ text: '[聊天记录]', forward: { ...fwd, failed: true } }), '[聊天记录]');
 });
 
-test('会话日志回读历史时走同一套净化（重启后那份记录仍在）', () => {
+test('inboundModelText：群聊带昵称前缀（模型的群里身份感知来源）', () => {
+  // 有昵称给昵称
+  assert.equal(inboundModelText({ text: '收一下', nickname: '小明' }), '小明：收一下');
+  // 昵称是空白/缺失就不产前缀（QQ 号回落由调用方做）
+  assert.equal(inboundModelText({ text: '收一下', nickname: '   ' }), '收一下');
+  assert.equal(inboundModelText({ text: '收一下' }), '收一下');
+  // 正文被剥干净了就不给孤零零一个前缀
+  assert.equal(inboundModelText({ text: '[回复:-1]', nickname: '小明' }), '');
+  // 前缀拼在引用块前面，不落在引用里
+  assert.equal(
+    inboundModelText({ text: '[回复:900]收一下', nickname: '小明', replyTo: { nickname: '张三', text: '文件在共享盘' } }),
+    '小明：（引用「张三」：文件在共享盘）收一下',
+  );
+});
+
+test('会话日志回读历史时走同一套净化（重启后那份记录仍在；群聊带昵称前缀、私聊不带）', () => {
   const d = dir();
   try {
     const log = new SessionLog(d, new Bus());
-    log.append('100', 'group', {
+    const e1 = log.append('100', 'group', {
       type: 'message_in', role: 'user', nickname: '小明', text: '[回复:900]收一下',
       data: { replyTo: { nickname: '张三', text: '文档在共享盘' } },
     });
-    log.append('100', 'group', {
+    const e2 = log.append('100', 'group', {
       type: 'message_in', role: 'user', nickname: '小红', text: '昨天的 [聊天记录]',
       data: { forward: { id: 'r1', title: '', dropped: 0, failed: false, nodes: [{ nickname: '甲', userId: '1', text: '定了', ts: 0 }] } },
     });
-    log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '收到' });
+    const e3 = log.append('100', 'group', { type: 'message_out', role: 'assistant', text: '收到' });
 
     const p = log.project('100', 'group');
     assert.deepEqual(p.messages, [
-      { role: 'user', content: '（引用「张三」：文档在共享盘）收一下' },
-      { role: 'user', content: '昨天的\n【聊天记录·共 1 条】\n甲：定了' },
-      { role: 'assistant', content: '收到' },
+      { role: 'user', content: '小明：（引用「张三」：文档在共享盘）收一下', ts: e1.ts },
+      { role: 'user', content: '小红：昨天的\n【聊天记录·共 1 条】\n甲：定了', ts: e2.ts },
+      { role: 'assistant', content: '收到', ts: e3.ts },
     ], JSON.stringify(p.messages));
+
+    // 私聊不带前缀：对面是谁 system 已写明，每条挂名只是白吃 token
+    const log2 = new SessionLog(d, new Bus());
+    const e4 = log2.append('200', 'private', { type: 'message_in', role: 'user', nickname: '小明', text: '收一下' });
+    const p2 = log2.project('200', 'private');
+    assert.deepEqual(p2.messages, [
+      { role: 'user', content: '收一下', ts: e4.ts },
+    ], JSON.stringify(p2.messages));
   } finally {
     rmSync(d, { recursive: true, force: true });
   }

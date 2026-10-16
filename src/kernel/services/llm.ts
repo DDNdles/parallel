@@ -8,7 +8,6 @@ import { todayKey } from '../util/misc.ts';
 import { mockEngine, mockStreams } from './mock-engine.ts';
 import {
   chatViaPiAi, isPiProtocol, piAiModule, piApiImpl, piApiName, piModelFor, injectMedia, mapUsage, prepareMedia,
-  withImages,
   providerBaseUrl,
 } from './pi-ai.ts';
 import type { StreamFn } from '@earendil-works/pi-agent-core';
@@ -401,11 +400,10 @@ export class LlmService {
             if (prepared?.skipped.length) {
               self.errors.record('warn', 'provider', `附件未能全部送达：${prepared.skipped.join('；')}`, { providerId: ref.provider });
             }
-            // 图片走 pi-ai 的原生块（它自己会按各家线格式序列化），音视频才需要在 payload 上补
-            const ctx = prepared?.images.length
-              ? { ...context, messages: withImages(context.messages as any[], prepared.images) }
-              : context;
-            const inner = models.streamSimple(piModel, ctx as never, {
+            // 图片**不在这里补**：播种区（agentloop 里 toPiMessages 的 attachmentsFor）已经把每张图
+            // 挂回它当时那条消息上了；这里只剩音频/视频要在 payload 上补块（pi-ai 的 content 块里没有这两类）。
+            // 传进来的 o.attachments 也只含这两类。
+            const inner = models.streamSimple(piModel, context as never, {
               apiKey: self.config.getProviderKey(ref.provider) || undefined,
               signal: options?.signal,
               maxTokens: options?.maxTokens ?? mcfg?.maxOutput,

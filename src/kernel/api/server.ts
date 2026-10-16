@@ -1096,6 +1096,10 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   const script = body.script as Record<string, unknown> | undefined;
   if (script && typeof script === 'object') applyBool(target.script, script, 'enable');
 
+  // 圈内黑话（表达学习）
+  const jargon = body.jargon as Record<string, unknown> | undefined;
+  if (jargon && typeof jargon === 'object') applyBool(target.jargon, jargon, 'enable');
+
   // 节奏反定型（HDSI ChatRhythm）
   const rhythm = body.rhythm as Record<string, unknown> | undefined;
   if (rhythm && typeof rhythm === 'object') {
@@ -1169,8 +1173,8 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   if (timing && typeof timing === 'object') {
     const t = target.timing;
     if ('replyTriggerMode' in timing) {
-      if (timing.replyTriggerMode !== 'necessity' && timing.replyTriggerMode !== 'frequency') {
-        return '回复触发模式只能是 necessity 或 frequency';
+      if (timing.replyTriggerMode !== 'likelihood' && timing.replyTriggerMode !== 'necessity' && timing.replyTriggerMode !== 'frequency') {
+        return '回复触发模式只能是 likelihood 或 necessity 或 frequency';
       }
       t.replyTriggerMode = timing.replyTriggerMode;
     }
