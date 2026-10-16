@@ -1,7 +1,7 @@
 'use client';
 /**
  * parallel 桌面端主程序（Next.js 静态导出，纯客户端 SPA）。
- * 状态机：登录门（账号卡 / 接入引导）→ 主壳（侧栏 + 顶栏 + 10 页面）。
+ * 状态机：登录门（账号卡 / 接入引导）→ 主壳（侧栏 + 顶栏 + 各页面）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, connectWS, onEvent } from '@/lib/api';
@@ -10,6 +10,7 @@ import { useThemeSwitch } from '@/components/useThemeSwitch';
 import type { PageCmd } from '@/lib/pageCmd';
 import GlassDefs from '@/components/GlassDefs';
 import LoginGate from '@/components/LoginGate';
+import SetupGate from '@/components/SetupGate';
 import ChatsPage from '@/components/pages/ChatsPage';
 import PluginsPage from '@/components/pages/PluginsPage';
 import PersonasPage from '@/components/pages/PersonasPage';
@@ -18,6 +19,7 @@ import UsersPage from '@/components/pages/UsersPage';
 import ErrorsPage from '@/components/pages/ErrorsPage';
 import WorkPage from '@/components/pages/WorkPage';
 import SandboxPage from '@/components/pages/SandboxPage';
+import UsagePage from '@/components/pages/UsagePage';
 import SettingsPage from '@/components/pages/SettingsPage';
 
 export interface AppState {
@@ -33,6 +35,7 @@ export interface AppState {
 
 export const PAGES: { id: string; name: string; nav: string; icon: string }[] = [
   { id: 'chats', name: '会话', nav: '会话', icon: 'chats' },
+  { id: 'usage', name: '用量', nav: '用量', icon: 'usage' },
   { id: 'plugins', name: '插件', nav: '插件', icon: 'plugins' },
   { id: 'personas', name: '人格', nav: '人格', icon: 'personas' },
   { id: 'models', name: '模型', nav: '模型', icon: 'models' },
@@ -70,6 +73,7 @@ const PAGE_TOOLS: Record<string, { id: string; icon: string; title: string; kind
     { id: 'btn-errors-clear', icon: 'trash', title: '清除全部记录', kind: 'clear' },
   ],
   work: [{ id: 'btn-work-reload', icon: 'refresh', title: '重新读取工作状态', kind: 'reload' }],
+  usage: [{ id: 'btn-usage-reload', icon: 'refresh', title: '重新拉取用量', kind: 'reload' }],
   sandbox: [
     { id: 'btn-sandbox-reload', icon: 'refresh', title: '重新读取沙箱', kind: 'reload' },
     { id: 'btn-sandbox-limits', icon: 'settings', title: '限额与清理', kind: 'limits' },
@@ -79,13 +83,22 @@ const PAGE_TOOLS: Record<string, { id: string; icon: string; title: string; kind
 const SIDE_ICON_W = 57;
 /** 有二级侧栏的页面：内容区 no-pad（贴合主侧栏），由页面内部自行布局 */
 const SUBNAV_PAGES = new Set(['chats']);
+/** 窄到放不下「二级列表 + 内容」并排时，会话列表改覆盖式抽屉（顶栏那颗钮才唤得出来） */
+const NARROW_Q = '(max-width: 720px)';
 
 export default function App() {
   const [entered, setEntered] = useState(false);
+  /** 初始环境检查页是否已过（SetupGate 自己判定：走过且环境齐就直接放行到登录门） */
+  const [setupPassed, setSetupPassed] = useState(false);
   const [page, setPage] = useState('chats');
   /** 会话页右侧「工作」抽屉（按钮在顶栏，抽屉本体在 ChatsPage 里） */
   const [workOpen, setWorkOpen] = useState(false);
   const [sideW, setSideW] = useState(SIDE_ICON_W);
+  /** 会话页二级列表在窄屏是抽屉：开合状态由顶栏那颗钮控制（抽屉本体在 ChatsPage） */
+  const [listOpen, setListOpen] = useState(false);
+  const [narrow, setNarrow] = useState(false);
+  /** 会话页正在回看的那一天：非空时顶栏亮出「回到实时」（钮在这，动作回到 ChatsPage） */
+  const [reviewDay, setReviewDay] = useState('');
   /** 顶栏圆钮 → 页面的一次性指令通道（page 标明发给谁，n 递增触发一次） */
   const [pageCmd, setPageCmd] = useState<PageCmd>({ page: '', kind: '', n: 0 });
   const [state, setState] = useState<AppState | null>(null);
@@ -129,8 +142,8 @@ export default function App() {
   const [avOK, setAvOK] = useState(true);
   useEffect(() => { setAvOK(true); }, [selfId]);   // 换号后重新试头像
 
-  // 状态轮询 + 错误徽标。/api/state 401（内核重启换了 token）→ 只有令牌恢复卡会挡住界面，
-  // QQ 的登录态不再挡路：没登录就顶栏亮"打开 QQNT"，点一下让内核把本机 QQ 拉起来。
+  // 状态轮询 + 错误徽标。/api/state 401（内核重启换了 token）→ 弹回登录门重新校验。
+  // QQ 的登录态是挡路的：登录门只在真在线时放行，主壳里持续复核，掉了/退了弹回登录门（见下方 offlineRef）。
   const refreshStatus = useCallback(async () => {
     try {
       const s = await get('/api/state');
@@ -170,10 +183,45 @@ export default function App() {
   // 会话被弹回令牌恢复卡（401）后再进主壳时，恢复各轮询（interval 句柄只建一次）
   const intervalsRef = useRef(false);
 
+  // QQ 掉了/退了必须把人弹回登录门（connected 以协议端自报的在线判据为准，不是反向 WS）。
+  // 可靠性红线：内核重启、协议端重启、一次网络抖动都不算退出——连续两轮（≈8s）读到离线才踢。
+  const offlineRef = useRef(0);
+  useEffect(() => {
+    offlineRef.current = 0;
+    if (!entered) return;
+    let alive = true;
+    const timer = setInterval(async () => {
+      let connected: boolean | undefined;
+      try {
+        connected = ((await get('/api/login/status')) as { connected: boolean }).connected;
+      } catch { return; }  // 读不到状态不判离线
+      if (!alive) return;
+      offlineRef.current = connected ? 0 : offlineRef.current + 1;
+      if (offlineRef.current >= 2) {
+        bootedRef.current = false;   // 否则 enterApp 的 booted 闸门会让登录门进不去第二次
+        setEntered(false);
+      }
+    }, 4000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [entered]);
+
   // 离开会话页就把「工作」抽屉的开启状态清掉，回来时不会自己弹开
   useEffect(() => { if (page !== 'chats') setWorkOpen(false); }, [page]);
+  useEffect(() => { if (page !== 'chats') setListOpen(false); }, [page]);
+  // 窄屏判定：只用 matchMedia，别在 resize 里读 innerWidth（拖窗口时每帧都 setState）
+  useEffect(() => {
+    const mq = window.matchMedia(NARROW_Q);
+    const on = () => setNarrow(mq.matches);
+    on();
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  useEffect(() => { if (!narrow) setListOpen(false); }, [narrow]);
 
   if (!entered) {
+    if (!setupPassed) {
+      return <SetupGate onPass={() => setSetupPassed(true)} onToggleTheme={toggle} />;
+    }
     return <LoginGate onEnter={enterApp} state={state} refreshStatus={refreshStatus} onToggleTheme={toggle} />;
   }
 
@@ -182,7 +230,7 @@ export default function App() {
 
   const pageEl = (() => {
     switch (page) {
-      case 'chats': return <ChatsPage masterId={state?.masterIds?.[0]} onNavigate={setPage} workOpen={workOpen} onCloseWork={() => setWorkOpen(false)} />;
+      case 'chats': return <ChatsPage masterId={state?.masterIds?.[0]} botId={selfId} onNavigate={setPage} workOpen={workOpen} onCloseWork={() => setWorkOpen(false)} narrow={narrow} listOpen={listOpen} onCloseList={() => setListOpen(false)} cmd={pageCmd} onReview={setReviewDay} />;
       case 'plugins': return <PluginsPage cmd={pageCmd} />;
       case 'personas': return <PersonasPage cmd={pageCmd} />;
       case 'models': return <ModelsPage onChanged={refreshStatus} cmd={pageCmd} />;
@@ -190,6 +238,7 @@ export default function App() {
       case 'errors': return <ErrorsPage cmd={pageCmd} />;
       case 'work': return <WorkPage cmd={pageCmd} />;
       case 'sandbox': return <SandboxPage cmd={pageCmd} />;
+      case 'usage': return <UsagePage cmd={pageCmd} />;
       case 'settings': return <SettingsPage />;
       default: return null;
     }
@@ -251,6 +300,18 @@ export default function App() {
             <button className="chip" id="btn-reload" title="界面已重新构建（站内换页不会重新下载 JS），点这里刷新才拿到新版"
               onClick={() => location.reload()}>界面已更新</button>
           )}
+          {page === 'chats' && narrow && (
+            <button
+              className={'chip icon-chip' + (listOpen ? ' on' : '')}
+              id="btn-chat-list"
+              aria-pressed={listOpen}
+              aria-label="会话列表"
+              title="会话列表"
+              onClick={() => setListOpen((v) => !v)}
+            >
+              <Icon name="chats" />
+            </button>
+          )}
           {page === 'chats' && (
             <button
               className={'chip icon-chip' + (workOpen ? ' on' : '')}
@@ -269,6 +330,17 @@ export default function App() {
               <Icon name={t.icon} />
             </button>
           ))}
+          {page === 'chats' && reviewDay && (
+            <button
+              className="chip icon-chip"
+              id="btn-live"
+              aria-label="回到实时"
+              title="回到实时"
+              onClick={() => setPageCmd((c) => ({ page: 'chats', kind: 'live', n: c.n + 1 }))}
+            >
+              <Icon name="download" />
+            </button>
+          )}
           <button className="chip icon-chip" id="btn-theme" onClick={toggle}>
             <span className="theme-btn-ic">
               <span className="glyph glyph-sun"><Icon name="sun" /></span>

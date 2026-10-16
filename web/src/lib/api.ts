@@ -3,12 +3,6 @@
 
 let TOKEN = '';
 if (typeof window !== 'undefined') {
-  // 旧版 UI 键名兼容：hachimi_token → parallel_token（迁移一次后删除旧键）
-  const legacy = localStorage.getItem('hachimi_token');
-  if (legacy && !localStorage.getItem('parallel_token')) {
-    localStorage.setItem('parallel_token', legacy);
-    localStorage.removeItem('hachimi_token');
-  }
   TOKEN = localStorage.getItem('parallel_token') || '';
 }
 

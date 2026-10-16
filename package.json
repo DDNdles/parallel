@@ -1,7 +1,7 @@
 {
   "name": "parallel",
   "version": "0.1.0",
-  "description": "通用 harness 形态的 QQ 机器人 —— LLM agent loop 内核 + 一切皆插件 + 桌面端管控 UI",
+  "description": "通用 harness 形态的 QQ 机器人 —— pi（Pi Agent Harness）的 agent runtime + 一切皆插件 + 桌面端管控 UI",
   "type": "module",
   "private": true,
   "engines": {
@@ -10,9 +10,12 @@
   "scripts": {
     "build": "npm --prefix web ci && npm --prefix web run build",
     "start": "node bin/parallel.js",
-    "test": "node --experimental-transform-types --no-warnings --test \"test/*.test.ts\""
+    "test": "node --experimental-transform-types --no-warnings --test \"test/*.test.ts\"",
+    "pack": "node scripts/pack-release.mjs"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.87.1",
+    "@earendil-works/pi-ai": "^0.87.1",
     "ws": "^8.21.3"
   }
 }

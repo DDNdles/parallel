@@ -116,13 +116,16 @@ export class Db {
       CREATE TABLE IF NOT EXISTS usage_stats (
         day TEXT NOT NULL,
         provider TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
         chat_id TEXT NOT NULL,
         prompt_tokens INTEGER DEFAULT 0,
         completion_tokens INTEGER DEFAULT 0,
+        cache_hit INTEGER DEFAULT 0,
+        cache_miss INTEGER DEFAULT 0,
         llm_calls INTEGER DEFAULT 0,
         messages_in INTEGER DEFAULT 0,
         messages_out INTEGER DEFAULT 0,
-        PRIMARY KEY (day, provider, chat_id)
+        PRIMARY KEY (day, provider, model, chat_id)
       );
 
       CREATE TABLE IF NOT EXISTS plugin_errors (
@@ -166,6 +169,36 @@ export class Db {
       CREATE INDEX IF NOT EXISTS idx_work_runs_ts ON work_runs(ts DESC);
     `);
     this.repairFts();
+    this.migrateUsageModel();
+  }
+
+  /** usage_stats 早先是 (day, provider, chat_id) 主键、没有模型与缓存命中列。
+   *  「用量」页要按模型分「输入未命中 / 输入缓存命中 / 输出」，主键必须带上 model，
+   *  而 SQLite 不支持改主键 —— 只能建新表搬一次。老行的 model 留空串（报表里显示成「未知模型」），
+   *  不猜、不改写历史。列已存在就是新库/已迁过的库，直接返回。 */
+  private migrateUsageModel(): void {
+    const cols = this.db.prepare('PRAGMA table_info(usage_stats)').all() as { name: string }[];
+    if (!cols.length || cols.some((c) => c.name === 'model')) return;
+    this.db.exec(`
+      CREATE TABLE usage_stats_new (
+        day TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL,
+        prompt_tokens INTEGER DEFAULT 0,
+        completion_tokens INTEGER DEFAULT 0,
+        cache_hit INTEGER DEFAULT 0,
+        cache_miss INTEGER DEFAULT 0,
+        llm_calls INTEGER DEFAULT 0,
+        messages_in INTEGER DEFAULT 0,
+        messages_out INTEGER DEFAULT 0,
+        PRIMARY KEY (day, provider, model, chat_id)
+      );
+      INSERT INTO usage_stats_new (day, provider, model, chat_id, prompt_tokens, completion_tokens, llm_calls, messages_in, messages_out)
+        SELECT day, provider, '', chat_id, prompt_tokens, completion_tokens, llm_calls, messages_in, messages_out FROM usage_stats;
+      DROP TABLE usage_stats;
+      ALTER TABLE usage_stats_new RENAME TO usage_stats;
+    `);
   }
 
   /** 老库的 FTS 索引缺 AFTER UPDATE 触发器：改过一次记忆后索引与内容错位，

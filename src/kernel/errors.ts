@@ -22,7 +22,7 @@ export interface ErrorRecord {
 
 const SUGGESTIONS: Partial<Record<ErrorCategory, string>> = {
   adapter: '协议端连接异常：检查 LLBot 是否运行、Auth Token 是否有效、反向 WS 地址与 access token 是否一致，然后在报错中心或控制台执行重连。',
-  provider: '模型调用失败：检查 API Key / Base URL / 模型名与网络连通性，然后重试。若使用 gemini-3.8-flash 占位项，请先切换到已接入的供应商。',
+  provider: '模型调用失败：检查 API Key / Base URL / 模型名与网络连通性，然后重试。',
   plugin: '插件运行出错：可尝试在插件管理里重载该插件；连续同错 3 次会被自动停用。',
   sandbox: '沙箱执行受限或失败：检查 Python/Node 是否可用、脚本是否超时或超出输出/资源限额。',
   storage: '数据读写异常：检查磁盘空间与 data 目录权限；配置文件损坏时会自动回退到 .bak 备份。',

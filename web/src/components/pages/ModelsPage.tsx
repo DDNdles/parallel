@@ -31,11 +31,12 @@ interface Resp {
   failoverThreshold: number;
 }
 
-/** 连接方式（内核三种线格式都已实现）；mock 是本地脚本，不发网络请求 */
+/** 连接方式（内核四种线格式都已实现）；mock 是本地脚本，不发网络请求 */
 const PROTOCOLS = [
   { v: 'openai-compatible', t: 'Chat Completions', p: '/chat/completions' },
   { v: 'openai-responses', t: 'OpenAI Responses', p: '/responses' },
   { v: 'anthropic', t: 'Anthropic Messages', p: '/v1/messages' },
+  { v: 'gemini', t: 'Gemini', p: '/v1beta/models' },
 ];
 /** 输入类型：声明了的媒体才会被内核转成多模态入参（见 LlmService.shapeForModel） */
 const INPUT_TYPES = [
@@ -125,7 +126,6 @@ export default function ModelsPage({ onChanged, cmd }: {
           <ChainGroup kind="chat" title="聊天模型" entries={data.chains.chat} providers={data.providers}
             onPick={() => setPicking('chat')} onCommit={(e) => void commitChain('chat', e)} />
           <ChainGroup kind="work" title="工作模型" entries={data.chains.work} providers={data.providers}
-            note={data.chains.work.length ? null : '跟随聊天模型'}
             onPick={() => setPicking('work')} onCommit={(e) => void commitChain('work', e)} />
         </aside>
 
@@ -144,9 +144,7 @@ export default function ModelsPage({ onChanged, cmd }: {
           />
         ) : (
           <section className="mset-detail">
-            <div className="mset-empty">
-              还没有供应商。点右上角的 + 添加一个（Base URL + API Key + 模型 ID 就能接上）。
-            </div>
+            <div className="mset-empty">还没有供应商</div>
           </section>
         )}
       </div>
@@ -286,7 +284,7 @@ function ChainPicker({ kind, providers, existing, onClose, onAdd }: {
 
   return (
     <Modal title={`添加${kind === 'chat' ? '聊天' : '工作'}模型`} onClose={onClose}>
-      <BrandInput value={q} placeholder="搜索供应商或模型…" spellCheck={false} autoFocus
+      <BrandInput value={q} spellCheck={false} autoFocus
         style={{ width: '100%', marginBottom: 10 }} onChange={(e) => setQ(e.target.value)} />
       <div className="mset-models chain-pick">
         {rows.length ? rows.map((r) => (
@@ -367,14 +365,15 @@ function ProviderDetail({ p, resp, models, err, onSave, onRemove, onSaveModels, 
 
       {protocol !== 'mock' && (
         <Field label="Base URL">
-          <BrandInput value={baseUrl} placeholder="https://api.example.com/v1" spellCheck={false}
+          <BrandInput value={baseUrl} spellCheck={false}
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={() => { if (baseUrl !== (p.config.baseUrl ?? '')) onSave(p.id, { baseUrl }); }} />
         </Field>
       )}
       <Field label="API Key">
         <div className="mset-keywrap">
-          <BrandInput type={showKey ? 'text' : 'password'} value={key} spellCheck={false} placeholder="未配置"
+          <BrandInput type={showKey ? 'text' : 'password'} value={key} spellCheck={false}
+            autoComplete="new-password"
             onChange={(e) => setKey(e.target.value)}
             onBlur={() => { if (key !== (p.apiKey ?? '')) { onSave(p.id, { apiKey: key.trim() }); setKey(key.trim()); } }} />
           <button className="mset-ibtn in" title={showKey ? '隐藏密钥' : '显示密钥'} onClick={() => setShowKey((v) => !v)}>
@@ -397,6 +396,7 @@ function ProviderDetail({ p, resp, models, err, onSave, onRemove, onSaveModels, 
             </button>
             {ctxBadge(m.contextWindow) && <span className="mset-badge">{ctxBadge(m.contextWindow)}</span>}
             {m.inputTypes?.includes('image') && <span className="mset-badge">视觉</span>}
+            {m.inputTypes?.includes('video') && <span className="mset-badge">视频</span>}
             {m.inputTypes?.includes('audio') && <span className="mset-badge">音频</span>}
             {m.capabilities?.includes('webSearch') && <span className="mset-badge">联网</span>}
             {inChain(m.id).map((x) => <span key={x} className="mset-badge mset-badge-rank">{x}</span>)}
@@ -422,18 +422,13 @@ function ProviderDetail({ p, resp, models, err, onSave, onRemove, onSaveModels, 
         {!!resp.chains.chat.filter((e) => e.provider === p.id).length && <span className="tag accent">聊天模型 ×{resp.chains.chat.filter((e) => e.provider === p.id).length}</span>}
         {!!resp.chains.work.filter((e) => e.provider === p.id).length && <span className="tag accent">工作模型 ×{resp.chains.work.filter((e) => e.provider === p.id).length}</span>}
       </div>
-      {!p.implemented && (
-        <div className="warnbox" style={{ marginTop: 12 }}>
-          {p.label} 仅为占位 Provider（内核未实现请求逻辑），配置可保存但不可调用。
-        </div>
-      )}
     </section>
   );
 }
 
 type Box = { x: number; y: number; w: number; h: number };
 
-/** 连接方式选择器：三张卡共用一条轨道，选中块像水一样从旧项流向新项。
+/** 连接方式选择器：四张卡排 2×2、共用一条轨道，选中块像水一样从旧项流向新项。
  *  做法：块按新位置排版，再把它逐帧"搬"回旧位置弹过来。每帧先算出想占的盒子、
  *  裁进轨道范围、最后才换算成 transform，所以水线拉多长都不会溢出轨道。
  *  旧位置另留一滴尾滴，被拖着吸回主体——两层都过 #goo 滤镜，重叠即融合、拉开即掐断。 */
@@ -591,9 +586,9 @@ function SmartRow({ smart, onToggle, probe, onRetry }: {
 
 /** 单条模型的明细字段：ID（带远端候选）/ 上下文窗口 / 最大输出 / 高级配置。
  *  「添加供应商」的多模型卡与「添加/编辑模型」弹窗共用这一份，保证两处字段一致。 */
-function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus, idPlaceholder = 'deepseek-chat' }: {
+function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus }: {
   m: ModelCfg; on: (patch: Partial<ModelCfg>) => void; remote?: string[] | null; protocol?: string;
-  advDefault?: boolean; autoFocus?: boolean; idPlaceholder?: string;
+  advDefault?: boolean; autoFocus?: boolean;
 }) {
   const [adv, setAdv] = useState(advDefault);
   const num = (s: string) => (s.trim() ? Number(s.trim()) : undefined);
@@ -609,7 +604,7 @@ function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus, i
   return (
     <>
       <Field label="模型 ID">
-        <BrandInput value={m.id} placeholder={idPlaceholder} spellCheck={false} autoFocus={autoFocus}
+        <BrandInput value={m.id} spellCheck={false} autoFocus={autoFocus}
           onChange={(e) => on({ id: e.target.value })} />
         {(remote?.length ?? 0) > 0 && (
           <div className="mset-cands">
@@ -620,11 +615,11 @@ function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus, i
         )}
       </Field>
       <Field label="上下文窗口">
-        <BrandInput type="number" value={m.contextWindow ?? ''} placeholder="65536"
+        <BrandInput type="number" value={m.contextWindow ?? ''}
           onChange={(e) => on({ contextWindow: num(e.target.value) })} />
       </Field>
       <Field label="最大输出 Token">
-        <BrandInput type="number" value={m.maxOutput ?? ''} placeholder="8192"
+        <BrandInput type="number" value={m.maxOutput ?? ''}
           onChange={(e) => on({ maxOutput: num(e.target.value) })} />
       </Field>
 
@@ -655,7 +650,7 @@ function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus, i
             <div className="mset-chips wrap">
               {(m.reasoningLevels ?? []).map((lv, i) => (
                 <span key={i} className="mset-lvl">
-                  <BrandInput value={lv} placeholder={`等级 ${i + 1}`} onChange={(e) => {
+                  <BrandInput value={lv} onChange={(e) => {
                     const next = [...(m.reasoningLevels ?? [])];
                     next[i] = e.target.value;
                     on({ reasoningLevels: next });
@@ -735,17 +730,17 @@ function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v
   return (
     <Modal title="添加供应商" wide onClose={onClose}>
       <Field label="名称">
-        <BrandInput value={v.label} placeholder="如 opencode go" autoFocus onChange={(e) => set('label', e.target.value)} />
+        <BrandInput value={v.label} autoFocus onChange={(e) => set('label', e.target.value)} />
       </Field>
       <Field label="Base URL">
-        <BrandInput value={v.baseUrl} placeholder="https://opencode.ai/zen/go/v1" spellCheck={false}
+        <BrandInput value={v.baseUrl} spellCheck={false}
           onChange={(e) => set('baseUrl', e.target.value)} />
       </Field>
       <Field label="连接方式">
         <ProtoPicker value={v.protocol} onPick={(x) => set('protocol', x)} />
       </Field>
       <Field label="API Key">
-        <BrandInput type="password" value={v.apiKey} placeholder="sk-…" spellCheck={false} onChange={(e) => set('apiKey', e.target.value)} />
+        <BrandInput type="password" value={v.apiKey} spellCheck={false} autoComplete="new-password" onChange={(e) => set('apiKey', e.target.value)} />
       </Field>
 
       <div className="mset-sec-h">
@@ -753,22 +748,24 @@ function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v
         <button className="mset-add" onClick={() => setEditing('new')}><Icon name="plus" size={13} /> 添加模型</button>
       </div>
       <SmartRow smart={smart} onToggle={setSmart} probe={probe} onRetry={() => setNonce((n) => n + 1)} />
-      <div className="mset-models">
-        {rows.length === 0 && <div className="mset-group-e">还没有模型，点右上「添加模型」</div>}
-        {rows.map((r) => (
-          <div key={r.uid} className="mset-mrow">
-            <button className="mset-mname mono" title="编辑该模型" onClick={() => setEditing(r.uid)}>{r.m.id}</button>
-            {ctxBadge(r.m.contextWindow) && <span className="mset-badge">{ctxBadge(r.m.contextWindow)}</span>}
-            {r.m.inputTypes?.includes('image') && <span className="mset-badge">视觉</span>}
-            {r.m.inputTypes?.includes('audio') && <span className="mset-badge">音频</span>}
-            {r.m.capabilities?.includes('webSearch') && <span className="mset-badge">联网</span>}
-            <span className="mset-macts">
-              <button className="mset-ibtn" title="编辑模型" onClick={() => setEditing(r.uid)}><Icon name="write" size={15} /></button>
-              <button className="mset-ibtn" title="删除该模型" onClick={() => delRow(r.uid)}><Icon name="trash" size={15} /></button>
-            </span>
-          </div>
-        ))}
-      </div>
+      {rows.length > 0 && (
+        <div className="mset-models">
+          {rows.map((r) => (
+            <div key={r.uid} className="mset-mrow">
+              <button className="mset-mname mono" title="编辑该模型" onClick={() => setEditing(r.uid)}>{r.m.id}</button>
+              {ctxBadge(r.m.contextWindow) && <span className="mset-badge">{ctxBadge(r.m.contextWindow)}</span>}
+              {r.m.inputTypes?.includes('image') && <span className="mset-badge">视觉</span>}
+              {r.m.inputTypes?.includes('video') && <span className="mset-badge">视频</span>}
+              {r.m.inputTypes?.includes('audio') && <span className="mset-badge">音频</span>}
+              {r.m.capabilities?.includes('webSearch') && <span className="mset-badge">联网</span>}
+              <span className="mset-macts">
+                <button className="mset-ibtn" title="编辑模型" onClick={() => setEditing(r.uid)}><Icon name="write" size={15} /></button>
+                <button className="mset-ibtn" title="删除该模型" onClick={() => delRow(r.uid)}><Icon name="trash" size={15} /></button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
 
       {editing !== null && (
         <ModelCard
@@ -794,9 +791,9 @@ function ProviderForm({ onClose, onSubmit }: { onClose: () => void; onSubmit: (v
 }
 
 /** 模型明细弹窗：模型页的「添加/编辑模型」与「添加供应商」里的模型行共用这一张卡片 */
-function ModelCard({ title, value, remote, protocol, idPlaceholder, dupIds = [], smart, advDefault = false, onClose, onSave }: {
+function ModelCard({ title, value, remote, protocol, dupIds = [], smart, advDefault = false, onClose, onSave }: {
   title: string; value: ModelCfg; remote?: string[] | null; protocol?: string;
-  idPlaceholder?: string; dupIds?: string[]; smart?: ReactNode; advDefault?: boolean;
+  dupIds?: string[]; smart?: ReactNode; advDefault?: boolean;
   onClose: () => void; onSave: (m: ModelCfg) => void;
 }) {
   const [m, setM] = useState<ModelCfg>(value);
@@ -817,7 +814,7 @@ function ModelCard({ title, value, remote, protocol, idPlaceholder, dupIds = [],
     <Modal title={title} wide onClose={onClose}>
       {smart}
       <ModelFields key={gen} m={m} on={on} remote={remote} protocol={protocol}
-        advDefault={advDefault} autoFocus idPlaceholder={idPlaceholder} />
+        advDefault={advDefault} autoFocus />
       <div className="mset-mfoot">
         <button className="mset-link" onClick={() => { setM(value); setGen((g) => g + 1); setErr(''); }}>重置表单</button>
         <div className="mset-mfoot-r">
@@ -857,7 +854,6 @@ function ModelForm({ provider, edit, onClose, onSave }: {
       title={edit ? '编辑模型' : '添加模型'}
       value={edit ? { ...blankModel(), ...edit } : blankModel()}
       remote={smart ? remote : null} protocol={protoOf(provider)}
-      idPlaceholder={provider.model || 'deepseek-chat'}
       dupIds={edit ? [] : modelsOf(provider).map((x) => x.id)}
       advDefault={!!edit}
       smart={<SmartRow smart={smart} onToggle={setSmart} probe={probe} />}

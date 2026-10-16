@@ -1,12 +1,13 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { join, resolve, sep, normalize, dirname } from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, rmSync, existsSync, unlinkSync } from 'node:fs';
 import type { Db } from '../db.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ChatRef, SandboxEntry, SandboxRunResult, SandboxStat, SandboxWriteResult } from '../types.ts';
 import { SlidingWindowCounter } from '../ratelimit.ts';
 import { newId, nowMs, truncate } from '../util/misc.ts';
+import { dockerBinCandidates } from './deps.ts';
 
 /** 覆盖写的行增减：整行做多重集比对（够 UI 显示 +N -M，不做逐行 diff）；含 NUL 的二进制不计算 */
 function lineDiff(oldText: string, newText: string): { added: number; removed: number } | null {
@@ -23,6 +24,21 @@ function lineDiff(oldText: string, newText: string): { added: number; removed: n
   for (const [l, n] of a) removed += Math.max(0, n - (b.get(l) ?? 0));
   return { added, removed };
 }
+
+/** 页面内联预览的图片类型（svg 不在内：它可携带脚本，同源内联等于执行位） */
+const INLINE_IMAGE_MIME: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+};
+
+/** 语音/视频内联播放白名单（会话页的聊天记录卡片要用）。silk 是 QQ 语音的原容器。 */
+const INLINE_MEDIA_MIME: Record<string, string> = {
+  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', opus: 'audio/ogg', m4a: 'audio/mp4',
+  aac: 'audio/aac', flac: 'audio/flac', amr: 'audio/amr', silk: 'audio/silk', slk: 'audio/silk',
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
+};
+/** 视频动辄几十 MB：流式发不占内存，但仍要有个天花板，别让人拿一条转发把磁盘 IO 拖死 */
+const INLINE_MEDIA_MAX = 200 * 1024 * 1024;
 
 /** 交给系统默认程序不会触发脚本执行的类型；不在此列的一律只在文件管理器里选中 */
 const SAFE_OPEN_EXT = new Set([
@@ -112,6 +128,44 @@ export class SandboxService {
     return out.sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
   }
 
+  /**
+   * 递归列出沙箱内的文件（给 grep / glob 用）。
+   * 边界与 `list` 同源：从 `resolveInside` 起步、逐层拼相对路径；不跟随符号链接（可能指到沙箱外）。
+   * 有上限（文件数 / 层数）并回报是否截断：宁可少扫，不把一次工具调用拖成整树遍历。
+   */
+  walkFiles(chat: ChatRef, relPath = '.', opts: { maxFiles?: number; maxDepth?: number } = {}): { files: SandboxEntry[]; truncated: boolean } {
+    const maxFiles = Math.max(1, Math.min(Math.floor(opts.maxFiles ?? 800), 5000));
+    const maxDepth = Math.max(1, Math.min(Math.floor(opts.maxDepth ?? 8), 24));
+    const startAbs = this.resolveInside(chat, relPath);
+    if (!existsSync(startAbs)) throw new SandboxError(`不存在: ${relPath}`);
+    if (!statSync(startAbs).isDirectory()) throw new SandboxError(`不是目录: ${relPath}`);
+    const files: SandboxEntry[] = [];
+    let truncated = false;
+    const startRel = relPath.replace(/\\/g, '/').replace(/\/+$/, '') || '.';
+    const walk = (abs: string, rel: string, depth: number): void => {
+      let names: string[];
+      try { names = readdirSync(abs).sort(); } catch { return; }
+      for (const name of names) {
+        if (files.length >= maxFiles) { truncated = true; return; }
+        const p = join(abs, name);
+        const relP = rel === '.' ? name : `${rel}/${name}`;
+        let s;
+        try { s = lstatSync(p); } catch { continue; }
+        if (s.isSymbolicLink()) continue;
+        if (s.isDirectory()) {
+          if (depth < maxDepth) walk(p, relP, depth + 1);
+          else truncated = true;
+          continue;
+        }
+        if (!s.isFile()) continue;
+        files.push({ name, relPath: relP, type: 'file', size: s.size, mtime: s.mtimeMs });
+        this.touchFile(chat, relP, s.size);
+      }
+    };
+    walk(startAbs, startRel, 0);
+    return { files, truncated };
+  }
+
   read(chat: ChatRef, relPath: string): string {
     const abs = this.resolveInside(chat, relPath);
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new SandboxError(`文件不存在: ${relPath}`);
@@ -122,7 +176,7 @@ export class SandboxService {
     return readFileSync(abs, 'utf-8');
   }
 
-  /** 桌面端预览：文本文件给内容（按字符截断，不切坏中文），二进制给 null（由 UI 决定改走系统程序打开） */
+/** 桌面端预览：文本文件给内容（按字符截断，不切坏中文），二进制给 null（由 UI 决定改走系统程序打开） */
   preview(chat: ChatRef, relPath: string, cap = 256_000): { text: string; truncated: boolean } | null {
     const abs = this.resolveInside(chat, relPath);
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new SandboxError(`文件不存在: ${relPath}`);
@@ -131,6 +185,27 @@ export class SandboxService {
     const full = buf.toString('utf-8');
     this.touchFile(chat, relPath, buf.length);
     return { text: full.slice(0, cap), truncated: full.length > cap };
+  }
+
+  /**
+   * 内联预览的字节：图片 + 语音 + 视频，只认白名单扩展名。
+   * svg/html 一类能带脚本的类型不放进来——沙箱里的文件名与内容都来自 QQ 附件和 LLM 工具，
+   * 同源内联等于把沙箱目录变成执行位。
+   * 语音/视频要能拖进度条，所以只回文件位置让路由层流式发（stream:true），不整个读进内存；
+   * 图片仍走一次性读取，体积上限也照原来的 sandbox.maxFileBytes。
+   */
+  rawInline(chat: ChatRef, relPath: string): { abs: string; mime: string; size: number; stream: boolean } {
+    const abs = this.resolveInside(chat, relPath);
+    if (!existsSync(abs) || !statSync(abs).isFile()) throw new SandboxError(`文件不存在: ${relPath}`);
+    const ext = /\.([A-Za-z0-9]+)$/.exec(abs)?.[1].toLowerCase() ?? '';
+    const isImg = !!INLINE_IMAGE_MIME[ext];
+    const mime = isImg ? INLINE_IMAGE_MIME[ext] : INLINE_MEDIA_MIME[ext];
+    if (!mime) throw new SandboxError(`不支持内联预览的类型：${ext || '（无扩展名）'}`);
+    const st = statSync(abs);
+    const cap = isImg ? this.config.config.sandbox.maxFileBytes : INLINE_MEDIA_MAX;
+    if (st.size > cap) throw new SandboxError(`文件过大（${st.size} > ${cap} 字节），拒绝读取`);
+    this.touchFile(chat, relPath, st.size);
+    return { abs, mime, size: st.size, stream: !isImg };
   }
 
   /**
@@ -277,10 +352,7 @@ export class SandboxService {
 
   /** 探测 docker CLI + daemon 是否可用（10s 预算，结果缓存）。PATH 找不到时尝试 Docker Desktop 默认安装位置。 */
   private probeDocker(): boolean {
-    const candidates = process.platform === 'win32'
-      ? ['docker', join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin', 'docker.exe')]
-      : ['docker'];
-    for (const bin of candidates) {
+    for (const bin of dockerBinCandidates()) {
       try {
         execFileSync(bin, ['info', '--format', 'ok'], { timeout: 10_000, windowsHide: true, stdio: 'pipe' });
         this.dockerBin = bin;
@@ -426,10 +498,10 @@ export class SandboxService {
       let stdout = '', stderr = '', truncated = false, timedOut = false;
       let command: string, args: string[];
       if (language === 'powershell') {
-        command = process.env['HACHIMI_PWSH'] || 'powershell';
+        command = process.env['PARALLEL_PWSH'] || 'powershell';
         args = ['-NoProfile', '-NonInteractive', '-Command', code];
       } else {
-        command = process.env['HACHIMI_BASH'] || 'bash';
+        command = process.env['PARALLEL_BASH'] || 'bash';
         args = ['-c', code];
       }
       const child = spawn(command, args, {
@@ -439,7 +511,7 @@ export class SandboxService {
           PATH: process.env.PATH ?? '',
           SYSTEMROOT: process.env.SYSTEMROOT ?? '',
           COMSPEC: process.env.COMSPEC ?? '',
-          HACHIMI_SANDBOX: '1',
+          PARALLEL_SANDBOX: '1',
           PYTHONIOENCODING: 'utf-8',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -483,14 +555,14 @@ export class SandboxService {
         ? ['-I', '-u', '-c', code]                       // -I 隔离模式：不加载用户 site-packages/环境变量
         : ['--input-type=module', '-e', code];
 
-      const child = spawn(language === 'python' ? process.env.HACHIMI_PYTHON || 'python' : process.execPath, args, {
+      const child = spawn(language === 'python' ? process.env.PARALLEL_PYTHON || 'python' : process.execPath, args, {
         cwd,
         windowsHide: true,
         env: {
           PATH: process.env.PATH ?? '',
           SYSTEMROOT: process.env.SYSTEMROOT ?? '',   // Windows 必需
           COMSPEC: process.env.COMSPEC ?? '',
-          HACHIMI_SANDBOX: '1',
+          PARALLEL_SANDBOX: '1',
           PYTHONIOENCODING: 'utf-8',
         },
         stdio: ['ignore', 'pipe', 'pipe'],

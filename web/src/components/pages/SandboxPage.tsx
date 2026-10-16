@@ -1,8 +1,8 @@
 'use client';
-/** 沙箱：左列表（按会话）+ 右详情（占用 / 文件浏览 / 清空），顶栏「限额与清理」弹窗
- *  文件点开：文本在弹窗里看，二进制或行尾那颗按钮交给系统默认程序（不可执行类型只在资源管理器里选中） */
+/** 沙箱：左列表（按会话）+ 右详情（占用 / 全部文件按日期装进文件夹 / 清空），顶栏「限额与清理」弹窗
+ *  文件点开：图片与文本都在弹窗里看；其余类型交给系统默认程序，不确定会执行的只在资源管理器里选中 */
 import { useCallback, useEffect, useState } from 'react';
-import { get, post, fmtBytes, fmtDT } from '@/lib/api';
+import { get, post, fmtBytes, fmtDT, fmtTime, getToken } from '@/lib/api';
 import { Icon } from '@/components/Icon';
 import { fileIcon } from '@/lib/fileIcon';
 import { BrandInput } from '@/components/BrandInput';
@@ -10,12 +10,12 @@ import { Modal, Field, Switch } from '@/components/Modal';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 
 interface Stat { chat: string; files: number; bytes: number; lastActivity: number; root: string }
-interface Entry { name: string; relPath: string; type: 'file' | 'dir'; size: number; mtime: number }
-interface View { name: string; text: string; truncated: boolean }
+interface Entry { name: string; relPath: string; size: number; mtime: number }
+interface View { name: string; kind: 'text' | 'image'; text: string; truncated: boolean }
 
 const NUM_FIELDS: { k: string; t: string; size?: 'bytes' | 'ms' | 'h' }[] = [
   { k: 'ttlHours', t: '文件 TTL（小时）', size: 'h' },
-  { k: 'inboxTtlHours', t: '收件文件 TTL（小时）', size: 'h' },
+  // 收件文件的保留期在设置页「沙箱」按天调，这里不再放第二个旋钮（同一个键两处改会互相打脸）
   { k: 'maxFileBytes', t: '单文件上限（字节）', size: 'bytes' },
   { k: 'maxSessionBytes', t: '单会话上限（字节）', size: 'bytes' },
   { k: 'execTimeoutPythonMs', t: 'Python 超时（毫秒）', size: 'ms' },
@@ -30,9 +30,12 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
   const [limits, setLimits] = useState(false);
   const [timeoutMs, setTimeoutMs] = useState(15000);   // 脚本默认超时（原「沙箱」插件的可配置项）
   const [sbGlobal, setSbGlobal] = useState(true);      // 沙箱能力的全局默认
-  const [path, setPath] = useState('.');
   const [entries, setEntries] = useState<Entry[]>([]);
+  /** 折叠起来的日期文件夹（键 = YYYY-MM-DD）；默认全展开，只在本次浏览里记 */
+  const [closed, setClosed] = useState<Set<string>>(new Set());
+  const [truncated, setTruncated] = useState(false);
   const [view, setView] = useState<View | null>(null);
+  const [imgErr, setImgErr] = useState('');
   const [err, setErr] = useState('');
   /** 限额弹窗里的写入失败就地报红（弹窗盖着页面，用 err 看不见） */
   const [limitsErr, setLimitsErr] = useState('');
@@ -55,39 +58,49 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
   }, []);
   useEffect(() => { reload(); }, [reload]);
 
-  usePageCmd('sandbox', cmd, (kind) => { if (kind === 'limits') setLimits((v) => !v); else reload(); });
-
-  const loadDir = useCallback((chat: string, p: string) => {
-    if (!chat) { setEntries([]); return; }
-    get('/api/sandbox/files?chat=' + encodeURIComponent(chat) + '&path=' + encodeURIComponent(p))
-      .then((r: { entries?: Entry[] }) => { setEntries(r.entries ?? []); setErr(''); })
+  const loadFiles = useCallback((chat: string) => {
+    if (!chat) { setEntries([]); setTruncated(false); return; }
+    get('/api/sandbox/files?chat=' + encodeURIComponent(chat))
+      .then((r: { entries?: Entry[]; truncated?: boolean }) => { setEntries(r.entries ?? []); setTruncated(!!r.truncated); setErr(''); })
       .catch((x: unknown) => { setEntries([]); setErr((x as Error).message); });
   }, []);
-  useEffect(() => { loadDir(sel, path); }, [sel, path, loadDir]);
+  useEffect(() => { loadFiles(sel); }, [sel, loadFiles]);
 
-  const pick = (chat: string) => { setSel(chat); setPath('.'); setErr(''); };
+  usePageCmd('sandbox', cmd, (kind) => { if (kind === 'limits') { setLimits((v) => !v); return; } reload(); loadFiles(sel); });
+
+  const pick = (chat: string) => { setSel(chat); setErr(''); };
+  const toggleDay = (key: string) => setClosed((p) => {
+    const n = new Set(p);
+    if (n.has(key)) n.delete(key); else n.add(key);
+    return n;
+  });
 
   const handOff = async (e: Entry) => {
     try { await post('/api/sandbox/open', { chatKey: sel, path: e.relPath }); }
     catch (x) { setErr((x as Error).message); }
   };
-  const open = async (e: Entry) => {
-    if (e.type === 'dir') { setPath(e.relPath); return; }
+  const openFile = async (e: Entry) => {
+    setImgErr('');
+    if (isImage(e.name)) { setView({ name: e.relPath, kind: 'image', text: '', truncated: false }); return; }
     try {
       const r = await get('/api/sandbox/read?chat=' + encodeURIComponent(sel) + '&path=' + encodeURIComponent(e.relPath));
-      if (r.kind === 'text') { setView({ name: e.relPath, text: r.text ?? '', truncated: !!r.truncated }); return; }
+      if (r.kind === 'text') { setView({ name: e.relPath, kind: 'text', text: r.text ?? '', truncated: !!r.truncated }); return; }
     } catch { /* 读不动的（超限等）一律交给系统打开 */ }
     await handOff(e);
   };
+  /** 图片走 raw 端点：<img> 带不上请求头，所以按 ws 的同款写法用 ?token= */
+  const rawUrl = (rel: string) => '/api/sandbox/raw?chat=' + encodeURIComponent(sel)
+    + '&path=' + encodeURIComponent(rel) + '&token=' + encodeURIComponent(getToken());
 
   const clear = async (chat: string) => {
     if (!confirm(`清空会话 ${chat} 的沙箱文件？`)) return;
-    try { await post('/api/sandbox/clear', { chatKey: chat }); setPath('.'); setErr(''); reload(); }
+    try { await post('/api/sandbox/clear', { chatKey: chat }); setErr(''); reload(); }
     catch { /* 失败不弹提示 */ }
   };
 
   const cur = stats.find((s) => s.chat === sel);
-  const here = cur ? (path === '.' ? cur.root : cur.root + '\\' + path.replace(/\//g, '\\')) : '';
+  const here = cur?.root ?? '';
+  const days = groupByDay(entries);
 
   return (
     <div>
@@ -125,33 +138,39 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
             </div>
 
             <div className="mset-sec-h">
-              <span>目录</span>
+              <span>位置</span>
               <span className="plg-sec-r plg-hint mono" title={here}>{tail(here)}</span>
             </div>
-            <div className="mset-models">
-              {path !== '.' && (
-                <div className="mset-mrow">
-                  <span className="mset-item-ic"><Icon name="file" size={14} /></span>
-                  <button className="mset-mname" onClick={() => setPath(path.split('/').slice(0, -1).join('/') || '.')}>..</button>
+            {days.map((d) => {
+              const open = !closed.has(d.key);
+              return (
+                <div className="mset-models sb-day" key={d.key}>
+                  <button className="mset-mrow" onClick={() => toggleDay(d.key)} aria-expanded={open}>
+                    <span className={'mset-chev' + (open ? ' open' : '')}><Icon name="chevron" size={12} /></span>
+                    <span className="sb-fold-nm mono">{d.key}</span>
+                    <span className="mset-macts">
+                      <span className="plg-hint">{d.items.length} 个 · {fmtBytes(d.bytes)}</span>
+                    </span>
+                  </button>
+                  {open && d.items.map((e) => (
+                    <div className="mset-mrow sb-in" key={e.relPath}>
+                      <span className="mset-item-ic"><Icon name={fileIcon(e.name)} size={14} /></span>
+                      <button className="mset-mname" onClick={() => void openFile(e)} title={e.relPath}>{base(e.relPath)}</button>
+                      <span className="mset-macts">
+                        {dirOf(e.relPath) && <span className="plg-hint mono">{dirOf(e.relPath)}</span>}
+                        <span className="plg-hint">{fmtBytes(e.size)}</span>
+                        <span className="plg-hint">{fmtTime(e.mtime)}</span>
+                        <button className="mset-ibtn" title="用系统程序打开" onClick={() => void handOff(e)}>
+                          <Icon name="browser" size={14} />
+                        </button>
+                      </span>
+                    </div>
+                  ))}
                 </div>
-              )}
-              {entries.map((e) => (
-                <div className="mset-mrow" key={e.relPath}>
-                  <span className="mset-item-ic"><Icon name={e.type === 'dir' ? 'file' : fileIcon(e.name)} size={14} /></span>
-                  <button className="mset-mname" onClick={() => void open(e)} title={e.relPath}>{e.name}</button>
-                  <span className="mset-macts">
-                    {e.type === 'file' && <span className="plg-hint">{fmtBytes(e.size)}</span>}
-                    <span className="plg-hint">{fmtDT(e.mtime)}</span>
-                    {e.type === 'file' && (
-                      <button className="mset-ibtn" title="用系统程序打开" onClick={() => void handOff(e)}>
-                        <Icon name="browser" size={14} />
-                      </button>
-                    )}
-                  </span>
-                </div>
-              ))}
-              {!entries.length && <div className="mset-group-e">（空目录）</div>}
-            </div>
+              );
+            })}
+            {!days.length && <div className="mset-group-e">（没有文件）</div>}
+            {truncated && <div className="plg-hint">（文件超过 800 个，未全部列出）</div>}
             {err && <span className="mset-err">{err}</span>}
           </section>
         )}
@@ -194,8 +213,11 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
 
       {view && (
         <Modal title={view.name} wide onClose={() => setView(null)}>
-          <pre className="sb-view mono">{view.text}</pre>
-          {view.truncated && <div className="plg-hint">（只显示前 256K 字）</div>}
+          {view.kind === 'image'
+            ? <img className="sb-image" src={rawUrl(view.name)} alt={view.name} onError={() => setImgErr('图片读取失败')} />
+            : <pre className="sb-view mono">{view.text}</pre>}
+          {view.kind === 'text' && view.truncated && <div className="plg-hint">（只显示前 256K 字）</div>}
+          {imgErr && <div className="mset-err">{imgErr}</div>}
         </Modal>
       )}
     </div>
@@ -204,3 +226,26 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
 
 /** 路径太长时只留尾巴：文件名比盘符重要 */
 const tail = (p: string) => (p.length <= 52 ? p : '…' + p.slice(-51));
+const base = (p: string) => p.split('/').pop() ?? p;
+/** 与内核 rawImage 的白名单保持一致：只有这些类型在页面里内联预览 */
+const isImage = (name: string) => /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
+/** 所在子目录（带尾斜杠），根目录下的文件返回空串 */
+const dirOf = (p: string) => { const i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i + 1); };
+
+/** 同一天的文件收进一个以日期命名的文件夹（YYYY-MM-DD，跨年也排得对）；文件夹之间与内部都按时间倒序 */
+function groupByDay(entries: Entry[]): { key: string; items: Entry[]; bytes: number }[] {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const dayKey = (t: number) => {
+    const d = new Date(t);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  };
+  const groups = new Map<string, { key: string; items: Entry[]; bytes: number }>();
+  for (const e of [...entries].sort((a, b) => b.mtime - a.mtime)) {
+    const k = dayKey(e.mtime);
+    let g = groups.get(k);
+    if (!g) { g = { key: k, items: [], bytes: 0 }; groups.set(k, g); }
+    g.items.push(e);
+    g.bytes += e.size;
+  }
+  return [...groups.values()];
+}

@@ -3,14 +3,15 @@ import { join, dirname } from 'node:path';
 
 /**
  * 原子化 JSON 落盘（红线 §3.4）：
- * 写 .tmp → rename 覆盖 → 保留滚动 .bak（3 份）。
+ * 写 .tmp → rename 覆盖 → 保留滚动 .bak（3 份，rotate:false 关掉）。
  * 所有配置写入必须走这里，禁止运行时手改文件。
+ * 密钥文件必须 rotate:false：轮转副本会把旧密钥长期留在盘上（.bak 一份都不该有）。
  */
-export function atomicWriteJson(file: string, data: unknown): void {
+export function atomicWriteJson(file: string, data: unknown, opts: { rotate?: boolean } = {}): void {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = file + '.tmp';
   writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
-  if (existsSync(file)) {
+  if ((opts.rotate ?? true) && existsSync(file)) {
     try { rotateBackups(file); } catch { /* 备份失败不阻塞主写入 */ }
   }
   renameSync(tmp, file);

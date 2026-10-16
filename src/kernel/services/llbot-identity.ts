@@ -50,6 +50,7 @@ export type LlbotLineEvent =
   | { type: 'session-invalid'; reason: string }
   | { type: 'logged-in' }
   | { type: 'login-failed'; state: number; message: string }
+  | { type: 'qq-exited' }
   | { type: 'qr-exhausted' };
 
 const KICK_CODE_RE = /\[Kick\]\s*code=(-?\d+)/;
@@ -82,6 +83,9 @@ export function parseLlbotLine(line: string): LlbotLineEvent | null {
     const m = /extraMsg=([^()]*)/.exec(line) ?? /: (.+)$/.exec(line);
     return { type: 'session-invalid', reason: (m?.[1] ?? '').trim() };
   }
+  // 有头模式：PMHQ 自己报「QQ 进程已退出」，随后 llbot.exe 以 code=0 正常退出。
+  // 这不是崩溃，是人在 QQ 那边退了/关了——据此才拦得住「退完又被自动拉起来」。
+  if (line.includes('QQ 进程已退出')) return { type: 'qq-exited' };
   if (line.includes('停止自动刷新')) return { type: 'qr-exhausted' };
   return null;
 }

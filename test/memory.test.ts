@@ -54,11 +54,9 @@ test('审计记的是内容而不是内部 id', () => {
   assert.equal(last(m, 'update_fact').payload, '爱吃甜');
 });
 
-test('每条消息都会刷的好感度/心情不进审计', () => {
+test('属性写入都进审计，值截断进 payload', () => {
   const m = mk();
   m.touchUser('1001');
-  for (const k of ['affection', 'affection_daily', 'affection_last_ts', 'mood']) m.setAttr('1001', k, 1);
-  assert.deepEqual(ops(m), ['create_profile']);
   m.setAttr('1001', 'school', '浙大');
   assert.deepEqual(ops(m), ['create_profile', 'set_attr:school']);
   assert.equal(last(m, 'set_attr:school').payload, '"浙大"');

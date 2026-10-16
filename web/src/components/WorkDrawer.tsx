@@ -17,10 +17,12 @@ import { Icon } from '@/components/Icon';
 import { fileIcon } from '@/lib/fileIcon';
 
 export interface LoopEvent {
-  kind: 'round' | 'thinking' | 'tool' | 'toolResult' | 'usage' | 'final';
+  kind: 'round' | 'thinking' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'final';
   n?: number; round?: number; text?: string; name?: string; args?: string;
   meta?: ToolMeta;
   prompt?: number; completion?: number; cacheHit?: number; cacheMiss?: number;
+  // compaction / settle
+  dropped?: number; tokensBefore?: number; summary?: string; reason?: 'terminate' | 'max_rounds';
 }
 export interface WorkUsage { prompt: number; completion: number; cacheHit: number; cacheMiss: number; calls: number }
 export interface WorkRun {
@@ -28,6 +30,10 @@ export interface WorkRun {
   ok: boolean; summary: string; error?: string;
   rounds: number; toolCalls: number; durationMs: number;
   artifacts: string[]; startedAt: number; usage?: WorkUsage;
+  /** 模型按交付格式写的备注 / 是否解析到了结构化交付 */
+  notes?: string; structured?: boolean;
+  /** 停下来等发起者回答（work_ask）：不是失败，也不是干完了 */
+  awaiting?: { question: string; notes?: string };
   events?: LoopEvent[];
 }
 
@@ -44,6 +50,17 @@ function loopActs(events: LoopEvent[]): { acts: ActRow[]; final?: string } {
       pushAct(acts, { ...head, body: isRun(head.kind) ? `$ ${args}` : args }, true);
     } else if (ev.kind === 'toolResult') {
       pushAct(acts, { ...actHead(ev.name ?? ''), body: ev.text ?? '', meta: ev.meta }, false);
+    } else if (ev.kind === 'compaction') {
+      // 上下文压缩：丢掉的是模型看不到的那部分历史，正文给出摘要（点开可看）
+      acts.push({
+        kind: 'compact',
+        subject: '上下文',
+        sub: `-${ev.dropped ?? 0} 条${ev.tokensBefore ? ` / 原 ~${Math.round(ev.tokensBefore / 1000)}k tokens` : ''}`,
+        body: ev.summary ?? '',
+      });
+    } else if (ev.kind === 'settle' && ev.reason === 'max_rounds') {
+      // 正常收尾（terminate）不占行；只有被轮次上限强制收尾才提示
+      acts.push({ kind: 'note', subject: '已达工具轮次上限', sub: '强制收尾', body: '' });
     }
   }
   return { acts, final };
@@ -63,6 +80,10 @@ const W_KEY = 'parallel_work_width';
 const W_MIN = 320;
 /** 宽度上限 = 视口 30%，与一级侧栏（App.tsx clampSide）同一条规则 */
 const W_MAX_RATIO = 0.3;
+/** 挤压式面板必须给会话列留下的下限：低于这个宽度，气泡和输入框就没法读了 */
+const W_CONV_MIN = 280;
+/** 上面那条留不出来时的面板地板宽（再窄就散，宁可让会话列短一点） */
+const W_FLOOR = 240;
 /** chat 模型流水在面板里最多回溯这么多条原始日志（分组后再截 LOOP_MAX 个 loop） */
 const FLOW_MAX = 120;
 /** 面板里最多显示最近几个 chat loop（每个 loop = 一次 agent_start 到 agent_end） */
@@ -70,15 +91,22 @@ const LOOP_MAX = 8;
 /** 上下文占比圆环周长（直径与标题文字同为 13px，r=5.5），用 stroke-dasharray 换算百分比 */
 const RING_C = 2 * Math.PI * 5.5;
 
-/** 动作行的图标与措辞：按能力分五类（执行/文件/联网/浏览器/其他），另加思考与异常两种行 */
+/** 动作行的图标与措辞：按能力分五类（执行/文件/联网/浏览器/其他），另加思考、异常、压缩、收尾四种行 */
 const ACT = {
   run: { icon: 'console', label: '终端' },
   file: { icon: 'file', label: '文件' },
   net: { icon: 'globe', label: '联网' },
   browser: { icon: 'browser', label: '浏览器' },
   other: { icon: 'tool', label: '工具' },
+  // 协议类动作（toolAction 按整名判）：措辞跟着图标一起换，别再顶着「工具」二字
+  todo: { icon: 'todo', label: '清单' },
+  ask: { icon: 'ask', label: '回问' },
+  done: { icon: 'done', label: '交付' },
+  delegate: { icon: 'delegate', label: '派生' },
   error: { icon: 'warn', label: '异常' },
   think: { icon: 'think', label: '思考' },
+  compact: { icon: 'collapse', label: '压缩' },
+  note: { icon: 'bolt', label: '收尾' },
 } as const;
 type ActKind = keyof typeof ACT;
 
@@ -176,12 +204,14 @@ function groupFlow(entries: LogEntry[]): FlowLoop[] {
   return loops.filter((l) => l.acts.length > 0).slice(-LOOP_MAX);
 }
 
-export default function WorkDrawer({ chatKey, open, onClose, ctxByModel }: {
+export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow }: {
   chatKey?: string;
   open: boolean;
   onClose: () => void;
   /** 模型 id -> 上下文窗口（token），来自模型设置页的配置；缺该模型 = 画不出占比 */
   ctxByModel?: Record<string, number>;
+  /** 窄屏：面板改覆盖式浮出（见 globals.css 的 .wb.narrow .wd-panel），不再挤会话列 */
+  narrow?: boolean;
 }) {
   const [runs, setRuns] = useState<WorkRun[]>([]);
   const [flow, setFlow] = useState<LogEntry[]>([]);
@@ -202,8 +232,14 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel }: {
   // 左缘拖拽调宽，宽度记在 localStorage（和一级侧栏 parallel_side_width 同一套做法）
   const clampW = useCallback((w: number) => {
     const max = Math.max(W_MIN, window.innerWidth * W_MAX_RATIO);
-    return Math.round(Math.min(Math.max(w, Math.min(W_MIN, max)), max));
-  }, []);
+    /* 面板是在流里挤会话列的，光按视口比例算不够：820 宽下 30% 是 320，扣掉一级侧栏和会话列表
+       只剩 190px 给对话（560 更夸张）。所以量「面板关掉时对话能拿到的宽度」，再给它留一条下限。
+       窄屏另有媒体查询把面板改成覆盖式（不占位），这里的 cap 自然不生效。 */
+    const conv = document.querySelector<HTMLElement>('.conv-side')?.clientWidth ?? 0;
+    const avail = conv + (asideRef.current?.clientWidth ?? 0);
+    const cap = narrow ? max : Math.max(W_FLOOR, Math.min(max, avail - W_CONV_MIN));
+    return Math.round(Math.min(Math.max(w, Math.min(W_MIN, cap)), cap));
+  }, [narrow]);
   /** 直接写 DOM 变量：不经过 React 就能立刻跟手（一帧内写多次由浏览器并成一次布局） */
   const applyW = useCallback((w: number) => {
     asideRef.current?.style.setProperty('--wd-w', `${w}px`);
@@ -300,6 +336,8 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel }: {
         setRuns((prev) => prev.map((r) => (r.id === d.id ? {
           ...r, ok: true, summary: d.summary, rounds: d.rounds, toolCalls: d.toolCalls,
           durationMs: d.durationMs, artifacts: d.artifacts ?? [],
+          // 停下来提问：状态先按事件里的 question 标上，300ms 后 load 会用完整记录覆盖
+          awaiting: d.awaiting ? { question: String(d.question ?? d.summary ?? '') } : undefined,
         } : r)));
         setTimeout(load, 300);   // 收尾后重拉一次：usage 是跑完才结算的
       }),
@@ -385,8 +423,8 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel }: {
                 </span>
               </span>
             )}
-            {run && <span className={'wd-state' + (running ? ' run' : run.ok ? '' : ' err')}>
-              {running ? '执行中' : run.ok ? '已完成' : '失败'}
+            {run && <span className={'wd-state' + (running ? ' run' : run.awaiting ? ' ask' : run.ok ? '' : ' err')}>
+              {running ? '执行中' : run.awaiting ? '等你回答' : run.ok ? '已完成' : '失败'}
             </span>}
             <span className="tb-flex" />
             <button className="wd-close" onClick={onClose} aria-label="关闭工作面板" title="关闭">

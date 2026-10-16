@@ -2,7 +2,8 @@ import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import type {
-  CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext, WorkDelegateInput,
+  CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext, WorkDelegateInput, GatedHumanlike,
+  LLMRequestContext, WorkAgentDef,
 } from './types.ts';
 import type { Db } from './db.ts';
 import type { Bus } from './bus.ts';
@@ -13,11 +14,14 @@ import type { MemoryService } from './services/memory.ts';
 import { SandboxService, SandboxError } from './services/sandbox.ts';
 import type { SessionContainers } from './services/session.ts';
 import type { WorkRunner } from './services/work.ts';
+import type { HumanlikeService } from './humanlike/index.ts';
 import type { ChatService } from './services/chat.ts';
 import type { LlmService } from './services/llm.ts';
+import type { SessionLog } from './sessionlog.ts';
 import type { Scheduler } from './scheduler.ts';
 import type { Logger } from './types.ts';
 import { McpStdioClient } from './services/mcp.ts';
+import { resolveWorkAgent, discoverWorkAgents, resolveWorkAgentByName, ENTRY_AGENT_NAME } from './work-agent.ts';
 import { atomicWriteJson, readJson } from './util/fsutil.ts';
 import { newId, nowMs } from './util/misc.ts';
 
@@ -58,11 +62,15 @@ export class PluginContainer {
       sandbox: SandboxService;
       session: SessionContainers;
       work: WorkRunner;
+      humanlike: HumanlikeService;
+      sessionLog: SessionLog;
       chat: ChatService;
       llm: LlmService;
       scheduler: Scheduler;
       loggerFactory: (name: string) => Logger;
       notifyOwner: (text: string) => Promise<void>;
+      /** 群名解析（work 会话节里展示"QQ 群聊「名字」"用） */
+      groupTitle: (chatId: string) => string;
     },
   ) {
     this.log = deps.loggerFactory('container');
@@ -292,19 +300,100 @@ export class PluginContainer {
 
   // =============== 贡献面：按群过滤 ===============
 
-  /** 该群 LLM 工具列表：禁用插件的工具严格缺席（不是注册了但拒绝） */
-  toolsForChat(chat: ChatRef, role: Role): ToolDef[] {
+  /**
+   * 该群 LLM 工具列表：禁用插件的工具严格缺席（不是注册了但拒绝）。
+   *
+   * `surface` 决定收集哪一面（pi 的 tool surface）：
+   *  - `'chat'`（默认，既有调用方语义不变）：排除 `surface:'work'` 的重工具；
+   *  - `'work'`：work 子代理取工具，含 work 面工具（仍受角色与 minRole 约束）。
+   * 可选 `allow` 给出工具白名单（work agent 定义里的 `tools:`），不在名单里的严格缺席。
+   */
+  toolsForChat(chat: ChatRef, role: Role, surface: 'chat' | 'work' = 'chat', allow?: string[]): ToolDef[] {
     const out: ToolDef[] = [];
+    const allowSet = allow ? new Set(allow) : undefined;
     for (const lp of this.plugins.values()) {
       if (lp.state !== 'loaded') continue;
       if (!this.effectiveEnabled(lp.manifest.id, chat.chatId)) continue;
       for (const t of lp.tools.values()) {
+        if (allowSet && !allowSet.has(t.name)) continue;
+        // chat 面拿不到 work 面工具；work 面可以拿 both
+        if (surface === 'chat' && t.surface === 'work') continue;
         if (t.ownerOnly && role !== 'owner') continue;
         if (t.minRole && !roleAtLeast(role, t.minRole)) continue;
         out.push(t);
       }
     }
     return out;
+  }
+
+  /**
+   * 生效的 work **入口** agent 定义：`config.work.agent` 指向的文件/名字优先，
+   * 否则取 agents 目录里的入口条目，都没有则用内置兜底。
+   */
+  workAgent(): WorkAgentDef {
+    const cfg = this.configCfg();
+    return resolveWorkAgent({
+      agentFile: cfg.work?.agent,
+      pluginDir: join(this.dirs.builtin, 'work'),
+      userDir: cfg.work?.agentsDir || join(this.dirs.dataDir, 'agents'),
+    });
+  }
+
+  /**
+   * 可委派的子代理清单（每次调用重新扫目录 —— pi 的口径：允许中途加/改 agent 不必重启）。
+   */
+  listWorkAgents(): WorkAgentDef[] {
+    const cfg = this.configCfg();
+    return discoverWorkAgents({
+      pluginDir: join(this.dirs.builtin, 'work'),
+      userDir: cfg.work?.agentsDir || join(this.dirs.dataDir, 'agents'),
+    });
+  }
+
+  private configCfg(): { work?: { agent?: string; agentsDir?: string; maxDepth?: number } } {
+    return this.deps.config.config as unknown as { work?: { agent?: string; agentsDir?: string; maxDepth?: number } };
+  }
+
+  /** 子代理嵌套上限（入口 depth=0；达到上限的那一层工具面里不再有 delegate） */
+  workMaxDepth(): number {
+    const n = this.configCfg().work?.maxDepth;
+    return Number.isFinite(n) && (n as number) >= 0 ? (n as number) : 2;
+  }
+
+  /**
+   * 某一层 work 轮实际可用的工具：agent 定义白名单 ∩（本群生效 ∩ 角色允许）。
+   *
+   * 白名单**没声明**（`tools:` 缺省或空）= 不设白名单，拿到全部 work 面工具：
+   * 内置兜底 agent 与"忘了写这一行"的自定义 agent 都属于这种，把空数组当白名单用
+   * 会让它们一个工具都拿不到（模型收到「可用工具：(none)」，还查不出为什么）。
+   *
+   * 到深度上限时 `delegate` 一律缺席 —— 工具**在收集阶段就不存在**，
+   * 而不是"注册了但调用时拒绝"（与 surface 同一条口径）。
+   */
+  workToolsFor(chat: ChatRef, role: Role, agent: WorkAgentDef, depth: number): ToolDef[] {
+    const allow = agent.tools?.length ? agent.tools : undefined;
+    const tools = this.toolsForChat(chat, role, 'work', allow);
+    if (depth < this.workMaxDepth()) return tools;
+    return tools.filter((t) => t.name !== 'delegate');
+  }
+
+  /**
+   * work 轮的插件钩子链（beforeWorkLLM）。与 chat 的 beforeLLM 是两条独立链：
+   * chat 轮的人格/世界书注入不会漏进 work，work 的子代理身份也不会污染 chat。
+   */
+  async runWorkHooks(req: LLMRequestContext): Promise<LLMRequestContext> {
+    let ctx = req;
+    for (const lp of this.plugins.values()) {
+      if (lp.state !== 'loaded') continue;
+      if (!this.effectiveEnabled(lp.manifest.id, ctx.chat.chatId)) continue;
+      if (!lp.hooks.beforeWorkLLM) continue;
+      try {
+        ctx = await lp.hooks.beforeWorkLLM(ctx);
+      } catch (e) {
+        this.deps.errors.record('warn', 'plugin', `beforeWorkLLM 出错（${lp.manifest.id}）: ${(e as Error).message}`, { pluginId: lp.manifest.id });
+      }
+    }
+    return ctx;
   }
 
   commandsForChat(chat: ChatRef, role: Role): { def: CommandDef; pluginId: string; enabled: boolean }[] {
@@ -423,7 +512,9 @@ export class PluginContainer {
       memory: makeGatedMemory(manifest, this.deps),
       sandbox: makeGatedSandbox(manifest, this.deps),
       session: makeGatedSession(manifest, this.deps),
-      work: makeGatedWork(manifest, { work: this.deps.work, plugins: this }),
+      work: makeGatedWork(manifest, { work: this.deps.work, plugins: this, groupTitle: this.deps.groupTitle }),
+      humanlike: makeGatedHumanlike(this.deps.humanlike),
+      history: makeGatedHistory(manifest, this.deps.sessionLog),
       llm: {
         registerTool: (def) => {
           if (lp.tools.has(def.name)) throw new Error(`工具 ${def.name} 重复注册`);
@@ -572,6 +663,36 @@ function roleAtLeast(role: Role, min: Role): boolean {
   return rank[role] >= rank[min];
 }
 
+/**
+ * 拟人层的门面。日程/氛围/节奏都属于"角色状态"，插件读写它就是改角色本身，
+ * 所以只开最小面：读快照、读日程、写日程；不开放直接改氛围权重之类的内部量。
+ */
+function makeGatedHumanlike(humanlike: HumanlikeService): GatedHumanlike {
+  return {
+    scheduleOf: (chat) => humanlike.scheduleOf(chat),
+    planSchedule: (chat, plan) => humanlike.planSchedule(chat, {
+      rules: Array.isArray(plan?.rules) ? (plan.rules as never[]) : [],
+      exceptions: Array.isArray(plan?.exceptions) ? (plan.exceptions as never[]) : [],
+    }),
+    snapshot: (chat) => humanlike.snapshot(chat),
+  };
+}
+
+/** 会话历史检索门控：权限来自 manifest（history.search）；范围钉死在调用方给的会话上，插件拿不到全库 */
+function makeGatedHistory(manifest: PluginManifest, sessionLog: SessionLog) {
+  const can = () => {
+    if (!manifest.permissions.includes('history.search' as any)) {
+      throw new PermissionDeniedError(`插件 ${manifest.id} 未声明权限 "history.search"，会话历史检索被拒绝`);
+    }
+  };
+  return {
+    searchMessages: (chat: ChatRef, q: string, limit?: number) => {
+      can();
+      return sessionLog.searchMessages(chat.chatId, chat.type, { q, limit });
+    },
+  };
+}
+
 function makeGatedMemory(manifest: PluginManifest, deps: { memory: MemoryService; errors: ErrorCenter }) {
   const can = (p: string) => {
     if (!manifest.permissions.includes(p as any)) {
@@ -604,12 +725,20 @@ function makeGatedSandbox(manifest: PluginManifest, deps: { sandbox: SandboxServ
   return {
     root: (chat: ChatRef) => { can('fs.sandbox'); return deps.sandbox.root(chat); },
     list: (chat: ChatRef, p?: string) => { can('fs.sandbox'); return deps.sandbox.list(chat, p); },
+    walkFiles: (chat: ChatRef, p?: string, o?: { maxFiles?: number; maxDepth?: number }) => { can('fs.sandbox'); return deps.sandbox.walkFiles(chat, p, o); },
     read: (chat: ChatRef, p: string) => { can('fs.sandbox'); return deps.sandbox.read(chat, p); },
     write: (chat: ChatRef, p: string, c: string | Buffer, o?: { work?: boolean }) => { can('fs.sandbox'); return deps.sandbox.write(chat, p, c, o); },
     delete: (chat: ChatRef, p: string) => { can('fs.sandbox'); return deps.sandbox.delete(chat, p); },
     run: (chat: ChatRef, o: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }) => {
       can('sandbox.exec');
       return deps.sandbox.run(chat, o);
+    },
+    // work 档：powershell/bash + work 配额。此前漏了这一项，导致 work 插件的 run_bash /
+    // run_powershell / run_python_work 三个工具恒不注册（typeof sb.runAny === 'function' 永假），
+    // 而 prompt 里还在教模型用它们——工具面与 prompt 漂移的典型。
+    runAny: (chat: ChatRef, o: { language: 'python' | 'javascript' | 'powershell' | 'bash'; code: string; timeoutMs?: number; work?: boolean }) => {
+      can('sandbox.exec');
+      return deps.sandbox.runAny(chat, o);
     },
     stats: () => { can('fs.sandbox'); return deps.sandbox.stats(); },
     clear: (chat: ChatRef) => { can('fs.sandbox'); return deps.sandbox.clear(chat); },
@@ -641,12 +770,19 @@ function makeGatedSession(manifest: PluginManifest, deps: { session: SessionCont
 /**
  * work 委派门控：需 work.delegate 权限。
  * 这里是「chat 模型 → work 模型」的桥：调用方给出任务，内核用 work 模型 + work 级工具面
- * 跑完整 agent loop（轮次预算 workMaxToolRounds），返回结论供 chat 模型转述。
+ * 跑完整 agent loop（轮次由 work agent 定义的 max_rounds 决定），返回结论供 chat 模型转述。
+ */
+/**
+ * work 委派门控：需 work.delegate 权限。
+ * 「work 模型 → 子代理」的桥（管理员 /work 也走同一条）：
+ * 调用方给出目标 agent 名与任务，内核按该 agent 的定义筛工具面、组装具名分节 system，
+ * 跑一个**隔离上下文**的 agent loop，返回结论供上层继续（子代理结果回给父代理，或由 chat 转述）。
  */
 function makeGatedWork(
   manifest: PluginManifest,
-  deps: { work: WorkRunner; plugins: PluginContainer },
+  deps: { work: WorkRunner; plugins: PluginContainer; groupTitle: (chatId: string) => string },
 ) {
+  const plugins = deps.plugins;
   const can = () => {
     if (!manifest.permissions.includes('work.delegate' as any)) {
       throw new PermissionDeniedError(`插件 ${manifest.id} 未声明权限 "work.delegate"，委派被拒绝`);
@@ -654,36 +790,40 @@ function makeGatedWork(
   };
   return {
     modelLabel: () => deps.work.workModelLabel(),
+    agents: () => plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
     list: (limit?: number) => deps.work.list(limit ?? 30),
     delegate: async (input: WorkDelegateInput) => {
       can();
-      const tools = deps.plugins.toolsForChat(input.chat, input.role as Role);
+      const depth = input.depth ?? 0;
+      const all = plugins.listWorkAgents();
+      const wanted = (input.agent ?? '').trim();
+      // 没点名就用入口 agent；点了名但不存在 → 明确报错（别静默换一个，那会让模型以为调对了）
+      const agent = wanted ? resolveWorkAgentByName(wanted, all) : plugins.workAgent();
+      if (!agent) {
+        throw new Error(`没有名为 ${wanted} 的子代理。可用：${all.map((a) => a.name).join('、') || '（无）'}`);
+      }
+      const chat = input.chat;
+      const role = input.role as Role;
       return deps.work.run({
-        chat: input.chat,
+        chat,
         task: input.task,
         userId: input.userId,
         nickname: input.nickname,
-        role: input.role,
-        system: WORK_SYSTEM_DEFAULT,
-        tools,
-        trigger: 'command',
+        role,
+        agent,
+        tools: plugins.workToolsFor(chat, role, agent, depth),
+        subagents: all.map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
+        trigger: input.trigger ?? 'subagent',
+        depth,
+        parentId: input.parentId,
+        groupTitle: deps.groupTitle(chat.chatId),
+        runHooks: (req) => plugins.runWorkHooks(req),
         abort: input.abort,
       });
     },
   };
 }
 
-/** work 子代理默认 system（work 插件可在自身 beforeLLM 覆盖；此处内核侧兜底） */
-export const WORK_SYSTEM_DEFAULT = [
-  '你是 parallel 的 work 子代理：由 chat 侧委派或管理员以 /work 触发，专注完成这一件事。',
-  '工作规则：',
-  '- 面向交付：拆解任务 → 逐步执行 → 汇报结果。可用 Markdown、代码块、列表。',
-  '- 计算/数据处理用 python_session（常驻会话，变量跨调用保留）或 run_bash / run_powershell。',
-  '- 需要浏览网页（JS 渲染、点击、登录）用 browser_* 工具；只读正文用 web_fetch。',
-  '- 产物写入会话沙箱（sandbox_write），需要交付给用户时用 send_file。',
-  '- 计算沙箱无外网，联网一律走工具。',
-  '- 遇到需要用户决策的点，简明列出选项再继续；完成后简述做了什么、产物在哪。',
-].join('\n');
 
 function mcpToolName(pluginId: string, serverId: string, tool: string): string {
   return `${pluginId}__${serverId}__${tool}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);

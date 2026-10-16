@@ -9,7 +9,7 @@ import { Modal, Field, Switch } from '@/components/Modal';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import { useSave } from '@/lib/useSave';
 
-interface U { userId: string; nickname: string; affection: number | null; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
+interface U { userId: string; nickname: string; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
 interface UsersApi { users: U[]; masterIds: string[]; extraAdminIds: string[] }
 interface Fact { id: string; content: string; sourcePlugin: string; ts: number }
 interface Detail {
@@ -193,8 +193,6 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
 
       <div className="mset-sec-h"><span>档案</span>{busy && <span className="plg-sec-r plg-hint">写入中…</span>}</div>
       <div className="mset-models">
-        <div className="mset-mrow"><span className="plg-k">好感度</span><span className="plg-v">{(a.affection as number) ?? u.affection ?? '未记录'} / 100</span></div>
-        <div className="mset-mrow"><span className="plg-k">心情</span><span className="plg-v">{(a.mood as string) ?? '平静'}</span></div>
         <div className="mset-mrow"><span className="plg-k">首次</span><span className="plg-v">{p?.firstSeen ? fmtDT(p.firstSeen) : '—'}</span></div>
         <div className="mset-mrow"><span className="plg-k">最近</span><span className="plg-v">{fmtDT(p?.lastSeen || u.lastSeen) || '—'}</span></div>
         <div className="mset-mrow"><span className="plg-k">权限</span><span className="plg-v">
@@ -204,7 +202,7 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
       <div className="mset-sec-h">
         <span>记忆</span>
         <span className="plg-sec-r">
-          <BrandInput value={qin} placeholder="全文检索…" spellCheck={false} style={{ width: 160 }}
+          <BrandInput value={qin} spellCheck={false} style={{ width: 160 }}
             onChange={(e) => setQin(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') onQ(qin.trim()); }} />
           <button className="mset-add" onClick={() => setAdding((v) => !v)}><Icon name="plus" size={13} /> 新增</button>
         </span>
@@ -212,7 +210,7 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
       <div className="mset-models">
         {adding && (
           <div className="mset-mrow">
-            <BrandInput value={draft} placeholder="新记忆内容，Enter 保存" spellCheck={false} style={{ flex: 1 }} autoFocus
+            <BrandInput value={draft} spellCheck={false} style={{ flex: 1 }} autoFocus
               onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void addFact(); }} />
             <span className="mset-macts">
               <button className="mset-ibtn" title="取消" onClick={() => { setAdding(false); setDraft(''); }}><Icon name="close" size={14} /></button>
@@ -283,10 +281,10 @@ function RolesModal({ data, onClose, onChanged }: { data: UsersApi; onClose: () 
   return (
     <Modal title="权限名单" onClose={onClose}>
       <Field label="主人（masterIds）">
-        <BrandInput value={masters} onChange={(e) => setMasters(e.target.value)} placeholder="QQ 号，逗号分隔" spellCheck={false} />
+        <BrandInput value={masters} onChange={(e) => setMasters(e.target.value)} spellCheck={false} />
       </Field>
       <Field label="追加管理员（extraAdminIds）">
-        <BrandInput value={admins} onChange={(e) => setAdmins(e.target.value)} placeholder="QQ 号，逗号分隔" spellCheck={false} />
+        <BrandInput value={admins} onChange={(e) => setAdmins(e.target.value)} spellCheck={false} />
       </Field>
       <div className="mset-mfoot">
         <button className="btn primary" onClick={save}>保存</button>

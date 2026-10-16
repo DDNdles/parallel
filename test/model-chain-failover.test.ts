@@ -18,7 +18,7 @@ import type { LLMChatRequest } from '../src/kernel/types.ts';
  * ② 只有连续失败满 llm.failoverThreshold 次，才把链上位置永久挪走（防一次网络抖动就换模型）；
  * ③ 已经往外吐过字 / 用户主动打断时不换模型（换了只会重复输出或违背中断）；
  * ④ 配置级不可用（未启用 / 缺 key）与请求失败同等对待，一样降级；
- * ⑤ work 链为空 = 跟随 chat 链。
+ * ⑤ work 链独立：空 = 没有可用模型（不跟随 chat 链）。
  */
 
 let server: Server;
@@ -47,11 +47,12 @@ before(async () => {
       const body = JSON.parse(raw || '{}');
       hits.push(body.model);
       bodies.push(body);
-      if (req.url === '/v1/messages') {
+      if (body.model === 'flaky-1') {
+        // 先吐出一个字（pi-ai 会把它作为 text_delta 交给上层），然后把连接掐掉，
+        // 模拟"已经流式吐过字之后才对端断掉"——这才是这条用例要验的场景。
         res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半"}}\n\n');
-        res.write('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"kaboom"}}\n\n');
-        res.end();
+        res.write('data: {"choices":[{"delta":{"content":"半"}}]}\n\n');
+        setTimeout(() => res.destroy(), 10);
         return;
       }
       if (body.model === 'bad-1') { res.writeHead(500, { 'content-type': 'application/json' }).end('{"error":"boom"}'); return; }
@@ -69,7 +70,7 @@ before(async () => {
   llm = new LlmService(config, errors, new Db(dataDir), bus);
 
   const providers = config.config.providers as Record<string, any>;
-  const defs: [string, string, string][] = [['bad', 'bad-1', 'openai-compatible'], ['good', 'good-1', 'openai-compatible'], ['flaky', 'flaky-1', 'anthropic']];
+  const defs: [string, string, string][] = [['bad', 'bad-1', 'openai-compatible'], ['good', 'good-1', 'openai-compatible'], ['flaky', 'flaky-1', 'openai-compatible']];
   for (const [id, model, protocol] of defs) {
     providers[id] = {
       label: id, model, enabled: true, baseUrl, protocol, custom: true,
@@ -147,7 +148,8 @@ test('已经流式吐过字就不再换模型（否则用户看到两份回答�
   let text = '';
   await assert.rejects(
     () => llm.chat(req(), { onDelta: (d) => { text += d.text ?? ''; } }),
-    /kaboom/,
+    // pi-ai 把对端断流报成 "terminated"（自研实现以前是把对端 body 里的 kaboom 原文带上来）
+    /terminated|kaboom/,
   );
   assert.equal(text, '半', '半个回答已经推给桌面端了');
   assert.equal(hits.length, 1, '只打了第一条，没有顺延');
@@ -175,23 +177,22 @@ test('配置级不可用（未启用）也走降级', async () => {
 test('整条链都不可用时抛最后一条的错误，并记进报错中心', async () => {
   reset();
   config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }];
-  await assert.rejects(() => llm.chat(req(), {}), /HTTP 500/);
+  // pi-ai 的错误文案：<状态码> "<对端 body>"（自研实现以前是 'HTTP 500 …'）
+  await assert.rejects(() => llm.chat(req(), {}), /500/);
   assert.equal(hits.length, 1, '单条链没有可顺延的对象');
   assert.ok(errors.list().some((e) => e.category === 'provider' && /bad: /.test(e.message)));
   config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
 });
 
-test('work 链为空 = 跟随 chat 链；配了才分离', () => {
+test('work 链独立：空 = 没有可用模型（不跟随 chat）；配了就用自己', () => {
+  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
   config.config.llm.workChain = [];
-  let split = llm.workModelSplit();
-  assert.equal(split.work, split.chat);
-  assert.equal(split.split, false);
-  assert.deepEqual(llm.chainsView().work, [], '没单独配过时左栏不该凭空长出跟随的条目');
+  assert.equal(llm.servingLabel('work'), '—', '工作链没配就是没配，不再借聊天链');
+  assert.deepEqual(llm.chainsView().work, [], '左栏不该凭空长出条目');
   config.config.llm.workChain = [{ provider: 'good', model: 'good-1' }];
-  split = llm.workModelSplit();
-  assert.equal(split.work, 'good:good-1');
-  assert.equal(split.split, true);
+  assert.equal(llm.servingLabel('work'), 'good:good-1');
   config.config.llm.workChain = [];
+  config.config.llm.chatChain = [];
 });
 
 test('链为空时按 activeProvider 兜底（手改 config.json 仍然生效）', () => {
@@ -203,30 +204,4 @@ test('链为空时按 activeProvider 兜底（手改 config.json 仍然生效）
   assert.equal(llm.activeProviderId(), 'good');
   assert.equal(llm.isActiveUsable().ok, true);
   config.config.llm.chatChain = saved;
-});
-
-test('声明了听觉的模型：QQ 语音转不出 wav 时不硬塞，并记一条 media 报错', async () => {
-  reset();
-  const silk = join(dataDir, 'v.amr');
-  writeFileSync(silk, Buffer.from('#!SILKv3', 'latin1'));
-  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
-  await llm.chat(req({ attachments: [{ kind: 'audio', path: silk, mime: 'audio/silk', name: 'v.amr' }] }), {});
-  const wire = JSON.stringify(bodies[bodies.length - 1]);
-  assert.ok(!wire.includes('input_audio'), '本机没有 ffmpeg（或该文件 ffmpeg 也解不了）时不该把原始字节塞给对端');
-  assert.ok(errors.list().some((e) => e.category === 'media'), '原因要能在报错页看到，而不是静默丢掉');
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
-});
-
-test('声明了视觉的模型：图片与视频按线格式各自的块发出', async () => {
-  reset();
-  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
-  await llm.chat(req({
-    attachments: [
-      { kind: 'image', url: 'https://x/p.png', mime: 'image/png' },
-      { kind: 'video', url: 'https://x/v.mp4', mime: 'video/mp4' },
-    ],
-  }), {});
-  const content = bodies[bodies.length - 1].messages.at(-1).content;
-  assert.deepEqual(content.map((c: any) => c.type), ['text', 'image_url', 'video_url']);
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
 });

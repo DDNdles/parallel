@@ -2,27 +2,20 @@ import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PluginContext, LLMRequestContext, ChatMessage } from '../../kernel/types.ts';
-import { todayKey, clamp } from '../../kernel/util/misc.ts';
 
 // ============================================================
 // chat —— 角色化聊天（人格即插件）
-// 五插槽：L1 人设卡 / L2 世界书 / L3 few-shot+尾部强化 / L5 好感度心情状态 / L4 记忆融合
-// L6 输出校验：规则式轻校验已实现，LLM 校验器留有插槽（afterLLM）
+//
+// 设定层照 HDSI（HDS Interlude）的分层来组织，替代原来的「人设卡 + 世界书 + few-shot」三件套：
+//   Canon       —— 初始设定（主角记号 / 世界 / 配角 / 语言），剧情起点，只由人写
+//   Perspective —— 独立于 Canon 的个体价值观：「她怎么看待世界」，不是设定条目
+//   Overlay     —— **演化层**：长期剧情里渐进形成的稳定变化（性格/世界/关系），非破坏性；
+//                  由模型经 `remember_setting` 提议写入，不动 Canon
+//   Voice       —— 说话方式与语气样例（原 few-shot）
+//   Lore        —— 关键词命中的世界事实（保留：HDSI 的 Canon 里也有世界事实）
+// 注入顺序：script(1000) → perspective(1040) → overlay(1050) → lore(1100) → 对方是谁(1200) → 记忆(1300)
 // ============================================================
 
-interface PersonaCard {
-  name: string;
-  /** 有 spec 时人设卡按这段原文注入（紧凑记号式人设），不再拼下面几个散文字段 */
-  spec?: string;
-  description: string;
-  personality: string;
-  scenario: string;
-  first_mes?: string;
-}
-interface PersonaFewshot {
-  post_history_instructions: string;
-  examples: { user: string; assistant: string }[];
-}
 interface LorebookEntry {
   keys: string[];
   constant?: boolean;
@@ -30,20 +23,54 @@ interface LorebookEntry {
   content: string;
   tokenBudget?: number;
 }
+
+/** HDSI 式剧本：canon.json */
+interface PersonaCanon {
+  name: string;
+  canon: {
+    /** 主角记号（原人设卡的 spec，原文保留） */
+    protagonist: string[];
+    /** 世界事实（剧情起点） */
+    world: string[];
+    /** 配角与初始关系：Canon 配角只是"可用角色"，不等于在场 */
+    cast?: { name: string; relation: string }[];
+    language?: string;
+  };
+  /** 独立于 canon 的个体价值观（HDSI Perspective） */
+  perspective?: string;
+  voice: {
+    style?: string;
+    examples: { user: string; assistant: string }[];
+    post_history?: string;
+  };
+  lore: LorebookEntry[];
+}
+
+/** Overlay 层的一条：长期剧情里形成的稳定变化（HDSI 要求可追溯来源） */
+interface OverlayEntry {
+  layer: 'character' | 'world' | 'relationship' | 'perspective';
+  /** relationship 层的对象（用户 QQ）；其余层留空 = 全局 */
+  targetId?: string;
+  content: string;
+  /** 从哪句话推出来的 */
+  source?: string;
+  at: number;
+}
+
 interface Persona {
   id: string;
-  card: PersonaCard;
-  fewshot: PersonaFewshot;
-  lore: LorebookEntry[];
+  canon: PersonaCanon;
   dir: string;
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-interface PersonaState {
-  affection: number;
-  mood: string;
-}
+/** Overlay 层的容量：太多了会淹没 Canon，超过就把最旧的挤掉 */
+const OVERLAY_MAX = 24;
+const OVERLAY_LAYERS = ['character', 'world', 'relationship', 'perspective'] as const;
+const OVERLAY_LAYER_LABEL: Record<string, string> = {
+  character: '性格', world: '世界', relationship: '关系', perspective: '价值观',
+};
 
 export function setup(ctx: PluginContext): void {
   const personas = new Map<string, Persona>();
@@ -55,12 +82,11 @@ export function setup(ctx: PluginContext): void {
     for (const id of readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)) {
       const dir = join(root, id);
       try {
-        const card = JSON.parse(readFileSync(join(dir, 'card.json'), 'utf-8'));
-        const fewshot = JSON.parse(readFileSync(join(dir, 'fewshot.json'), 'utf-8'));
-        const lore = existsSync(join(dir, 'lorebook.json'))
-          ? JSON.parse(readFileSync(join(dir, 'lorebook.json'), 'utf-8')).entries ?? []
-          : [];
-        personas.set(id, { id, card, fewshot, lore, dir });
+        const canon = JSON.parse(readFileSync(join(dir, 'canon.json'), 'utf-8')) as PersonaCanon;
+        if (!canon?.canon || !Array.isArray(canon.canon.protagonist)) throw new Error('canon.json 缺少 canon.protagonist');
+        canon.lore = Array.isArray(canon.lore) ? canon.lore : [];
+        canon.voice = canon.voice ?? { examples: [] };
+        personas.set(id, { id, canon, dir });
       } catch (e) {
         ctx.log.error(`人格 ${id} 加载失败: ${(e as Error).message}`);
       }
@@ -76,88 +102,7 @@ export function setup(ctx: PluginContext): void {
     return String((ctx.config as any)?.persona?.default ?? 'whale-girl');
   }
 
-  // ---------- 好感度（防刷） ----------
-
-  function affectionCfg(): any {
-    return (ctx.config as any)?.persona?.affection ?? { min: 0, max: 100, dailyDeltaCap: 15, minIntervalMs: 60000, stages: [] };
-  }
-
-  function getState(userId: string): PersonaState {
-    const affection = ctx.memory.getAttr<number>(userId, 'affection') ?? 20;
-    const mood = ctx.memory.getAttr<string>(userId, 'mood') ?? '平静';
-    return { affection: clamp(Number(affection) || 0, 0, 100), mood };
-  }
-
-  function stageOf(v: number): { label: string; tone: string } {
-    const stages = (affectionCfg().stages ?? []).slice().sort((a: any, b: any) => b.min - a.min);
-    for (const s of stages) {
-      if (v >= s.min) return { label: s.label, tone: s.tone ?? '' };
-    }
-    return { label: '陌生', tone: '礼貌，保持距离' };
-  }
-
-  /** 应用好感度变化（含日上限与冷却防刷），返回给模型的文本 */
-  function applyAffection(userId: string, delta: number, reason: string): string {
-    if (!(ctx.userConfig as any).affectionEnabled) return '（好感度系统未启用）';
-    const cfg = affectionCfg();
-    const min = cfg.min ?? 0, max = cfg.max ?? 100, cap = cfg.dailyDeltaCap ?? 15;
-    const cur = getState(userId).affection;
-    // 冷却
-    const last = ctx.memory.getAttr<number>(userId, 'affection_last_ts') ?? 0;
-    if (Date.now() - last < (cfg.minIntervalMs ?? 60000)) {
-      return `（好感度更新被拒绝：距上次更新不足 ${(cfg.minIntervalMs ?? 60000) / 1000}s，防刷限制）`;
-    }
-    // 单日上限
-    const daily = ctx.memory.getAttr<{ date: string; delta: number }>(userId, 'affection_daily') ?? { date: '', delta: 0 };
-    const used = daily.date === todayKey() ? daily.delta : 0;
-    if (delta > 0 && used >= cap) return `（好感度更新被拒绝：今日已变动 +${used}，达到单日上限 ±${cap}）`;
-    if (delta < 0 && used <= -cap) return `（好感度更新被拒绝：今日已变动 ${used}，达到单日上限 ±${cap}）`;
-    const allowed = delta > 0 ? Math.min(delta, cap - used) : Math.max(delta, -cap - used);
-    const next = clamp(cur + allowed, min, max);
-    ctx.memory.setAttr(userId, 'affection', next);
-    ctx.memory.setAttr(userId, 'affection_daily', { date: todayKey(), delta: used + allowed });
-    ctx.memory.setAttr(userId, 'affection_last_ts', Date.now());
-    const before = stageOf(cur).label;
-    const after = stageOf(next).label;
-    ctx.log.info(`好感度 ${userId}: ${cur}→${next} (${allowed>=0?'+':''}${allowed}) ${reason}`);
-    return `（好感度 ${cur} → ${next}${allowed !== delta ? `，因单日上限被限制为 ${allowed>=0?'+':''}${allowed}` : ''}${before !== after ? `，关系段位变化：${before} → ${after}` : ''}）`;
-  }
-
   // ---------- 工具 ----------
-
-  ctx.llm.registerTool({
-    name: 'update_affection',
-    description: '在对方做了让你开心/难过/感动的事情时，更新你与该用户的好感度（-10~+10）。有防刷限制（单日±15、冷却60s），不要频繁调用。',
-    parameters: {
-      type: 'object',
-      properties: {
-        delta: { type: 'number', description: '变化量，范围 -10 ~ +10' },
-        reason: { type: 'string', description: '一句话原因，如“夸了我”' },
-      },
-      required: ['delta', 'reason'],
-    },
-    handler: (args, tctx) => {
-      const delta = clamp(Number(args.delta ?? 0), -10, 10);
-      const reason = String(args.reason ?? '');
-      if (Math.abs(delta) < 1) return '（变化量为 0，未更新）';
-      return applyAffection(tctx.event.userId, Math.round(delta), reason);
-    },
-  });
-
-  ctx.llm.registerTool({
-    name: 'set_mood',
-    description: '设置你当前对该用户的心情（如：开心、平静、委屈、兴奋、生气）。心情会体现在你之后的回复里。',
-    parameters: {
-      type: 'object',
-      properties: { mood: { type: 'string', description: '心情词' } },
-      required: ['mood'],
-    },
-    handler: (args, tctx) => {
-      const mood = String(args.mood ?? '').slice(0, 12) || '平静';
-      ctx.memory.setAttr(tctx.event.userId, 'mood', mood);
-      return `（心情已设为：${mood}）`;
-    },
-  });
 
   ctx.llm.registerTool({
     name: 'remember_fact',
@@ -177,7 +122,7 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'recall_facts',
-    description: '检索该用户的历史记忆（当对话提到过去的约定/喜好而上方记忆未提及时使用）。',
+    description: '检索 bot 为这位用户存过的长期事实（昵称、喜好、约定、经历）。你只看得到最近几分钟的消息，凡对方提到「上次、以前、说好了的」而眼前信息对不上，就先查这里再回答。',
     parameters: {
       type: 'object',
       properties: { query: { type: 'string', description: '检索关键词' } },
@@ -191,45 +136,68 @@ export function setup(ctx: PluginContext): void {
     },
   });
 
+  // 上下文窗口外的旧消息平时看不到，这是她"翻旧账"的通道：按关键词搜本会话的历史原文。
+  // 只搜当前会话（群/私聊各自独立），工具面不提供跨会话检索。
+  ctx.llm.registerTool({
+    name: 'search_history',
+    description: '检索本会话更早的聊天记录原文（上下文时限之外的旧消息，带时间与说话人）。当话题涉及「之前、上次、我们说过什么」而最近几分钟的上下文不够时使用。只搜当前会话，按关键词匹配。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '关键词，在消息原文里匹配' },
+        limit: { type: 'number', description: '最多返回几条，缺省 20' },
+      },
+      required: ['query'],
+    },
+    handler: (args, tctx) => {
+      const q = String(args.query ?? '').trim();
+      if (!q) return '（关键词为空）';
+      const limit = Math.max(1, Math.min(Math.round(Number(args.limit) || 20), 50));
+      let hits;
+      try {
+        hits = ctx.history.searchMessages(tctx.chat, q, limit);
+      } catch (e) {
+        return `（检索不可用：${(e as Error).message}）`;
+      }
+      if (!hits.length) return '（没有找到相关消息）';
+      const fmt = (ts: number) => {
+        const d = new Date(ts);
+        const p = (n: number) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      };
+      // 每条截 200 字：50 条 × 200 字封顶，别让一次翻旧账把上下文顶爆
+      return `找到 ${hits.length} 条相关消息：\n` +
+        hits.map((h) => `- [${fmt(h.ts)}] ${h.role === 'user' ? (h.nickname || '用户') : '我'}：${h.text.slice(0, 200)}`).join('\n');
+    },
+  });
+
   // ---------- 清除记忆的权限口径（设置·风控里的 forgetScope） ----------
 
   const ROLE_RANK: Record<string, number> = { member: 0, admin: 1, owner: 2 };
   /** 返回 null = 放行，否则是给看的拒绝文案。清别人一律要管理员/主人；
-   *  admin_only 模式下连清自己也要管理员/主人（否则设置形同虚设，绕自然语言也一样）。 */
+   *  admin_only（默认）模式下连清自己也要管理员/主人（否则形同虚设，绕自然语言也一样）。 */
   function checkForget(role: string, target: string, sender: string): string | null {
     const admin = (ROLE_RANK[role] ?? 0) >= ROLE_RANK.admin;
     if (target !== sender && !admin) return '权限不足：清除别人的记忆需要群管理员/群主/主人。';
-    if (target === sender && String((ctx.config as any)?.risk?.forgetScope ?? 'self_and_admin') === 'admin_only' && !admin) {
-      return '当前设置只允许管理员或主人清除记忆，请让 TA 来操作。';
+    if (target === sender && String((ctx.config as any)?.risk?.forgetScope ?? 'admin_only') === 'admin_only' && !admin) {
+      return '只有管理员或主人能清除记忆，请让 TA 来操作。';
     }
     return null;
   }
 
   ctx.llm.registerTool({
     name: 'forget_me',
-    description: '当用户明确要求“忘记我”时调用：清空该用户的全部记忆（事实、好感度、心情）。调用前向用户确认过意图。',
+    description: '当用户明确要求“忘记我”时调用：清空该用户的全部记忆。',
     parameters: { type: 'object', properties: {} },
     handler: (_args, tctx) => {
       const deny = checkForget(String(tctx.role ?? 'member'), tctx.event.userId, tctx.event.userId);
       if (deny) return `（未执行清除。${deny}）`;
       ctx.memory.forget(tctx.event.userId);
-      return '（该用户的全部记忆已清除：事实、好感度、心情均已重置）';
+      return '（该用户的全部记忆已清除）';
     },
   });
 
   // ---------- 命令 ----------
-
-  ctx.registerCommand({
-    name: '好感度',
-    aliases: ['haogandu'],
-    description: '查看你与当前人格的好感度与关系段位',
-    handler: (_args, event) => {
-      const s = getState(event.userId);
-      const st = stageOf(s.affection);
-      const p = personas.get(activePersonaId());
-      return { text: `你与「${p?.card.name ?? '人格'}」的好感度：${s.affection}/100（${st.label}）\n当前心情：${s.mood}` };
-    },
-  });
 
   ctx.registerCommand({
     name: '忘记我',
@@ -245,8 +213,8 @@ export function setup(ctx: PluginContext): void {
       if (deny) return { text: deny };
       ctx.memory.forget(who);
       return { text: who === sender
-        ? '好的，我已经忘记了关于你的一切。我们重新认识一下吧。(重新认识也是从好感度 20 开始的哦)'
-        : `已清除 ${who} 的全部记忆（事实、好感度、心情）。` };
+        ? '好的，我已经忘记了关于你的一切。我们重新认识一下吧。'
+        : `已清除 ${who} 的全部记忆。` };
     },
   });
 
@@ -259,77 +227,235 @@ export function setup(ctx: PluginContext): void {
       const sub = args[0] ?? '列表';
       if (sub === '切换' || sub === 'switch') {
         const key = (args[1] ?? '').toLowerCase();
-        const found = [...personas.values()].find((p) => p.id === key || p.card.name === args[1]);
-        if (!found) return { text: `没有这个人格。可用：${[...personas.values()].map((p) => `${p.card.name}(${p.id})`).join('、')}，或 auto（用默认人格）` };
+        const found = [...personas.values()].find((p) => p.id === key || p.canon.name === args[1]);
+        if (!found) return { text: `没有这个人格。可用：${[...personas.values()].map((p) => `${p.canon.name}(${p.id})`).join('、')}，或 auto（用默认人格）` };
         ctx.state.set('active_persona', found.id);
-        return { text: `已切换人格为「${found.card.name}」（手动锁定）。发 /人格 auto 可恢复默认。` };
+        return { text: `已切换人格为「${found.canon.name}」（手动锁定）。发 /人格 auto 可恢复默认。` };
       }
       if (sub === 'auto') {
         ctx.state.set('active_persona', 'auto');
         const bound = personas.get(activePersonaId());
-        return { text: `已恢复 auto 模式，当前人格「${bound?.card.name ?? '默认'}」。` };
+        return { text: `已恢复 auto 模式，当前人格「${bound?.canon.name ?? '默认'}」。` };
       }
       const activeId = activePersonaId();
       const mode = ctx.state.get<string>('active_persona', 'auto');
-      const lines = [...personas.values()].map((p) => `${p.id === activeId ? '▶' : '　'} ${p.card.name} (${p.id})`);
+      const lines = [...personas.values()].map((p) => `${p.id === activeId ? '▶' : '　'} ${p.canon.name} (${p.id})`);
       return {
         text: `当前模式：${mode === 'auto' ? 'auto（默认人格）' : '手动锁定'}\n${lines.join('\n')}\n切换：/人格 切换 <人格名>`,
       };
     },
   });
 
-  // ---------- beforeLLM：五插槽组装 ----------
+  // ---------- Overlay 层（HDSI 的演化层） ----------
+  // Canon 只由人写；长期剧情里渐进形成的稳定变化写在这里，非破坏性、可清、可追溯来源。
+
+  function overlayOf(personaId: string): OverlayEntry[] {
+    const raw = ctx.state.get<OverlayEntry[]>(`overlay:${personaId}`, []);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((e) => e && typeof e.content === 'string'
+      && (OVERLAY_LAYERS as readonly string[]).includes(String(e.layer)));
+  }
+
+  /** 写一条演化。同一层同一句话不重复记；超上限挤掉最旧的（Canon 不能被淹没）。 */
+  function addOverlay(personaId: string, entry: { layer: OverlayEntry['layer']; targetId?: string; content: string; source?: string }): string {
+    const content = entry.content.trim().slice(0, 160);
+    if (!content) return '（内容为空，未写入）';
+    const list = overlayOf(personaId);
+    if (list.some((e) => e.layer === entry.layer && e.content === content)) return '（这句已经记过了）';
+    list.push({ ...entry, content, at: Date.now() });
+    while (list.length > OVERLAY_MAX) list.shift();
+    ctx.state.set(`overlay:${personaId}`, list);
+    return `（已写入「${OVERLAY_LAYER_LABEL[entry.layer]}」演化层：${content}）`;
+  }
+
+  function clearOverlay(personaId: string, layer?: string): number {
+    const list = overlayOf(personaId);
+    const kept = layer ? list.filter((e) => e.layer !== layer) : [];
+    ctx.state.set(`overlay:${personaId}`, kept);
+    return list.length - kept.length;
+  }
+
+  ctx.llm.registerTool({
+    name: 'remember_setting',
+    description: [
+      '把长期剧情里稳定形成的新设定写进演化层（HDSI 的 Overlay）。',
+      '适用：性格被磨出了新的一面、和某人的关系定型、世界/环境有了既定变化。',
+      '不适用：一次性的情绪、闲聊、你当场编的东西。写之前先问自己「这件事之后还成立吗」。',
+      '每条要能指出是从哪句话/哪件事推出来的。每轮最多 1 条。',
+    ].join('\n'),
+    parameters: {
+      type: 'object',
+      properties: {
+        layer: { type: 'string', enum: [...OVERLAY_LAYERS], description: 'character 性格 / world 世界 / relationship 关系 / perspective 价值观' },
+        content: { type: 'string', description: '一句话，第三人称陈述句，如「她开始接受被叫小名」' },
+        source: { type: 'string', description: '从哪句话或哪件事推出来的' },
+      },
+      required: ['layer', 'content'],
+    },
+    handler: (args, tctx) => {
+      const layer = String(args.layer ?? '');
+      if (!(OVERLAY_LAYERS as readonly string[]).includes(layer)) return `（layer 只能是 ${OVERLAY_LAYERS.join('/')}）`;
+      return addOverlay(activePersonaId(), {
+        layer: layer as OverlayEntry['layer'],
+        targetId: layer === 'relationship' ? String(tctx.event.userId) : undefined,
+        content: String(args.content ?? ''),
+        source: String(args.source ?? '').slice(0, 120),
+      });
+    },
+  });
+
+  ctx.llm.registerTool({
+    name: 'plan_schedule',
+    description: [
+      '记录你接下来的安排（周规律或某一天的例外）。这些只是计划，不是已经发生的事实。',
+      '忙的时段（busy）里你不会主动找人说话 —— 所以该忙就标忙。',
+      'label 写你那时候在做什么，一句话，比如「在深水区补觉」「上岸买米饭」。',
+    ].join('\n'),
+    parameters: {
+      type: 'object',
+      properties: {
+        days: { type: 'array', items: { type: 'number' }, description: '周几，0=周日…6=周六（写周规律时用）' },
+        date: { type: 'string', description: 'YYYY-MM-DD（写某一天的例外时用，优先于周规律）' },
+        from: { type: 'string', description: '开始时间 HH:MM' },
+        to: { type: 'string', description: '结束时间 HH:MM' },
+        label: { type: 'string', description: '这段时间在做什么' },
+        busy: { type: 'boolean', description: '是否忙（忙的时候不会主动找你）' },
+      },
+      required: ['from', 'to', 'label'],
+    },
+    handler: (args, tctx) => {
+      const chat = { platform: tctx.event.platform, type: tctx.event.type, chatId: tctx.event.chatId };
+      const plan = ctx.humanlike.scheduleOf(chat);
+      const from = String(args.from ?? '').trim();
+      const to = String(args.to ?? '').trim();
+      const label = String(args.label ?? '').trim().slice(0, 40);
+      if (!/^\d{1,2}:\d{2}$/.test(from) || !/^\d{1,2}:\d{2}$/.test(to) || !label) {
+        return '（时间要写成 HH:MM，label 不能空）';
+      }
+      const busy = args.busy === true;
+      const date = String(args.date ?? '').trim();
+      if (date) {
+        plan.exceptions.push({ date, from, to, label, busy });
+      } else {
+        const days = Array.isArray(args.days) ? args.days.map(Number).filter((d) => d >= 0 && d <= 6) : [];
+        if (!days.length) return '（要么给 days（周几），要么给 date（某一天））';
+        plan.rules.push({ days, from, to, label, busy });
+      }
+      const saved = ctx.humanlike.planSchedule(chat, plan);
+      return `（已记下：${date || days.join('/')} ${from}-${to} ${label}${busy ? '，忙' : ''}；现在共 ${saved.rules.length} 条规律 / ${saved.exceptions.length} 条例外）`;
+    },
+  });
+
+  ctx.registerCommand({
+    name: '日程',
+    aliases: ['schedule'],
+    description: '查看当前的日程计划（周规律 + 日期例外）',
+    handler: (_args, event) => {
+      const plan = ctx.humanlike.scheduleOf({ platform: event.platform, type: event.type, chatId: event.chatId });
+      const lines: string[] = [];
+      if (plan.rules.length) {
+        lines.push('周规律：', ...plan.rules.map((r) => `- 周${r.days.join('/')} ${r.from}-${r.to} ${r.label}${r.busy ? '（忙）' : ''}`));
+      }
+      if (plan.exceptions.length) {
+        lines.push('日期例外：', ...plan.exceptions.map((e) => `- ${e.date} ${e.from}-${e.to} ${e.label}${e.busy ? '（忙）' : ''}`));
+      }
+      return { text: lines.length ? lines.join("\n") : '还没有日程。她会自己在对话里安排。' };
+    },
+  });
+
+  ctx.registerCommand({
+    name: '设定',
+    aliases: ['overlay'],
+    description: '（主人）查看/清空人格的演化层（长期剧情里形成的稳定变化）',
+    usage: '/设定　/设定 清空 [性格|世界|关系|价值观]',
+    minRole: 'owner',
+    handler: (args) => {
+      const pid = activePersonaId();
+      const list = overlayOf(pid);
+      const sub = args[0] ?? '';
+      if (sub === '清空' || sub === 'clear') {
+        const want = args[1];
+        const layer = want ? Object.entries(OVERLAY_LAYER_LABEL).find(([, v]) => v === want)?.[0] : undefined;
+        if (want && !layer) return { text: `要清哪一层？可选：${Object.values(OVERLAY_LAYER_LABEL).join('、')}` };
+        const n = clearOverlay(pid, layer);
+        return { text: layer ? `已清空「${want}」层的 ${n} 条演化。` : `已清空全部 ${n} 条演化。` };
+      }
+      if (!list.length) return { text: '当前演化层是空的。长期剧情里稳定形成的设定会自动写进来。' };
+      return {
+        text: `演化层（${list.length}/${OVERLAY_MAX}）：\n` + list
+          .map((e, i) => `${i + 1}. [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`)
+          .join('\n'),
+      };
+    },
+  });
+
+  // ---------- beforeLLM：HDSI 式分层组装 ----------
 
   ctx.hooks.beforeLLM = (req: LLMRequestContext): LLMRequestContext => {
     const persona = personas.get(activePersonaId()) ?? personas.values().next().value;
     if (!persona) return req;
     const userId = req.event.userId;
-    const s = getState(userId);
-    const st = stageOf(s.affection);
     const role = req.event.role ?? 'member';
 
-    // L1 人设卡 / L2 世界书 / L5 状态 / L4 记忆 → 各自独立节追加到 systemSections
-    // （不整体覆盖 system：内核固定节——身份/会话上下文/回复风格/信任边界/压缩说明——全部保留）
+    // 设定层按 HDSI 分层追加到 systemSections，各自独立节
+    // （不整体覆盖 system：内核固定节——身份/会话/回复风格/剧本体/信任边界/压缩说明——全部保留）
     if (!req.systemSections) req.systemSections = [];
     const sections = req.systemSections;
+    const canon = persona.canon.canon;
 
-    // L1 人设卡
-    const card = persona.card;
+    // Canon：初始设定（剧情起点，只由人写）
     sections.push({
       order: 1000,
-      title: 'persona-card',
-      text: card.spec
-        ? `# 人设卡：${card.name}\n${card.spec}`
-        : [
-            `# 人设卡：${card.name}`,
-            `简介：${card.description}`,
-            `性格：${card.personality}`,
-            `场景：${card.scenario}`,
-          ].join('\n'),
+      title: 'script',
+      text: [
+        `# 剧本：${persona.canon.name}`,
+        ...canon.protagonist,
+        canon.world?.length ? `\n世界：\n${canon.world.map((w) => `- ${w}`).join('\n')}` : '',
+        canon.cast?.length ? `\n配角（只是可用角色，不等于在场）：\n${canon.cast.map((c) => `- ${c.name}：${c.relation}`).join('\n')}` : '',
+        canon.language ? `语言：${canon.language}` : '',
+      ].filter(Boolean).join('\n'),
     });
 
-    // L2 世界书（常驻 + 关键词命中）
+    // Perspective：独立于 Canon 的个体价值观（HDSI 的"外壳人格层"）
+    if (persona.canon.perspective?.trim()) {
+      sections.push({
+        order: 1040,
+        title: 'perspective',
+        text: `# 她看世界的方式\n${persona.canon.perspective.trim()}`,
+      });
+    }
+
+    // Overlay：演化层（长期剧情里稳定下来的变化；按既定事实对待，不要逐条念出来）
+    const own = overlayOf(persona.id).filter((e) => e.layer !== 'relationship' || !e.targetId || e.targetId === userId);
+    if (own.length) {
+      sections.push({
+        order: 1050,
+        title: 'overlay',
+        text: '# 长期演化（已经稳定形成的变化，按既定事实对待）\n'
+          + own.map((e) => `- [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`).join('\n'),
+      });
+    }
+
+    // Lore：关键词命中的世界事实（常驻 + 命中）
     const recentText = [req.event.text, ...req.messages.slice(-8).map((m) => m.content)].join('\n');
-    const matched = persona.lore
+    const matched = persona.canon.lore
       .filter((e) => e.constant || e.keys.some((k) => recentText.toLowerCase().includes(k.toLowerCase())))
       .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
     if (matched.length) {
       sections.push({
         order: 1100,
         title: 'lorebook',
-        text: '# 世界书（相关背景）\n' + matched.map((e) => `- ${e.content}`).join('\n'),
+        text: '# 世界事实（相关背景）\n' + matched.map((e) => `- ${e.content}`).join('\n'),
       });
     }
 
-    // L5 状态注入
+    // L5 状态注入：这一轮对面是谁（身份与权限）
     sections.push({
       order: 1200,
-      title: 'relation-state',
+      title: 'speaker-role',
       text: [
-        `# 关系状态（与本次发言的用户 ${req.event.nickname || userId}）`,
-        `- 好感度：${s.affection}/100（段位：${st.label}）→ 当前应有的称呼与语气：${st.tone}`,
-        `- 当前心情：${s.mood}`,
-        `- 对方权限等级：${role === 'owner' ? 'owner（bot 的主人）' : role === 'admin' ? 'admin（群管理员）' : 'member（普通成员）'}${role === 'owner' ? '。这是你的主人，可以切换人格与管理插件。' : ''}`,
+        `# 对方是谁（本次发言的用户 ${req.event.nickname || userId}）`,
+        `- 权限等级：${role === 'owner' ? 'owner（bot 的主人）' : role === 'admin' ? 'admin（群管理员）' : 'member（普通成员）'}${role === 'owner' ? '。这是你的主人，可以切换人格与管理插件。' : ''}`,
       ].join('\n'),
     });
 
@@ -341,23 +467,29 @@ export function setup(ctx: PluginContext): void {
       ``,
       `# 记忆工具`,
       `对话中得知值得长期记住的事实时，调用 remember_fact；对方明确要求被忘记时，先口头确认再调用 forget_me。`,
+      `你眼前只有最近几分钟的消息。对方提到「上次、以前、说好了的」而眼下对不上时，先调 recall_facts 查长期记忆、search_history 翻本会话旧记录，查清楚了再回话。`,
     ];
     sections.push({ order: 1300, title: 'memory', text: memoryLines.join('\n').trim() });
 
-    // L3 few-shot（语气样例）
+    // Voice：语气样例。样例本身写成"小说片段"（旁白 + <say> 台词），
+    // 模型才学得到剧本体的写法，而不是学出一堆括号动作描写。
     const messages: ChatMessage[] = [];
-    if (persona.fewshot.examples?.length) {
-      messages.push({ role: 'system', content: '（以下是你过往对话的语气示例，供参考语气，不要照抄内容）' });
-      for (const ex of persona.fewshot.examples.slice(0, 6)) {
+    const voice = persona.canon.voice;
+    if (voice.style?.trim()) {
+      messages.push({ role: 'system', content: `（说话方式：${voice.style.trim()}）` });
+    }
+    if (voice.examples?.length) {
+      messages.push({ role: 'system', content: '（以下是你过往对话的片段，供参考语气与写法，不要照抄内容）' });
+      for (const ex of voice.examples.slice(0, 6)) {
         messages.push({ role: 'user', content: ex.user });
         messages.push({ role: 'assistant', content: ex.assistant });
       }
     }
     // 历史
     messages.push(...req.messages);
-    // L3 尾部强化
-    if (persona.fewshot.post_history_instructions) {
-      messages.push({ role: 'system', content: persona.fewshot.post_history_instructions });
+    // 尾部强化
+    if (voice.post_history?.trim()) {
+      messages.push({ role: 'system', content: voice.post_history });
     }
 
     return { ...req, messages };
@@ -369,7 +501,10 @@ export function setup(ctx: PluginContext): void {
     // 规则式轻校验：阻止配置内容外泄的兜底（LLM 校验器插槽留待接入轻量模型）
     let out = reply;
     const leakPatterns = [
-      /system\s*prompt/i, /system_prompt/i, /post_history_instructions/i, /人设卡[:：]/, /世界书[:：]/, /【关系状态/,
+      /system\s*prompt/i, /system_prompt/i, /post_history_instructions/i, /人设卡[:：]/, /世界书[:：]/, /【人格强化/,
+      // HDSI 式分层：剧本 / 演化层 也是配置内容，同样不许念出来
+      // （注意：`<say id=` 是模型**自己的**输出格式，不是泄露，绝不能拦）
+      /剧本[:：]/, /长期演化/, /看世界的方式/,
     ];
     for (const re of leakPatterns) {
       if (re.test(out)) {
@@ -382,20 +517,45 @@ export function setup(ctx: PluginContext): void {
     return out;
   };
 
+  // ---------- 演化层（桌面端人格页读/清，经 API 一问一答） ----------
+  // 演化层存在插件的 state 里，内核 API 读不到，所以走 bus 回旋：
+  // 请求带 requestId，插件把结果用 persona.overlay_reply 发回来。
+
+  ctx.bus.on('persona.overlay_request', (payload: { requestId: string; personaId?: string; op?: string; layer?: string; requesterRole?: string }) => {
+    if (!payload?.requestId) return;
+    const pid = payload.personaId && personas.has(payload.personaId) ? payload.personaId : activePersonaId();
+    let removed: number | undefined;
+    if (payload.op === 'clear') {
+      if (payload.requesterRole !== 'owner') return;   // 改设定仅主人（红线 §2.1）
+      removed = clearOverlay(pid, payload.layer);
+    }
+    ctx.bus.emit('persona.overlay_reply', { requestId: payload.requestId, personaId: pid, entries: overlayOf(pid), removed });
+  });
+
   // ---------- 人格文件编辑（桌面端人格管理页调用，经 API） ----------
 
   ctx.bus.on('persona.edit_request', (payload: { personaId: string; file: string; content: string; requesterRole: string }) => {
-    if (payload.requesterRole !== 'owner') return; // 人设内容仅主人可改（红线 §2.1）
+    // 每条路径都要回 edit_done：API 在等它（3s 超时会报"没有收到插件响应"），
+    // 只写日志不回话，桌面端就会在**已经保存成功**的情况下弹一句失败。
+    const done = (ok: boolean, error?: string) => ctx.bus.emit('persona.edit_done', { ok, error });
+    if (payload.requesterRole !== 'owner') return done(false, '仅主人可改人格文件');   // 人设内容仅主人可改（红线 §2.1）
     const p = personas.get(payload.personaId);
-    if (!p) return;
-    if (!['card.json', 'fewshot.json', 'lorebook.json'].includes(payload.file)) return;
+    if (!p) return done(false, `没有名为 ${payload.personaId} 的人格`);
+    if (payload.file !== 'canon.json') return done(false, `不允许写 ${payload.file}（目前只开放 canon.json）`);
+    const content = typeof payload.content === 'string' ? payload.content : '';
     try {
-      JSON.parse(payload.content);
-      writeFileSync(join(p.dir, payload.file), payload.content, 'utf-8');
+      const parsed = JSON.parse(content);
+      if (!parsed?.canon || !Array.isArray(parsed.canon.protagonist)) {
+        return done(false, 'canon.json 缺少 canon.protagonist（主角记号那一段）');
+      }
+      writeFileSync(join(p.dir, payload.file), content, 'utf-8');
       loadPersonas();
       ctx.log.info(`人格 ${payload.personaId}/${payload.file} 已更新并热加载`);
+      done(true);
     } catch (e) {
-      ctx.log.error(`人格文件保存失败: ${(e as Error).message}`);
+      const msg = (e as Error).message;
+      ctx.log.error(`人格文件保存失败: ${msg}`);
+      done(false, `保存失败：${msg}`);
     }
   });
 
@@ -412,9 +572,13 @@ export function setup(ctx: PluginContext): void {
     try {
       mkdirSync(dir);
       const write = (f: string, obj: unknown) => writeFileSync(join(dir, f), JSON.stringify(obj, null, 2) + '\n', 'utf-8');
-      write('card.json', { name, description: '', personality: '', scenario: '', first_mes: '' });
-      write('fewshot.json', { post_history_instructions: '', examples: [] });
-      write('lorebook.json', { entries: [] });
+      write('canon.json', {
+        name,
+        canon: { protagonist: ['PERSONA_LOAD', id.toUpperCase()], world: [], cast: [], language: '简体中文。' },
+        perspective: '',
+        voice: { style: '', examples: [], post_history: '' },
+        lore: [],
+      });
       loadPersonas();
       ctx.log.info(`人格 ${id}（${name}）已创建`);
       done(true);

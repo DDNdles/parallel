@@ -17,6 +17,9 @@ interface Props {
   type?: 'text' | 'password' | 'number';
   multiline?: boolean;
   rows?: number;
+  /** 多行框随内容长高（下限=rows 撑出来的高度）。固定高度的框装不下内容时会把最后半行字裁掉，
+   *  长高后真控件永远不用滚动，也就没有了文本层与控件失同步的机会。 */
+  grow?: boolean;
   autoFocus?: boolean;
   spellCheck?: boolean;
   id?: string;
@@ -24,6 +27,8 @@ interface Props {
   style?: CSSProperties;
   className?: string;
   onKeyDown?: (e: KeyboardEvent<Field>) => void;
+  /** 交给浏览器别记住/回填这一格：密钥类输入用 new-password，删掉的 key 才不会在下次挂载时被自动填回来 */
+  autoComplete?: string;
   onBlur?: (e: FocusEvent<Field>) => void;
   onFocus?: (e: FocusEvent<Field>) => void;
 }
@@ -32,8 +37,8 @@ interface Props {
 const COPY = ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing', 'textIndent', 'textTransform'] as const;
 
 export function BrandInput({
-  value, onChange, placeholder, type = 'text', multiline = false, rows = 4,
-  autoFocus, spellCheck = false, id, style, className, onKeyDown, onBlur, onFocus,
+  value, onChange, placeholder, type = 'text', multiline = false, rows = 4, grow = false,
+  autoFocus, spellCheck = false, id, style, className, onKeyDown, onBlur, onFocus, autoComplete,
 }: Props) {
   const fieldRef = useRef<Field | null>(null);
   const layerRef = useRef<HTMLSpanElement | null>(null);
@@ -54,26 +59,45 @@ export function BrandInput({
     const py = parseFloat(cs.paddingTop) + parseFloat(cs.borderTopWidth);
     const pr = parseFloat(cs.paddingRight) + parseFloat(cs.borderRightWidth);
     layer.style.padding = `${py}px ${pr}px ${py}px ${px}px`;
-    const ty = `translateY(${-f.scrollTop}px)`;
-    if (layer.style.transform !== ty) layer.style.transform = ty;
+    /* 同步滚动只能让层"自己滚"：transform 会把裁剪框一起搬走，文字整块飘到框外压住上面的标题。
+       overflow:hidden 仍然允许程序滚动，所以层的盒子始终钉在控件上。 */
+    if (layer.scrollTop !== f.scrollTop) layer.scrollTop = f.scrollTop;
+    if (layer.scrollLeft !== f.scrollLeft) layer.scrollLeft = f.scrollLeft;
   }, []);
 
   useEffect(() => { sync(); }, [value, sync]);
+  /* rows 撑出来的高度就是长高的下限，只在第一次量（之后 height 已被我们写死，量不到原值） */
+  const minH = useRef(0);
+  const refit = useCallback(() => {
+    if (!grow || !multiline) return;
+    const f = fieldRef.current as HTMLTextAreaElement | null;
+    if (!f) return;
+    f.style.height = 'auto';
+    const cs = getComputedStyle(f);
+    /* textarea 的 height:auto 仍取 rows（不是内容高），内容高只能读 scrollHeight；
+       scrollHeight 含 padding 不含 border，而全站是 border-box，所以补回上下边框。 */
+    const nat = f.getBoundingClientRect().height;
+    const need = f.scrollHeight + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+    if (!minH.current) minH.current = nat;
+    f.style.height = `${Math.max(need, minH.current)}px`;
+  }, [grow, multiline]);
+  useEffect(() => { refit(); sync(); }, [value, refit, sync]);
   useEffect(() => {
     const bump = () => setTimeout(sync, 0);
+    const onResize = () => { refit(); sync(); };
     document.addEventListener('selectionchange', sync);
     document.addEventListener('focusin', bump);
     document.addEventListener('focusout', bump);
     document.addEventListener('mousedown', bump);
-    window.addEventListener('resize', sync);
+    window.addEventListener('resize', onResize);
     return () => {
       document.removeEventListener('selectionchange', sync);
       document.removeEventListener('focusin', bump);
       document.removeEventListener('focusout', bump);
       document.removeEventListener('mousedown', bump);
-      window.removeEventListener('resize', sync);
+      window.removeEventListener('resize', onResize);
     };
-  }, [sync]);
+  }, [sync, refit]);
 
   const shown = type === 'password' ? '•'.repeat(String(value).length) : String(value);
   /* 上下键步进：原生 number 的箭头没了，但改数量的手感要留着（这些框都是尺寸/超时/端口，不给负数）。
@@ -112,6 +136,7 @@ export function BrandInput({
     autoFocus,
     spellCheck,
     id,
+    autoComplete,
     onKeyDown: keyDown,
     onFocus: (e: FocusEvent<Field>) => { sync(); onFocus?.(e); },
     onBlur: (e: FocusEvent<Field>) => { setCaret((c) => (c.on ? { on: false, pos: 0 } : c)); onBlur?.(e); },
@@ -120,7 +145,7 @@ export function BrandInput({
     className: 'bfield-field',
   };
   const layer = (
-    <span className="bfield-text" ref={layerRef} aria-hidden>
+    <span className={'bfield-text' + (multiline ? '' : ' single')} ref={layerRef} aria-hidden>
       {shown.slice(0, caret.on ? caret.pos : shown.length)}
       {caret.on && <span className="caret-slot"><Icon name="brand" size={13} /></span>}
       {caret.on ? shown.slice(caret.pos) : ''}

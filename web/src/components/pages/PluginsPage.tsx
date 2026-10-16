@@ -235,12 +235,10 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
                 {f.description && <span className="plg-chint">{f.description}</span>}
                 {f.type === 'text' ? (
                   <BrandInput multiline rows={4} spellCheck={false} value={shown}
-                    placeholder={f.secret && val ? '已设置（留空则不改动）' : ''}
                     onChange={(e) => setCfg((c) => ({ ...(c ?? {}), [k]: e.target.value }))} />
                 ) : (
                   <BrandInput type={(f.secret ? 'password' : f.type === 'number' ? 'number' : 'text') as 'text' | 'password'} value={shown}
                     spellCheck={false}
-                    placeholder={f.secret && val ? '已设置（留空则不改动）' : ''}
                     onChange={(e) => setCfg((c) => ({ ...(c ?? {}), [k]: e.target.value }))} />
                 )}
               </Field>

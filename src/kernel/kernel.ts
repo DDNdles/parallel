@@ -2,6 +2,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
 import { Bus, busEvents } from './bus.ts';
 import { Db } from './db.ts';
 import { ConfigStore } from './config.ts';
@@ -15,10 +16,15 @@ import { WorkRunner } from './services/work.ts';
 import { ChatService } from './services/chat.ts';
 import { LlmService } from './services/llm.ts';
 import { LLBotManager } from './services/llbot.ts';
+import { bundledFfmpeg } from './services/downloads.ts';
+import { setFfmpegCandidate } from './services/media.ts';
 import { NapCatManager } from './services/napcat.ts';
 import { PluginContainer } from './container.ts';
 import { AgentLoop, HistoryStore } from './agentloop.ts';
 import { Pipeline, roleAtLeastRole } from './pipeline.ts';
+import { HumanlikeService } from './humanlike/index.ts';
+import { ALTER_ANALYSIS_SYSTEM, buildAlterPrompt, parseAlterAnalysis } from './humanlike/alter.ts';
+import type { HumanlikeConfig } from './humanlike/types.ts';
 import { OneBot11Adapter } from './adapters/onebot11.ts';
 import { startApiServer } from './api/server.ts';
 import type { ChatEvent, Logger, ProtocolEnd, Role } from './types.ts';
@@ -32,6 +38,17 @@ function openBrowser(url: string): void {
     else if (process.platform === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
     else spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
   } catch { /* headless 环境无浏览器，忽略 */ }
+}
+
+/** 端口上是否已经有东西在应答（只判「能不能连上」，不发请求） */
+function portBusy(host: string, port: number): Promise<boolean> {
+  return new Promise((resolveP) => {
+    const s = createConnection({ host, port });
+    const done = (v: boolean) => { s.destroy(); resolveP(v); };
+    s.setTimeout(800, () => done(false));
+    s.once('connect', () => done(true));
+    s.once('error', () => done(false));
+  });
 }
 
 export interface KernelOptions {
@@ -62,6 +79,7 @@ export class Kernel {
   container: PluginContainer;
   agentLoop: AgentLoop;
   history: HistoryStore;
+  humanlike: HumanlikeService;
   pipeline: Pipeline;
   adapter: OneBot11Adapter;
   dataDir: string;
@@ -75,6 +93,8 @@ export class Kernel {
     this.dataDir = opts.dataDir ?? join(root, 'data');
     mkdirSync(this.dataDir, { recursive: true });
     this.log = makeLogger('kernel');
+    // 环境检查页替用户下过的 ffmpeg 落在 data/bin：语音转码那头要先认它（没有就照旧找 PATH）
+    setFfmpegCandidate(bundledFfmpeg(this.dataDir));
 
     this.bus = new Bus();
     this.db = new Db(this.dataDir);
@@ -92,17 +112,16 @@ export class Kernel {
     this.session = new SessionContainers(this.dataDir, this.config, this.errors);
     this.chat = new ChatService(this.bus, {
       ratePerMin: this.config.config.risk.replyRatePerMin,
-      jitterMinMs: this.config.config.risk.jitterMinMs,
-      jitterMaxMs: this.config.config.risk.jitterMaxMs,
       sandboxRoot: (c) => this.sandbox.root(c),
       sessionLog: this.sessionLog,
-      onUsage: () => {},
+      // 出站每条计一次数（pipeline 在这之后才建好，所以留闭包）
+      onUsage: (dir) => { if (dir === 'out') this.pipeline?.bumpUsage('messages_out'); },
     });
     this.llm = new LlmService(this.config, this.errors, this.db, this.bus);
     this.llbot = new LLBotManager(this.config, this.errors, this.bus, makeLogger);
     // agent loop 与 work 子代理执行器需先于插件容器创建（插件 setup 时会取 ctx.work.modelLabel）
     this.agentLoop = new AgentLoop(this.llm, this.sessionLog, this.bus, this.config, this.errors);
-    this.workRunner = new WorkRunner(this.agentLoop, this.llm, this.bus, this.db, this.config, this.errors);
+    this.workRunner = new WorkRunner(this.agentLoop, this.llm, this.bus, this.db, this.config, this.errors, this.sandbox);
     this.container = new PluginContainer(
       {
         builtin: join(root, 'src', 'plugins'),
@@ -113,13 +132,42 @@ export class Kernel {
       {
         db: this.db, bus: this.bus, errors: this.errors, config: this.config,
         memory: this.memory, sandbox: this.sandbox, session: this.session, work: this.workRunner,
-        chat: this.chat, llm: this.llm,
+        chat: this.chat, llm: this.llm, humanlike: this.humanlike, sessionLog: this.sessionLog,
         scheduler: this.scheduler,
         loggerFactory: makeLogger,
         notifyOwner: (t) => this.notifyOwner(t),
+        // 容器先于适配器构造，这里给的是惰性取值：真正调用发生在 work 轮（远晚于 boot）
+        groupTitle: (chatId) => this.adapter?.groupName(chatId) || `群${chatId}`,
       },
     );
     this.history = new HistoryStore(this.sessionLog, this.config.config.storage.historyLimit);
+    // 拟人层：chat 区行为本身（分段发送 / 接话打分 / 主动发言 / 频率）。
+    // trigger 回调要等到定时器触发才用得上，那时 pipeline 早已装配好，所以这里可以惰性取。
+    this.humanlike = new HumanlikeService({
+      config: () => this.config.config.humanlike as unknown as HumanlikeConfig,
+      selfNickname: () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
+      trigger: (batch) => this.pipeline.enqueueBatch(batch),
+      // Alter 的侧端氛围分析（HDSI 的分析任务）：异步跑、不阻塞可见回复；失败就当没这回事
+      describeAlter: async ({ value, direction, recent }) => {
+        try {
+          const resp = await this.llm.chat(
+            {
+              model: '',
+              messages: [
+                { role: 'system', content: ALTER_ANALYSIS_SYSTEM },
+                { role: 'user', content: buildAlterPrompt(value, recent) },
+              ],
+              stream: false,
+            },
+            { chatId: '', chain: 'chat' },
+          );
+          return parseAlterAnalysis(resp.content ?? '');
+        } catch { return null; }
+      },
+      sessionLog: this.sessionLog,
+      bus: this.bus,
+      errors: this.errors,
+    });
     this.adapter = new OneBot11Adapter(
       this.config, this.errors, this.bus, this.sandbox,
       (e) => this.pipeline.submit(e),
@@ -133,14 +181,17 @@ export class Kernel {
     });
     this.pipeline = new Pipeline(
       this.container, this.agentLoop, this.history, this.chat, this.memory, this.sessionLog,
-      this.config, this.errors, this.bus, this.db, this.workRunner,
+      this.config, this.errors, this.bus, this.db, this.workRunner, this.humanlike,
       (event) => this.resolveRole(event),
       (chatId) => this.adapter.groupName(chatId) || `群${chatId}`,
+      () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
+      () => (this.adapter?.status() as { selfId?: string } | undefined)?.selfId ?? '',
     );
 
     // 配置限速热更新
     this.bus.on(busEvents.configChanged, () => {
       this.chat.setRatePerMin(this.config.config.risk.replyRatePerMin);
+      this.humanlike.rearmAll();
     });
   }
 
@@ -171,6 +222,17 @@ export class Kernel {
   }
 
   async boot(): Promise<void> {
+    // 桌面快捷方式会被连点两下：UI 端口上已有应答 = 另一个内核正在跑。
+    // 必须赶在拉起协议端之前判——第二个实例往同一个 QQ 档案再注入一个 llbot，会把在跑的那个顶下线。
+    if (!this.opts.noApi) {
+      const ui = this.config.config.ui;
+      if (await portBusy(ui.host, ui.port)) {
+        const url = `http://127.0.0.1:${ui.port}/#token=${this.config.secrets.uiToken}`;
+        this.log.warn(`端口 ${ui.port} 上已有内核在跑，不再重复启动：直接打开桌面端 ${url}`);
+        openBrowser(url);
+        process.exit(0);
+      }
+    }
     mkdirSync(join(this.dataDir, 'plugins'), { recursive: true });
     await this.container.scanAndLoadAll();
     await this.adapter.start();
@@ -293,6 +355,7 @@ export class Kernel {
       await this.container.unload(lp.manifest.id).catch(() => {});
     }
     this.scheduler.dispose();
+    this.humanlike.dispose();
     await this.adapter.stop();
     await this.llbot.stop().catch(() => {});
     await this.napcat.stop().catch(() => {});
@@ -306,6 +369,6 @@ export function makeLogger(name: string): Logger {
     info: (msg, extra) => console.log(`${fmt('INFO')} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     warn: (msg, extra) => console.warn(`${fmt('WARN')} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     error: (msg, extra) => console.error(`${fmt('ERROR')} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
-    debug: (msg, extra) => { if (process.env.HACHIMI_DEBUG) console.log(`${fmt('DEBUG')} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`); },
+    debug: (msg, extra) => { if (process.env.PARALLEL_DEBUG) console.log(`${fmt('DEBUG')} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`); },
   };
 }

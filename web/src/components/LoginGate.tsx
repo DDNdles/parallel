@@ -11,7 +11,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, post, setToken, getToken } from '@/lib/api';
 import { Icon } from '@/components/Icon';
-import { BrandInput } from '@/components/BrandInput';
 import type { AppState } from '@/components/App';
 
 const AUTO_KEY = 'parallel_auto_login';
@@ -32,6 +31,8 @@ interface LoginStatus {
     mode?: 'pmhq' | 'direct'; qqProfile?: string; expectedQq?: string;
     online?: boolean; uin?: string; deviceId?: string;
     lastDrop?: { desc: string; at: number } | null;
+    /** 内核判为「在 QQ 客户端里退出了登录」：已停止自动重登，等人点「打开 QQNT」 */
+    loggedOutByUser?: boolean;
     kickCode?: number; kickDesc?: string; kicksInWindow?: number;
     savedSessions?: string[]; recoveredAt?: number;
   };
@@ -47,9 +48,10 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
   const [stateMsg, setStateMsg] = useState('');
   const [stateCls, setStateCls] = useState('');
   const [opening, setOpening] = useState(false);
-  const [tokenDraft, setTokenDraft] = useState('');
+  const [avOK, setAvOK] = useState(true);
   const timers = useRef<ReturnType<typeof setInterval | typeof setTimeout>[]>([]);
   const enteredRef = useRef(false);
+  useEffect(() => { setAvOK(true); }, [info?.qq]);   // 换号后重新试头像
 
   const clearTimers = () => { timers.current.forEach(clearInterval); timers.current.forEach(clearTimeout); timers.current = []; };
 
@@ -108,11 +110,12 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
       } catch (e) {
         if (!alive) return;
         attempt++;
-        // 401 = 本地 token 与内核不一致（旧 token 残留/内核重装）：提示粘贴新令牌；
+        // 401 = 本地 token 与内核不一致（旧 token 残留/内核重装）：这里没有手填令牌的入口，
+        // 恢复靠重启内核——它启动时会带着 #token= 自动把浏览器打开；
         // 其他错误（超时/网络抖动/内核繁忙）只重试，绝不据此判定"未登录"。
         const msg = (e as Error)?.message ?? '';
         if (msg.includes('unauthorized') || msg.includes('401')) {
-          setStateMsg('浏览器令牌与内核不匹配：把内核启动日志里 #token= 后的值粘贴到下面');
+          setStateMsg('浏览器令牌与内核不匹配：重启内核，它会自动带着新令牌打开这个页面');
           setStateCls('err');
           return;
         }
@@ -142,20 +145,6 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
     }
   };
 
-  // 应用粘贴的令牌（校验 32 位十六进制）
-  const applyToken = () => {
-    const v = tokenDraft.trim();
-    if (!/^[0-9a-f]{32}$/i.test(v)) {
-      setStateMsg('令牌格式不对：应为内核日志 #token= 后的 32 位十六进制');
-      setStateCls('err');
-      return;
-    }
-    if (v !== getToken()) setToken(v);
-    setStateMsg('令牌已更新，正在重新校验…');
-    setStateCls('ok');
-    location.reload();
-  };
-
   const avatar = info?.qq ? `/api/login/avatar/${encodeURIComponent(info.qq)}?token=${encodeURIComponent(getToken())}` : '';
 
   // 掉线/登错号提示：登录门「突然弹出来」时必须说清原因 ——
@@ -168,6 +157,9 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
     }
     const m = info?.end;
     if (!m || m.online) return '';
+    // 有头模式下「没有踢线通知的掉线」= 有人在 QQ 窗口里点了退出登录：内核已停止自动重登，
+    // 这里要说清是人为退出而不是网络抖动，恢复动作就是下面那颗按钮。
+    if (m.loggedOutByUser) return '已在 QQ 里退出登录，parallel 不会自动把你登回去。要恢复请点下面的「打开 QQNT」。';
     const drop = m.lastDrop;
     if (drop && Date.now() - drop.at < 30 * 60_000) return `账号已下线：${drop.desc}`;
     if (m.kickDesc) return `账号已离线：${m.kickDesc}`;
@@ -186,9 +178,14 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
           <span className="wm"><b>PARALLEL</b></span> console
         </div>
 
-        <img id="login-avatar" className="login-avatar" alt="QQ 头像" src={avatar} />
+        {/* 头像取不到（未登录/代理图 401）时走首字占位：留 <img> 在页上会露出 alt 字压成黑圆 */}
+        {avatar && avOK ? (
+          <img id="login-avatar" className="login-avatar" alt="" src={avatar} onError={() => setAvOK(false)} />
+        ) : (
+          <span className="login-avatar login-avatar-ph" aria-hidden>{(info?.nickname || 'P').slice(0, 1)}</span>
+        )}
         <div className="login-nick">{info?.nickname || (info?.qq ? `QQ ${info.qq}` : '等待 QQ 登录')}</div>
-        <div className="login-qq mono">{info?.qq ? `QQ ${info.qq}` : '--'}</div>
+        {info?.qq && <div className="login-qq mono">QQ {info.qq}</div>}
         <div id="login-state" className={'login-state ' + (blocked || (dropNotice && !stateMsg) ? 'err' : stateCls)}>{statusLine}</div>
 
         {/* 主按钮：QQ 不在线时就是"打开 QQNT"，在线后变成"进入控制台" */}
@@ -202,22 +199,12 @@ export default function LoginGate({ onEnter, onToggleTheme }: {
 
         <label className="login-auto"><input type="checkbox" id="login-auto-chk" /><span>自动登录，下次直接进入</span></label>
 
-        {/* 浏览器 token 与内核不一致时的免扫码恢复入口（32 位十六进制；回车或点击「应用」生效） */}
-        <div className="login-token-row">
-          <BrandInput value={tokenDraft} className="mono" spellCheck={false}
-            placeholder="或粘贴内核日志里 #token= 后的值（32 位）"
-            onChange={(e) => setTokenDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') applyToken(); }} />
-          <button className="login-ghost" onClick={applyToken}>应用令牌</button>
-        </div>
-
-        <div style={{ marginTop: 18 }}>
-          <button className="chip icon-chip" onClick={onToggleTheme}>
-            <span className="theme-btn-ic">
-              <span className="glyph glyph-sun"><Icon name="sun" /></span>
-              <span className="glyph glyph-moon"><Icon name="moon" /></span>
-            </span>
-          </button>
-        </div>
+        <button className="chip icon-chip" id="btn-login-theme" onClick={onToggleTheme}>
+          <span className="theme-btn-ic">
+            <span className="glyph glyph-sun"><Icon name="sun" /></span>
+            <span className="glyph glyph-moon"><Icon name="moon" /></span>
+          </span>
+        </button>
       </div>
     </div>
   );

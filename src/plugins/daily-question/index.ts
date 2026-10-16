@@ -30,14 +30,15 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'daily_question',
-    description: '获取今天的每日一题（谜语/脑筋急转弯）。答案在用户猜完或要求时再给。',
+    description: '获取今天的每日一题（谜语/脑筋急转弯）。',
+    promptGuidelines: ['题目抛出去后别马上揭晓，等对方猜完或主动要答案，再用 daily_question_answer 核对。'],
     parameters: { type: 'object', properties: {} },
     handler: () => `今日一题：${pickOfTheDay().q}（答案用 daily_question_answer 工具获取）`,
   });
 
   ctx.llm.registerTool({
     name: 'daily_question_answer',
-    description: '获取今天每日一题的答案（用户放弃或答对后核对时用）。',
+    description: '获取今天每日一题的答案。',
     parameters: { type: 'object', properties: {} },
     handler: () => pickOfTheDay().a,
   });

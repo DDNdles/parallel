@@ -13,8 +13,11 @@ export const chatKeyOf = (e: LogEntry) => `${e.chatType}_${e.chatId}`;
 /** 工具动作的结构化说明（与内核 types.ts 的 ToolMeta 同形，随 tool_result 一起传过来） */
 export interface ToolMeta { path?: string; added?: number; removed?: number }
 
-/** 工具能力归类（决定「工作」面板那行的图标与措辞）：执行 / 文件 / 联网 / 浏览器 / 其他 */
-export type ToolKind = 'run' | 'file' | 'net' | 'browser' | 'other';
+/** 工具能力归类（决定「工作」面板那行的图标与措辞）：执行 / 文件 / 联网 / 浏览器 / 协议动作 / 其他 */
+export type ToolKind = 'run' | 'file' | 'net' | 'browser' | 'todo' | 'ask' | 'done' | 'delegate' | 'other';
+
+/** 协议类工具（清单/回问/交付/派生）没有"能力词素"可判，按整名精确取形状 */
+const PROTO: Record<string, ToolKind> = { todo: 'todo', work_ask: 'ask', work_finish: 'done', delegate: 'delegate' };
 
 /**
  * 按名字里的词素判能力，MCP 名（pluginId__serverId__tool）拿最后一段来判——
@@ -24,6 +27,7 @@ export function toolAction(name: string): ToolKind {
   const n = (name || '').toLowerCase();
   const seg = n.split('__');
   const t = seg.length > 1 ? seg[seg.length - 1] : n;
+  if (PROTO[t]) return PROTO[t];
   if (/(^|_)(browser|chrome|playwright|puppeteer)(_|$)/.test(t)) return 'browser';
   if (/(^|_)(web|http|url|link|search|fetch|crawl|query)(_|$)/.test(t)) return 'net';
   if (/(^|_)(run|exec|shell|bash|zsh|powershell|python|node|js|ts|deno|eval|command|script)(_|$)/.test(t)) return 'run';

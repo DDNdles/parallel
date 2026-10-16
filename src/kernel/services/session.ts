@@ -36,6 +36,12 @@ export class SessionContainers {
     return this.config.config.sandbox as any;
   }
 
+  /** 镜像名：compute 读 sandbox.session.image，browser 读 sandbox.browser.image；缺省两个内置镜像 */
+  private imageOf(kind: 'compute' | 'browser'): string {
+    if (kind === 'compute') return this.sandboxCfg.session?.image ?? 'parallel-sandbox-python:latest';
+    return this.sandboxCfg.browser?.image ?? 'parallel-sandbox-browser:latest';
+  }
+
   private dockerEnv(): NodeJS.ProcessEnv {
     if (process.platform !== 'win32') return process.env;
     const extra = join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin');
@@ -64,6 +70,23 @@ export class SessionContainers {
     return this.ensureDocker() !== null;
   }
 
+  /** 镜像是否已在本地（docker image inspect 现场探测；60s 缓存，桌面端 8s 轮询别每次都打 docker） */
+  private imageCache = new Map<string, { ok: boolean; at: number }>();
+
+  imagesAvailable(): { python: boolean; browser: boolean } {
+    const bin = this.ensureDocker();
+    if (!bin) return { python: false, browser: false };
+    const probe = (kind: 'compute' | 'browser'): boolean => {
+      const image = this.imageOf(kind);
+      const hit = this.imageCache.get(image);
+      if (hit && nowMs() - hit.at < 60_000) return hit.ok;
+      const ok = spawnSync(bin, ['image', 'inspect', image], 15_000, this.dockerEnv()).ok;
+      this.imageCache.set(image, { ok, at: nowMs() });
+      return ok;
+    };
+    return { python: probe('compute'), browser: probe('browser') };
+  }
+
   private hostMount(chat: ChatRef): string {
     const dir = resolve(join(this.dataDir, 'sandbox', `${chat.type}_${chat.chatId}`));
     return dir.replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
@@ -74,8 +97,7 @@ export class SessionContainers {
   private async startContainer(kind: 'compute' | 'browser', chat: ChatRef): Promise<string> {
     const bin = this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用（会话容器需要 Docker Desktop 运行中）');
-    const cfg = this.sandboxCfg[kind] ?? {};
-    const image = cfg.image ?? (kind === 'compute' ? 'parallel-sandbox-python:latest' : 'parallel-sandbox-browser:latest');
+    const image = this.imageOf(kind);
     const name = `parallel-${kind}-${chat.type}-${chat.chatId}`.slice(0, 60);
     // 先清理同名残留（可能是异常退出留下的）
     spawnSync(bin, ['rm', '-f', name], 20_000, this.dockerEnv());

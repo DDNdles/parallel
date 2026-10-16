@@ -26,7 +26,7 @@ export interface ProviderCfg {
   model: string;                            // 当前使用的模型名
   enabled: boolean;
   baseUrl: string;
-  protocol: string;                         // openai-compatible | mock
+  protocol: string;                         // openai-compatible | openai-responses | anthropic | gemini | mock
   custom?: boolean;
   models?: ProviderModelCfg[];
 }
@@ -43,6 +43,10 @@ export const DEFAULT_CONFIG = {
     expectedQq: '',
     // 会话列表偏好（按 bot 登录号区分，随 QQ 账号走）
     chatPrefs: {} as Record<string, { pinned: string[]; hidden: string[]; listWidth?: number }>, // qq -> { pinned, hidden, listWidth(会话列表宽 px) }
+    /** 初始环境检查页已走过的时间戳：走过就直接进登录门，没走过（首次运行）先看依赖页 */
+    setupDoneAt: 0,
+    /** 会话页预览：群友头像 + 收来的图片缩略图（关掉就不发这些图片请求） */
+    chatPreview: true,
   },
   onebot: {
     reverseWsPath: '/onebot',             // 协议端反向 WS 上报地址
@@ -53,7 +57,8 @@ export const DEFAULT_CONFIG = {
     flavor: 'llbot' as 'llbot' | 'napcat',
     llbot: {
       // 接入方式：'pmhq' = 有头模式（PMHQ 注入本机 QQNT；官方文档明示「无头模式有掉线风险」，PMHQ 是稳的那条路）
-      //           'direct' = 无头模式（纯协议直连 + 签名服务 Auth Token）
+      //           'direct' = 无头模式（纯协议直连 + 签名服务 Auth Token）——**2026-10-11 起放弃**：
+      //           token 要向作者申请（见 services/llbot.ts 的 authState），且有头本来就更稳，界面上没有切过去的入口
       mode: 'pmhq' as 'pmhq' | 'direct',
       webuiPort: 15173,                   // LLBot WebUI 端口（CLI 包内置默认；实际以 stdout 解析为准，登录二维码经内核代理）
       qqPath: '',                         // 本机 QQ.exe 路径（有头模式用；空 = 自动探测）
@@ -65,7 +70,7 @@ export const DEFAULT_CONFIG = {
     },
   },
   llm: {
-    activeProvider: 'gemini-3.8-flash',   // 镜像值：始终等于 chatChain 首条的供应商（人设绑定与状态展示读它）
+    activeProvider: '',                   // 镜像值：始终等于 chatChain 首条的供应商（状态展示读它）
     modelByProvider: {
       'deepseek': 'deepseek-chat',
       'openai-compatible': 'gpt-4o-mini',
@@ -73,19 +78,112 @@ export const DEFAULT_CONFIG = {
     maxToolRounds: 8,
     // 供应商不再分聊天/工作用途：两条有序链各自列「供应商 + 模型」，靠前的优先，掉线自动接后一个
     chatChain: [] as ModelRef[],
-    workChain: [] as ModelRef[],          // 空 = 工作跟随聊天链
+    workChain: [] as ModelRef[],          // 工作链独立于聊天链（不跟随）；空 = /work 没有可用模型
     failoverThreshold: 2,                 // 同一条链上连续掉线 N 次才切到下一个模型
-    historyLimit: 24,
+  },
+  // work 子代理（/work 链路）。定义与压缩口径都放在这里，改配置即可调整，不必改代码。
+  work: {
+    agent: '',                            // 入口 agent 定义文件或名字（空 = agents 目录里的 work）
+    agentsDir: '',                        // 用户自加的子代理目录（空 = <data>/agents；同名覆盖内置）
+    maxDepth: 2,                          // 子代理嵌套上限（入口 0；达到上限那层不再有 delegate）
+    compaction: {                          // 上下文压缩（对齐 pi 的 compaction 口径）
+      enabled: true,
+      reserveTokens: 16384,               // 为模型回复预留的 token（也是触发阈值的一部分）
+      keepRecentTokens: 20000,            // 保留最近多少 token 的原文不摘要
+    },
+  },
+  // 拟人化层（chat 区行为本身，不是插件）。两侧来源分工明确：
+  // 「什么时候开口」对齐 MaiBot 的 ChatReplyTimingConfig / idle_backoff（保留）；
+  // 「怎么说 / 拆几条 / 隔多久」对齐 HDSI 的 runtime（见 humanlike/delivery.ts）——
+  // MaiBot 的分段器 / 错字 / 打字速度已整体删除。
+  // 这里没有总开关：说几句、拆几条、隔多久、要不要理都调，但"她是不是这样活着"没有 off 档。
+  humanlike: {
+    // 剧本体（HDSI 的 <say> authored actions）：模型写小说的下一段，只有 <say> 里的台词进 QQ，
+    // 旁白（动作/神态/环境）留在剧本里 —— 动作描写从结构上就漏不到群里。
+    script: {
+      enable: true,
+    },
+    // ① 出站投递（HDSI `runtime`）：分隔标记切分 + 打字节奏 + 单条长度上限。
+    // 字段名与默认值逐条对齐 HDSI；MaiBot 的分段器 / 错字 / 打字速度已整体删除。
+    outgoing: {
+      splitReplyMessages: true,           // 是否把回复里的分隔标记拆成多条 QQ 消息
+      messageSeparator: '<sep/>',         // 分段标记；模型需要多条气泡时输出它
+      typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
+      typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久
+      typingMaxDelaySeconds: 12,          // 单条后续气泡的最长打字等待（秒）
+      typingJitterRatio: 0.3,             // 打字延迟随机浮动比例（0 = 固定）；整体下限固定 250ms
+      maxMessageCharacters: 2000,         // 单条可见消息最大字符数（先截断整条、再分段）
+    },
+    // ② 什么时候开口（MaiBot ChatReplyTimingConfig + reply_necessity）
+    timing: {
+      replyTriggerMode: 'necessity' as 'necessity' | 'frequency',
+      pendingThreshold: 12,               // 攒够几条就思考（frequency 的门槛 / necessity 的压力单位）
+      necessityThreshold: 80,             // necessity 模式的分数门槛（MaiBot 常量）
+      talkValue: 1,                       // 群聊频率 0–1，越小越安静
+      privateTalkValue: 1,
+      enableRules: false,                 // 按群/时段单独调频率
+      rules: [
+        { platform: '', itemId: '', ruleType: 'group' as const, time: '00:00-08:59', value: 0.8 },
+        { platform: '', itemId: '', ruleType: 'group' as const, time: '09:00-18:59', value: 1 },
+      ],
+      mentionedBotReply: false,           // 提到名字就更想回（默认关）
+      inevitableAtReply: true,            // 被 @ 必回（默认开）
+      focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
+    },
+    // ③ 多用户消息防抖合并
+    merge: {
+      enable: true,
+      windowMs: 1500,                     // 静默这么久就把攒着的消息一起处理
+      maxWaitMs: 6000,                    // 群里刷屏时的兜底上限
+      bufferTtlMs: 120000,                // 攒着的消息超过 2 分钟就丢掉（老话不值得再接）
+    },
+    // ④ 空闲退避（MaiBot idle_backoff）
+    backoff: {
+      baseSeconds: 15,
+      capSeconds: 300,
+      startCount: 2,
+      bypassPendingCount: 6,
+    },
+    // ⑤ 真正的主动发言：没人说话也起话头。默认关（主动发言属于主动推送，要显式开启）
+    proactive: {
+      enable: false,
+      idleSeconds: 3600,
+    },
+    // ⑥ 聊天节奏反定型（HDSI ChatRhythm）：回复结构定型时，以角色视角注入纠偏
+    rhythm: {
+      enable: true,
+      mode: 'balanced' as 'gentle' | 'balanced' | 'aggressive',
+      historyLimit: 12,                 // 节奏签名窗口（HDSI 5~20）
+      collapseMinSamples: 5,            // 判定定型所需最少样本（宽限期，HDSI 3~10）
+      exhaustLimit: 6,                  // 连续注入失败几次熔断（HDSI 3~12）
+    },
+    // ⑦ 情绪偏移（HDSI Alter）：每轮 <alter>±n</alter>，累计到动态阈值后侧端分析出氛围参考
+    alter: {
+      enabled: true,
+      baseThreshold: 10,                // 基准阈值
+      densityFactor: 0.3,               // 聊天越密阈值越低
+      sameDirectionBoost: 0.05,         // 同向继续时权重每点涨多少
+      oppositeDecay: 0.15,              // 反向时每点衰减多少
+      minWeight: 0.2,                   // 权重低于它就过期
+      maxIntensity: 2,                  // 强度上限
+    },
+    // ⑧ 主体行动窗口（HDSI Agency）：日程/隐私/设备构成主动开口的容量
+    agency: {
+      enable: true,
+      quietHours: '00:30-07:30',        // 安静时段（她睡着，不主动开口）
+      minimumProactiveIntervalMinutes: 60,
+      maxWindowMinutes: 240,
+      maxCandidateHours: 24,
+    },
+    // ⑨ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
+    schedule: {
+      enable: false,
+      horizonHours: 12,                 // 主动轮能看到的未来时长（HDSI 约半天）
+      maxRules: 12,
+      maxExceptions: 32,
+    },
   },
   providers: {
-    'gemini-3.8-flash': {
-      label: 'Gemini 3.8 Flash',
-      model: 'gemini-3.8-flash',
-      enabled: false,                     // 红线 §2.2：只留接口不接入
-      baseUrl: '',                        // TODO: 接入时填写
-      protocol: 'openai-compatible',
-      models: [{ id: 'gemini-3.8-flash', contextWindow: 1048576, inputTypes: ['text', 'image'], enabled: true }],
-    },
     'deepseek': {
       label: 'DeepSeek',
       model: 'deepseek-chat',
@@ -106,16 +204,19 @@ export const DEFAULT_CONFIG = {
       models: [{ id: 'gpt-4o-mini', contextWindow: 128000, inputTypes: ['text', 'image'], enabled: true }],
     },
   } as Record<string, ProviderCfg>,
+  /**
+   * 风控 —— 只管内核红线（防刷屏、防隐私），**不描述她的性格**。
+   * 与 `humanlike` 的分工：这里设天花板，"什么时候说、说几句、隔多久"在那里。
+   * 两边刻意不重复同一个旋钮 —— 原本放在这里的「随机抖动」和「唤醒方式/唤醒词」
+   * 都属于行为，已随拟人化一起收进那一页，这里不再留影子。
+   */
   risk: {
-    groupWake: 'at_or_reply',             // at_or_reply | at_reply_or_wakeword
-    wakeWords: [] as string[],
-    replyRatePerMin: 12,                  // 每会话回复上限
-    jitterMinMs: 400,                     // 回复随机抖动下限
-    jitterMaxMs: 1600,
+    replyRatePerMin: 12,                  // 每会话发言上限（条/分钟）：一轮拆成几条就按几条计
     silentWhenNothingEnabled: true,       // 空插件群被 @ 时是否给管理员提示
-    proactive: {} as Record<string, boolean>,  // 插件主动推送开关，默认全关（风控）
-    // 清除记忆的权限口径：self_and_admin = 本人可清自己、管理员/主人可清指定的人；admin_only = 一律要管理员/主人
-    forgetScope: 'self_and_admin' as 'self_and_admin' | 'admin_only',
+    proactive: {} as Record<string, boolean>,  // 插件定时推送开关，默认全关（≠ 角色主动开口，那是 humanlike.agency）
+    // 清除记忆的权限口径：self_and_admin = 本人可清自己、管理员/主人可清指定的人；admin_only = 一律要管理员/主人。
+    // 2026-10-03 起默认 admin_only（界面入口已删，改这里需手改 config.json + 重启）。
+    forgetScope: 'admin_only' as 'self_and_admin' | 'admin_only',
   },
   sandbox: {
     runtime: 'auto',                      // 执行运行时：'docker'=容器强隔离（断网+文件隔离）| 'subprocess'=本机子进程 | 'auto'=docker 可用则用之，否则回落 subprocess
@@ -123,9 +224,9 @@ export const DEFAULT_CONFIG = {
     dockerImageNode: 'node:24-slim',
     dockerImageBash: 'debian:12-slim',
     ttlHours: 24,                         // chat 临时文件 TTL（最后一次访问起算）
-    inboxTtlHours: 6,                     // 聊天收件文件 TTL（更短：通常看完即弃）
+    inboxTtlHours: 360,                   // 聊天收件文件 TTL（15 天：图片要能回看，设置页「沙箱」按天调）
     workTtlHours: 168,                    // work 产物 TTL（7 天：交付物值得多留）
-    workInboxTtlHours: 24,                // work 会话的收件文件 TTL
+    workInboxTtlHours: 360,               // work 会话的收件文件 TTL（与 chat 档一致，别悄悄更早删图）
     maxFileBytes: 10 * 1024 * 1024,       // 单文件上限
     maxSessionBytes: 200 * 1024 * 1024,   // 单会话总占用上限
     execTimeoutPythonMs: 20000,
@@ -153,17 +254,6 @@ export const DEFAULT_CONFIG = {
   },
   persona: {
     default: 'whale-girl',                 // 唯一人格：没有 /人格 锁定时的默认人设
-    affection: {
-      min: 0, max: 100,
-      dailyDeltaCap: 15,                  // 防刷：单用户单日 ±15 封顶
-      minIntervalMs: 60_000,
-      stages: [
-        { min: 81, label: '主人的宝', tone: '极亲昵，主动撒娇，称呼“主人”' },
-        { min: 51, label: '亲近', tone: '亲近自然，称呼“主人”或名字' },
-        { min: 21, label: '熟悉', tone: '友好熟络，直呼昵称' },
-        { min: 0, label: '陌生', tone: '礼貌略带警惕，称呼“你”' },
-      ],
-    },
     memoryFactsTopK: 5,
   },
   storage: {
@@ -235,8 +325,24 @@ export class ConfigStore {
       }
     }
     this.migrateModelChains();
+    // 迁移：风控里的「随机抖动」与「唤醒方式/唤醒词」已并入拟人化（回复前的等待归打字节奏，
+    // 要不要理人归必要性打分），配置里残留的旧键在这里清掉，别让它们一直躺在文件里当死配置。
+    for (const k of ['jitterMinMs', 'jitterMaxMs', 'groupWake', 'wakeWords'] as const) {
+      delete (this.config.risk as any)[k];
+    }
+    // 拟人化不再有总开关（她不是可关的功能），旧配置里那个键同样清掉
+    delete (this.config.humanlike as any).enabled;
+    // 输出侧改用 HDSI 的 outgoing：MaiBot 的分段器/错字/打字速度与表达风格这四个旧键清掉，
+    // 别让它们一直躺在文件里当死配置（老桌面端标签页回放的旧表单也写不回来 —— 白名单已同步）。
+    for (const k of ['splitter', 'typo', 'typing'] as const) delete (this.config.humanlike as any)[k];
+    const hlTiming = (this.config.humanlike as any).timing;
+    if (hlTiming && typeof hlTiming === 'object') delete hlTiming.replyStyle;
+    // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费
+    delete (this.config.llm as any).historyLimit;
+    // 好感度与心情整套删除（2026-10-16）：老配置里那个 affection 块（含段位表）清掉，别留死配置
+    delete (this.config.persona as any).affection;
     atomicWriteJson(this.configFile, this.config);
-    atomicWriteJson(this.secretsFile, this.secrets);
+    atomicWriteJson(this.secretsFile, this.secrets, { rotate: false });
   }
 
   /** 迁移：① 旧的「工作供应商」指针 → work 链的一条（聊天链不预填：空链在 LlmService 里按
@@ -265,6 +371,20 @@ export class ConfigStore {
       llm.workChain = llm.workChain.filter((x: ModelRef) => x.provider !== 'mock');
       if (llm.activeProvider === 'mock') llm.activeProvider = llm.chatChain[0]?.provider ?? Object.keys(providers)[0] ?? '';
     }
+    // ③ 预置的 Gemini 占位供应商已删（内核从未实现它的请求逻辑），旧配置里残留的条目一并清掉
+    if (providers['gemini-3.8-flash'] && !providers['gemini-3.8-flash'].custom) {
+      delete providers['gemini-3.8-flash'];
+      delete llm.modelByProvider['gemini-3.8-flash'];
+      llm.chatChain = llm.chatChain.filter((x: ModelRef) => x.provider !== 'gemini-3.8-flash');
+      llm.workChain = llm.workChain.filter((x: ModelRef) => x.provider !== 'gemini-3.8-flash');
+      if (llm.activeProvider === 'gemini-3.8-flash') llm.activeProvider = llm.chatChain[0]?.provider ?? '';
+    }
+  }
+
+  /** 桌面端「已隐藏」的会话：内核在这一路上收不到任何东西——消息不落账、附件不落盘。
+   *  chatPrefs 按 bot 登录号存；桌面端只有一个 bot 号，事实上的全局口径。 */
+  chatHidden(selfId: string, type: 'group' | 'private', chatId: string): boolean {
+    return !!this.config.ui.chatPrefs[selfId]?.hidden?.includes(`${type}_${chatId}`);
   }
 
   saveConfig(): void {
@@ -279,7 +399,8 @@ export class ConfigStore {
   }
 
   saveSecrets(): void {
-    atomicWriteJson(this.secretsFile, this.secrets);
+    // 密钥文件不留轮转副本：.bak 会把改掉/清掉的密钥长期留在盘上
+    atomicWriteJson(this.secretsFile, this.secrets, { rotate: false });
     this.bus.emit(busEvents.configChanged, 'secrets');
   }
 

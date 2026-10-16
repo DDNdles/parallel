@@ -3,7 +3,7 @@ import type { IncomingMessage } from 'node:http';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { statSync, existsSync } from 'node:fs';
-import type { ChatEvent, MsgSegment, ChatRef } from '../types.ts';
+import type { ChatEvent, MsgSegment, ChatRef, ForwardNode, ForwardRecord, IncomingFile } from '../types.ts';
 import type { TransportAdapter } from '../services/chat.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
@@ -12,9 +12,16 @@ import { busEvents } from '../bus.ts';
 import type { SandboxService } from '../services/sandbox.ts';
 import type { Logger } from '../types.ts';
 import { newId, nowMs } from '../util/misc.ts';
+import { toWav } from '../services/media.ts';
+import {
+  FORWARD_MAX_IMAGE_BYTES, FORWARD_MAX_MEDIA_BYTES, FORWARD_MAX_NODE_CHARS, FORWARD_MAX_NODE_IMAGES,
+  FORWARD_MAX_NODE_MEDIA, FORWARD_MAX_NODES, FORWARD_MAX_DEPTH,
+} from '../util/forward.ts';
 
 /** 群名按需拉取失败后的重试间隔（与全量刷新的 5 分钟一拍） */
 const NAME_RETRY_MS = 5 * 60_000;
+/** 取聊天记录正文的超时：合并转发的内容不在事件里，要现向服务器取，比普通动作慢 */
+const FORWARD_TIMEOUT_MS = 10_000;
 
 /**
  * OneBot 11 适配器（支持 access token）。
@@ -175,54 +182,31 @@ export class OneBot11Adapter implements TransportAdapter {
     const type = msg.message_type === 'group' ? 'group' : 'private';
     const chatId = String(type === 'group' ? msg.group_id : msg.user_id);
     const userId = String(msg.user_id);
+    // 已隐藏的会话：在下载之前就收口——图片/文件不进沙箱，消息也不进内核（解除隐藏后不补历史）。
+    if (this.config.chatHidden(this.selfId, type, chatId)) return;
     const segments = normalizeSegments(msg.message);
-    let text = '';
-    let isAtMe = false;
-    let isReplyToMe = false;
-    for (const s of segments) {
-      if (s.type === 'text') text += String(s.data.text ?? '');
-      else if (s.type === 'at') {
-        const qq = String(s.data.qq ?? '');
-        if (qq === this.selfId) isAtMe = true;
-        else if (qq === 'all') { /* @全体成员不算唤醒 */ }
-        text += ` @${qq}`;
-      } else if (s.type === 'reply') {
-        text += ` [回复:${s.data.id ?? ''}]`;
-        // 协议端一般会在 reply 段后带实际被回复者信息；尽力判断是否回复 bot
-        const replyUserId = String(s.data.user_id ?? msg.source?.user_id ?? '');
-        if (replyUserId && replyUserId === this.selfId) isReplyToMe = true;
-      } else if (s.type === 'image') text += ' [图片]';
-      else if (s.type === 'record') text += ' [语音]';
-      else if (s.type === 'video') text += ' [视频]';
-      else if (s.type === 'file') text += ` [文件:${String(s.data.name ?? '').trim() || '未命名'}]`;
-      else if (s.type === 'face') text += `[表情:${s.data.id ?? ''}]`;
-    }
+    const rendered = segmentsToText(segments, this.selfId, String(msg.source?.user_id ?? ''));
+    const text = rendered.text;
+    const isAtMe = rendered.isAtMe;
+    const isReplyToMe = rendered.isReplyToMe;
 
-    // 语音/视频段常常只带协议端的 file id：补出 url 内核才可能把它交给模型（补不出来仍会留 [语音] 占位）
+    // 语音/视频段常常只带协议端的 file id：补出 url 内核才可能把它交给模型（补不出来仍会留 [语音] 占位）。
+    // 下面落盘那步也吃这个 url，所以这里补一次就够，别两处各问一遍协议端。
     for (const s of segments) {
       if (s.type !== 'record' && s.type !== 'video') continue;
       const f = String(s.data.file ?? '');
       if (s.data.url || !f || /^https?:\/\//.test(f) || existsSync(f)) continue;
-      const r: any = await this.call(s.type === 'record' ? 'get_record' : 'get_file', { file: f }, 5000).catch(() => null);
+      const r: any = await this.call(s.type === 'record' ? 'get_record' : 'get_file', fileIdParams(f), 5000).catch(() => null);
       const url = String(r?.url ?? '');
       if (/^https?:\/\//.test(url)) s.data.url = url;
     }
 
-    // 消息内的图片：下载进沙箱 inbox（红线 §3.2）
-    const files: ChatEvent['files'] = [];
-    for (const s of segments) {
-      if (s.type === 'image' && s.data.url) {
-        try {
-          const name = String(s.data.file ?? newId('img_') + '.jpg');
-          const buf = await downloadToBuffer(String(s.data.url));
-          const rel = this.sandbox.saveInbox({ platform: 'qq', type, chatId }, name, buf);
-          const abs = join(this.sandbox.root({ platform: 'qq', type, chatId }), rel);
-          files.push({ name, sandboxPath: abs, size: buf.length });
-        } catch (e) {
-          this.log.warn(`图片落盘失败: ${(e as Error).message}`);
-        }
-      }
-    }
+    // 消息内的图片/语音/视频：下载进沙箱 inbox（红线 §3.2），桌面端据此出缩略图与播放器
+    const files = await this.pullMedia(segments, { platform: 'qq', type, chatId },
+      { nodes: 0, images: 0, media: 0, dropped: 0 }, '消息');
+
+    // 「聊天记录」合集：段里只有一个 resId，正文要再问协议端取一次才看得见（取不到不拦这条消息）
+    const forward = await this.fetchForwards(segments.filter((s) => s.type === 'forward'), { platform: 'qq', type, chatId });
 
     const event: ChatEvent = {
       id: newId('ev_'),
@@ -237,6 +221,7 @@ export class OneBot11Adapter implements TransportAdapter {
       isAtMe, isReplyToMe,
       messageId: String(msg.message_id ?? ''),
       files: files.length ? files : undefined,
+      forward: forward ?? undefined,
       raw: msg,
       ts: (msg.time ? msg.time * 1000 : nowMs()),
     };
@@ -245,16 +230,167 @@ export class OneBot11Adapter implements TransportAdapter {
     this.onEvent(event);
   }
 
+  /**
+   * 一条消息里可能有好几个聊天记录段（群友连着转了几份），逐段取回后**并成一张卡**：
+   * 节点按段顺序接起来，resId 取第一段那个，任一段取不到就整体算 failed——
+   * 宁可让界面留占位，也不摆一张缺了内容的卡。
+   */
+  private async fetchForwards(segs: MsgSegment[], chat: ChatRef): Promise<ForwardRecord | null> {
+    if (!segs.length) return null;
+    // 一条消息里几个记录段共用一份预算：上限是"这条消息最多带多少内容"，不是"每段这么多"
+    const budget: FwdBudget = { nodes: 0, images: 0, media: 0, dropped: 0 };
+    const parts: ForwardRecord[] = [];
+    for (const s of segs) parts.push(await this.fetchForward(s, chat, budget));
+    if (parts.length === 1) return parts[0];
+    const nodes = parts.flatMap((p) => p.nodes);
+    const failed = nodes.length === 0;
+    return {
+      id: parts[0].id,
+      title: parts.map((p) => p.title).find((t) => t) ?? '',
+      nodes: failed ? [] : nodes,
+      dropped: budget.dropped,
+      failed,
+    };
+  }
+
+  /**
+   * 取「聊天记录」（合并转发）的正文节点。
+   * 2026-10-15 实测有头模式下的 LLBot：入站段只有一个 `{type:'forward',data:{id:<resId>}}`，
+   * 标题/预览都不给，正文必须靠 get_forward_msg 现取（NapCat 同名动作，形状一致）。
+   * 取不到就算 failed：协议端不支持、超时、那份记录过期都是这条路，界面留着占位、不许编内容。
+   */
+  private async fetchForward(seg: MsgSegment, chat: ChatRef, budget: FwdBudget): Promise<ForwardRecord> {
+    const id = forwardResId(seg);
+    const title = String(seg.data.title ?? '');
+    const nodes = id ? await this.fetchNodes(id, chat, 0, budget) : [];
+    // 一条都没拿到就按 failed 处理：QQ 撤回过的记录也会返回个空壳，摆一张没字的卡不如留占位
+    if (!nodes.length) return { id, title, nodes: [], dropped: budget.dropped, failed: true };
+    return { id, title, nodes, dropped: budget.dropped, failed: false };
+  }
+
+  /**
+   * 按 resId 取一层记录的节点。取不到就是空数组——上层留 [聊天记录] 占位，不许编内容。
+   * 2026-10-15 实测有头模式下的 LLBot：入站段与记录里的嵌套段形状同一个
+   * `{type:'forward',data:{id:<resId>}}`，所以嵌套的也能照这条路再取一层（NapCat 同名动作）。
+   */
+  private async fetchNodes(id: string, chat: ChatRef, depth: number, budget: FwdBudget): Promise<ForwardNode[]> {
+    try {
+      const r = await this.call<any>('get_forward_msg', { id }, FORWARD_TIMEOUT_MS);
+      return await this.collectNodes(Array.isArray(r?.messages) ? r.messages : [], chat, depth, budget);
+    } catch (e) {
+      this.log.warn(`聊天记录取不回（${id.slice(0, 16)}…）: ${(e as Error).message}`);
+      return [];
+    }
+  }
+
+  /** 把一层记录摊平成节点列表；budget 跨整份记录共享，套娃也绕不过条数与图片上限 */
+  private async collectNodes(list: any[], chat: ChatRef, depth: number, budget: FwdBudget): Promise<ForwardNode[]> {
+    const out: ForwardNode[] = [];
+    for (const m of list) {
+      if (budget.nodes >= FORWARD_MAX_NODES) { budget.dropped++; continue; }
+      budget.nodes++;
+      const segs = normalizeSegments(m?.content);
+      const node: ForwardNode = {
+        nickname: String(m?.sender?.nickname ?? m?.sender?.card ?? ''),
+        userId: String(m?.sender?.user_id ?? ''),
+        text: segmentsToText(segs).text.trim().slice(0, FORWARD_MAX_NODE_CHARS),
+        ts: Number(m?.time ?? 0) * 1000,
+        depth,
+      };
+      const files = await this.pullMedia(segs, chat, budget, '聊天记录');
+      if (files.length) node.files = files;
+      out.push(node);
+      // 记录套记录（群里递来的那份"聊天记录"本身又是几份记录）：就地往下展开，
+      // 里面夹的图也照这一层落盘——不展开的话那些图就永远看不见。
+      if (depth < FORWARD_MAX_DEPTH) {
+        for (const s of segs) {
+          if (s.type !== 'forward') continue;
+          const kidId = forwardResId(s);
+          if (!kidId) continue;
+          const kids = await this.fetchNodes(kidId, chat, depth + 1, budget);
+          if (!kids.length) continue;
+          node.text = node.text.replace('[聊天记录]', `[聊天记录·已展开 ${kids.length} 条]`);
+          out.push(...kids);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 把记录里的图片/语音/视频落到沙箱 inbox（与顶层图片同一目录、同一 raw 端点），
+   * 桌面端据此出缩略图与播放器。段里给 url/temp_url 就直接下；只给文件号就按类型补问一次
+   * （get_image / get_record / get_file）换临时链接——转发进来的媒体常常不在协议端的文件缓存里，
+   * 那次补问会失败，此时留着 [图片]/[语音]/[视频] 占位不硬编。
+   * 视频可能几十 MB，所以每种类型各有一份条数上限与单文件体积上限。
+   */
+  private async pullMedia(segs: MsgSegment[], chat: ChatRef, budget: FwdBudget, where: string): Promise<IncomingFile[]> {
+    const out: IncomingFile[] = [];
+    for (const s of segs) {
+      const kind = s.type === 'image' ? 'image' : s.type === 'record' ? 'audio' : s.type === 'video' ? 'video' : null;
+      if (!kind) continue;
+      const left = kind === 'image' ? FORWARD_MAX_NODE_IMAGES - budget.images : FORWARD_MAX_NODE_MEDIA - budget.media;
+      if (left <= 0) continue;
+      const url = await this.nodeMediaUrl(s, kind);
+      if (!url) {
+        // 一声不吭地跳过就没法回答"为什么这条视频没下来"：把段里给了哪些字段打出来
+        const label = kind === 'image' ? '图片' : kind === 'audio' ? '语音' : '视频';
+        this.log.warn(`${where}里的${label}取不到可下载地址（段里字段：${Object.keys(s.data).join(',') || '无'}）`);
+        continue;
+      }
+      try {
+        let name = nodeName(s.data.file, kind);
+        let buf = await downloadToBuffer(url, kind === 'image' ? FORWARD_MAX_IMAGE_BYTES : FORWARD_MAX_MEDIA_BYTES);
+        if (kind === 'audio' && !BROWSER_AUDIO_RE.test(name)) {
+          // QQ 语音是 silk：浏览器的 <audio> 解不了，本机先转 wav 再存（模型那边也直接吃这份，省一次转码）。
+          // 没有 ffmpeg 就按原样存——至少人在沙箱页能用系统播放器听，别把文件弄丢。
+          try {
+            buf = await toWav(buf, 'audio/silk');
+            name = name.replace(/\.[a-z0-9]+$/i, '') + '.wav';
+          } catch (e) {
+            this.log.warn(`语音转 wav 失败，按原样存（桌面端播不动）: ${(e as Error).message}`);
+          }
+        }
+        const rel = this.sandbox.saveInbox(chat, name, buf);
+        if (kind === 'image') budget.images++; else budget.media++;
+        out.push({ name, rel, sandboxPath: join(this.sandbox.root(chat), rel), size: buf.length, url });
+      } catch (e) {
+        this.log.warn(`聊天记录里的${kind === 'image' ? '图片' : kind === 'audio' ? '语音' : '视频'}落盘失败: ${(e as Error).message}`);
+      }
+    }
+    return out;
+  }
+
+  /** 记录里的媒体 → 可下载的地址：段里自带 url/temp_url 最好，只给文件号就按类型补问一次 */
+  private async nodeMediaUrl(seg: MsgSegment, kind: 'image' | 'audio' | 'video'): Promise<string> {
+    const d = seg.data;
+    const direct = String(d.url ?? d.temp_url ?? '');
+    if (/^https?:\/\//.test(direct)) return direct;
+    const f = String(d.file ?? d.file_id ?? d.resource_id ?? '');
+    if (!f || existsSync(f)) return '';
+    // 答不上来就是这条取不到，不许假装下载成功；入参键名两家不同，见 fileIdParams
+    const action = kind === 'audio' ? 'get_record' : 'get_file';
+    const r: any = await this.call(kind === 'image' ? 'get_image' : action, fileIdParams(f), 5000).catch(() => null);
+    const url = String(r?.url ?? '');
+    return /^https?:\/\//.test(url) ? url : '';
+  }
+
+  /**
+   * 群文件上传通知：协议端只给文件号，得换一次临时链接再下。
+   * `get_image` 的入参键名两家不一样（LLBot 要 `file`，NapCat 按 OneBot 11 要 `file_id`），
+   * 所以两个键一起给——LLBot 的 zod 是 strip 模式，多出来的键会被忽略，不会报参数错误。
+   */
   private async handleGroupUpload(msg: any): Promise<void> {
     const chatId = String(msg.group_id);
     const file = msg.file ?? {};
     const chat: ChatRef = { platform: 'qq', type: 'group', chatId };
+    if (this.config.chatHidden(this.selfId, 'group', chatId)) return;
     try {
       let buf: Buffer | null = null;
       let name = String(file.name ?? 'file');
       if (file.url) buf = await downloadToBuffer(String(file.url));
       else if (file.id) {
-        const r = await this.call('get_image', { file_id: file.id }).catch(() => null);
+        const r = await this.call('get_image', fileIdParams(file.id)).catch(() => null);
         if (r?.url) buf = await downloadToBuffer(String(r.url));
       }
       if (buf) {
@@ -270,13 +406,14 @@ export class OneBot11Adapter implements TransportAdapter {
   private async handleOfflineFile(msg: any): Promise<void> {
     const chatId = String(msg.user_id);
     const chat: ChatRef = { platform: 'qq', type: 'private', chatId };
+    if (this.config.chatHidden(this.selfId, 'private', chatId)) return;
     try {
       const file = msg.file ?? {};
       let buf: Buffer | null = null;
       let name = String(file.name ?? 'file');
       if (file.url) buf = await downloadToBuffer(String(file.url));
       else if (file.id) {
-        const r = await this.call('get_image', { file_id: file.id }).catch(() => null);
+        const r = await this.call('get_image', fileIdParams(file.id)).catch(() => null);
         if (r?.url) buf = await downloadToBuffer(String(r.url));
       }
       if (buf) {
@@ -453,6 +590,63 @@ export class OneBot11Adapter implements TransportAdapter {
   }
 }
 
+/** 一份聊天记录的共享预算：条数、图片数、被上限切掉多少（套娃也不能各层单独算） */
+interface FwdBudget { nodes: number; images: number; media: number; dropped: number }
+
+/** 浏览器 <audio> 能直接解的容器；其余（silk/amr）先转 wav 再存 */
+const BROWSER_AUDIO_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac)$/i;
+
+/** 落盘文件名：段里带了原名就用它（保住扩展名，raw 端点据此给 MIME），否则按类型编一个 */
+function nodeName(dataFile: unknown, kind: 'image' | 'audio' | 'video'): string {
+  const given = String(dataFile ?? '').trim();
+  if (given && /\.[a-z0-9]{2,5}$/i.test(given)) return given;
+  const ext = kind === 'audio' ? '.silk' : kind === 'video' ? '.mp4' : '.jpg';
+  return (kind === 'audio' ? 'voice_' : kind === 'video' ? 'video_' : 'img_') + newId('') + ext;
+}
+
+/** 合并转发段的 resId：实测有头模式只给 id，其余键名是别家/别条序列化路径的形状 */
+function forwardResId(seg: MsgSegment): string {
+  return String(seg.data.id ?? seg.data.forward_id ?? seg.data.resId ?? seg.data.resid ?? '');
+}
+
+/**
+ * `get_image` 的入参键名两家不一样：LLBot 的 schema 要 `file`（号或文件名都认），
+ * NapCat 按 OneBot 11 要 `file_id`。只给一个，另一家就 retcode 1400 参数错——
+ * 所以两个键一起给：LLBot 的 zod 是 strip 模式，多出来的那个会被安静忽略。
+ */
+function fileIdParams(id: unknown): Record<string, unknown> {
+  const s = String(id);
+  return { file: s, file_id: s };
+}
+
+/**
+ * 消息段 → 一行文本：@、引用、媒体、聊天记录都落成占位（桌面端有真内容时再把字样剥掉）。
+ * 入站正文与聊天记录里的每条节点共用这一套口径，两处不会各写一份走偏。
+ */
+function segmentsToText(segments: MsgSegment[], selfId = '', replyFallbackUserId = ''): { text: string; isAtMe: boolean; isReplyToMe: boolean } {
+  let text = '', isAtMe = false, isReplyToMe = false;
+  for (const s of segments) {
+    if (s.type === 'text') text += String(s.data.text ?? '');
+    else if (s.type === 'at') {
+      const qq = String(s.data.qq ?? '');
+      if (qq === selfId) isAtMe = true;
+      else if (qq === 'all') { /* @全体成员不算唤醒 */ }
+      text += ` @${qq}`;
+    } else if (s.type === 'reply') {
+      text += ` [回复:${s.data.id ?? ''}]`;
+      // 协议端一般会在 reply 段后带实际被回复者信息；尽力判断是否回复 bot
+      const replyUserId = String(s.data.user_id ?? replyFallbackUserId);
+      if (replyUserId && replyUserId === selfId) isReplyToMe = true;
+    } else if (s.type === 'image') text += ' [图片]';
+    else if (s.type === 'record') text += ' [语音]';
+    else if (s.type === 'video') text += ' [视频]';
+    else if (s.type === 'file') text += ` [文件:${String(s.data.name ?? '').trim() || '未命名'}]`;
+    else if (s.type === 'face') text += `[表情:${s.data.id ?? ''}]`;
+    else if (s.type === 'forward') text += ' [聊天记录]';
+  }
+  return { text, isAtMe, isReplyToMe };
+}
+
 function normalizeRole(role: unknown): ChatEvent['senderRole'] {
   if (role === 'owner' || role === 'admin') return role;
   if (role === 'member') return 'member';
@@ -484,8 +678,13 @@ function localizeSegment(s: MsgSegment): MsgSegment {
   return s;
 }
 
-async function downloadToBuffer(url: string): Promise<Buffer> {
+/** 取回字节，超过 maxBytes 就放弃：QQ 视频动辄几十 MB，不能由着一条转发把磁盘吃掉 */
+async function downloadToBuffer(url: string, maxBytes = 16 * 1024 * 1024): Promise<Buffer> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`下载失败 HTTP ${resp.status}`);
-  return Buffer.from(await resp.arrayBuffer());
+  const declared = Number(resp.headers.get('content-length') ?? 0);
+  if (declared > maxBytes) throw new Error(`文件过大（${declared} > ${maxBytes} 字节），不下载`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  if (buf.length > maxBytes) throw new Error(`文件过大（${buf.length} > ${maxBytes} 字节），已丢弃`);
+  return buf;
 }

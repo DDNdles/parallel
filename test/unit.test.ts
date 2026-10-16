@@ -51,6 +51,26 @@ test('RateLimiter: 令牌桶限速', () => {
   assert.equal(rl.tryTake('other').ok, true);
 });
 
+test('RateLimiter: 按条计费 —— 一轮拆成几条就吃几个令牌', () => {
+  const rl = new RateLimiter(6);
+  // 拟人化一轮拆成 4 条 → 一次吃掉 4 个令牌（按轮计费的话这里只吃 1，红线形同虚设）
+  const first = rl.tryTake('g', 4);
+  assert.equal(first.ok, true);
+  assert.equal(first.granted, 4);
+  // 只剩 2 个令牌，这一轮要 3 条 → 部分放行而不是整批拒绝
+  const second = rl.tryTake('g', 3);
+  assert.equal(second.ok, false);
+  assert.equal(second.granted, 2);
+  // 放行掉的 2 个确实扣掉了，不白送
+  assert.equal(rl.tryTake('g', 3).granted, 0);
+});
+
+test('RateLimiter: 单批最多吃满一个桶（不欠账）', () => {
+  const rl = new RateLimiter(3);
+  assert.equal(rl.tryTake('g', 10).granted, 3);   // 桶只有 3 个，先给 3
+  assert.equal(rl.tryTake('g', 1).granted, 0);
+});
+
 test('SlidingWindowCounter: 60s 窗口计数', () => {
   const c = new SlidingWindowCounter();
   c.hit('k');

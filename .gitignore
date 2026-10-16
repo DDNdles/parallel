@@ -16,3 +16,6 @@ plugins-off/
 *.log
 
 .DS_Store
+
+# 发布产物
+dist/

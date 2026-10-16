@@ -5,9 +5,6 @@ import { busEvents } from '../bus.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { MemoryOp, UserFact, UserProfile } from '../types.ts';
 
-/** 每条消息都会刷新的派生值：不算"一次操作"，写进审计只会淹没真正的记录 */
-const QUIET_ATTRS = new Set(['affection', 'affection_daily', 'affection_last_ts', 'mood']);
-
 /**
  * 用户记忆服务：按 QQ 号记忆，SQLite + FTS5(trigram) 检索。
  * 预留 memoryBackend 切换位（mem0 等适配器实现同一接口即可替换）。
@@ -141,7 +138,7 @@ export class MemoryService {
     this.bus.emit(busEvents.memoryChanged, { userId, op: 'update_fact' });
   }
 
-  // ---- 结构化属性（好感度等） ----
+  // ---- 结构化属性 ----
 
   getAttr<T = unknown>(userId: string, key: string): T | undefined {
     const row = this.db.get<{ value: string }>('SELECT value FROM user_attrs WHERE user_id=? AND key=?', userId, key);
@@ -156,7 +153,7 @@ export class MemoryService {
        ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
       userId, key, JSON.stringify(value ?? null), nowMs(),
     );
-    if (!QUIET_ATTRS.has(key)) this.op(userId, `set_attr:${key}`, truncate(JSON.stringify(value), 100), 'kernel');
+    this.op(userId, `set_attr:${key}`, truncate(JSON.stringify(value), 100), 'kernel');
     this.bus.emit(busEvents.memoryChanged, { userId, op: `set_attr:${key}` });
   }
 

@@ -18,10 +18,19 @@ const WAV_MAX_BYTES = 20 * 1024 * 1024;
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
 let ffmpegBin: string | null | undefined;
+/** 内核自己下的那个 ffmpeg（data/bin/ffmpeg.exe）：由 kernel 在启动时登记 */
+let ffmpegCandidate = '';
 
-/** 找 ffmpeg：PARALLEL_FFMPEG 优先，其次 PATH。结果缓存，探测只跑一次 */
+/** 环境检查页代下载完 ffmpeg 后调用：清掉缓存，下一次转码就用新位置 */
+export function setFfmpegCandidate(path: string): void {
+  ffmpegCandidate = path;
+  ffmpegBin = undefined;
+}
+
+/** 找 ffmpeg：内核对下载的（PARALLEL_FFMPEG 覆盖它）→ PARALLEL_FFMPEG → PATH。结果缓存，探测只跑一次 */
 export function findFfmpeg(): string | null {
   if (ffmpegBin !== undefined) return ffmpegBin;
+  if (ffmpegCandidate && existsSync(ffmpegCandidate)) return (ffmpegBin = ffmpegCandidate);
   const env = (process.env.PARALLEL_FFMPEG ?? '').trim();
   if (env && existsSync(env)) return (ffmpegBin = env);
   const bin = env || 'ffmpeg';

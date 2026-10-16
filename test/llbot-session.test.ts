@@ -39,6 +39,12 @@ test('parseLlbotLine: 会话失效 / 登录成功 / 二维码用尽 / 无关行'
   assert.equal(parseLlbotLine('2026-09-15 22:18:42 [I] core [收-群] 某群(915382720) 某人(892792272)：看看个子可爱'), null);
 });
 
+test('parseLlbotLine: 有头模式下 QQ 自行退出（人为退出，不许再自动拉起）', () => {
+  assert.equal(parseLlbotLine('[I] PMHQ 服务运行中：按 Ctrl+C 退出，或等待 QQ 进程退出...'), null, '提示行只说「QQ 进程退出」，不是退出事件');
+  assert.equal(parseLlbotLine('[I] core QQ 进程已退出')?.type, 'qq-exited');
+  assert.equal(parseLlbotLine('[I] core 延迟 15 秒后退出...'), null);
+});
+
 test('parseLlbotLine: 扫码后被 QQ 拒绝登录（风控 state=168）', () => {
   const ev = parseLlbotLine('[E] qq-protocol Login failed: state=168 社交功能限制提醒 你的账号近期存在安全风险，部分功能使用受限，请登录最新手机QQ并根据提示恢复账号使用。');
   assert.equal(ev?.type, 'login-failed');
@@ -410,8 +416,49 @@ test('OneBot11Adapter: 账号守卫 —— 登录号与预期 bot 账号不符�
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('pmhqPreflightVerdict: 有头模式首次注入会让开——本机有别家 QQ 在跑且 bot 的 QQ 还没起来', () => {
-  // 本机没 QQ：可以安全拉起（PMHQ 会自己开一个）
+test('OneBot11Adapter: 已隐藏的会话在下载之前就收口（不产生事件，附件也不落盘）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'parallel-hidden-'));
+  try {
+    const bus = new Bus();
+    const errors = new ErrorCenter(bus, { dataDir: root });
+    const hidden: string[] = [];
+    const saved: string[] = [];
+    // chatHidden 照 ConfigStore 的实现写（键格式 type_chatId 就是这里要验的东西）
+    const config = {
+      config: {
+        ui: { expectedQq: '', chatPrefs: { '3095966025': { pinned: [], hidden } } },
+        onebot: { host: '127.0.0.1', port: 3001, reverseWsPath: '/onebot' },
+      },
+      chatHidden(this: { config: any }, selfId: string, type: string, chatId: string) {
+        return !!this.config.ui.chatPrefs[selfId]?.hidden?.includes(`${type}_${chatId}`);
+      },
+    };
+    const seen: unknown[] = [];
+    const sandbox = { saveInbox: (_c: unknown, name: string) => { saved.push(name); return 'inbox/' + name; } };
+    const adapter = new OneBot11Adapter(
+      config as never, errors, bus, sandbox as never, (e) => seen.push(e),
+      () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }),
+    );
+    const a = adapter as unknown as Record<string, any>;
+    a.selfId = '3095966025';
+    const msg = (text: string) => ({
+      post_type: 'message', message_type: 'group', group_id: 7101, user_id: 1,
+      message: [{ type: 'text', data: { text } }],
+    });
+
+    hidden.push('group_7101');
+    await a.handleMessageEvent(msg('隐藏了还说'));
+    await a.handleGroupUpload({ group_id: 7101, user_id: 1, file: { name: 'a.pdf' } });
+    assert.deepEqual(seen, [], '隐藏会话不该往内核送事件');
+    assert.deepEqual(saved, [], '隐藏会话不该落任何附件');
+
+    hidden.length = 0;
+    await a.handleMessageEvent(msg('解除隐藏'));
+    assert.equal(seen.length, 1, '解除隐藏后消息照常进内核');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pmhqPreflightVerdict: 有头模式首次注入会让开——本机有别家 QQ 在跑且 bot 的 QQ 还没起来', () => {  // 本机没 QQ：可以安全拉起（PMHQ 会自己开一个）
   assert.equal(pmhqPreflightVerdict({ total: 0, ours: 0 }, true), '');
   // bot 自己的 QQ 已在跑（同一个档案）：注入目标就是它，放行
   assert.equal(pmhqPreflightVerdict({ total: 3, ours: 3 }, true), '');

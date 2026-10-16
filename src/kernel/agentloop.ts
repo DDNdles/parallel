@@ -1,6 +1,21 @@
-import type {
-  ChatEvent, ChatMessage, LLMRequestContext, ToolCall, ToolContext, ToolDef, ChatRef, Role, ToolMeta,
-} from './types.ts';
+// ============================================================
+// Agent Loop —— 跑在 pi-agent-core 的 Agent 上
+//
+// 2026-09-28 起，循环本身（轮次、工具调度、terminate 早停、事件流）交给
+// `@earendil-works/pi-agent-core` 的 `Agent`；内核这一层只负责：
+//  - 把 parallel 的 ctx（system 分节 / 历史 / 工具面）翻译成 pi-agent-core 的形状；
+//  - 把它的 AgentEvent 映射回内核自己的 bus 事件与「工作」抽屉的 LoopEvent；
+//  - 模型请求走 `LlmService.chainStreamFn`（**不是**直连 pi-ai）——降级链是内核的价值面；
+//  - 轮次上限、收尾（work_finish 的 finalReply）、上下文压缩这些 parallel 自己的语义。
+//
+// 工具执行用 sequential：parallel 的工具共享沙箱/常驻容器状态（python_session 的变量、
+// 浏览器页面），并发跑会互相串味，与改造前"一次调一个"的行为保持一致。
+//
+// 对外契约不变：`run(ctx, opts)` 仍返回 `{reply, rounds, toolCalls, steps}`，
+// bus 事件与 LoopEvent 的种类、时点也保持原样——插件与桌面端不需要知道自己换了内核。
+// ============================================================
+
+import type { ChatMessage, LLMRequestContext, ToolContext, ToolDef, ChatRef, ToolMeta } from './types.ts';
 import { composeSystem } from './types.ts';
 import type { LlmService, ModelChainKind } from './services/llm.ts';
 import type { SessionLog } from './sessionlog.ts';
@@ -9,21 +24,35 @@ import { busEvents } from './bus.ts';
 import type { ConfigStore } from './config.ts';
 import type { ErrorCenter } from './errors.ts';
 import { truncate } from './util/misc.ts';
+import {
+  DEFAULT_COMPACTION_SETTINGS,
+  estimateContextTokens, estimateTokens, serializeConversation, shouldCompact,
+  type CompactionSettings,
+} from '@earendil-works/pi-agent-core';
+import { toPiMessages } from './services/pi-ai.ts';
 
-/**
- * Agent Loop（内核最小必需部分）：
- * system + few-shot + 历史 + 尾部强化 → LLM → 工具调用（≤ N 轮）→ 收敛输出。
- * 全程写 session log，工具调用对桌面端实时可见。
- */
-
-/** 结构化步骤事件：给桌面端侧栏画 harness 式 loop（工具调用/结果/思考/用量） */
+/** 结构化步骤事件：给桌面端侧栏画 harness 式 loop（工具调用/结果/思考/用量/压缩） */
 export type LoopEvent =
   | { kind: 'round'; n: number }
   | { kind: 'thinking'; round: number; text: string }
   | { kind: 'tool'; round: number; name: string; args: string }
   | { kind: 'toolResult'; round: number; name: string; text: string; meta?: ToolMeta }
   | { kind: 'usage'; round: number; prompt: number; completion: number; cacheHit: number; cacheMiss: number }
+  | { kind: 'compaction'; round: number; dropped: number; tokensBefore: number; summary: string }
+  | { kind: 'settle'; round: number; reason: 'terminate' | 'max_rounds' }
   | { kind: 'final'; text: string };
+
+/** 一次 run 里由事件与工具回调攒起来的东西（Agent 不给我们返回值，只能边跑边收） */
+interface RunCapture {
+  rounds: number;
+  toolCalls: number;
+  /** 最后一条 assistant 的正文（没有收尾工具时的最终回答） */
+  lastText: string;
+  /** 收尾工具（work_finish）给的最终回答，优先级最高 */
+  finalReply?: string;
+  /** 收尾工具是否表示"活干完了"（pi-agent-core 自己也会据此早停，这里只为 LoopEvent 记一笔） */
+  settled: boolean;
+}
 
 export class AgentLoop {
   constructor(
@@ -41,11 +70,8 @@ export class AgentLoop {
       abort?: AbortSignal;
       /** 工具轮次上限（work 档无上限，缺省用 chat 的 maxToolRounds） */
       maxRounds?: number;
-      /** 走哪条模型优先级链（缺省 chat）；providerId/model 显式指定时不走链 */
+      /** 走哪条模型优先级链（由 chainStreamFn 在链内部做降级） */
       chain?: ModelChainKind;
-      /** 指定供应商/模型（覆盖链） */
-      providerId?: string;
-      model?: string;
       /** 每步回调（work 进度推送：工具调用/结果摘要） */
       onStep?: (step: string) => void;
       /** 结构化事件（work 侧栏的 loop 视图：轮次/思考/工具/用量） */
@@ -54,138 +80,311 @@ export class AgentLoop {
   ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[] }> {
     const { chat } = ctx;
     const chatKey = opts.chatKey;
+    const chain: ModelChainKind = opts.chain ?? (ctx.workTurn ? 'work' : 'chat');
     const steps: string[] = [];
     const step = (s: string) => { steps.push(s); opts.onStep?.(s); };
     const event = (ev: LoopEvent) => { try { opts.onEvent?.(ev); } catch { /* 订阅方问题不影响主流程 */ } };
+
+    const { Agent } = await import('@earendil-works/pi-agent-core');
+    const pie = await import('./services/pi-ai.ts');
+    const pieMod = await pie.piAiModule();
+    if (!pieMod) {
+      throw new Error('未安装 @earendil-works/pi-ai：agent loop 跑在它的引擎上，请先 `npm i`');
+    }
+
+    // 轮次上限：opts.maxRounds 显式给出则生效；否则 work agent 定义里的 max_rounds（0/缺省 = 无上限），
+    // 再否则 chat 轮用配置值。work 的"无上限"是用户定稿的语义，这里保持。
+    const agentRounds = ctx.workTurn ? ctx.workAgent?.maxRounds : undefined;
+    const maxRounds = opts.maxRounds
+      ?? (ctx.workTurn ? (agentRounds && agentRounds > 0 ? agentRounds : Infinity) : this.config.config.llm.maxToolRounds);
+    const compaction = ctx.workTurn ? this.compactionSettings() : null;
+    const contextWindow = ctx.workTurn ? this.llm.contextWindow(chain) : undefined;
+    let lastSummary: string | undefined;
+    let compactions = 0;
+
+    const cap: RunCapture = { rounds: 0, toolCalls: 0, lastText: '', settled: false };
+
     this.bus.emit(busEvents.agentStart, { chatKey, userId: ctx.event.userId });
     this.sessionLog.append(chat.chatId, chat.type, { type: 'agent_start', role: 'system', text: 'agent loop 开始' });
 
-    const messages: ChatMessage[] = [
-      { role: 'system', content: composeSystem(ctx.system, ctx.systemSections) },
-      ...ctx.messages,
-    ];
-    const tools = ctx.tools.length
-      ? ctx.tools.map((t) => ({ type: 'function' as const, function: { name: t.name, description: t.description, parameters: t.parameters } }))
-      : undefined;
+    // ---- 工具面：parallel 的 ToolDef → pi-agent-core 的 AgentTool ----
+    const tools = ctx.tools.map((def) => this.toAgentTool(ctx, def, cap, pieMod));
 
-        // 轮次上限：opts.maxRounds 显式给出则生效；未给出时——chat 轮用配置值，work 轮（ctx.workTurn）无上限
-    const maxRounds = opts.maxRounds ?? (ctx.workTurn ? Infinity : this.config.config.llm.maxToolRounds);
-    let rounds = 0;
-    let toolCallCount = 0;
-    let reply = '';
+    // ---- 历史：ctx.messages 的最后一条就是本轮用户发言，交给 Agent 自己接着跑 ----
+    // 中途的 system（人格插件那几条设定）在这里摘出来接到 system 末尾，不占 user 轮（见 toPiMessages 的说明）
+    const seeded = toPiMessages(ctx.messages, { id: chainModelId(this.config, ctx), provider: '' }, '');
+    const history = seeded.messages;
+    const modelStub = await pie.piModelFor({
+      providerId: '', protocol: 'openai-compatible', baseUrl: '',
+      model: { id: chainModelId(this.config, ctx) },
+    });
+
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: composeSystem(ctx.system, ctx.systemSections, seeded.extraSystem),
+        model: modelStub as never,
+        tools: tools as never,
+        // 只播种历史；system 由 Agent 自己按 systemPrompt + tools 生成（否则会重复一条）
+        messages: history as never,
+      },
+      // 模型请求经内核的走链流函数：保住"一个模型挂了自动换下一个"
+      streamFn: this.llm.chainStreamFn(chain, { attachments: ctx.attachments, chatId: chat.chatId }) as never,
+      getApiKey: (pid: string) => this.config.getProviderKey(pid),
+      // 我们塞进去的都是标准消息，这里只挡掉未知角色（pi-agent-core 允许自定义类型）
+      convertToLlm: (msgs: any[]) => msgs.filter((m) => ['system', 'user', 'assistant', 'toolResult'].includes(m?.role)),
+      toolExecution: 'sequential',
+      // 上下文压缩：在每次要发请求之前换掉 context（pi-agent-core 给的边界）
+      prepareNextTurn: compaction
+        ? async () => {
+          // pi 的 token 账：estimateContextTokens 会优先采用最后一条 assistant 报的真实 usage，
+          // 再补上它之后的估算，所以不必自己维护 lastPromptTokens
+          const used = estimateContextTokens(agent.state.messages as never).tokens;
+          if (!contextWindow || !shouldCompact(used, contextWindow, compaction)) return undefined;
+          const done = await this.compactOnce({
+            messages: agent.state.messages as any[],
+            chat, summaryOf: lastSummary, reserveTokens: compaction.reserveTokens,
+            keepRecentTokens: compaction.keepRecentTokens, chain, signal: opts.abort, round: cap.rounds,
+          });
+          if (!done) return undefined;
+          lastSummary = done.summary;
+          compactions++;
+          event({ kind: 'compaction', round: cap.rounds, dropped: done.dropped, tokensBefore: done.tokensBefore, summary: truncate(done.summary, 600) });
+          return { context: { messages: done.messages as never, tools: tools as never }, model: agent.state.model };
+        }
+        : undefined,
+    });
+
+    const onAbort = () => agent.abort();
+    opts.abort?.addEventListener('abort', onAbort, { once: true });
+
+    const off = agent.subscribe((ev: any) => this.onAgentEvent(ev, ctx, cap, { chatKey, step, event }));
 
     try {
-      while (rounds < maxRounds) {
-        rounds++;
-        event({ kind: 'round', n: rounds });
-        const resp = await this.llm.chat(
-          { model: '', messages, tools, attachments: ctx.attachments, signal: opts.abort },
-          {
-            chatId: chat.chatId,
-            chain: opts.chain,
-            providerId: opts.providerId,
-            model: opts.model,
-            onDelta: (d) => {
-              if (d.text) {
-                this.bus.emit(busEvents.llmDelta, { chatKey, text: d.text });
-              }
-            },
-          },
-        );
+      // 历史最后一条就是本轮用户发言：用 continue 从当前 transcript 接着跑
+      await agent.continue();
+      await agent.waitForIdle();
+      agent.clearAllQueues();
 
-        if (resp.usage) {
-          event({
-            kind: 'usage', round: rounds,
-            prompt: resp.usage.promptTokens, completion: resp.usage.completionTokens,
-            cacheHit: resp.usage.cacheHitTokens ?? 0, cacheMiss: resp.usage.cacheMissTokens ?? 0,
-          });
-        }
-        // 本轮模型正文（有工具调用时就是"思考"，没有就是最终回答）
-        if (resp.content.trim()) event({ kind: 'thinking', round: rounds, text: resp.content.trim() });
-
-        if (resp.toolCalls.length === 0) {
-          reply = resp.content.trim();
-          break;
-        }
-
-        // 工具调用轮
-        messages.push({ role: 'assistant', content: resp.content, tool_calls: resp.toolCalls });
-        for (const tc of resp.toolCalls) {
-          toolCallCount++;
-          step(`▶ ${tc.function.name} ${truncate(tc.function.arguments ?? '', 160)}`);
-          event({ kind: 'tool', round: rounds, name: tc.function.name, args: truncate(tc.function.arguments ?? '', 400) });
-          const { text: result, meta } = await this.execTool(ctx, tc);
-          step(`◀ ${tc.function.name}: ${truncate(result.replace(/\s+/g, ' '), 200)}`);
-          event({ kind: 'toolResult', round: rounds, name: tc.function.name, text: truncate(result, 1200), meta });
-          messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.function.name, content: result });
-        }
-        // 无上限模式（Infinity）自然跳过收尾提示
-        if (Number.isFinite(maxRounds) && rounds >= maxRounds - 1) {
-          messages.push({ role: 'user', content: '（工具调用轮次已达上限，请直接给出最终回答）' });
-        }
+      let reply = (cap.finalReply ?? cap.lastText ?? '').trim();
+      if (ctx.workTurn && cap.settled) event({ kind: 'settle', round: cap.rounds, reason: 'terminate' });
+      if (ctx.workTurn && Number.isFinite(maxRounds) && cap.rounds >= maxRounds) {
+        event({ kind: 'settle', round: cap.rounds, reason: 'max_rounds' });
       }
-
-      if (!reply) reply = '（这次没能好好组织回答，请再问我一次吧）';
+      // 空输出不再编一句"没答好"的托词：模型没接、额度耗尽、链全挂时群里必须一个字都没有。
+      // 沉默由 pipeline 落 gate 条目，错误细节走报错中心；work 链靠 WorkRunner 把空回复判成失败。
       reply = reply.slice(0, 3500);
       event({ kind: 'final', text: reply });
 
-      this.sessionLog.append(chat.chatId, chat.type, { type: 'agent_end', role: 'system', text: `agent loop 结束（${rounds} 轮 / ${toolCallCount} 次工具调用）` });
-      this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds });
-      return { reply, rounds, toolCalls: toolCallCount, steps };
+      this.sessionLog.append(chat.chatId, chat.type, {
+        type: 'agent_end', role: 'system',
+        text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
+      });
+      this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds: cap.rounds });
+      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps };
     } catch (e) {
       const err = e as Error;
       this.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });
       throw e;
+    } finally {
+      off();
+      opts.abort?.removeEventListener('abort', onAbort);
     }
   }
 
-  private async execTool(ctx: LLMRequestContext, call: ToolCall): Promise<{ text: string; meta?: ToolMeta }> {
-    const def = ctx.tools.find((t) => t.name === call.function.name);
-    const chat = ctx.chat;
-    let args: Record<string, unknown> = {};
-    try {
-      args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
-    } catch {
-      args = {};
-    }
-    this.bus.emit(busEvents.toolCall, {
-      chatKey: `${chat.type}_${chat.chatId}`, name: call.function.name, args, id: call.id, ts: Date.now(),
-    });
-    this.sessionLog.append(chat.chatId, chat.type, {
-      type: 'tool_call', role: 'tool', text: call.function.name,
-      data: { args: truncate(JSON.stringify(args), 600), callId: call.id },
-    });
-
-    let resultText: string;
-    let meta: ToolMeta | undefined;
-    if (!def) {
-      resultText = `错误：工具 ${call.function.name} 不存在或在本会话不可用`;
-    } else {
-      const tctx: ToolContext = { event: ctx.event, chat, role: ctx.event.role ?? 'member' };
-      try {
-        const r = await def.handler(args, tctx);
-        resultText = typeof r === 'string' ? r : r.content;
-        meta = typeof r === 'string' ? undefined : r.meta;
-      } catch (e) {
-        const err = e as Error;
-        // 权限/边界拒绝也返回给模型（诚实告知），同时留痕
-        resultText = `错误：${err.message}`;
-        if (!(err.name === 'PermissionDeniedError') && !err.message.includes('路径越界')) {
-          this.errors.record('warn', 'plugin', `工具 ${call.function.name} 执行失败: ${err.message}`, { chatId: chat.chatId });
+  /** parallel 的工具定义 → pi-agent-core 的 AgentTool（参数用 Type.Unsafe 包一层 JSON Schema） */
+  private toAgentTool(ctx: LLMRequestContext, def: ToolDef, cap: RunCapture, pie: any): unknown {
+    return {
+      name: def.name,
+      label: def.name,
+      description: def.description,
+      // pi-ai 的工具参数是 TypeBox schema；parallel 存的就是 JSON Schema，原样包一层即可
+      parameters: pie.Type.Unsafe(def.parameters),
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const tctx: ToolContext = {
+          event: ctx.event, chat: ctx.chat, role: ctx.event.role ?? 'member',
+          work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
+        };
+        try {
+          const r = await def.handler(params ?? {}, tctx);
+          const text = typeof r === 'string' ? r : r.content;
+          const meta = typeof r === 'string' ? undefined : r.meta;
+          const terminate = typeof r === 'string' ? undefined : r.terminate;
+          const finalReply = typeof r === 'string' ? undefined : r.finalReply;
+          // 收尾工具的交付内容优先当最终回答（模型不必再复述一遍，也就不会走样）
+          if (finalReply?.trim()) { cap.finalReply = finalReply.trim(); cap.settled = true; }
+          else if (terminate) cap.settled = true;
+          return { content: [{ type: 'text', text: truncate(text, 4000) }], details: meta, terminate };
+        } catch (e) {
+          const err = e as Error;
+          // 权限/边界拒绝也返回给模型（诚实告知），同时留痕
+          if (!(err.name === 'PermissionDeniedError') && !err.message.includes('路径越界')) {
+            this.errors.record('warn', 'plugin', `工具 ${def.name} 执行失败: ${err.message}`, { chatId: ctx.chat.chatId });
+          }
+          return { content: [{ type: 'text', text: `错误：${err.message}` }], details: undefined };
         }
-      }
-    }
-
-    resultText = truncate(resultText, 4000);
-    this.bus.emit(busEvents.toolResult, {
-      chatKey: `${chat.type}_${chat.chatId}`, name: call.function.name, result: resultText, id: call.id, ts: Date.now(), meta,
-    });
-    this.sessionLog.append(chat.chatId, chat.type, {
-      type: 'tool_result', role: 'tool', text: call.function.name,
-      data: { result: truncate(resultText, 1200), callId: call.id, meta },
-    });
-    return { text: resultText, meta };
+      },
+    };
   }
+
+  /** pi-agent-core 的 AgentEvent → 内核的 bus 事件 / LoopEvent / 步骤文案 / 会话日志 */
+  private onAgentEvent(
+    ev: any,
+    ctx: LLMRequestContext,
+    cap: RunCapture,
+    h: { chatKey: string; step: (s: string) => void; event: (e: LoopEvent) => void },
+  ): void {
+    const { chat } = ctx;
+    switch (ev?.type) {
+      case 'turn_start':
+        cap.rounds++;
+        h.event({ kind: 'round', n: cap.rounds });
+        break;
+
+      case 'message_update': {
+        const a = ev.assistantMessageEvent;
+        if (a?.type === 'text_delta' && a.delta) this.bus.emit(busEvents.llmDelta, { chatKey: h.chatKey, text: a.delta });
+        break;
+      }
+
+      case 'message_end': {
+        const m = ev.message;
+        if (m?.role !== 'assistant') break;
+        const text = textOf(m);
+        // 本轮模型正文：有工具调用时就是"思考"，没有就是最终回答（与改造前一致）
+        if (text.trim()) h.event({ kind: 'thinking', round: cap.rounds, text: text.trim() });
+        if (m.usage) {
+          h.event({
+            kind: 'usage', round: cap.rounds,
+            prompt: Number(m.usage.input ?? 0) + Number(m.usage.cacheRead ?? 0),
+            completion: Number(m.usage.output ?? 0),
+            cacheHit: Number(m.usage.cacheRead ?? 0), cacheMiss: Number(m.usage.input ?? 0),
+          });
+        }
+        cap.lastText = text || cap.lastText;
+        break;
+      }
+
+      case 'tool_execution_start': {
+        cap.toolCalls++;
+        const args = safeJson(ev.args);
+        h.step(`▶ ${ev.toolName} ${truncate(args, 160)}`);
+        h.event({ kind: 'tool', round: cap.rounds, name: ev.toolName, args: truncate(args, 400) });
+        this.bus.emit(busEvents.toolCall, { chatKey: h.chatKey, name: ev.toolName, args: ev.args ?? {}, id: ev.toolCallId, ts: Date.now() });
+        this.sessionLog.append(chat.chatId, chat.type, {
+          type: 'tool_call', role: 'tool', text: ev.toolName,
+          data: { args: truncate(args, 600), callId: ev.toolCallId },
+        });
+        break;
+      }
+
+      case 'tool_execution_end': {
+        const text = contentText(ev.result?.content);
+        h.step(`◀ ${ev.toolName}: ${truncate(text.replace(/\s+/g, ' '), 200)}`);
+        h.event({ kind: 'toolResult', round: cap.rounds, name: ev.toolName, text: truncate(text, 1200), meta: ev.result?.details });
+        this.bus.emit(busEvents.toolResult, {
+          chatKey: h.chatKey, name: ev.toolName, result: truncate(text, 4000),
+          id: ev.toolCallId, ts: Date.now(), meta: ev.result?.details,
+        });
+        this.sessionLog.append(chat.chatId, chat.type, {
+          type: 'tool_result', role: 'tool', text: ev.toolName,
+          data: { result: truncate(text, 1200), callId: ev.toolCallId, meta: ev.result?.details },
+        });
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  /** work 轮的压缩设置（config.work.compaction；缺省用 pi-agent-core 的 DEFAULT_COMPACTION_SETTINGS） */
+  private compactionSettings(): CompactionSettings {
+    const c = (this.config.config as unknown as { work?: { compaction?: Partial<CompactionSettings> } }).work?.compaction ?? {};
+    return {
+      enabled: c.enabled ?? DEFAULT_COMPACTION_SETTINGS.enabled,
+      reserveTokens: c.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+      keepRecentTokens: c.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+    };
+  }
+
+  /**
+   * 压一次：把待摘要前缀交给工作链的模型生成结构化摘要，返回「摘要 + 保留段」的新消息表。
+   * 失败时返回 null（宁可上下文偏大，也不能把历史弄丢）。
+   */
+  private async compactOnce(opts: {
+    messages: any[];
+    chat: ChatRef;
+    summaryOf?: string;
+    reserveTokens: number;
+    keepRecentTokens: number;
+    chain?: ModelChainKind;
+    signal?: AbortSignal;
+    round: number;
+  }): Promise<{ summary: string; dropped: number; tokensBefore: number; messages: any[] } | null> {
+    const plan = planCut(opts.messages, opts.keepRecentTokens);
+    // 整段都要被丢掉（没有可保留的尾巴）时不压：压了等于把当前对话整个换成摘要，得不偿失
+    if (!plan.dropped.length || plan.cutIndex >= opts.messages.length) return null;
+    // 原文已经是 pi 消息了，直接交给 pi 的序列化器（它负责把工具结果截到 2000 字等细节）
+    const serialized = serializeConversation(plan.dropped as never);
+    if (!serialized.trim()) return null;
+    try {
+      const resp = await this.llm.chat(
+        {
+          model: '',
+          messages: [
+            { role: 'system', content: SUMMARY_SYSTEM_ZH },
+            { role: 'user', content: buildSummaryPrompt(serialized, opts.summaryOf) },
+          ],
+          stream: false,
+          signal: opts.signal,
+        },
+        { chatId: opts.chat.chatId, chain: opts.chain },
+      );
+      const summary = trimSummary(resp.content ?? '', opts.reserveTokens);
+      if (!summary.trim()) return null;
+      // 落一条 compaction 条目：它标记"这一刻之前的历史由这段摘要代替"。
+      // firstKeptEntryId 给 null = 只保留摘要；字段留着是为了将来做更细的切分（pi 的语义）。
+      try {
+        this.sessionLog.appendCompaction(opts.chat.chatId, opts.chat.type, {
+          summary, firstKeptEntryId: null, tokensBefore: plan.droppedTokens,
+        });
+      } catch { /* 落盘失败不影响本次请求 */ }
+      return {
+        summary,
+        dropped: plan.dropped.length,
+        tokensBefore: plan.droppedTokens,
+        messages: [summaryPiMessage(summary), ...opts.messages.slice(plan.cutIndex)],
+      };
+    } catch (e) {
+      this.errors.record('warn', 'kernel', `上下文压缩失败（跳过本次压缩）: ${(e as Error).message}`, { chatId: opts.chat.chatId });
+      return null;
+    }
+  }
+}
+
+/** 链上当前生效的模型名（只给 pi-ai 的 Model 元数据用，真正发请求由 chainStreamFn 决定） */
+function chainModelId(config: ConfigStore, ctx: LLMRequestContext): string {
+  const llm = (config.config as unknown as { llm: { workChain?: { model: string }[]; chatChain?: { model: string }[] } }).llm;
+  const list = ctx.workTurn ? (llm.workChain ?? []) : (llm.chatChain ?? []);
+  return list[0]?.model ?? 'unknown';
+}
+
+/** 从 pi-ai 的 content 块里取正文（跳过思考块与工具调用块） */
+function textOf(message: any): string {
+  const blocks = message?.content;
+  if (typeof blocks === 'string') return blocks;
+  if (!Array.isArray(blocks)) return '';
+  return blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text ?? '')).join('');
+}
+
+function contentText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text ?? '')).join('');
+}
+
+function safeJson(v: unknown): string {
+  try { return JSON.stringify(v ?? {}); } catch { return '{}'; }
 }
 
 /**
@@ -203,6 +402,11 @@ export class HistoryStore {
 
   key(chat: ChatRef): string {
     return `${chat.type}_${chat.chatId}`;
+  }
+
+  /** 运行时改环形上限（config API 保存后立即生效；已缓存的历史不回溯重建，只影响此后的裁剪与增长） */
+  setLimit(n: number): void {
+    this.limit = Math.max(1, Math.round(n));
   }
 
   get(chat: ChatRef): ChatMessage[] {
@@ -238,19 +442,113 @@ export class HistoryStore {
     while (h.length && h[0].role === 'assistant') h.shift();
   }
 
-  /** 从 session log 重建最近对话（message_in / message_out） */
+  /**
+   * 从 session log 重建最近对话。
+   * 走 `project()`（活动分支 + 最近的 compaction 边界），所以**重启后不会把压缩过的历史又变回全文**：
+   * 摘要接在最前，其后只跟压缩之后记录的消息。
+   */
   private rebuild(chat: ChatRef): ChatMessage[] {
-    const entries = this.sessionLog.tail(chat.chatId, chat.type, this.limit * 2);
-    const out: ChatMessage[] = [];
-    for (const e of entries) {
-      if (e.type === 'message_in' && e.role === 'user' && e.text) {
-        out.push({ role: 'user', content: e.text });
-      } else if (e.type === 'message_out' && e.role === 'assistant' && e.text) {
-        out.push({ role: 'assistant', content: e.text });
-      }
-    }
+    const { messages, summary } = this.sessionLog.project(chat.chatId, chat.type, this.limit * 2);
+    const out: ChatMessage[] = messages.map((m) => ({ role: m.role, content: m.content }));
+    if (summary) out.unshift(summaryMessage(summary));
     while (out.length > this.limit) out.shift();
     while (out.length && out[0].role === 'assistant') out.shift();
     return out;
   }
+}
+
+
+// =====================================================================
+// 压缩的"胶水"（算法/阈值/序列化用 pi-agent-core 的，这里只留三件它管不到的事）
+//
+//  ① 切点：pi 的 `findCutPoint` 是面向它自己的会话条目的，我们手上是消息数组，
+//     所以在数组下标上做等价的事——从后往前攒够 keepRecent，**切点避开 toolResult**
+//     （工具结果必须跟着自己的 tool_call 一起走，否则线格式会收到孤儿消息）。
+//  ② 摘要提示词与中文口径：pi 的 `SUMMARIZATION_SYSTEM_PROMPT` 没有从包入口导出、
+//     深路径也不在它的 exports map 里，所以这段我们自己写，但照搬它"不要继续对话、
+//     只输出结构化摘要"的两条硬要求，字段结构也与它一致。
+//  ③ 摘要回填的形状：并行侧的历史是 ChatMessage（字符串 content），
+//     pi-agent-core 的上下文是块数组消息——两者都要，别混用（混过一次：ch.codePointAt is not a function）。
+// =====================================================================
+
+/** 摘要的系统提示词（见上面 ②） */
+const SUMMARY_SYSTEM_ZH = [
+  '你是一个上下文压缩助手。读下面的对话（用户与 AI 助手之间），产出一段结构化摘要。',
+  '不要继续这段对话，不要回答里面的任何问题，只输出摘要本身。',
+  '',
+  '用中文、Markdown，严格按这个结构输出（没有内容的小节写"（无）"）：',
+  '',
+  '## 目标',
+  '用户要达成什么。',
+  '',
+  '## 约束与偏好',
+  '- 用户明确提出过的要求',
+  '',
+  '## 进展',
+  '### 已完成',
+  '### 进行中',
+  '### 受阻',
+  '',
+  '## 关键决定',
+  '- **决定**：理由',
+  '',
+  '## 下一步',
+  '',
+  '## 关键上下文',
+  '- 继续任务必须知道的数据、路径、结论、报错原文',
+  '',
+  '要求：保留具体的事实与数值（路径、命令、变量名、错误信息），不要写"做了一些分析"这种没有信息量的句子；',
+  '不要复述工具调用的过程，只留结果；不要编造对话里没有的内容。',
+].join('\n');
+
+/** 摘要回填时的包装（与 pi 的 COMPACTION_SUMMARY_PREFIX 同义，这里用中文） */
+const SUMMARY_PREFIX = '【历史压缩】到此为止之前的对话已被压缩成下面这段摘要：\n\n<summary>\n';
+const SUMMARY_SUFFIX = '\n</summary>';
+
+/** 摘要内容超出预算时的硬上限（字符），防一段摘要又把窗口顶爆 */
+const SUMMARY_MAX_CHARS = 8000;
+
+/**
+ * 切点（见上面 ①）：pi 消息原生——用 pi 的 `estimateTokens` 估算，
+ * 并避开 `toolResult`（pi 的角色名）。
+ */
+export function planCut(messages: any[], keepRecentTokens: number): { cutIndex: number; dropped: any[]; droppedTokens: number } {
+  let acc = 0;
+  let cut = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    acc += estimateTokens(messages[i]) + 4;
+    if (acc >= keepRecentTokens) { cut = i; break; }
+  }
+  // 切点不能落在工具结果上：向后滑到发起这次调用的那条 assistant，
+  // 让"调用 + 结果"整体落在保留段里（向前滑会滑过末尾，等于什么都没压）。
+  while (cut > 0 && messages[cut]?.role === 'toolResult') cut--;
+  const dropped = messages.slice(0, cut);
+  return { cutIndex: cut, dropped, droppedTokens: dropped.reduce((n, m) => n + estimateTokens(m) + 4, 0) };
+}
+
+/** 拼摘要请求的用户消息：上一版摘要作为迭代上下文带上（pi 的 previousSummary 语义） */
+function buildSummaryPrompt(serialized: string, previousSummary?: string): string {
+  const parts: string[] = [];
+  if (previousSummary) {
+    parts.push('这是更早一次压缩产出的摘要（本次压缩的区间从它之后开始），请把它一并纳入新的摘要：', '', previousSummary, '', '---', '');
+  }
+  parts.push('需要压缩的对话：', '', serialized);
+  return parts.join('\n');
+}
+
+/** 摘要太长时按预留预算截断 */
+function trimSummary(summary: string, reserveTokens: number): string {
+  const budget = Math.max(1200, Math.min(SUMMARY_MAX_CHARS, reserveTokens * 2));
+  const t = summary.trim();
+  return t.length > budget ? `${t.slice(0, budget)}…（摘要过长已截断）` : t;
+}
+
+/** 摘要回填成并行侧的历史消息（HistoryStore 重建时用；之后会被转成 pi 消息） */
+function summaryMessage(summary: string): ChatMessage {
+  return { role: 'user', content: `${SUMMARY_PREFIX}${summary}${SUMMARY_SUFFIX}` };
+}
+
+/** 同上，但回填进 pi-agent-core 的上下文（content 是块数组） */
+function summaryPiMessage(summary: string): unknown {
+  return { role: 'user', content: [{ type: 'text', text: `${SUMMARY_PREFIX}${summary}${SUMMARY_SUFFIX}` }], timestamp: Date.now() };
 }

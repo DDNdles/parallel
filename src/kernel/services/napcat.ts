@@ -2,11 +2,12 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { ConfigStore } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { EndCheck, LoginQrcode, Logger, ProtocolEnd } from '../types.ts';
+import { findQqInstallPath } from './deps.ts';
 
 /**
  * NapCat（NapCatQQ）内嵌托管：下载 Shell 发行包 → 预写 WebUI 与 ob11 网络配置 →
@@ -56,13 +57,6 @@ export function mergeNapcatNetworkConfig(existing: unknown, client: ReturnType<t
   const prev = list.find((c) => c?.name === client.name);
   const rest = list.filter((c) => c?.name !== client.name);
   return { ...base, network: { ...net, websocketClients: [...rest, { ...prev, ...client }] } };
-}
-
-/** 注册表 HKLM\...\Uninstall\QQ 的 UninstallString（带引号的卸载器路径）→ 同目录下的 QQ.exe */
-export function qqPathFromUninstallString(s: string): string {
-  const m = /"([^"]+)"|(\S+)/.exec(s.trim());
-  const exe = m?.[1] ?? m?.[2] ?? '';
-  return exe ? join(dirname(exe), 'QQ.exe') : '';
 }
 
 /** 注入模式没有可代理的出码接口：登录发生在 QQ 窗口里，所以 fetchQrcode 恒为 null */
@@ -282,23 +276,9 @@ export class NapCatManager implements ProtocolEnd {
     }
   }
 
-  /** QQ 路径：配置优先，其次照官方启动脚本读注册表，最后试几个默认安装位 */
+  /** QQ 路径：配置优先，其次照官方启动脚本读注册表，最后试几个默认安装位（与有头模式同一套探测） */
   private async resolveQQPath(): Promise<string> {
-    const cfgPath = String(this.cfg.qqPath || '').trim();
-    if (cfgPath) return existsSync(cfgPath) ? cfgPath : '';
-    const fromRegistry = await new Promise<string>((resolveP) => {
-      execFile('reg', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', '/v', 'UninstallString'],
-        { timeout: 8000, windowsHide: true }, (e, stdout) => {
-          if (e) return resolveP('');
-          const line = String(stdout).split('\n').find((l) => /REG_SZ/.test(l));
-          resolveP(qqPathFromUninstallString((line ?? '').replace(/.*REG_SZ\s*/, '').trim()));
-        });
-    });
-    if (fromRegistry && existsSync(fromRegistry)) return fromRegistry;
-    for (const p of ['C:\\Program Files\\Tencent\\QQNT\\QQ.exe', 'C:\\Program Files (x86)\\Tencent\\QQNT\\QQ.exe', 'D:\\QQ\\QQ.exe']) {
-      if (existsSync(p)) return p;
-    }
-    return '';
+    return findQqInstallPath(String(this.cfg.qqPath || '').trim());
   }
 
   /** 下载发行包（约 117MB，自带 Node 运行时）并解压到 home */

@@ -38,6 +38,25 @@ const QR_SCAN_QUIET_MS = 3 * 60_000;
 const QR_ART_RE = /^[\s\u2500-\u257F\u2580-\u259F]+$/;
 
 /**
+ * LLBot 的使用授权页：签名服务（SignProxy）要一个 Auth Token，不是下载了就能登录 QQ。
+ * 申请要在页面上说明用途，或进官方 QQ 群过审核 —— 所以「初始化」这一步只能把人送到门口，
+ * 拿码那一下内核替不了（要人工填理由 + 等审核）。cf 接入点与国内镜像两个域名都给它。
+ */
+const LLBOT_AUTH_PAGE = 'https://auth.luckylillia.com';
+const LLBOT_AUTH_PAGE_CN = 'https://llbot.wumiao.wang';
+const LLBOT_QQ_GROUP = '545402644';
+const LLBOT_QQ_GROUP_LINK = 'https://qm.qq.com/q/NsbdKiQ3eg';
+
+/** 授权状态：本地文件那一半 + LLBot 控制台报的那一半（后者拿不到时 reachable=false） */
+export interface LLBotAuthState {
+  pageUrl: string; mirrorUrl: string; qqGroup: string; groupLink: string;
+  tokenFile: string; hasToken: boolean;
+  reachable: boolean; applicable: boolean; online: boolean;
+  /** '' | idle | validating | valid | invalid | error（LLBot 自己的词表，原样透传） */
+  validation: string; message: string; loginError: string;
+}
+
+/**
  * LLBot（LuckyLilliaBot）内嵌托管：自动下载 CLI 发行包 → 预写配置与 Auth Token →
  * 拉起 llbot.exe → 崩溃守护 → 经其 WebUI 代理登录二维码/登录状态。
  *
@@ -87,6 +106,14 @@ export class LLBotManager implements ProtocolEnd {
   private sawOnlineThisRun = false;
   /** 本轮掉线是否已自愈过（一波掉线只重启一次） */
   private recoveredThisEpisode = false;
+  /**
+   * 本轮掉线判为「人在 QQ 那边退出登录」（有头模式 + 没有踢线通知）。
+   * 此时自愈 = PMHQ 带着 quick_login 又把号登回去，等于把用户的退出抹掉，登录门就永远关不住；
+   * 所以停在离线，等桌面端登录门那颗「打开 QQNT」由人点。
+   */
+  private logoutByUser = false;
+  /** 本轮 LLBot 里 PMHQ 是否报过「QQ 进程已退出」（= QQ 那边人为退的，不是崩溃） */
+  private qqExited = false;
   /** LLBot 是否已耗尽自动刷新（10 张码），此后没人扫就停在死码上 */
   private qrExhausted = false;
   log: Logger;
@@ -135,6 +162,8 @@ export class LLBotManager implements ProtocolEnd {
       online: this.online,
       uin: this.onlineUin,
       lastDrop: this.lastDrop,
+      /** 判为在 QQ 客户端里退出了登录：已停止自动重登，等桌面端点「打开 QQNT」 */
+      loggedOutByUser: this.logoutByUser || undefined,
       kickCode: id.lastKick?.code,
       kickDesc: id.lastKick?.desc,
       kicksInWindow: id.kicksInWindow,
@@ -308,6 +337,76 @@ export class LLBotManager implements ProtocolEnd {
       return;
     }
     writeFileSync(join(this.llbotDataDir(), 'auth_token.txt'), token, 'utf-8');
+  }
+
+  /** 授权页与群：LLBot 的签名 Auth Token 不是自助下载就有的，要先向作者申请（填用途，或进官方群过审） */
+  authPage(): { pageUrl: string; mirrorUrl: string; qqGroup: string; groupLink: string } {
+    return {
+      pageUrl: LLBOT_AUTH_PAGE,
+      mirrorUrl: LLBOT_AUTH_PAGE_CN,
+      qqGroup: LLBOT_QQ_GROUP,
+      groupLink: LLBOT_QQ_GROUP_LINK,
+    };
+  }
+
+  /**
+   * 授权状态：本地 token 文件 + LLBot 控制台报的校验态（它自己每 1s 轮询那个文件，写完不用重启）。
+   * 控制台连不上时只回本地那半截并标 `reachable:false` —— 连不上不等于没授权，别说反。
+   *
+   * **前端刻意不接（2026-10-11 决定）**：LLBot 在有头（PMHQ）模式下自报 `applicable:false` ——
+   * 本机真 QQ 自己签名，压根不需要这个 token，而项目已全面放弃无头模式。接口与测试留着，
+   * 万一要回到无头直连，`GET|POST /api/setup/auth` 这套原样能用，别再从零摸一遍。
+   */
+  async authState(): Promise<LLBotAuthState> {
+    const base = this.authPage();
+    const file = join(this.llbotDataDir(), 'auth_token.txt');
+    const out: LLBotAuthState = {
+      ...base,
+      tokenFile: file,
+      hasToken: existsSync(file) || !!(this.config.secrets.llbotAuthToken || '').trim(),
+      reachable: false,
+      applicable: true,
+      online: false,
+      validation: '',
+      message: '',
+      loginError: '',
+    };
+    try {
+      const resp = await fetch(`${this.webuiUrl()}/api/auth-token/status`, {
+        headers: this.webuiAuthHeader(), signal: AbortSignal.timeout(4000),
+      });
+      const j = (await resp.json().catch(() => null)) as { data?: Record<string, unknown> } | null;
+      const d = j?.data;
+      if (!resp.ok || !d) return out;
+      out.reachable = true;
+      out.applicable = d.applicable !== false;
+      out.online = !!d.online;
+      out.hasToken = !!d.hasToken || out.hasToken;
+      out.validation = String(d.validation ?? '');
+      out.message = String(d.message ?? '');
+      out.loginError = String(d.loginError ?? '');
+      if (typeof d.authTokenPageUrl === 'string' && d.authTokenPageUrl) out.pageUrl = d.authTokenPageUrl;
+    } catch { /* 控制台没起来（协议端没跑 / 端口没定）：只报本地状态 */ }
+    return out;
+  }
+
+  /**
+   * 存授权 token：落 secrets.json 与 auth_token.txt，LLBot 下一次轮询就重新校验并登录。
+   * 传空串 = 撤销：把文件删掉，否则它会一直拿旧 token 跑。
+   */
+  setAuthToken(token: string): void {
+    const t = (token ?? '').trim();
+    this.config.secrets.llbotAuthToken = t;
+    this.config.saveSecrets();
+    // 目录可能还没建（协议端从没启动过就贴 token 是常见路径）：先补上，别让写入抛 ENOENT
+    if (t) {
+      mkdirSync(this.llbotDataDir(), { recursive: true });
+      writeFileSync(join(this.llbotDataDir(), 'auth_token.txt'), t, 'utf-8');
+    } else {
+      rmSync(join(this.llbotDataDir(), 'auth_token.txt'), { force: true });
+    }
+    // 日志里绝不出现 token 内容，只说长度：这东西能签名登录 QQ
+    this.log.info(t ? `已写入 LLBot Auth Token（${t.length} 字符），等它自行校验` : '已清除 LLBot Auth Token');
   }
 
   /** WebUI 密码（明文存 data/webui_token.txt，LLBot 自管）；缺失时生成。内核调其 API 用 sha256 值鉴权 */
@@ -514,6 +613,7 @@ export class LLBotManager implements ProtocolEnd {
     }
     this.webuiPortActual = 0;
     this.qqMissing = false;
+    this.qqExited = false;
     this.child = spawn(this.exePath(), args, { cwd: home, stdio: ['ignore', 'pipe', 'pipe'] });
     this.startLoginWatch();
     this.startOnlineWatch();
@@ -527,6 +627,17 @@ export class LLBotManager implements ProtocolEnd {
       if (this.qqMissing) {
         this.log.warn(this.lastError);
         this.errors.record('error', 'adapter', this.lastError, { notifyOwner: true });
+        return;
+      }
+      // QQ 是自己退的（在 QQ 窗口里点了退出登录 / 关了 QQ）：这不是崩溃，自动重启 = PMHQ 又把 QQ 拉起来，
+      // 用户的退出就被抹掉了。停在这里，等桌面端登录门那颗「打开 QQNT」。
+      if (this.qqExited && this.mode() === 'pmhq') {
+        this.logoutByUser = true;
+        this.online = false;
+        this.onlineUin = '';
+        this.lastDrop = { desc: '在 QQ 里退出了登录', at: Date.now() };
+        this.log.info('QQ 进程自行退出：不再自动拉起（要恢复请在桌面端点「打开 QQNT」）');
+        this.errors.record('warn', 'adapter', 'QQ 已退出登录：parallel 不会自动把它拉起来，需要时在桌面端点「打开 QQNT」');
         return;
       }
       this.exitCount++;
@@ -550,6 +661,8 @@ export class LLBotManager implements ProtocolEnd {
     if (this.watchTimer) { clearInterval(this.watchTimer); this.watchTimer = undefined; }
     this.online = false;
     this.onlineUin = '';
+    // 显式停一次（登录门那颗「打开 QQNT」/ 切协议端 / 内核退出）= 有人接手了，解除「等人重登」的闸门
+    this.logoutByUser = false;
     const c = this.child;
     if (!c) return;
     await new Promise<void>((resolveP) => {
@@ -586,9 +699,10 @@ export class LLBotManager implements ProtocolEnd {
     for (const raw of t.split('\n')) {
       const line = raw.trim();
       if (!line) continue;
-      this.handleLlbotLine(line);
       // 终端二维码行（含着色的块字符）不落日志
       const printable = line.replace(/\u001b?\[[0-9;]*m/g, '').trim();
+      // 登录态事件按去色后的文本判：ANSI 码可能夹在关键字中间
+      if (printable) this.handleLlbotLine(printable);
       if (!printable || QR_ART_RE.test(printable)) continue;
       const text = `[llbot] ${printable.slice(0, 200)}`;
       if (stream === 'stderr') this.log.warn(text);
@@ -643,6 +757,11 @@ export class LLBotManager implements ProtocolEnd {
       this.errors.record('warn', 'adapter', this.lastError);
       return;
     }
+    if (ev.type === 'qq-exited') {
+      // 有头模式的人为退出信号：LLBot 随后会以 code=0 退出，exit 分支据此不再自动拉起 QQ
+      this.qqExited = true;
+      return;
+    }
     if (ev.type === 'qr-exhausted') {
       this.qrExhausted = true;
       this.log.warn('LLBot 已停止自动刷新二维码（等登录页刷新，或看门狗在无人扫码时重启）');
@@ -669,6 +788,7 @@ export class LLBotManager implements ProtocolEnd {
       this.onlineUin = li.uin || this.onlineUin;
       this.offlineSince = 0;
       this.recoveredThisEpisode = false;
+      this.logoutByUser = false;
       this.sawOnlineThisRun = true;
       const deviceId = this.identity.adoptLiveGuid();
       const backed = this.identity.backupSessions();
@@ -692,20 +812,26 @@ export class LLBotManager implements ProtocolEnd {
 
     if (this.online) {
       const kick = this.identity.status().lastKick;
-      const desc = kick ? `code=${kick.code} ${kick.desc}` : '与 QQ 的连接中断（未收到下线通知）';
+      // lastKick 是跨进程持久历史，只有「刚刚发生的」才能用来解释这次掉线，
+      // 否则昨天那次被踢会把今天的人为退出误判成腾讯踢号（然后又被自动登回去）。
+      const dropAt = Date.now();
+      const kicked = !!kick && kick.at >= dropAt - 60_000;
+      const desc = kicked ? `code=${kick!.code} ${kick!.desc}` : '与 QQ 的连接中断（未收到下线通知）';
       this.online = false;
       this.onlineUin = '';
-      this.offlineSince = Date.now();
+      this.offlineSince = dropAt;
       this.recoveredThisEpisode = false;
+      this.logoutByUser = !kicked && this.mode() === 'pmhq';
       this.lastDrop = { desc, at: this.offlineSince };
       this.log.warn(`QQ 掉线：${desc}`);
+      if (this.logoutByUser) this.log.info('判为在 QQ 客户端侧退出登录：不再自动重登，需要在桌面端点「打开 QQNT」');
       // 掉线时发不出 QQ 消息，故用 warn 级（只进报错中心 + 登录页），不私聊主人
-      this.errors.record('warn', 'adapter', `QQ 掉线：${desc}`);
+      this.errors.record('warn', 'adapter', `QQ 掉线：${desc}${this.logoutByUser ? '（已停止自动重登，需要时在桌面端点「打开 QQNT」）' : ''}`);
     } else if (!this.offlineSince) {
       this.offlineSince = Date.now();
     }
 
-    if (this.recoveredThisEpisode) return;
+    if (this.recoveredThisEpisode || this.logoutByUser) return;
     // 「在线过然后掉了」= 真掉线，20s 内确认后自愈；
     // 「从没上过线」= 在等用户扫码，不动它 —— 除非二维码已用尽且长时间没人扫（否则会整夜停在死码上）
     const waitMs = this.sawOnlineThisRun ? RECOVER_DELAY_MS : this.qrExhausted ? QR_STALL_RECOVER_MS : Number.POSITIVE_INFINITY;

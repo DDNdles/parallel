@@ -1,11 +1,17 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { spawn } from 'node:child_process';
 import { createReadStream, existsSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { join, normalize, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import type { Kernel } from '../kernel.ts';
 import type { ModelRef, ProviderModelCfg } from '../config.ts';
-import { newId } from '../util/misc.ts';
+import { newId, nowMs } from '../util/misc.ts';
+import { usageReport } from '../services/usage.ts';
+import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
+import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
+import { geminiApiBase } from '../services/pi-ai.ts';
+import { LLBotManager } from '../services/llbot.ts';
 import { busEvents } from '../bus.ts';
 import type { ChatEvent, ChatRef } from '../types.ts';
 
@@ -75,7 +81,7 @@ function uniqueProviderId(label: string, existing: Record<string, unknown>): str
   return id;
 }
 
-const PROVIDER_PROTOCOLS = ['openai-compatible', 'openai-responses', 'anthropic', 'mock'];
+const PROVIDER_PROTOCOLS = ['openai-compatible', 'openai-responses', 'anthropic', 'gemini', 'mock'];
 const RESERVED_IDS = ['chain', 'create', 'probe'];
 /** 模型行可选值：内核会按这些语义去整形请求，收不认识的键没有意义 */
 const MODEL_INPUT_TYPES = ['text', 'image', 'video', 'audio'];
@@ -108,7 +114,12 @@ function sanitizeModels(list: unknown[]): ProviderModelCfg[] {
 }
 
 /** 探一次供应商的 GET {base}/models（test 与创建前的 probe 共用） */
-async function listRemoteModels(base: string, key: string) {
+/** 远端模型列表按连接方式分家：Anthropic 没有这个接口（调用方提前挡掉），其余两家路径与鉴权头都不同 */
+async function listRemoteModels(base: string, key: string, protocol = 'openai-compatible') {
+  return protocol === 'gemini' ? listGeminiModels(base, key) : listOpenAiModels(base, key);
+}
+
+async function listOpenAiModels(base: string, key: string) {
   try {
     const resp = await fetch(`${base}/models`, {
       headers: key ? { authorization: `Bearer ${key}` } : {},
@@ -116,6 +127,28 @@ async function listRemoteModels(base: string, key: string) {
     });
     const j = (await resp.json().catch(() => null)) as { data?: { id?: unknown }[] } | null;
     const ids = (j?.data ?? []).map((m) => String(m?.id ?? '')).filter(Boolean).slice(0, 300);
+    return { ok: resp.ok, status: resp.status, models: ids, error: resp.ok ? undefined : `HTTP ${resp.status}` };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** Gemini：GET <base>/v1beta/models + `x-goog-api-key`。同目录里还挂着 embedding / tuning 那些
+ *  不能对话的模型，只留 supportedGenerationMethods 里有 generateContent 的，否则候选列表全是噪音。 */
+async function listGeminiModels(base: string, key: string) {
+  try {
+    const resp = await fetch(`${geminiApiBase(base)}/models`, {
+      headers: key ? { 'x-goog-api-key': key } : {},
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = (await resp.json().catch(() => null)) as {
+      models?: { name?: unknown; supportedGenerationMethods?: unknown }[];
+    } | null;
+    const ids = (j?.models ?? [])
+      .filter((m) => Array.isArray(m.supportedGenerationMethods)
+        && (m.supportedGenerationMethods as unknown[]).some((g) => g === 'generateContent' || g === 'streamGenerateContent'))
+      .map((m) => String(m.name ?? '').replace(/^models\//, ''))
+      .filter(Boolean).slice(0, 300);
     return { ok: resp.ok, status: resp.status, models: ids, error: resp.ok ? undefined : `HTTP ${resp.status}` };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
@@ -133,9 +166,10 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
   }
 
   // ---- 鉴权 ----
-  // 登录页接口免 uiToken：浏览器尚未持有 token 时就要用（status/qrcode/avatar），
-  // 仅暴露登录状态与二维码，不含会话/配置等敏感数据；其余 /api/* 一律要求 token。
-  const pathIsLoginApi = path.startsWith('/api/login/');
+  // 免 uiToken 的两组：登录页接口（浏览器还没拿到 token 时就要用 status/qrcode/avatar），
+  // 以及初始环境检查页（它排在登录之前，且只报本机装了哪些软件/在哪，不含会话与配置）。
+  // 两者都只在 127.0.0.1 上提供，其余 /api/* 一律要求 token。
+  const pathIsLoginApi = path.startsWith('/api/login/') || path.startsWith('/api/setup/');
   const token = req.headers['x-auth-token'] ?? url.searchParams.get('token') ?? '';
   if (!pathIsLoginApi && token !== kernel.config.secrets.uiToken) {
     res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
@@ -146,7 +180,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
   const body = await readBody(req).catch(() => ({}));
   const segments = path.split('/').filter(Boolean); // ['api', ...]
   const send = (data: unknown, status = 200) => {
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    // API 一律 no-store：清掉的 key / 改完的配置不许被浏览器缓存端回来（静态资源在 serveStatic 另有缓存头）
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(JSON.stringify(data));
   };
 
@@ -161,10 +196,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       };
       const selfId = st.selfId || kernel.config.config.ui.lastLogin?.qq || '';
       const selfNickname = st.selfNickname || kernel.config.config.ui.lastLogin?.nickname || '';
+      const end = kernel.protocolEnd().status() as { online?: boolean };
       if (b === 'status') {
         return send({
           // 登错号（见 adapter 账号守卫）不算"可用"：登录页据此把原因显示出来，而不是当作已登录
-          connected: !!st.connected && !st.accountBlocked,
+          // 反向 WS 连着 ≠ QQ 在线（协议端掉线后仍照常上报心跳，与 llbot 在线看门狗同源），
+          // 所以只要协议端自己报了在线判据（end.online），就必须它也为真才算登录。
+          connected: !!st.connected && !st.accountBlocked && end.online !== false,
           qq: selfId,
           nickname: selfNickname,
           avatar: selfId ? avatarUrl(selfId) : '',
@@ -172,22 +210,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           expectedQq: st.expectedQq || '',
           accountBlocked: st.accountBlocked,
           protocol: kernel.config.config.onebot.flavor ?? 'llbot',
-          end: kernel.protocolEnd().status(),
+          end,
         });
-      }
-      if (b === 'protocol' && req.method === 'POST') {
-        const to = String(body.flavor ?? '');
-        if (to !== 'llbot' && to !== 'napcat') return send({ error: 'flavor 只能是 llbot 或 napcat' }, 400);
-        const other = to === 'napcat' ? kernel.llbot : kernel.napcat;
-        kernel.config.config.onebot.flavor = to;
-        kernel.config.saveConfig();
-        // 换端必须先把上一个停掉：两个协议端注入同一个 QQ / 抢同一条反向 WS 只会互相踩登录态
-        await other.stop().catch(() => {});
-        const end = kernel.protocolEnd();
-        if (kernel.managesEnd()) void end.start().catch((e) => {
-          kernel.errors.record('error', 'adapter', `${end.id} 托管启动失败: ${(e as Error).message}`, { notifyOwner: true });
-        });
-        return send({ ok: true, protocol: to, status: end.status() });
       }
       if (b === 'qrcode' && req.method === 'POST') {
         // 二维码：当前协议端的 WebUI 代理（拿不到再回退协议端扩展动作）
@@ -229,6 +253,80 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       }
     }
 
+    // ================= 初始环境检查（依赖探测） =================
+    if (area === 'api' && a === 'setup') {
+      const ob = kernel.config.config.onebot as unknown as Record<string, Record<string, unknown>>;
+      const ctx = (): DepProbe => {
+        const end = kernel.protocolEnd();
+        return {
+          dataDir: kernel.dataDir,
+          // 有头模式（PMHQ / NapCat 注入）必须有本机 QQNT；无头直连不需要
+          headed: kernel.config.config.onebot.flavor === 'napcat' || String(ob.llbot?.mode ?? 'pmhq') === 'pmhq',
+          // 这一项对外的名字与落点跟着当前那一档走（LuckyLillia / NapCat）
+          endFlavor: end.id,
+          endDownloaded: !!end.status().downloaded,
+          // 用户自己起的协议端（不走托管）也算在跑：别让这页报"必备项缺失"
+          endConnected: !!(kernel.adapter.status() as { connected?: boolean }).connected,
+          qqPathCfg: String(ob.llbot?.qqPath ?? ob.napcat?.qqPath ?? ''),
+        };
+      };
+      if (b === 'deps') {
+        const fresh = url.searchParams.get('fresh') === '1' || req.method === 'POST';
+        if (fresh) invalidateDepCache();
+        const items = await probeDeps(ctx(), fresh);
+        return send({
+          items, ready: depsReady(items),
+          setupDoneAt: kernel.config.config.ui.setupDoneAt ?? 0,
+          managesEnd: kernel.managesEnd(),
+        });
+      }
+      // 「点击就下载」这一渠道：协议端发行包由 manager 全权处理（下载+解包+就位），
+      // 其余按 DEP_FETCHES 白名单把官方包拉到 data/downloads——装不装由人，内核不静默跑别人的安装程序。
+      // 下载要跑几分钟，不能把 HTTP 请求挂在那儿：后台起流，前端轮 /api/setup/fetch 看进度。
+      if (b === 'install' && req.method === 'POST') {
+        const id = String(body.id ?? 'llbot');
+        if (id === 'llbot') {
+          if (!kernel.managesEnd()) return send({ error: '这个内核不托管协议端（noApi），不该由它下载发行包' }, 409);
+          const end = kernel.protocolEnd();
+          if (end.status().downloaded) return send({ ok: true, already: true, status: end.status() });
+          void end.start().catch((e) => kernel.errors.record('error', 'adapter', `协议端发行包下载失败：${(e as Error).message}`, { notifyOwner: false }));
+          return send({ ok: true, started: true });
+        }
+        if (!DEP_FETCHES[id]) return send({ error: `这一项不由内核代下载：${id}` }, 400);
+        try {
+          return send({ ok: true, state: startDepFetch(id, kernel.dataDir) });
+        } catch (e) {
+          return send({ error: (e as Error).message }, 400);
+        }
+      }
+      if (b === 'fetch' && req.method === 'GET') {
+        return send({ state: fetchState(String(url.searchParams.get('id') ?? '')) });
+      }
+      // 协议端使用授权（LLBot 的签名 Auth Token）：状态 + 录入。这页排在登录之前，所以跟着 /api/setup/* 免 token；
+      // 它只报"授权到哪一步了"，不回 token 内容（日志同理）。NapCat 那一档没有这套机制 → supported:false。
+      if (b === 'auth') {
+        const end = kernel.protocolEnd();
+        if (!(end instanceof LLBotManager)) return send({ supported: false });
+        if (req.method === 'POST') {
+          const token = String(body.token ?? '').trim().slice(0, 4096);
+          end.setAuthToken(token);
+        }
+        return send({ supported: true, ...(await end.authState()) });
+      }
+      // 只允许拉 Docker Desktop（装了就绪不了的那种「没启动」）：按 id 白名单，绝不拿 body 里的路径去 spawn
+      if (b === 'start' && req.method === 'POST') {
+        const exe = String(body.id ?? '') === 'docker' ? dockerDesktopExe() : '';
+        if (!exe) return send({ error: '没探到 Docker Desktop，请自己启动它后再重新检测' }, 409);
+        spawn(exe, [], { detached: true, stdio: 'ignore' }).unref();
+        return send({ ok: true, exe });
+      }
+      if (b === 'done' && req.method === 'POST') {
+        kernel.config.config.ui.setupDoneAt = nowMs();
+        kernel.config.saveConfig();
+        return send({ ok: true, setupDoneAt: kernel.config.config.ui.setupDoneAt });
+      }
+    }
+
     // ================= 会话列表偏好（置顶/隐藏/列表宽，按 bot 登录号存储） =================
     if (area === 'api' && a === 'chat-prefs') {
       const qq = (kernel.adapter.status() as { selfId?: string }).selfId || 'default';
@@ -257,8 +355,6 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       return send({
         adapter: kernel.adapter.status(),
         model: { provider: kernel.llm.activeProviderId(), model: kernel.llm.activeModel(), usable: kernel.llm.isActiveUsable() },
-        // 双模型架构：chat 用哪个、work 用哪个（桌面端「工作」页展示）
-        workModel: kernel.llm.workModelSplit(),
         providers: kernel.llm.listProviders(),
         usage,
         plugins: {
@@ -271,6 +367,11 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         // 入口 html 的落盘时间：桌面端拿它判断"标签页里跑的还是上次构建的旧界面"
         uiBuild: uiBuildStamp(),
       });
+    }
+
+    // ================= 用量（桌面端「用量」页：整份报表，前端按指标/时间窗切片） =================
+    if (area === 'api' && a === 'usage' && !b && req.method === 'GET') {
+      return send(usageReport(kernel.db));
     }
 
     // ================= 插件 =================
@@ -366,6 +467,15 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         const limit = Number(url.searchParams.get('limit') ?? 200);
         return send({ chatKey: b, entries: kernel.sessionLog.tail(m[2], m[1], limit) });
       }
+      if (c === 'days') {
+        // 日轨：这个会话有哪些日子、各有几条（不受 tail 的 300 条内存缓冲限制，扫的是整份盘）
+        return send({ chatKey: b, days: kernel.sessionLog.days(m[2], m[1]) });
+      }
+      if (c === 'day') {
+        const day = String(url.searchParams.get('day') ?? '');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return send({ error: 'bad day' }, 400);
+        return send({ chatKey: b, day, entries: kernel.sessionLog.dayEntries(m[2], m[1], day) });
+      }
       if (c === 'log') {
         const limit = Number(url.searchParams.get('limit') ?? 800);
         return send({ entries: kernel.sessionLog.readFromDisk(b, limit) });
@@ -402,6 +512,28 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     }
 
     // ================= 人格 =================
+    if (area === 'api' && a === 'personas' && b === 'overlay') {
+      // 演化层存在 chat 插件的 state 里，内核读不到 → 走 bus 一问一答
+      const ask = (op: string, personaId: string, layer?: string): Promise<any> => new Promise((resolve) => {
+        const requestId = `ov_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const off = kernel.bus.on('persona.overlay_reply', (d: any) => {
+          if (d?.requestId !== requestId) return;
+          off(); clearTimeout(timer); resolve(d);
+        });
+        const timer = setTimeout(() => { off(); resolve(null); }, 2000);
+        kernel.bus.emit('persona.overlay_request', { requestId, personaId, op, layer, requesterRole: 'owner' });
+      });
+      const personaId = String(url.searchParams.get('personaId') ?? body?.personaId ?? '');
+      if (req.method === 'GET') {
+        const r = await ask('list', personaId);
+        return send({ personaId: r?.personaId ?? personaId, entries: r?.entries ?? [] });
+      }
+      if (req.method === 'POST') {
+        const r = await ask('clear', personaId, typeof body?.layer === 'string' ? body.layer : undefined);
+        if (!r) return send({ error: '人格插件未响应（chat 插件可能未载入）' }, 503);
+        return send({ ok: true, removed: r.removed ?? 0, entries: r.entries ?? [] });
+      }
+    }
     if (area === 'api' && a === 'personas') {
       const personaPlugins = kernel.container.list().filter((lp) => lp.manifest.category === 'persona');
       if (!b) {
@@ -412,12 +544,12 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           if (existsSync(dir)) {
             for (const id of readdirSync(dir, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name)) {
               const read = (f: string) => existsSync(join(dir, id, f)) ? readFileSync(join(dir, id, f), 'utf-8') : '';
+              const canonRaw = read('canon.json');
               personas.push({
                 id, pluginId: lp.manifest.id,
-                card: safeJson(read('card.json')), fewshot: safeJson(read('fewshot.json')), lore: safeJson(read('lorebook.json')),
-                raw: {
-                  'card.json': read('card.json'), 'fewshot.json': read('fewshot.json'), 'lorebook.json': read('lorebook.json'),
-                },
+                // HDSI 式剧本：canon（初始设定）/ perspective（个体价值观）/ voice（语气样例）/ lore（世界事实）
+                canon: safeJson(canonRaw),
+                raw: { 'canon.json': canonRaw },
               });
             }
           }
@@ -459,7 +591,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             apiKey: kernel.config.getProviderKey(p.id),
           })),
           usage: kernel.llm.todayUsage(),
-          // 两条模型优先级链（靠前的优先，掉线自动接后一个）；work 为空 = 跟随 chat
+          // 两条模型优先级链（靠前的优先，掉线自动接后一个）；两条各自独立，谁都不跟随谁
           chains: kernel.llm.chainsView(),
           failoverThreshold: kernel.config.config.llm.failoverThreshold,
         });
@@ -516,7 +648,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         if (proto === 'anthropic') {
           return send({ ok: false, error: 'Anthropic 没有模型列表接口，创建后可用模型行上的「测试连接」逐个验证' });
         }
-        return send(await listRemoteModels(baseUrl, String(body.apiKey ?? '').trim().slice(0, 400)));
+        return send(await listRemoteModels(baseUrl, String(body.apiKey ?? '').trim().slice(0, 400), proto));
       }
       if (req.method === 'POST') {
         const pc = allProviders[b];
@@ -544,7 +676,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             return send({ ok: false, error: 'Anthropic 没有模型列表接口，请用模型行上的「测试连接」逐个验证' });
           }
           const key = kernel.config.getProviderKey(b);
-          return send(await listRemoteModels(base, key));
+          return send(await listRemoteModels(base, key, String(pc.protocol ?? 'openai-compatible')));
         }
         if (typeof body.model === 'string' && body.model) {
           const want = (pc.models ?? []).find((x: any) => x.id === body.model.trim());
@@ -588,7 +720,10 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           kernel.memory.touchUser(u.userId, u.nickname);
           for (const f of u.facts ?? []) kernel.memory.addFact(u.userId, { content: f.content, weight: f.weight });
           for (const [k, v] of Object.entries(u.attrs ?? {})) {
-            if (k !== 'affection_daily' && k !== 'affection_last_ts') kernel.memory.setAttr(u.userId, k, v);
+            // 好感度那套属性键（含心情）已从系统里删除，老导出文件里可能还带着，导进来也没人读
+            if (k !== 'affection' && k !== 'affection_daily' && k !== 'affection_last_ts' && k !== 'mood') {
+              kernel.memory.setAttr(u.userId, k, v);
+            }
           }
           n++;
         }
@@ -629,8 +764,6 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     if (area === 'api' && a === 'users' && !b && req.method === 'GET') {
       const users = kernel.memory.listUsers().map((u) => ({
         ...u,
-        affection: kernel.memory.getAttr<number>(u.userId, 'affection') ?? null,
-        mood: kernel.memory.getAttr<string>(u.userId, 'mood') ?? null,
         isMaster: kernel.config.isOwner(u.userId),
         isAdmin: kernel.config.isAdmin(u.userId),
       }));
@@ -654,24 +787,17 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       if (b === 'clear' && req.method === 'POST') { kernel.errors.clear(); return send({ ok: true }); }
     }
 
-    // ================= 沙箱 =================
+    // ================= work 子代理 =================
     if (area === 'api' && a === 'work') {
-      // 「工作」页：任务运行记录 + 双模型标识 + 常驻容器状态
+      // 「工作」页：任务运行记录 + 模型链标识 + 常驻容器状态
       if (!b) {
         // chatKey 给了就只回该会话的任务（会话页右侧「工作」抽屉按当前会话拉）
         const chatKey = url.searchParams.get('chatKey') || undefined;
         return send({
           runs: kernel.workRunner.list(Number(url.searchParams.get('limit') ?? 40), chatKey),
-          models: kernel.llm.workModelSplit(),
-          maxToolRounds: {
-            chat: kernel.config.config.llm.maxToolRounds,
-            work: '∞',
-          },
+          models: { chat: kernel.llm.servingLabel('chat'), work: kernel.llm.servingLabel('work') },
           containers: kernel.session.status(),
-          images: {
-            python: (kernel.config.config.sandbox as any).session?.image,
-            browser: (kernel.config.config.sandbox as any).browser?.image,
-          },
+          images: kernel.session.imagesAvailable(),
           docker: kernel.session.available(),
         });
       }
@@ -693,10 +819,57 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       if (b === 'files' || b === 'read') {
         const chat = ref(url.searchParams.get('chat'));
         if (!chat) return send({ error: 'chatKey 不合法' }, 400);
-        const rel = url.searchParams.get('path') || '.';
-        if (b === 'files') return send({ path: rel, entries: kernel.sandbox.list(chat, rel) });
-        const r = kernel.sandbox.preview(chat, rel);
+        if (b === 'files') {
+          const w = kernel.sandbox.walkFiles(chat);
+          return send({ entries: w.files, truncated: w.truncated });
+        }
+        const r = kernel.sandbox.preview(chat, url.searchParams.get('path') || '.');
         return send(r ? { kind: 'text', ...r } : { kind: 'binary' });
+      }
+      if (b === 'raw') {
+        const chat = ref(url.searchParams.get('chat'));
+        if (!chat) return send({ error: 'chatKey 不合法' }, 400);
+        let f;
+        try {
+          f = kernel.sandbox.rawInline(chat, url.searchParams.get('path') || '');
+        } catch (e) {
+          const m = (e as Error).message;
+          // 会话流里的消息会一直留着，图却早被 TTL 清掉了：取不到是正常结局（前端静默不占位），
+          // 别让它进报错中心——开一次会话页就能灌十几条。越界与非法类型仍照原样抛。
+          if (m.startsWith('文件不存在') || m.startsWith('不支持内联预览的类型')) return send({ error: m }, 404);
+          throw e;
+        }
+        // 内联只给白名单类型；nosniff + 空 CSP 兜住「把这个文件当文档解析」的走法
+        const heads: Record<string, string | number> = {
+          'content-type': f.mime,
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': "default-src 'none'; img-src 'self'; media-src 'self'; script-src 'none'",
+          'content-disposition': 'inline',
+          // 语音/视频要能拖进度条（<video>/<audio> 靠 Range 分段取），图片也一并声明
+          'accept-ranges': 'bytes',
+        };
+        if (!f.stream) {
+          res.writeHead(200, { ...heads, 'content-length': f.size });
+          res.end(readFileSync(f.abs));
+          return;
+        }
+        const rng = typeof req.headers.range === 'string' ? /bytes=(\d*)-(\d*)/.exec(req.headers.range) : null;
+        if (rng && (rng[1] || rng[2])) {
+          const start = rng[1] ? Number(rng[1]) : 0;
+          const end = Math.min(rng[2] ? Number(rng[2]) : f.size - 1, f.size - 1);
+          if (Number.isNaN(start) || start < 0 || start > end || end >= f.size) {
+            res.writeHead(416, { 'content-range': `bytes */${f.size}` });
+            res.end();
+            return;
+          }
+          res.writeHead(206, { ...heads, 'content-length': end - start + 1, 'content-range': `bytes ${start}-${end}/${f.size}` });
+          createReadStream(f.abs, { start, end }).pipe(res);
+          return;
+        }
+        res.writeHead(200, { ...heads, 'content-length': f.size });
+        createReadStream(f.abs).pipe(res);
+        return;
       }
       if (b === 'clear' && req.method === 'POST') {
         const chat = ref(body.chatKey);
@@ -727,14 +900,39 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           onebot: { ...kernel.config.config.onebot, hasToken: !!kernel.config.secrets.onebotAccessToken, llbot: kernel.config.config.onebot.llbot },
           ui: kernel.config.config.ui,
           persona: kernel.config.config.persona,
+          humanlike: kernel.config.config.humanlike,
+          // work 子代理（pi 内核那套）：agent 定义 / 子代理目录 / 嵌套上限 / 上下文压缩
+          work: kernel.config.config.work,
+          storage: kernel.config.config.storage,
+          // 收件文件保留：内核按小时存（sweep 用），界面按天给
+          sandbox: { inboxKeepDays: Math.max(1, Math.round(kernel.config.config.sandbox.inboxTtlHours / 24)) },
         });
       }
       if (!b && req.method === 'POST') {
         const cfg = kernel.config.config as any;
-        for (const section of ['risk', 'onebot', 'persona'] as const) {
+        // 风控走白名单：这一段只剩 3 个键，逐项收。曾删掉的 jitter / groupWake / wakeWords / forgetScope
+        // 要是被旧页面或脚本带回来，整段 Object.assign 会把它们写回配置文件变成死配置。
+        if (body.risk && typeof body.risk === 'object') {
+          const r = body.risk as Record<string, unknown>;
+          if ('replyRatePerMin' in r) {
+            const n = Number(r.replyRatePerMin);
+            if (!Number.isInteger(n) || n < 1 || n > 600) return send({ error: '每会话发言上限需要是 1~600 的整数' }, 400);
+            cfg.risk.replyRatePerMin = n;
+          }
+          if ('silentWhenNothingEnabled' in r) cfg.risk.silentWhenNothingEnabled = !!r.silentWhenNothingEnabled;
+          // forgetScope（忘记记忆权限）不走这里——界面入口已删、默认 admin_only，只认 config.json 手改（重启生效）
+          // proactive 是插件定时推送的显式开启，逐个插件 id 收；其它键一律忽略
+          if (r.proactive && typeof r.proactive === 'object') {
+            for (const [id, on] of Object.entries(r.proactive as Record<string, unknown>)) {
+              if (!/^[\w-]{1,64}$/.test(id)) continue;
+              cfg.risk.proactive[id] = !!on;
+            }
+          }
+        }
+        for (const section of ['onebot', 'persona'] as const) {
           if (body[section] && typeof body[section] === 'object') {
             // onebot.llbot / onebot.napcat 嵌套合并，避免浅覆盖丢字段；
-            // flavor（协议端）不走这里——换端要连带停/起进程，只认 POST /api/login/protocol
+            // flavor（协议端）不走这里——换端只认 config.json 手改（重启内核生效），API/界面都没有切换入口
             if (section === 'onebot') {
               const { llbot, napcat, flavor, ...rest } = body.onebot;
               Object.assign(cfg.onebot, rest);
@@ -750,7 +948,12 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
                 }
               }
             } else {
-              Object.assign(cfg[section], body[section]);
+              // persona 走逐键白名单：整段 assign 会让过期页面把已删除的键（好感度那套）写回配置
+              const p = body[section] as Record<string, unknown>;
+              if (typeof p.default === 'string' && /^[\w-]{1,64}$/.test(p.default.trim())) cfg.persona.default = p.default.trim();
+              if (Number.isFinite(Number(p.memoryFactsTopK))) {
+                cfg.persona.memoryFactsTopK = Math.min(20, Math.max(1, Math.round(Number(p.memoryFactsTopK))));
+              }
             }
           }
         }
@@ -760,17 +963,100 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           if (qq && !/^\d{5,12}$/.test(qq)) return send({ error: 'expectedQq 必须是 QQ 号' }, 400);
           cfg.ui.expectedQq = qq;
         }
-        // llm 段只放行掉线阈值：模型链本身走 /api/providers/chain
+        // ui 段只放行会话页预览开关；端口/登录号/会话偏好不走这里
+        if (body.ui && typeof body.ui === 'object' && 'chatPreview' in (body.ui as object)) {
+          cfg.ui.chatPreview = !!(body.ui as Record<string, unknown>).chatPreview;
+        }
+        // llm 段只放行掉线阈值与工具轮上限：模型链本身走 /api/providers/chain。
+        // 每一项都**独立可选**：工作页只发 maxToolRounds，模型页只发 failoverThreshold，
+        // 谁都不该因为对方缺席而被判 400（踩过：把 failoverThreshold 当必填，工作页保存直接 400）。
         if (body.llm && typeof body.llm === 'object') {
-          const n = Number((body.llm as any).failoverThreshold);
-          if (!Number.isFinite(n) || n < 1 || n > 10) return send({ error: '掉线阈值需要是 1~10 的整数' }, 400);
-          cfg.llm.failoverThreshold = Math.round(n);
-          kernel.llm.resetFailover();
+          if ((body.llm as any).failoverThreshold !== undefined) {
+            const n = Number((body.llm as any).failoverThreshold);
+            if (!Number.isFinite(n) || n < 1 || n > 10) return send({ error: '掉线阈值需要是 1~10 的整数' }, 400);
+            cfg.llm.failoverThreshold = Math.round(n);
+            kernel.llm.resetFailover();
+          }
+          if ((body.llm as any).maxToolRounds !== undefined) {
+            const v = Number((body.llm as any).maxToolRounds);
+            if (!Number.isInteger(v) || v < 1 || v > 32) return send({ error: 'chat 工具轮上限需要是 1~32 的整数' }, 400);
+            cfg.llm.maxToolRounds = v;
+          }
+        }
+        // storage 段：每会话历史条数（HistoryStore 环形缓冲真正读的键），保存后立即生效
+        if (body.storage && typeof body.storage === 'object') {
+          const st = body.storage as Record<string, unknown>;
+          if (st.historyLimit !== undefined) {
+            const n = Number(st.historyLimit);
+            if (!Number.isInteger(n) || n < 1 || n > 500) return send({ error: '每会话历史条数需要是 1~500 的整数' }, 400);
+            cfg.storage.historyLimit = n;
+            kernel.history.setLimit(n);
+          }
+          // 上下文时间窗（分钟）：模型只看最近这么多分钟的消息，与 historyLimit 条数上限同时生效。
+          // 这里只挡非有限数；范围交给 round+clamp，好让旧配置与页面控件的越界值都能安全落库而不必 400
+          if (st.contextMinutes !== undefined) {
+            const n = Number(st.contextMinutes);
+            if (!Number.isFinite(n)) return send({ error: '上下文时间窗需要是 1~720 的整数' }, 400);
+            cfg.storage.contextMinutes = Math.min(720, Math.max(1, Math.round(n)));
+          }
+        }
+        // sandbox 段：只放收件文件保留天数（内核存小时，sweep 每 10 分钟读一次配置，存完即生效）；
+        // 其余限额（单文件/会话上限、执行超时等）仍走沙箱页「限额与清理」弹窗
+        if (body.sandbox && typeof body.sandbox === 'object') {
+          const s = body.sandbox as Record<string, unknown>;
+          if (s.inboxKeepDays !== undefined) {
+            const n = Number(s.inboxKeepDays);
+            if (!Number.isInteger(n) || n < 1 || n > 90) return send({ error: '收件文件保留天数需要是 1~90 的整数' }, 400);
+            cfg.sandbox.inboxTtlHours = n * 24;
+            // work 档的收件文件跟着同一天数：一个旋钮说"收进来的文件留 N 天"，就别让另一档悄悄更早删
+            cfg.sandbox.workInboxTtlHours = n * 24;
+          }
+        }
+        // humanlike 段：逐字段白名单 + 范围钳制（页面控件的取值范围在服务端也要成立）
+        if (body.humanlike && typeof body.humanlike === 'object') {
+          const err = applyHumanlikeConfig(cfg.humanlike, body.humanlike as Record<string, unknown>);
+          if (err) return send({ error: err }, 400);
+        }
+        // work 段（pi 内核那套）：只是几个数字与路径，逐项校验
+        if (body.work && typeof body.work === 'object') {
+          const w = body.work as Record<string, unknown>;
+          if (typeof w.agent === 'string') cfg.work.agent = w.agent.trim().slice(0, 120);
+          if (typeof w.agentsDir === 'string') cfg.work.agentsDir = w.agentsDir.trim().slice(0, 260);
+          if ('maxDepth' in w) {
+            const n = Number(w.maxDepth);
+            if (!Number.isInteger(n) || n < 0 || n > 5) return send({ error: '子代理嵌套上限需要是 0~5 的整数' }, 400);
+            cfg.work.maxDepth = n;
+          }
+          const comp = w.compaction as Record<string, unknown> | undefined;
+          if (comp && typeof comp === 'object') {
+            if ('enabled' in comp) cfg.work.compaction.enabled = !!comp.enabled;
+            for (const [k, min, max, label] of [
+              ['reserveTokens', 1024, 200000, '预留 token'],
+              ['keepRecentTokens', 0, 400000, '保留原文 token'],
+            ] as const) {
+              if (!(k in comp)) continue;
+              const n = Number(comp[k]);
+              if (!Number.isFinite(n) || n < min || n > max) return send({ error: `${label}需要是 ${min}~${max}` }, 400);
+              cfg.work.compaction[k] = Math.round(n);
+            }
+          }
         }
         kernel.config.saveConfig();
         kernel.chat.setRatePerMin(kernel.config.config.risk.replyRatePerMin);
         return send({ ok: true });
       }
+    }
+
+    // ================= 拟人层状态（排障：这个群现在为什么不出声） =================
+    if (area === 'api' && a === 'humanlike' && b === 'status' && req.method === 'GET') {
+      const m = String(url.searchParams.get('chatKey') ?? '').match(/^(group|private)_(.+)$/);
+      if (!m) return send({ error: 'chatKey 不合法' }, 400);
+      const chat = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };
+      return send({
+        chatKey: m[0],
+        ...kernel.humanlike.snapshot(chat),
+        config: kernel.config.config.humanlike,
+      });
     }
 
     // ================= 适配器动作 =================
@@ -786,8 +1072,169 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
   }
 }
 
-function serveStatic(root: string, path: string, res: ServerResponse): void {
-  let rel = path === '/' ? '/index.html' : path;
+/** 拟人化配置的入参白名单：逐字段校验 + 范围钳制，非法值直接拒绝（不静默取默认）。 */
+function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, unknown>): string | undefined {
+  const num = (v: unknown, min: number, max: number, label: string): number | string => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < min || n > max) return `${label}需要是 ${min}~${max} 之间的数`;
+    return n;
+  };
+  const applyNum = (obj: Record<string, any>, src: Record<string, unknown>, key: string, min: number, max: number, label: string): string | undefined => {
+    if (!(key in src)) return;
+    const r = num(src[key], min, max, label);
+    if (typeof r === 'string') return r;
+    obj[key] = r;
+  };
+  const applyBool = (obj: Record<string, any>, src: Record<string, unknown>, key: string): void => {
+    if (key in src) obj[key] = !!src[key];
+  };
+
+  // 刻意没有 `enabled` 总开关：拟人化不是可关的功能，POST 里带这个键也不认（直接忽略）。
+  // 各子项（剧本体/节奏/情绪/行动容量/日程…）仍是独立开关，逐项收。
+
+  // 剧本体（HDSI <say>）
+  const script = body.script as Record<string, unknown> | undefined;
+  if (script && typeof script === 'object') applyBool(target.script, script, 'enable');
+
+  // 节奏反定型（HDSI ChatRhythm）
+  const rhythm = body.rhythm as Record<string, unknown> | undefined;
+  if (rhythm && typeof rhythm === 'object') {
+    const t = target.rhythm;
+    applyBool(t, rhythm, 'enable');
+    if ('mode' in rhythm) {
+      if (!['gentle', 'balanced', 'aggressive'].includes(String(rhythm.mode))) return '节奏反定型档位只能是 gentle/balanced/aggressive';
+      t.mode = rhythm.mode;
+    }
+    let e = applyNum(t, rhythm, 'historyLimit', 5, 20, '节奏窗口轮数'); if (e) return e;
+    e = applyNum(t, rhythm, 'collapseMinSamples', 3, 10, '定型判定样本数'); if (e) return e;
+    e = applyNum(t, rhythm, 'exhaustLimit', 3, 12, '熔断轮数'); if (e) return e;
+  }
+
+  // 情绪偏移（HDSI Alter）
+  const alter = body.alter as Record<string, unknown> | undefined;
+  if (alter && typeof alter === 'object') {
+    const t = target.alter;
+    applyBool(t, alter, 'enabled');
+    let e = applyNum(t, alter, 'baseThreshold', 1, 100, '氛围阈值'); if (e) return e;
+    e = applyNum(t, alter, 'densityFactor', 0, 1, '密度系数'); if (e) return e;
+    e = applyNum(t, alter, 'sameDirectionBoost', 0, 1, '同向加成'); if (e) return e;
+    e = applyNum(t, alter, 'oppositeDecay', 0, 1, '反向衰减'); if (e) return e;
+    e = applyNum(t, alter, 'minWeight', 0, 1, '最小权重'); if (e) return e;
+    e = applyNum(t, alter, 'maxIntensity', 1, 5, '强度上限'); if (e) return e;
+  }
+
+  // 行动窗口（HDSI Agency）
+  const agency = body.agency as Record<string, unknown> | undefined;
+  if (agency && typeof agency === 'object') {
+    const t = target.agency;
+    applyBool(t, agency, 'enable');
+    if ('quietHours' in agency) {
+      const q = String(agency.quietHours ?? '').trim();
+      if (q && !/^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$/.test(q)) return '安静时段要写成 HH:MM-HH:MM';
+      t.quietHours = q;
+    }
+    let e = applyNum(t, agency, 'minimumProactiveIntervalMinutes', 0, 1440, '主动最小间隔'); if (e) return e;
+    e = applyNum(t, agency, 'maxWindowMinutes', 5, 1440, '窗口有效期'); if (e) return e;
+    e = applyNum(t, agency, 'maxCandidateHours', 1, 168, '候选前瞻时长'); if (e) return e;
+  }
+
+  // 日程（HDSI Schedule Preplan）
+  const schedule = body.schedule as Record<string, unknown> | undefined;
+  if (schedule && typeof schedule === 'object') {
+    const t = target.schedule;
+    applyBool(t, schedule, 'enable');
+    let e = applyNum(t, schedule, 'horizonHours', 1, 72, '日程前瞻时长'); if (e) return e;
+    e = applyNum(t, schedule, 'maxRules', 1, 100, '周规律上限'); if (e) return e;
+    e = applyNum(t, schedule, 'maxExceptions', 1, 200, '例外上限'); if (e) return e;
+  }
+
+  // 出站投递（HDSI `runtime`）：分隔标记切分 + 打字节奏 + 单条长度上限
+  const outgoing = body.outgoing as Record<string, unknown> | undefined;
+  if (outgoing && typeof outgoing === 'object') {
+    const t = target.outgoing;
+    applyBool(t, outgoing, 'splitReplyMessages');
+    if ('messageSeparator' in outgoing) {
+      const sepStr = String(outgoing.messageSeparator ?? '').trim();
+      if (!sepStr || sepStr.length > 16) return '分段标记需要是 1~16 个字符';
+      t.messageSeparator = sepStr;
+    }
+    let e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
+    e = applyNum(t, outgoing, 'typingCharactersPerSecond', 1, 100, '打字速度'); if (e) return e;
+    e = applyNum(t, outgoing, 'typingMaxDelaySeconds', 0, 120, '单条最长打字等待'); if (e) return e;
+    e = applyNum(t, outgoing, 'typingJitterRatio', 0, 0.5, '打字抖动比例'); if (e) return e;
+    e = applyNum(t, outgoing, 'maxMessageCharacters', 1, 12000, '单条最大字符数'); if (e) return e;
+  }
+
+  const timing = body.timing as Record<string, unknown> | undefined;
+  if (timing && typeof timing === 'object') {
+    const t = target.timing;
+    if ('replyTriggerMode' in timing) {
+      if (timing.replyTriggerMode !== 'necessity' && timing.replyTriggerMode !== 'frequency') {
+        return '回复触发模式只能是 necessity 或 frequency';
+      }
+      t.replyTriggerMode = timing.replyTriggerMode;
+    }
+    applyBool(t, timing, 'mentionedBotReply');
+    applyBool(t, timing, 'inevitableAtReply');
+    applyBool(t, timing, 'focusMode');
+    applyBool(t, timing, 'enableRules');
+    let e = applyNum(t, timing, 'pendingThreshold', 1, 100, '条数阈值'); if (e) return e;
+    e = applyNum(t, timing, 'necessityThreshold', 0, 200, '必要性阈值'); if (e) return e;
+    e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
+    e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;
+    if (Array.isArray(timing.rules)) {
+      const rules: Record<string, unknown>[] = [];
+      for (const raw of timing.rules as unknown[]) {
+        if (!raw || typeof raw !== 'object') continue;
+        const r = raw as Record<string, unknown>;
+        const type = String(r.ruleType ?? 'any');
+        if (!['group', 'private', 'any'].includes(type)) return '频率规则的聊天类型只能是 group/private/any';
+        const value = Number(r.value);
+        if (!Number.isFinite(value) || value < 0 || value > 1) return '频率规则的频率需要是 0~1';
+        const time = String(r.time ?? '').trim();
+        if (time && time !== '*' && !/^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$/.test(time)) {
+          return '频率规则的时段要写成 HH:MM-HH:MM、* 或留空';
+        }
+        rules.push({
+          platform: String(r.platform ?? '').trim().slice(0, 32),
+          itemId: String(r.itemId ?? '').trim().slice(0, 64),
+          ruleType: type as 'group' | 'private' | 'any',
+          time,
+          value,
+        });
+      }
+      t.rules = rules;
+    }
+  }
+
+  const merge = body.merge as Record<string, unknown> | undefined;
+  if (merge && typeof merge === 'object') {
+    const t = target.merge;
+    applyBool(t, merge, 'enable');
+    let e = applyNum(t, merge, 'windowMs', 0, 60_000, '合并窗口'); if (e) return e;
+    e = applyNum(t, merge, 'maxWaitMs', 0, 300_000, '合并兜底上限'); if (e) return e;
+    e = applyNum(t, merge, 'bufferTtlMs', 0, 3_600_000, '攒货过期时间'); if (e) return e;
+  }
+
+  const backoff = body.backoff as Record<string, unknown> | undefined;
+  if (backoff && typeof backoff === 'object') {
+    const t = target.backoff;
+    let e = applyNum(t, backoff, 'baseSeconds', 0, 600, '退避基准'); if (e) return e;
+    e = applyNum(t, backoff, 'capSeconds', 0, 3600, '退避上限'); if (e) return e;
+    e = applyNum(t, backoff, 'startCount', 1, 50, '退避起点'); if (e) return e;
+    e = applyNum(t, backoff, 'bypassPendingCount', 0, 200, '退避绕过条数'); if (e) return e;
+  }
+
+  const proactive = body.proactive as Record<string, unknown> | undefined;
+  if (proactive && typeof proactive === 'object') {
+    const t = target.proactive;
+    applyBool(t, proactive, 'enable');
+    const e = applyNum(t, proactive, 'idleSeconds', 60, 86_400, '主动发言静默时长'); if (e) return e;
+  }
+  return undefined;
+}
+
+function serveStatic(root: string, path: string, res: ServerResponse): void {  let rel = path === '/' ? '/index.html' : path;
   const file = normalize(join(root, rel));
   if (!file.startsWith(normalize(root))) {
     res.writeHead(403); res.end(); return;

@@ -4,7 +4,7 @@
 
 /** 发送段（OneBot 风格的归一化消息段） */
 export interface MsgSegment {
-  type: 'text' | 'at' | 'image' | 'face' | 'reply' | 'file' | 'record' | 'video' | 'json';
+  type: 'text' | 'at' | 'image' | 'face' | 'reply' | 'file' | 'record' | 'video' | 'json' | 'forward';
   data: Record<string, unknown>;
 }
 
@@ -29,7 +29,12 @@ export interface ChatEvent {
   isAtMe: boolean;
   isReplyToMe: boolean;
   messageId?: string;
+  /** 引用链快照：适配器给出 reply 段的原消息 id，内核在落账前把它查出来钉在这（桌面端画气泡内的引用块）。
+   *  files 一起带上：被引用的常常是一张图，只给 text="[图片]" 桌面端就没法出预览。 */
+  replyTo?: { userId: string; nickname: string; text: string; files?: { name: string; rel: string }[] };
   files?: IncomingFile[];    // 消息内文件/图片（由适配器落盘到沙箱 inbox 后挂上来）
+  /** 消息里的「聊天记录」合集（合并转发）：段里只有一个 resId，正文靠适配器向协议端现取 */
+  forward?: ForwardRecord;
   raw: unknown;
   ts: number;
   /** 内核解析后的三级角色（owner/admin/member），工具与命令边界用 */
@@ -38,8 +43,38 @@ export interface ChatEvent {
 
 export interface IncomingFile {
   name: string;
+  rel: string;               // 沙箱内相对路径（inbox/xxx；重名时 saveInbox 会加 _1 后缀，只有这个是真落盘的）
   sandboxPath: string;       // 已落入沙箱 inbox 的绝对路径
   size: number;
+  /** 下载时那份协议端临时 URL：**只活在本次事件里，不落盘**（带 rkey，且几小时就过期）。
+   *  视频进模型必须靠它——对端取不了我们本机路径，而语音能本机转码所以不看这个字段。 */
+  url?: string;
+}
+
+/** 聊天记录合集里的一条（合并转发的一个节点） */
+export interface ForwardNode {
+  nickname: string;
+  userId: string;
+  text: string;              // 节点正文；语音/视频仍是 [语音]/[视频] 占位
+  ts: number;
+  /** 记录套记录时它在第几层（0 = 最外面那份）；界面据此缩进，模型那边按层加前缀 */
+  depth?: number;
+  /** 记录里的图片：与顶层图片同一套口径落进沙箱 inbox，桌面端据此出缩略图 */
+  files?: IncomingFile[];
+}
+
+/**
+ * 「聊天记录」合集本体（QQ 的合并转发）。
+ * 入站段里只给一个 resId，节点要靠 get_forward_msg 现取一次；取不到就是 failed，
+ * 界面留着 [聊天记录] 占位、模型也只看到占位，不编内容。
+ */
+export interface ForwardRecord {
+  id: string;
+  title: string;             // 协议端有时带（如「群聊的聊天记录」），没带就空着由界面写「聊天记录」
+  nodes: ForwardNode[];
+  /** 节点总数超过上限时，被丢掉的那部分条数（0 = 全拿到了） */
+  dropped: number;
+  failed: boolean;
 }
 
 // ---------------- 权限 ----------------
@@ -55,6 +90,7 @@ export type PluginPermission =
   | 'fs.sandbox'     // 读写沙箱文件
   | 'container'      // 使用常驻会话容器（状态化 Python / 浏览器）
   | 'work.delegate'  // 把任务委派给 work 子代理（work 模型）
+  | 'history.search' // 检索会话历史消息（仅限当前会话）
   | 'schedule';      // 注册定时任务
 
 // ---------------- 插件清单 ----------------
@@ -99,7 +135,17 @@ export interface ToolContext {
   event: ChatEvent;            // 触发本轮对话的事件
   chat: ChatRef;
   role: Role;                  // 调用者角色
+  /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
+  work?: { depth: number; runId?: string; agent?: string };
 }
+
+/**
+ * 工具在哪个面上可见（pi 的 tool surface 思想）：
+ *  - `both`（默认）：chat 轮与 work 轮都能用；
+ *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见。
+ * 由 `toolsForChat(chat, role, surface)` 在收集阶段就过滤掉，不是"注册了但调用时拒绝"。
+ */
+export type ToolSurface = 'both' | 'work';
 
 export interface ToolDef {
   name: string;
@@ -109,6 +155,19 @@ export interface ToolDef {
   minRole?: Role;
   /** 是否向普通用户隐藏该工具的存在（仅主人可见可用） */
   ownerOnly?: boolean;
+  /** 可见面，默认 both */
+  surface?: ToolSurface;
+  /**
+   * 「可用工具」清单里的一行说明（pi 的 promptSnippet）。
+   * 缺省时该工具不出现在 work system 的工具清单里。
+   */
+  promptSnippet?: string;
+  /**
+   * 使用该工具时要遵守的规则条目（pi 的 promptGuidelines）。
+   * 由内核按「本轮实际生效的工具」汇总去重成 work system 的规则节——
+   * 工具面一变规则自动跟着变，不会像手写 prompt 那样漂移。
+   */
+  promptGuidelines?: string[];
   handler(args: Record<string, unknown>, tctx: ToolContext): Promise<string | ToolResult> | string | ToolResult;
 }
 
@@ -118,6 +177,17 @@ export interface ToolResult {
   notify?: string;
   /** 只给桌面端「工作」面板的结构化信息，不进模型上下文 */
   meta?: ToolMeta;
+  /**
+   * 本批工具调用完成后即可收尾（pi 的 terminate）：work 轮用，
+   * 表达"活干完了、不必再要一轮"。同一批全部为真才生效。
+   */
+  terminate?: boolean;
+  /**
+   * 直接作为本轮的最终回答（与 terminate 搭配）。
+   * 用于「收尾类工具」：模型把交付内容交给工具，工具把它变成最终回答，
+   * 避免再耗一轮让模型复述一遍（也就避免了复述时的走样）。
+   */
+  finalReply?: string;
 }
 
 /** 工具动作的结构化说明（UI 用来画 +N -M 与文件主体） */
@@ -125,6 +195,14 @@ export interface ToolMeta {
   path?: string;
   added?: number;
   removed?: number;
+  /** 本次调用产出的文件（会话沙箱内相对路径）：work 侧据此汇总产物清单 */
+  artifacts?: string[];
+  /** 收尾类工具：这次不是"干完了"，而是停下来等发起者回答（work_ask） */
+  awaiting?: boolean;
+  /** awaiting 时要问发起者的那句话 */
+  question?: string;
+  /** awaiting 时附的"已经做到哪一步" */
+  notes?: string;
 }
 
 // ---------------- 聊天命令 ----------------
@@ -153,6 +231,11 @@ export interface PluginHooks {
   onChatMessage?(event: ChatEvent): void | Promise<void>;
   /** LLM 请求发出前：可修改 system/messages（人格插件的核心插槽） */
   beforeLLM?(req: LLMRequestContext): Promise<LLMRequestContext> | LLMRequestContext;
+  /**
+   * work 轮（workTurn）的 system 组装插槽：与 beforeLLM 分开，两边互不干扰。
+   * 只有 work 轮会跑这条链；chat 轮跑 beforeLLM。插件往 req.systemSections 里 push 自己的节。
+   */
+  beforeWorkLLM?(req: LLMRequestContext): Promise<LLMRequestContext> | LLMRequestContext;
   /** 模型产出后、发送前：可校验/改写 */
   afterLLM?(req: LLMRequestContext, reply: string): Promise<string> | string;
   /** 插件卸载前最后清理机会 */
@@ -164,10 +247,12 @@ export interface LLMRequestContext {
   event: ChatEvent;
   system: string;
   /**
-   * 分节注入（dsh 式 section 组装）：插件在 beforeLLM 里往这里 push 自己的节，
-   * 不再整体覆盖 system。AgentLoop 组装时把 system 与 systemSections 按 order 稳定排序合并。
-   * order 参考：内核固定节 0-999（身份 0 / 会话 100 / 风格 200 / 安全 300 / 压缩 400），
-   * 插件节建议从 1000 起（人格 1000 / 世界书 1100 / 状态 1200 / 记忆 1300 / skill 目录 1400）。
+   * 分节注入（dsh 式 section 组装）：插件在 beforeLLM / beforeWorkLLM 里往这里 push 自己的节，
+   * 不再整体覆盖 system。AgentLoop 组装时把 system 与 systemSections 按 order 稳定排序合并；
+   * 带 `name` 的节渲染成 `<name>…</name>`（pi 式具名节，便于按节定位与差分）。
+   * order 参考：内核固定节 0-999（身份 0 / 会话 100 / 风格 200 / 安全 300 / 压缩 400，
+   * work 轮另有 任务 420 / 工具 600 / 规则 620 / 沙箱 700 / 交付 800），
+   * 插件节建议从 1000 起（人格 1000 / 世界书 1100 / 状态 1200 / 记忆 1300 / 子代理身份 1400）。
    */
   systemSections?: SystemSection[];
   messages: ChatMessage[];     // 不含 system
@@ -178,17 +263,57 @@ export interface LLMRequestContext {
   workTurn?: boolean;
   /** /work 命令携带的任务原文（workTurn 时存在） */
   workTask?: string;
+  /** 本轮的 work 子代理定义（workTurn 时存在；内核按它筛工具面、插件按它写身份节） */
+  workAgent?: WorkAgentDef;
+  /** 触发来源（workTurn 时存在；目前只有 command） */
+  workTrigger?: 'command';
+  /** 本次 work 轮的嵌套深度（入口 = 0）；达到上限时子代理工具面里不再有 delegate */
+  workDepth?: number;
+  /** 本次 work 运行的 id（子代理委派时作为 parentId 透传，桌面端表达嵌套） */
+  workRunId?: string;
 }
 
-/** 一节 system 提示：order 决定拼接顺序（小的在前），title 仅日志诊断用 */
+// ---------------- work 子代理 ----------------
+
+/**
+ * work 子代理的 agent 定义（对齐 pi 的 `agents/*.md`：frontmatter 声明能力 + 正文写身份）。
+ * 定义来自 `src/plugins/work/agents/*.md`（内置）与 `<data>/agents/*.md`（用户自加，同名覆盖），
+ * 内核侧有内置兜底。关键点：正文只是 system 的一个分节，不是整张 prompt——
+ * 内核固定节与按实际工具面生成的规则仍然生效。
+ */
+export interface WorkAgentDef {
+  name: string;
+  description: string;
+  /** 工具白名单（缺省 = 全部 work 面工具） */
+  tools?: string[];
+  /** 轮次上限（缺省 = 无上限，用户定稿的 work 语义） */
+  maxRounds?: number;
+  /** 跑哪条模型链（缺省 work；子代理可声明走 chat 链） */
+  chain?: 'work' | 'chat';
+  /** 来源：内置（随仓库）或用户自加 */
+  source?: 'builtin' | 'user';
+  /** 身份与人设正文 */
+  instructions: string;
+}
+
+/** 一节 system 提示：order 决定拼接顺序（小的在前）。
+ *  `name` 给了就渲染成 `<name>…</name>`（pi 式具名节）；只给 `title` 则是纯文本节（chat 现状）。 */
 export interface SystemSection {
   order: number;
   text: string;
+  /** 具名节的标签名（小写字母/数字/下划线/连字符）；不给则不加标签 */
+  name?: string;
+  /** 仅日志诊断用 */
   title?: string;
 }
 
-/** 把主 system 与分节按 order 合并成最终 system 文本（order 相同按插入序稳定排序） */
-export function composeSystem(main: string, sections?: SystemSection[]): string {
+/** 具名节的合法标签名（对齐 pi 的 section name 规则） */
+const SECTION_NAME_RE = /^[a-z][a-z0-9_-]*$/;
+
+/** 把主 system 与分节按 order 合并成最终 system 文本（order 相同按插入序稳定排序）。
+ *  带 `name` 的节渲染成 `<name>\n…\n</name>`；不带的原样拼接（保持 chat 侧输出不变）。
+ *  `tail` 永远排在最后：人格插件那种"尾部强化"靠位置取胜，不该被 order 挪到中间。 */
+export function composeSystem(main: string, sections?: SystemSection[], tail?: string): string {
   const sorted = (sections ?? [])
     .map((s, i) => ({ s, i }))
     .sort((a, b) => (a.s.order - b.s.order) || (a.i - b.i))
@@ -196,9 +321,12 @@ export function composeSystem(main: string, sections?: SystemSection[]): string 
   const parts: string[] = [];
   if (main.trim()) parts.push(main.trim());
   for (const s of sorted) {
-    if (!s.text?.trim()) continue;
-    parts.push(s.text.trim());
+    const text = s.text?.trim();
+    if (!text) continue;
+    if (s.name && SECTION_NAME_RE.test(s.name)) parts.push(`<${s.name}>\n${text}\n</${s.name}>`);
+    else parts.push(text);
   }
+  if (tail?.trim()) parts.push(tail.trim());
   return parts.join('\n\n');
 }
 
@@ -263,9 +391,9 @@ export interface LLMResponse {
 }
 
 export interface LLMProvider {
-  id: string;                  // 'gemini-3.8-flash' | 'deepseek' | ...
+  id: string;                  // 'deepseek' | 'openai-compatible' | ...
   label: string;
-  /** false = 仅占位（如 gemini-3.8-flash），调用时报"未接入" */
+  /** false = 仅注册未实现请求逻辑，调用时报"未接入"（预置供应商当前全部已实现） */
   implemented: boolean;
   /** 支持流式 */
   streaming: boolean;
@@ -341,6 +469,10 @@ export interface PluginContext {
   session: GatedSession;
   /** work 子代理委派（chat 模型把任务交给 work 模型执行；需 work.delegate 权限） */
   work: GatedWork;
+  /** 拟人层（内核自有）：日程读写 + 状态查询（HDSI Schedule/Alter/Rhythm） */
+  humanlike: GatedHumanlike;
+  /** 会话历史检索（需 history.search 权限）：只能搜当前会话，不是全库 */
+  history: GatedHistory;
   /** LLM：注册工具 + 直连补全（需在 manifest 声明 llm 能力即默认可用） */
   llm: {
     registerTool(def: ToolDef): void;
@@ -475,16 +607,46 @@ export interface WorkDelegateInput {
   userId: string;
   nickname?: string;
   role: string;
-  /** 触发来源：目前仅 /work 命令（chat 模型不自主委派，用户定稿） */
-  trigger?: 'command';
+  /** 目标子代理名（缺省 = 入口 agent）；取 agents 注册表里的条目 */
+  agent?: string;
+  /** 触发来源：/work 命令或上一层 work 子代理的 delegate 工具 */
+  trigger?: 'command' | 'subagent';
+  /** 嵌套深度（入口 0，子代理逐层 +1） */
+  depth?: number;
+  /** 发起这次委派的父运行 id（桌面端「工作」页表达嵌套） */
+  parentId?: string;
   abort?: AbortSignal;
+}
+
+export interface GatedHumanlike {
+  /** 读某会话的日程计划（周规律 + 日期例外） */
+  scheduleOf(chat: ChatRef): { rules: { days: number[]; from: string; to: string; label: string; busy?: boolean }[]; exceptions: { date: string; from: string; to: string; label: string; busy?: boolean }[] };
+  /** 写某会话的日程计划（会顺手清过期项并截断容量） */
+  planSchedule(chat: ChatRef, plan: { rules?: unknown[]; exceptions?: unknown[] }): { rules: unknown[]; exceptions: unknown[] };
+  /** 拟人层当前状态快照（排障：为什么不出声 / 氛围 / 节奏） */
+  snapshot(chat: ChatRef): Record<string, unknown>;
+}
+
+/** 会话历史检索的一条命中 */
+export interface HistoryHit {
+  ts: number;
+  role: 'user' | 'assistant';
+  nickname?: string;
+  text: string;
+}
+
+export interface GatedHistory {
+  /** 关键词检索**当前会话**的历史消息（入站+出站原文），按时间正序返回最近 limit 条命中 */
+  searchMessages(chat: ChatRef, q: string, limit?: number): HistoryHit[];
 }
 
 export interface GatedWork {
   /** work 模型标识（如 'deepseek:deepseek-reasoner'），桌面端展示 chat/work 双模型 */
   modelLabel(): string;
+  /** 可委派的子代理清单（delegate 工具的描述与 work system 的子代理节用） */
+  agents(): { name: string; description: string; tools?: string[]; source?: string }[];
   /** 委派一个任务给 work 模型执行（阻塞直到完成；返回结论 + 产物） */
-  delegate(input: WorkDelegateInput): Promise<{ id: string; ok: boolean; summary: string; artifacts: string[]; rounds: number; toolCalls: number; durationMs: number; error?: string }>;
+  delegate(input: WorkDelegateInput): Promise<{ id: string; ok: boolean; summary: string; artifacts: string[]; rounds: number; toolCalls: number; durationMs: number; notes?: string; error?: string }>;
   /** 最近任务（桌面端「工作」页） */
   list(limit?: number): unknown[];
 }

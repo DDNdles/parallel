@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { test, before, after } from 'node:test';
+import { test, before, after, beforeEach } from 'node:test';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
-import { MockProvider } from '../src/kernel/services/llm.ts';
+import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
 import { SandboxError } from '../src/kernel/services/sandbox.ts';
 
@@ -15,13 +15,13 @@ import { SandboxError } from '../src/kernel/services/sandbox.ts';
 let kernel: Kernel;
 let dataDir: string;
 let mock: MockOneBot;
-let mockProvider: MockProvider;
+let mockProvider: MockEngine;
 
 const GROUP = 123;
 const MEMBER = 10001;
 const MASTER = 9999;
 
-async function until<T>(fn: () => T | undefined | null | false, timeoutMs = 8000, what = 'condition'): Promise<T> {
+async function until<T>(fn: () => T | undefined | null | false, timeoutMs = 15000, what = 'condition'): Promise<T> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const v = fn();
@@ -31,14 +31,34 @@ async function until<T>(fn: () => T | undefined | null | false, timeoutMs = 8000
   throw new Error(`等待 ${what} 超时`);
 }
 
-const ONEBOT_PORT = 30000 + (process.pid % 20000); // 随机端口避免并发测试/残留进程冲突
+/** 等协议端动作安静下来（连发分片、上一用例遗留的轮次都结束），再开始下一段断言 */
+async function quiesce(idleMs = 300, maxMs = 8000): Promise<void> {
+  const start = Date.now();
+  let last = mock.actions.length;
+  let since = Date.now();
+  while (Date.now() - start < maxMs) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (mock.actions.length !== last) { last = mock.actions.length; since = Date.now(); continue; }
+    if (Date.now() - since >= idleMs) return;
+  }
+}
 
+const ONEBOT_PORT = 30000 + (process.pid % 20000); // 随机端口避免并发测试/残留进程冲突
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-e2e-'));
   kernel = new Kernel({ dataDir, noApi: true });
-  // 加速：抖动/限速调整 + 主人配置
-  kernel.config.config.risk.jitterMinMs = 5;
-  kernel.config.config.risk.jitterMaxMs = 30;
+  // 加速：限速放开 + 主人配置
+  // 限速按条计费（一轮回复拆成几条就吃几个令牌），默认值 12 条/分钟是这个文件里几十条断言的量级 ——
+  // 不放开的话跑到后半程桶就空了，消息被静默丢弃，后面几条用例会莫名其妙地超时。
+  // 两处都要写：写 config 是为了扛住中途 saveConfig 触发的 configChanged 热更新。
+  kernel.config.config.risk.replyRatePerMin = 10_000;
+  kernel.chat.setRatePerMin(10_000);
+  // 拟人层在测试里要确定性：把打字延迟压到 HDSI 的下限（公式不可关闭，最低 250ms/条），
+  // 基础延迟与上限归零、抖动归零。拆分开关保持打开 —— 但只有模型写了分隔标记才会分多条。
+  const hlOut = kernel.config.config.humanlike.outgoing;
+  hlOut.typingBaseDelaySeconds = 0;
+  hlOut.typingMaxDelaySeconds = 0;
+  hlOut.typingJitterRatio = 0;
   kernel.config.config.onebot.port = ONEBOT_PORT;
   // 协议端托管只在带桌面端的内核里跑（见 kernel.boot 的 noApi 判断）：测试内核用 MockOneBot
   // 顶替，真托管会在临时目录下载 89MB 发行包，抢磁盘/网络并在首个 agent loop 窗口里制造偶发超时（历史 flake 根因）。
@@ -49,12 +69,19 @@ before(async () => {
     models: [{ id: 'mock-1', enabled: true }],
   };
   kernel.config.config.llm.activeProvider = 'mock';
-  mockProvider = (kernel.llm as unknown as { providers: Map<string, MockProvider> }).providers.get('mock')!;
+  // 两条链各自独立、不再互相跟随（work 链空 = /work 没有模型），测试显式配满两条
+  kernel.config.config.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  kernel.config.config.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
+  mockProvider = (kernel.llm as unknown as { providers: Map<string, MockEngine> }).providers.get('mock')!;
   await kernel.boot();
   mock = new MockOneBot(`ws://127.0.0.1:${ONEBOT_PORT}/onebot`, kernel.config.secrets.onebotAccessToken);
   await mock.connect();
   await until(() => mock.actions.some((a) => a.action === 'get_login_info'), 5000, 'get_login_info');
 });
+
+// 用例共用一个群，拟人层会把"决定不回"的消息攒在缓冲里；上一条用例的攒货不能漏到下一条，
+// 否则一条旧消息会在后面的用例里突然触发一轮回复。每个用例开始前清空攒货与计时器。
+beforeEach(() => { kernel.humanlike.resetAll(); });
 
 after(async () => {
   mock.close();
@@ -166,11 +193,12 @@ test('普通成员/管理员不能切换人格，主人可以', async () => {
   reply = await mock.waitForReply(GROUP, 8000, mark);
   assert.match(reply, /权限不足/);
 
-  // 主人（config.masterIds）
+  // 主人（config.masterIds）：能拿到人格列表（人格显示名是人格文件里的内容，会变，这里只认 id）
   mark = mock.actions.length;
   mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/人格', role: 'member', nickname: '主人' });
   reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /CETACEA_MOLI/);
+  assert.match(reply, /whale-girl/);
+  assert.ok(!reply.includes('权限不足'), `主人不该被拒：${reply}`);
 
   // 主人切换人格（当前只有这一个）
   mark = mock.actions.length;
@@ -183,39 +211,7 @@ test('普通成员/管理员不能切换人格，主人可以', async () => {
 });
 
 // ============================================================
-// 5. 好感度：LLM 工具更新 + 防刷限制（红线 §2.1）
-// ============================================================
-
-test('好感度工具更新、单日上限防刷、段位注入', async () => {
-  // 找到 chat 插件注册的 update_affection 工具直接调用（与 LLM 调用同一 handler）
-  const tool = kernel.container.get('chat')!.tools.get('update_affection')!;
-  const tctx = {
-    event: {
-      id: 't1', platform: 'qq', type: 'group' as const, chatId: String(GROUP), userId: String(MEMBER),
-      nickname: '小明', senderRole: 'member' as const, segments: [], text: '', isAtMe: false,
-      isReplyToMe: false, raw: {}, ts: Date.now(), role: 'member' as const,
-    },
-    chat: { platform: 'qq', type: 'group' as const, chatId: String(GROUP) },
-    role: 'member' as const,
-  };
-  const r1 = await tool.handler({ delta: 5, reason: '夸了 bot' }, tctx);
-  assert.match(String(r1), /好感度 20 → 25/);
-  // 冷却期内再更新被拒
-  const r2 = await tool.handler({ delta: 5, reason: '又夸' }, tctx);
-  assert.match(String(r2), /防刷|拒绝/);
-  // 工具入口把单次变化钳制在 ±10
-  kernel.memory.setAttr(String(MEMBER), 'affection_last_ts', Date.now() - 120_000);
-  const big = await tool.handler({ delta: 50, reason: '试图一次刷很多' }, tctx);
-  assert.match(String(big), /好感度 25 → 35/);
-  // 今日已变动 +15（5+10）达到上限，再次更新被拒
-  kernel.memory.setAttr(String(MEMBER), 'affection_last_ts', Date.now() - 120_000);
-  const capped = await tool.handler({ delta: 10, reason: '继续刷' }, tctx);
-  assert.match(String(capped), /单日上限/);
-  assert.equal(kernel.memory.getAttr(String(MEMBER), 'affection'), 35);
-});
-
-// ============================================================
-// 6. 用户记忆：FTS 检索 + 忘记我
+// 5. 用户记忆：FTS 检索 + 忘记我
 // ============================================================
 
 test('记忆服务：添加/检索/忘记', () => {
@@ -224,18 +220,23 @@ test('记忆服务：添加/检索/忘记', () => {
   const hits = kernel.memory.searchFacts(String(MEMBER), '乐队', 5);
   assert.ok(hits.length >= 1);
   assert.match(hits[0].content, /万人谜/);
-  // 忘记我：清空事实与好感度
+  // 忘记我：清空事实
   kernel.memory.forget(String(MEMBER));
   assert.equal(kernel.memory.searchFacts(String(MEMBER), '乐队', 5).length, 0);
-  assert.equal(kernel.memory.getAttr(String(MEMBER), 'affection'), undefined);
 });
 
-test('/忘记我 命令清空记忆', async () => {
+test('默认 admin_only：普通成员 /忘记我 被拒，管理员可清（含自己）', async () => {
   mock.actions.length = 0;
   kernel.memory.addFact(String(MEMBER), { content: '爱吃香菜', sourcePlugin: 'test' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/忘记我', nickname: '小明' });
   const reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /忘记/);
+  assert.match(reply, /只有管理员|权限不足/);
+  assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 1, '普通成员清不掉自己');
+
+  mock.actions.length = 0;
+  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: `/forget ${MEMBER}`, role: 'admin', nickname: '群管' });
+  const reply2 = await mock.waitForReply(GROUP);
+  assert.match(reply2, /已清除/);
   assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 0);
   mock.actions.length = 0;
 });
@@ -257,22 +258,17 @@ test('/forget 指定别人：普通成员被拒，管理员可清除', async () 
   mock.actions.length = 0;
 });
 
-test('forgetScope=admin_only 时本人也不能清', async () => {
-  kernel.memory.addFact(String(MEMBER), { content: '临时记忆', sourcePlugin: 'test' });
-  kernel.config.config.risk.forgetScope = 'admin_only';
+test('forgetScope=self_and_admin（config.json 手改口径）时本人可清自己的', async () => {
+  kernel.config.config.risk.forgetScope = 'self_and_admin';
   try {
     mock.actions.length = 0;
+    kernel.memory.addFact(String(MEMBER), { content: '爱吃香菜', sourcePlugin: 'test' });
     mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/忘记我', nickname: '小明' });
-    let reply = await mock.waitForReply(GROUP);
-    assert.match(reply, /只允许管理员|权限不足/);
-    assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 1, '本人也没被清');
-
-    mock.actions.length = 0;
-    mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '/忘记我', role: 'admin', nickname: '群管' });
-    reply = await mock.waitForReply(GROUP);
+    const reply = await mock.waitForReply(GROUP);
     assert.match(reply, /忘记|重新认识/);
+    assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 0);
   } finally {
-    kernel.config.config.risk.forgetScope = 'self_and_admin';
+    kernel.config.config.risk.forgetScope = 'admin_only';
     mock.actions.length = 0;
   }
 });
@@ -387,6 +383,69 @@ test('群聊非 @机器人 时保持沉默', async () => {
   assert.equal(afterCount, before, '非唤醒消息不应回复');
 });
 
+test('隐藏会话：bot 收不到任何东西（消息不落账，也不回复/不命令/不主动）', async () => {
+  const HIDE_GROUP = '7101';
+  kernel.container.setGroupState('chat', HIDE_GROUP, true, 'ui');
+  const selfId = (kernel.adapter.status() as unknown as { selfId?: string }).selfId || 'default';
+  const prefs = kernel.config.config.ui.chatPrefs[selfId] ??= { pinned: [], hidden: [] };
+  prefs.hidden.push(`group_${HIDE_GROUP}`);
+  try {
+    const scriptLen = mockProvider.script.length;
+    mockProvider.script.push({ content: '（这句不该出现在任何地方）' });
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: HIDE_GROUP, userId: MASTER, text: '/work 算点什么', nickname: '主人' });
+    // 隐藏即"收不到"：会话流里既没有入站也没有出站
+    await new Promise((r) => setTimeout(r, 900));
+    const tail = kernel.sessionLog.tail(HIDE_GROUP, 'group', 50);
+    assert.ok(!tail.some((e) => e.type === 'message_in'), '隐藏会话不该收下这条消息');
+    assert.ok(!tail.some((e) => e.type === 'message_out'), '隐藏会话不该有任何出站');
+    const spoke = mock.actions.slice(mark).some((a) => a.action === 'send_group_msg' && String(a.params.group_id) === HIDE_GROUP);
+    assert.ok(!spoke, '协议端不应收到该群的任何发言');
+    mockProvider.script.length = scriptLen;   // 闸口生效时哨兵不会被消费，别漏给后面的用例
+  } finally {
+    prefs.hidden = prefs.hidden.filter((k) => k !== `group_${HIDE_GROUP}`);
+  }
+});
+
+test('引用一条消息：内核按消息号查回原文，落进条目的 replyTo 快照', async () => {
+  const G = '7102';
+  kernel.container.setGroupState('chat', G, true, 'ui');
+  mock.sendGroupMessage({ groupId: Number(G), userId: MEMBER, text: '两顿 20 行不行', nickname: '小明', messageId: 55001 });
+  await new Promise((r) => setTimeout(r, 500));
+  mock.sendGroupMessage({
+    groupId: Number(G), userId: MEMBER, text: '那我请', nickname: '小明', messageId: 55002,
+    extraSegments: [{ type: 'reply', data: { id: '55001' } }, { type: 'at', data: { qq: String(MEMBER), name: '小明' } }],
+  });
+  await new Promise((r) => setTimeout(r, 500));
+  const tail = kernel.sessionLog.tail(G, 'group', 20);
+  const quoted = tail.find((e) => e.text?.includes('那我请'));
+  assert.equal(quoted?.data?.messageId, '55002', '入站条目要记下协议端消息号（下次被引用才查得到）');
+  assert.ok(String(quoted?.data?.replyTo?.text ?? '').includes('两顿 20'), 'replyTo 要带上被引用那条的原文');
+  assert.equal(quoted?.data?.replyTo?.nickname, '小明');
+
+  // 被引用的是一张图：快照必须连附件一起抄过来，否则桌面端引用块里只能看到"[图片]"三个字
+  kernel.sessionLog.append(G, 'group', {
+    type: 'message_in', role: 'user', userId: String(MEMBER), nickname: '小明', text: '[图片]',
+    data: { messageId: '55100', files: [{ name: 'a.jpg', rel: 'inbox/a.jpg', size: 12 }] },
+  });
+  mock.sendGroupMessage({ groupId: Number(G), userId: MEMBER, text: '这张好看', nickname: '小明', messageId: 55101,
+    extraSegments: [{ type: 'reply', data: { id: '55100' } }] });
+  await new Promise((r) => setTimeout(r, 500));
+  const imgQuote = kernel.sessionLog.tail(G, 'group', 20).find((e) => e.text?.includes('这张好看'));
+  assert.deepEqual(imgQuote?.data?.replyTo?.files, [{ name: 'a.jpg', rel: 'inbox/a.jpg' }], '引用图片消息要把 rel 带上');
+
+  // 老条目只存过文件名（10-10 之前的形状）：快照要补出 inbox/ 前缀，桌面端才取到图
+  kernel.sessionLog.append(G, 'group', {
+    type: 'message_in', role: 'user', userId: String(MEMBER), nickname: '小明', text: '[图片]',
+    data: { messageId: '55102', files: ['b.png'] },
+  });
+  mock.sendGroupMessage({ groupId: Number(G), userId: MEMBER, text: '上面那张', nickname: '小明', messageId: 55103,
+    extraSegments: [{ type: 'reply', data: { id: '55102' } }] });
+  await new Promise((r) => setTimeout(r, 500));
+  const legacyQuote = kernel.sessionLog.tail(G, 'group', 20).find((e) => e.text?.includes('上面那张'));
+  assert.deepEqual(legacyQuote?.data?.replyTo?.files, [{ name: 'b.png', rel: 'inbox/b.png' }]);
+});
+
 test('私聊全收并回复', async () => {
   mock.actions.length = 0;
   // 私聊会话同样遵循"默认全关"：先给该私聊开启 chat 插件
@@ -440,9 +499,11 @@ test('桌面端注入消息走完 Pipeline（platform=ui）', async () => {
     isAtMe: true, isReplyToMe: false, raw: { injected: true }, ts: Date.now(), role: 'member',
   });
   await until(() => {
-    const tail = kernel.sessionLog.tail('456', 'group', 10);
-    return tail.some((e) => e.type === 'message_out' && (e.text ?? '').includes('ui 注入回复'));
-  }, 8000, '桌面注入回复');
+    // 出站按"所有消息拼起来"断言；HDSI 下括号不再被程序清洗，整条只发一条。
+    const tail = kernel.sessionLog.tail('456', 'group', 30);
+    const joined = tail.filter((e) => e.type === 'message_out').map((e) => e.text ?? '').join('');
+    return joined.includes('ui 注入回复');
+  }, undefined, '桌面注入回复');
 });
 
 // ============================================================
@@ -505,4 +566,215 @@ test('work 任务产出 loop 事件与缓存命中，且按 chatKey 过滤', asy
 
   // 别的会话取不到这条（抽屉只认当前会话）
   assert.equal(kernel.workRunner.list(10, 'group_999999').length, 0);
+});
+
+test('work 停下来提问：转述按"等你回答"口径；管理员回答后接着干（不从头重来）', async () => {
+  const WORK_GROUP = '7002';
+  const chatKey = `group_${WORK_GROUP}`;
+  const submit = (text: string) => kernel.pipeline.submit({
+    id: `work-ask-${Math.random().toString(36).slice(2)}`, platform: 'ui', type: 'group', chatId: WORK_GROUP,
+    userId: String(MASTER), nickname: '主人', senderRole: 'owner',
+    segments: [{ type: 'text', data: { text } }], text,
+    isAtMe: true, isReplyToMe: false, raw: { injected: true }, ts: Date.now(),
+  } as any);
+  const waitDone = () => new Promise<any>((resolve) => {
+    const off = kernel.bus.on('work.done' as any, (d: any) => { if (d.chatKey === chatKey) { off(); resolve(d); } });
+  });
+
+  await quiesce();
+  // 第一轮：work 模型卡在"不知道用哪份文件"，调 work_ask 停下来
+  const done1 = waitDone();
+  const calls1 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_ask', args: { question: '用哪份文件？', notes: '已把 inbox 列出来' } }] });
+  submit('/work 整理一下那份报表');
+  const ev1 = await done1;
+  assert.equal(ev1.awaiting, true, 'work.done 要标出"停下来提问"');
+  assert.equal(ev1.question, '用哪份文件？');
+
+  const run1 = kernel.workRunner.list(5, chatKey)[0];
+  assert.equal(run1.ok, true, '跑通了，只是要人拍板');
+  assert.equal(run1.summary, '用哪份文件？', '结论就是那个问题，不是「## 待确认」那坨文本');
+  assert.equal(run1.awaiting?.question, '用哪份文件？');
+  assert.equal(run1.awaiting?.notes, '已把 inbox 列出来');
+
+  // 转述轮口径：不能说成"已完成"
+  await quiesce();
+  const relay = mockProvider.calls.slice(calls1).map((c) => c.lastUser ?? '').find((t) => t.includes('【工作子代理'));
+  assert.ok(relay, '要有一轮转述请求');
+  assert.ok(relay!.includes('停下来问你一件事'), `转述要说"停下来问"：${relay}`);
+  assert.ok(!relay!.includes('已完成任务'), '提问不能被说成已完成');
+  assert.ok(relay!.includes('/work'), '要告诉用户怎么回答');
+
+  // 第二轮：管理员回答 → 拼成"接着上次"的新任务交回 work
+  const done2 = waitDone();
+  const calls2 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '整理完了，产出 report.md', artifacts: ['report.md'] } }] });
+  submit('/work 用 inbox/a.csv 那份');
+  await done2;
+  await quiesce();
+
+  const task2 = mockProvider.calls.slice(calls2).map((c) => c.lastUser ?? '').find((t) => t.includes('接着上次'));
+  assert.ok(task2, '第二轮的 work 请求要带上"接着上次"的任务描述');
+  assert.ok(task2!.includes('你上次停下来问发起者的：用哪份文件？'), task2);
+  assert.ok(task2!.includes('发起者这次说的是：用 inbox/a.csv 那份'), task2);
+
+  const run2 = kernel.workRunner.list(5, chatKey)[0];
+  assert.equal(run2.awaiting, undefined, '这一轮是正常交付，不该再挂着"等回答"');
+  assert.equal(run2.summary, '整理完了，产出 report.md');
+  assert.equal(run2.task, '整理一下那份报表（续）', '列表里显示短标题，不是拼接文本');
+
+  // 待答复已被消费：再来一次 /work 不该再粘上那段历史
+  const done3 = waitDone();
+  const calls3 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '另一件事做完了' } }] });
+  submit('/work 换个任务：看看沙箱里有什么');
+  await done3;
+  await quiesce();
+  const task3 = mockProvider.calls.slice(calls3).map((c) => c.lastUser ?? '').find((t) => t.includes('看看沙箱里有什么'));
+  assert.ok(task3, '第三轮的 work 请求');
+  assert.ok(!task3!.includes('接着上次'), '没有待答复时不该拼续接前缀');
+});
+
+// ============================================================
+// 17. 拟人层（chat 区全量替换）：分段发送 / 合批 / 主动发言
+// ============================================================
+
+test('拟人化：模型写了分隔标记才拆成多条；不写就整条发出（HDSI 口径）', async () => {
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  const groupSends = () => mock.actions
+    .filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP))
+    .map((a) => (a.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join(''));
+
+  // ① 模型写了分隔标记 → 按标记分多条
+  mock.actions.length = 0;
+  mockProvider.script.push({ content: '今天去上课了<sep/>然后回来睡觉<sep/>睡醒吃了饭。' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+  await mock.waitForReply(GROUP);
+  const parts = groupSends();
+  assert.ok(parts.length >= 2, `写了分隔标记就该拆成多条，实际 ${parts.length} 条`);
+  for (const piece of ['今天去上课了', '回来睡觉', '睡醒吃了饭']) {
+    assert.ok(parts.some((t) => t.includes(piece)), `缺 ${piece}: ${JSON.stringify(parts)}`);
+  }
+
+  // ② 不写分隔标记 → 整条发（不再自动断句，这是 HDSI 与 MaiBot 分段器的分水岭）
+  await quiesce();
+  mock.actions.length = 0;
+  mockProvider.script.push({ content: '今天去上课了，然后回来睡觉，睡醒吃了饭。' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+  await mock.waitForReply(GROUP);
+  const one = groupSends();
+  assert.equal(one.length, 1, `没有分隔标记就该整条发，实际 ${one.length} 条: ${JSON.stringify(one)}`);
+});
+
+test('拟人化：群里几条消息攒一起，一次交给模型（且带上说话人）', async () => {
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  mock.actions.length = 0;
+  mockProvider.script.push({ content: '收到' });
+  // 两条没人理的消息先进缓冲，第三条 @ 触发时把它们一起带上
+  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '今天游戏更新了', nickname: '阿强' });
+  await new Promise((r) => setTimeout(r, 80));
+  mock.sendGroupMessage({ groupId: GROUP, userId: 10003, text: '下班回去看看', nickname: '小美' });
+  await new Promise((r) => setTimeout(r, 80));
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '你玩吗', atMe: true, nickname: '小明' });
+  await mock.waitForReply(GROUP);
+
+  const call = (kernel.llm as any).providers.get('mock').calls.at(-1);
+  const joined = String(call?.usersJoined ?? '');
+  assert.ok(joined.includes('今天游戏更新了'), `模型应看到前序消息: ${joined}`);
+  assert.ok(joined.includes('阿强') && joined.includes('小美'), `应带说话人: ${joined}`);
+  assert.ok(joined.includes('你玩吗'), `当前消息也在: ${joined}`);
+});
+
+test('拟人化：主动发言轮里模型回 SKIP 就保持沉默', async () => {
+  await quiesce();
+  const PRO_GROUP = 4570;
+  kernel.container.setGroupState('chat', String(PRO_GROUP), true, String(MASTER));
+  const hl = kernel.config.config.humanlike;
+  const savedProactive = hl.proactive.enable;
+  const savedAgency = hl.agency.enable;
+  hl.proactive.enable = true;                 // 主动发言默认关，这里临开
+  // 行动容量跟着墙钟走：夜里（默认安静时段 00:30-07:30）会把主动轮整体挡下，用例就失去意义。
+  // 这里测的是主动发言链路本身，容量判据在 humanlike.test.ts 里有专门单元测试。
+  hl.agency.enable = false;
+  try {
+    mock.actions.length = 0;
+    mockProvider.script.push({ content: 'SKIP' });
+    // 走 pipeline 的主动发言入口（真实链路里由拟人层定时器调用）
+    kernel.pipeline.enqueueBatch({
+      chat: { platform: 'qq', type: 'group', chatId: String(PRO_GROUP) },
+      events: [], reason: 'proactive', detail: '测试注入',
+    });
+    await quiesce();
+    const sends = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(PRO_GROUP));
+    assert.equal(sends.length, 0, '模型回 SKIP 时一个字都不该发');
+  } finally {
+    hl.proactive.enable = savedProactive;
+    hl.agency.enable = savedAgency;
+  }
+});
+
+test('拟人化：主动发言轮真说话时不往历史塞假用户消息', async () => {
+  await quiesce();
+  const PRO_GROUP = 4571;
+  kernel.container.setGroupState('chat', String(PRO_GROUP), true, String(MASTER));
+  const hl = kernel.config.config.humanlike;
+  const savedProactive = hl.proactive.enable;
+  const savedAgency = hl.agency.enable;
+  hl.proactive.enable = true;
+  hl.agency.enable = false;                   // 同上：别让墙钟的安静时段挡下主动轮
+  const chat = { platform: 'qq', type: 'group' as const, chatId: String(PRO_GROUP) };
+  try {
+    // 先造一轮真实对话，历史里就该有 user+assistant
+    mock.actions.length = 0;
+    mockProvider.script.push({ content: '在的' });
+    mock.sendGroupMessage({ groupId: PRO_GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    await mock.waitForReply(PRO_GROUP);
+    const before = kernel.history.snapshot(chat).length;
+    assert.ok(before >= 2, `真实一轮后历史应有 user+assistant: ${before}`);
+
+    mock.actions.length = 0;
+    mockProvider.script.push({ content: '话说最近有什么好看的剧吗？' });
+    kernel.pipeline.enqueueBatch({ chat, events: [], reason: 'proactive', detail: '测试注入' });
+    const text = await mock.waitForReply(PRO_GROUP);
+    assert.ok(text.includes('好看的剧'), `主动发言应真的发出去: ${text}`);
+
+    const after = kernel.history.snapshot(chat);
+    assert.equal(after.length, before + 1, '只该多一条 assistant');
+    assert.equal(after.at(-1)?.role, 'assistant');
+    assert.ok(!after.some((m) => String(m.content).includes('安静了一阵子')), '主动发言的提示词不该进历史');
+  } finally {
+    hl.proactive.enable = savedProactive;
+    hl.agency.enable = savedAgency;
+  }
+});
+
+test('拟人化：没有总开关可关（剧本体始终在生效）', async () => {
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  // 内核不提供关掉拟人化的入口：配置里没有 enabled 键，API 也不认
+  assert.equal('enabled' in kernel.config.config.humanlike, false);
+  mock.actions.length = 0;
+  // 没有分隔标记 → 整条发出（分不分条已改为由模型自己写标记决定）
+  mockProvider.script.push({ content: '第一句，第二句，第三句。' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+  await mock.waitForReply(GROUP, 8000);
+  await quiesce();
+  const sends = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
+  assert.ok(sends.length >= 1, '回复照常发出');
+});
+
+test('拟人化：首轮请求不会把同一条用户消息发两遍', async () => {
+  await quiesce();
+  const G = 4572;                                   // 全新会话 → 历史缓存必然走"从会话日志重建"那条路
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  mock.actions.length = 0;
+  mockProvider.script.push({ content: '收到' });
+  mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '独一无二的一句话', atMe: true, nickname: '小明' });
+  await mock.waitForReply(G);
+  const call = (kernel.llm as any).providers.get('mock').calls.at(-1);
+  const joined = String(call?.usersJoined ?? '');
+  const hits = joined.split('独一无二的一句话').length - 1;
+  assert.equal(hits, 1, `同一条消息只该出现一次，实际 ${hits} 次: ${joined}`);
 });

@@ -9,13 +9,15 @@ interface WorkRun {
   id: string; chatKey: string; task: string; model: string; ok: boolean; summary: string;
   error?: string; rounds: number; toolCalls: number; durationMs: number; artifacts: string[];
   startedAt: number; steps: string[];
+  /** 停下来等发起者回答（work_ask）：不是失败，也不是干完了 */
+  awaiting?: { question: string; notes?: string };
+  notes?: string;
 }
 interface WorkApi {
   runs: WorkRun[];
-  models: { chat: string; work: string; split: boolean };
-  maxToolRounds: { chat: number; work: string };
+  models: { chat: string; work: string };
   containers: { kind: string; chat: string; id: string; idleMs: number }[];
-  images: { python?: string; browser?: string };
+  images: { python: boolean; browser: boolean };
   docker: boolean;
 }
 interface LiveRun { id: string; chatKey: string; task: string; model: string; trigger: string; steps: string[] }
@@ -83,7 +85,7 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
               <button key={r.id} className={'mset-item' + (r.id === sel ? ' sel' : '')} onClick={() => setSel(r.id)} title={r.task}>
                 <span className="mset-item-ic"><Icon name="work" size={15} /></span>
                 <span className="mset-item-nm">{r.task}</span>
-                {!r.ok && <i className="dot plg-dot-err" />}
+                {r.awaiting ? <i className="dot plg-dot-ask" /> : !r.ok && <i className="dot plg-dot-err" />}
               </button>
             ))}
             {!runs.length && <div className="mset-group-e">还没有工作任务</div>}
@@ -105,7 +107,7 @@ function RunDetail({ r }: { r: View }) {
     <section className="mset-detail">
       <div className="mset-dhead">
         <span className="mset-dic"><Icon name="work" size={17} /></span>
-        <h2 className="mset-dtitle">{r.live ? '正在执行' : r.ok ? '已完成' : '失败'}</h2>
+        <h2 className="mset-dtitle">{r.live ? '正在执行' : r.awaiting ? '等你回答' : r.ok ? '已完成' : '失败'}</h2>
         <span className="plg-ver mono">{r.chatKey}</span>
       </div>
 
@@ -127,8 +129,14 @@ function RunDetail({ r }: { r: View }) {
       )}
       {!r.live && r.summary && (
         <>
-          <div className="mset-sec-h"><span>结论</span></div>
-          <pre className="plg-msg">{r.summary}</pre>
+          <div className="mset-sec-h"><span>{r.awaiting ? '它要你定的事' : '结论'}</span></div>
+          <pre className="plg-msg">{String(r.summary)}</pre>
+        </>
+      )}
+      {!r.live && r.awaiting?.notes && (
+        <>
+          <div className="mset-sec-h"><span>它已经做到</span></div>
+          <pre className="plg-msg">{String(r.awaiting.notes)}</pre>
         </>
       )}
       {!r.live && r.artifacts?.length > 0 && (
@@ -161,9 +169,8 @@ function EnvDetail({ data, onReload }: { data: WorkApi | null; onReload: () => v
 
       <div className="mset-meta">
         <span className={'tag' + (data && !data.docker ? ' warn' : '')}>Docker {data?.docker ? '就绪' : '不可用'}</span>
-        <span className="tag mono">Python {data?.images?.python ?? '—'}</span>
-        <span className="tag mono">浏览器 {data?.images?.browser ?? '—'}</span>
-        <span className="tag">轮次预算 chat {data?.maxToolRounds.chat ?? '—'} / work 无上限</span>
+        <span className={'tag' + (data && !data.images?.python ? ' warn' : '')}>Python{data?.images?.python ? '可用' : '不可用'}</span>
+        <span className={'tag' + (data && !data.images?.browser ? ' warn' : '')}>浏览器{data?.images?.browser ? '可用' : '不可用'}</span>
       </div>
 
       <div className="mset-sec-h"><span>模型链</span></div>
@@ -172,7 +179,6 @@ function EnvDetail({ data, onReload }: { data: WorkApi | null; onReload: () => v
         <div className="mset-mrow">
           <span className="plg-k">work</span>
           <span className="plg-v mono">{m?.work ?? '—'}</span>
-          {m && !m.split && <span className="mset-badge">跟随 chat</span>}
         </div>
       </div>
 

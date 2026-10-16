@@ -5,10 +5,12 @@
  * + 宽卡片 composer（双模型选择 pill + 斜杠命令补全 + parallel 品牌 mark 插入光标）
  */
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { get, post, onEvent, fmtTime, mdLite } from '@/lib/api';
+import { get, post, onEvent, fmtTime, mdLite, getToken } from '@/lib/api';
 import { isWorkEntry } from '@/lib/entries';
 import { Icon } from '@/components/Icon';
+import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import WorkDrawer from '@/components/WorkDrawer';
+import { Modal } from '@/components/Modal';
 
 interface ChatInfo { chatKey: string; chatId: string; chatType: string; lastTs: number; title?: string }
 interface Entry {
@@ -30,13 +32,28 @@ interface ModelsData {
 }
 
 const MAX_TURNS = 400;
+/** 日轨没量到高度时的兜底格数，以及一节的间距（热区 12px + gap 2px，与 .conv-rail 一致） */
+const RAIL_VIEW = 10;
+const RAIL_PITCH = 14;
+/** 会话左侧日轨的一格（内核按本地日期聚合整份 jsonl 算出来的） */
+interface ChatDay { day: string; count: number; firstTs: number; lastTs: number }
 
-export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork }: {
+export default function ChatsPage({ masterId, botId, onNavigate, workOpen, onCloseWork, narrow, listOpen, onCloseList, cmd, onReview }: {
   masterId?: string;
+  /** bot 自己的登录号：会话流里 bot 那条消息右侧的头像用它取图 */
+  botId?: string;
   onNavigate?: (page: string) => void;
   /** 顶栏「工作」按钮的开关状态（抽屉本体在这里渲染） */
   workOpen?: boolean;
   onCloseWork?: () => void;
+  /** 窄屏（≤720）：二级会话列表改覆盖式抽屉，开合状态在顶栏那颗钮上 */
+  narrow?: boolean;
+  listOpen?: boolean;
+  onCloseList?: () => void;
+  /** 顶栏「回到实时」的页指令（kind='live'） */
+  cmd?: PageCmd;
+  /** 把「正在回看哪一天」报给顶栏：非空时顶栏才亮出那颗钮 */
+  onReview?: (day: string) => void;
 }) {
   const [chats, setChats] = useState<ChatInfo[]>([]);
   const [current, setCurrent] = useState<{ key: string; type: string; id: string } | null>(null);
@@ -51,9 +68,29 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
   // 是否停在最底部（贴着最新消息）：是则收起渐隐遮罩——停在底部时最新消息要能看清，
   // 往上翻（正在滑动/读历史）才让下缘淡出
   const [atBottom, setAtBottom] = useState(true);
+  /** 左侧日轨：一格 = 有消息的一天；railTop 是可见窗口的起点，窗口大小按列高实测（装不下才滚轮滑） */
+  const [days, setDays] = useState<ChatDay[]>([]);
+  const [railTop, setRailTop] = useState(0);
+  const [railView, setRailView] = useState(RAIL_VIEW);
+  const railRef = useRef<HTMLDivElement>(null);
+  /** 回看时已经加载的日子区间（days 下标）：滑到顶就往前并一天、滑到底就往后追一天。null = 实时窗口 */
+  const dayWinRef = useRef<{ from: number; to: number } | null>(null);
+  const daysRef = useRef<ChatDay[]>([]);
+  const edgeBusyRef = useRef(false);
+  /** 上一次 scrollTop（判划动方向用）与"刚跳过天，先别翻页"的短锁时刻 */
+  const lastScrollTopRef = useRef(0);
+  const edgeLockRef = useRef(0);
+  /** 往前并了一天之后多出来的高度：布局阶段补回 scrollTop，视野才不会被推走 */
+  const prependHRef = useRef(0);
+  /** 回看的那一天（'' = 实时窗口）。回看态下新消息不追加进列表，看完点箭头回实时 */
+  const [viewDay, setViewDay] = useState('');
+  const viewDayRef = useRef('');
   const [folded, setFolded] = useState<Record<string, boolean>>({});
   const [animatingId, setAnimatingId] = useState<string | null>(null); // 正在开合的分组 id：淡化 mask 只作用于该分组自身
   const [listW, setListW] = useState(250);
+  /** 会话页预览（群友头像 + 收来的图片缩略图）：设置页「会话」里的那个开关 */
+  const [preview, setPreview] = useState(true);
+  const [zoom, setZoom] = useState<{ rel: string; name: string } | null>(null);
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
@@ -175,8 +212,8 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     setCaretOn(focused && collapsed);   // 选中一段文字时不摆光标（否则会把选区撑开）
     if (focused && collapsed) setCaretPos(ta.selectionStart ?? ta.value.length);
     if (layer) {
-      const ty = `translateY(${-ta.scrollTop}px)`;
-      if (layer.style.transform !== ty) layer.style.transform = ty;
+      // 让层自己滚，别用 transform——那会把裁剪框一起搬走，长消息滚起来时整块文字飘到输入框外
+      if (layer.scrollTop !== ta.scrollTop) layer.scrollTop = ta.scrollTop;
     }
   }, []);
 
@@ -227,15 +264,6 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     loadModels();
   }, [models, loadModels]);
 
-  /** 工作链清空 = 跟随聊天链 */
-  const followChat = useCallback(async () => {
-    try {
-      await post('/api/providers/chain', { kind: 'work', entries: [] });
-      setChainErr('');
-    } catch (e) { setChainErr(`未生效：${(e as Error)?.message ?? String(e)}`); }
-    loadModels();
-  }, [loadModels]);
-
   const togglePin = useCallback((key: string) => {
     setPinned((p) => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }, []);
@@ -266,8 +294,10 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
    *  链还没配过时回落到内核的兜底供应商，至少告诉用户现在是谁在答 */
   const servingChat = models?.chains.chat.find((e) => e.state === 'current') ?? models?.chains.chat[0]
     ?? (models ? { provider: models.active, model: models.activeModel } as ChainEntry : null);
-  const chatLabel = models
-    ? (models.providers.find((p) => p.id === servingChat?.provider)?.label ?? servingChat?.model ?? '模型')
+  /** 链上兜底供应商也没有 = 这台机器还没配过模型，胶囊改成待办态 */
+  const noChat = !!models && !servingChat?.model;
+  const chatLabel = noChat ? '配置模型' : models
+    ? (models.providers.find((p) => p.id === servingChat?.provider)?.label ?? servingChat?.model ?? '配置模型')
     : '模型';
   /** 模型 id -> 上下文窗口：右侧「工作」面板的占比圆环用它当分母 */
   const ctxByModel = useMemo(() => {
@@ -276,9 +306,26 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     return m;
   }, [models]);
 
+  // 预览开关在设置页「会话」里改；回到这页会重挂载，所以拉一次就够
+  useEffect(() => {
+    get('/api/config').then((d: { ui?: { chatPreview?: boolean } }) => setPreview(d?.ui?.chatPreview !== false)).catch(() => {});
+  }, []);
+  /** 缩略图与大图都走沙箱 raw 端点：<img> 带不上请求头，按 ws 的同款写法用 ?token= */
+  const srcOf = useCallback((rel: string) => '/api/sandbox/raw?chat=' + encodeURIComponent(current?.key ?? '')
+    + '&path=' + encodeURIComponent(rel) + '&token=' + encodeURIComponent(getToken()), [current?.key]);
+
+  // 消息号 → 条目：给引用块兜底。内核快照是落账那一刻抄的，改口之前的条目没带附件（甚至没带快照），
+  // 只要被引用那条还在已加载的流里，这里就能现查出来，不必等用户重新发一遍。
+  const quoteIndexRef = useRef<Map<string, Entry>>(new Map());
+  quoteIndexRef.current = new Map(
+    entries.filter((e) => e.data?.messageId).map((e) => [String(e.data.messageId), e]));
+  const findQuoted = useCallback((id: string) => quoteIndexRef.current.get(id), []);
+
   // 消息流是页面里最重的子树（几百行 + markdown 渲染）：只在 entries 变化时重建，
   // 打字/移动光标/开关菜单都不会碰它——否则每敲一个字整屏重排一次。
-  const stream = useMemo(() => entries.map((e, i) => <EntryRow key={i} e={e} />), [entries]);
+  const stream = useMemo(
+    () => entries.map((e, i) => <EntryRow key={i} e={e} preview={preview} botId={botId} srcOf={srcOf} findQuoted={findQuoted} onZoom={setZoom} />),
+    [entries, preview, botId, srcOf, findQuoted]);
 
   /** 消息行的稳定键：列表会从头部裁掉（MAX_TURNS），索引会变，所以不能用索引当键 */
   const rowKeyOf = (e: Entry) => `${e.type}|${e.ts}|${e.userId ?? ''}`;
@@ -354,6 +401,13 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     rowKeysRef.current = keys;
     if (!col) return;
 
+    // 往前并了一天：多出来的高度要加回 scrollTop，不然视野会被新塞进来的旧消息推走
+    const sc0 = streamRef.current;
+    if (sc0 && prependHRef.current) {
+      sc0.scrollTop += sc0.scrollHeight - prependHRef.current;
+      prependHRef.current = 0;
+    }
+
     const rows = col.children;
     const hs = rowHeightsRef.current;
     const width = col.clientWidth;
@@ -394,12 +448,26 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     if (force || near) { sc.scrollTop = sc.scrollHeight; setAtBottom(true); }
   }, []);
 
-  // 距底部 24px 内算"停在最新"；只在跨过阈值时改状态，滚动过程中不会反复重渲染
-  const onStreamScroll = useCallback(() => {
+  // 距底部 24px 内算"停在最新"；只在跨过阈值时改状态，滚动过程中不会反复重渲染。
+  // 故意不做成 useCallback：它要读到"当前是哪个会话"的最新闭包，否则换会话后翻页会打错 key。
+  const onStreamScroll = () => {
     const sc = streamRef.current;
     if (!sc) return;
-    setAtBottom(sc.scrollHeight - sc.scrollTop - sc.clientHeight <= 24);
-  }, []);
+    const distBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+    setAtBottom(distBottom <= 24);
+    const w = dayWinRef.current;
+    // 翻页只认"人在往那个方向划"：程序改 scrollTop（跳当天、补 prepend 的高度）不算，
+    // 否则一天内容不够一屏时会连着把好几天并进来。
+    const dir = sc.scrollTop < lastScrollTopRef.current - 1 ? -1 : sc.scrollTop > lastScrollTopRef.current + 1 ? 1 : 0;
+    lastScrollTopRef.current = sc.scrollTop;
+    if (w) {
+      const locked = Date.now() < edgeLockRef.current;
+      if (!locked && dir < 0 && sc.scrollTop <= 40 && w.from > 0) void loadEdge(-1);
+      else if (!locked && dir > 0 && distBottom <= 40 && w.to < daysRef.current.length - 1) void loadEdge(1);
+      // 窗口已经含到最新一天、又翻到底 = 眼前的就是最新消息，那颗「回到实时」的钮没有存在意义了
+      if (distBottom <= 24 && w.to >= daysRef.current.length - 1) { setReview(''); setWin(null); }
+    }
+  };
 
   // WS 实时追加（当前会话）
   useEffect(() => {
@@ -408,6 +476,7 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
       const key = `${entry.chatType}_${entry.chatId}`;
       if (key !== current.key) return;
       if (isWorkEntry(entry.type)) return;      // 工具/系统行归右侧「工作」面板
+      if (viewDayRef.current) return;           // 回看某一天时别把实时消息插进去，列表会跳
       setEntries((prev) => {
         const next = [...prev, entry];
         return next.length > MAX_TURNS ? next.slice(next.length - MAX_TURNS) : next;
@@ -415,11 +484,114 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     });
   }, [current]);
 
-  useEffect(() => { scrollBottom(); }, [entries, scrollBottom]);
+  // 实时态下停在底部就来新消息 → 继续贴住底部。回看态一律不自动滚：跨天翻页往尾部并进来时，
+  // 把人一把拽到最新那端等于把他从正在读的那一页踢走。
+  useEffect(() => { if (!viewDayRef.current) scrollBottom(); }, [entries, scrollBottom]);
+
+  /** 日轨一列能摆几格：按内容盒实测（量不到时退回 10）。回看条会让内边距变，所以它也进依赖 */
+  useEffect(() => {
+    const el = railRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const measure = () => {
+      const cs = getComputedStyle(el);
+      const usable = el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+      const n = Math.floor((usable + 2) / RAIL_PITCH);
+      if (n >= 3) setRailView(n);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [days.length > 1, viewDay]);
+
+  /** 窗口起点钳到合法区间：容量变大（日子全装得下）时自动回到"从最早那天铺起" */
+  const railMax = Math.max(0, days.length - railView);
+  const railTopClamped = Math.min(railTop, railMax);
+
+  /** 日轨数据：扫的是整份 jsonl，所以能看到 300 条窗口之外的日子 */
+  const loadDays = useCallback(async (chatKey: string) => {
+    try {
+      const d = await get(`/api/chats/${chatKey}/days`);
+      const list: ChatDay[] = d.days ?? [];
+      setDays(list);
+      daysRef.current = list;
+      setRailTop(list.length);   // 贴最新那端（真正的起点由 railMax 钳出来）
+      return list;
+    } catch { return []; }
+  }, []);
+
+  const setReview = (day: string) => { viewDayRef.current = day; setViewDay(day); };
+  const setWin = (w: { from: number; to: number } | null) => { dayWinRef.current = w; };
+
+  /** 点日轨的一格 = 换成看那一天的消息（内核按本地日期取，不受 tail 的 300 条上限约束）。
+   *  同时把"已加载窗口"标成这一天，之后往上/往下滑会连着并前后天（见 loadEdge）。 */
+  const gotoDay = async (day: string) => {
+    if (!current) return;
+    const idx = daysRef.current.findIndex((d) => d.day === day);
+    const d = await get(`/api/chats/${current.key}/day?day=${day}`);
+    setReview(day);
+    setWin(idx < 0 ? null : { from: idx, to: idx });
+    setEntries((d.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
+    const sc = streamRef.current;
+    if (sc) { sc.scrollTop = 0; lastScrollTopRef.current = 0; }
+    edgeLockRef.current = Date.now() + 500;   // 置顶这一动作本身会发 scroll 事件，别让它当成"用户在往上翻"
+  };
+
+  /** 贴着边界还在往那个方向划 = 想跨天。到顶时 scrollTop 已经是 0，滚不动也就没有 scroll 事件，
+   *  所以"滚轮意图"单独接一份（触摸板连划、滚轮到底都算）。 */
+  const onStreamWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    const sc = streamRef.current, w = dayWinRef.current;
+    if (!sc || !w || edgeBusyRef.current || Date.now() < edgeLockRef.current) return;
+    if (e.deltaY < 0 && sc.scrollTop <= 40 && w.from > 0) void loadEdge(-1);
+    else if (e.deltaY > 0 && sc.scrollHeight - sc.scrollTop - sc.clientHeight <= 40 && w.to < daysRef.current.length - 1) void loadEdge(1);
+  };
+
+  /** 连续翻阅：回看窗口往外扩一天。往前并要补 scrollTop（否则视野被新内容推走），往后追不用。 */
+  const loadEdge = async (dir: -1 | 1) => {
+    const w = dayWinRef.current, list = daysRef.current;
+    if (!w || !current || edgeBusyRef.current) return;
+    const idx = dir < 0 ? w.from - 1 : w.to + 1;
+    if (idx < 0 || idx >= list.length) return;
+    edgeBusyRef.current = true;
+    try {
+      const d = await get(`/api/chats/${current.key}/day?day=${list[idx].day}`);
+      const add: Entry[] = (d.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type));
+      if (dir < 0) {
+        const sc = streamRef.current;
+        prependHRef.current = sc ? sc.scrollHeight : 0;
+        setEntries((prev) => [...add, ...prev]);
+      } else {
+        setEntries((prev) => [...prev, ...add]);
+      }
+      setWin(dir < 0 ? { from: idx, to: w.to } : { from: w.from, to: idx });
+    } finally { edgeBusyRef.current = false; }
+  };
+
+  /** 回到实时：重取 tail 窗口（顺带补上回看期间漏掉的新消息） */
+  const backToLive = async () => {
+    if (!current) return;
+    setReview('');
+    setWin(null);
+    const data = await get(`/api/chats/${current.key}/tail?limit=300`);
+    setEntries((data.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
+    void loadDays(current.key);
+    setTimeout(() => scrollBottom(true), 50);
+  };
+
+  // 「回到实时」那颗钮做在顶栏与主题切换同排：钮的显隐报给上层，点击动作走页指令通道回来。
+  usePageCmd('chats', cmd, (kind) => { if (kind === 'live') void backToLive(); });
+  useEffect(() => { onReview?.(viewDay); }, [viewDay]);
+  useEffect(() => () => onReview?.(''), []);   // 离开会话页时收掉那颗钮，别让它悬在别的页上
 
   const openChat = async (c: ChatInfo) => {
     setCurrent({ key: c.chatKey, type: c.chatType, id: c.chatId });
+    if (narrow) onCloseList?.();   // 窄屏选完就把抽屉收起来，别让它压在对话上
     cmdCache.current = { key: '', cmds: [] };
+    setReview('');
+    setWin(null);
+    setDays([]);
+    daysRef.current = [];
+    void loadDays(c.chatKey);
     const data = await get(`/api/chats/${c.chatKey}/tail?limit=300`);
     setEntries((data.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
     setTimeout(() => scrollBottom(true), 50);
@@ -470,9 +642,11 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
     }
   };
 
+  // 窄屏还没选会话时列表必须看得见，否则进来只剩一片空白
+  const listShown = !narrow || listOpen || !current;
   return (
-    <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
-      <aside className="wb-list" style={{ width: listW }}>
+    <div className={'wb' + (narrow ? ' narrow' : '')}>
+      <aside className={'wb-list' + (narrow && listShown ? ' open' : '')} style={narrow ? undefined : { width: listW }}>
         <div className="wb-groups">
           {groups.map((g) => (
             <div key={g.id} className="wb-group">
@@ -561,8 +735,10 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
           onMouseLeave={(e) => e.currentTarget.classList.remove('dragging')}
         />
       </aside>
+      {/* 窄屏抽屉的遮罩：点空白处收起列表（宽屏不渲染，别抢正常点击） */}
+      {narrow && listShown && <div className="wb-scrim" onClick={() => onCloseList?.()} aria-hidden />}
 
-      <section style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--bg)' }}>
+      <section className="conv-side">
         {!current ? (
           <div className="wb-empty">
             <svg className="empty-illo" viewBox="0 0 200 120" fill="none" aria-hidden>
@@ -578,8 +754,25 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
           </div>
         ) : (
           <>
-            <div className={'conv-wrap' + (atBottom ? ' at-bottom' : '')}>
-              <div className="conv-scroll" ref={streamRef} onScroll={onStreamScroll}>
+            <div className={'conv-wrap' + (atBottom ? ' at-bottom' : '') + (days.length > 1 ? ' has-rail' : '') + (viewDay ? ' reviewing' : '')}>
+              {/* 回看哪天：透明的一行字浮在会话列上方，不占行也不画分界，消息照旧从顶栏毛玻璃底下走过去。
+                  回去的口在顶栏那一排（与主题切换同列） */}
+              {viewDay && <div className="conv-review mono">{viewDay}</div>}
+              {/* 日轨：一格一天，铺满「日期下方 → 输入框上方」这一列，装不下才用滚轮滑窗 */}
+              {days.length > 1 && (
+                <div className="conv-rail" ref={railRef} aria-label="按天回看" onWheel={(e) => {
+                  const max = Math.max(0, days.length - railView);
+                  if (max) setRailTop((t) => Math.min(max, Math.max(0, t + (e.deltaY > 0 ? 1 : -1))));
+                }}>
+                  {days.slice(railTopClamped, railTopClamped + railView).map((d) => (
+                    <button key={d.day}
+                      className={'conv-tick' + (d.day === (viewDay || days[days.length - 1].day) ? ' on' : '')}
+                      title={`${d.day} · ${d.count} 条`} aria-label={d.day}
+                      onClick={() => void gotoDay(d.day)} />
+                  ))}
+                </div>
+              )}
+              <div className="conv-scroll" ref={streamRef} onScroll={onStreamScroll} onWheel={onStreamWheel}>
                 <div className="conv-col" ref={colRef} onAnimationEnd={onTurnRiseEnd}>{stream}</div>
               </div>
               {/* 消息滑到对话框上方时渐隐淡出（纯背景色渐变，比 mask 便宜，不拖累滚动） */}
@@ -624,10 +817,12 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
                   </div>
                   <div className="composer-bar">
                     <div className="cmp-wrap">
-                      <button type="button" className={'cmp-pill' + (modelOpen ? ' open' : '')}
+                      <button type="button" className={'cmp-pill' + (modelOpen ? ' open' : '') + (noChat ? ' blank' : '')}
                         aria-haspopup="menu" aria-expanded={modelOpen} aria-label="选择对话模型与工作模型"
                         onClick={() => { setModelOpen((v) => !v); loadModels(); }}>
+                        <Icon name="models" size={15} />
                         <span className="nm">{chatLabel}</span>
+                        <Icon name="chevron" size={12} style={{ transform: 'rotate(180deg)', marginLeft: 'auto' }} />
                       </button>
                     </div>
                     <span className="flex" />
@@ -658,13 +853,8 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
                         {!models.chains.chat.length && <div className="mp-item off"><span className="nm">未配置</span></div>}
 
                         <div className="mp-sep" />
-                        <div className="mp-head">工作模型 · /work 子代理</div>
-                        <button type="button" role="menuitemradio" aria-checked={!models.chains.work.length} className="mp-item"
-                          onClick={followChat}>
-                          <span className="nm">跟随对话模型</span>
-                          <span className="mp-desc mono">{servingChat?.model ?? models.activeModel}</span>
-                          <span className="mp-right">{!models.chains.work.length && <Icon name="check" size={14} />}</span>
-                        </button>
+                        <div className="mp-head">工作模型</div>
+                        {!models.chains.work.length && <div className="mp-item off"><span className="nm">未配置</span></div>}
                         {models.chains.work.map((e, i) => (
                           <button key={`${e.provider}|${e.model}`} type="button" role="menuitemradio" aria-checked={e.state === 'current'}
                             className={'mp-item' + (e.state === 'current' ? ' sel' : '')}
@@ -696,8 +886,16 @@ export default function ChatsPage({ masterId, onNavigate, workOpen, onCloseWork 
         )}
       </section>
 
+      {/* 窄屏「工作」栏是覆盖式的：点栏外的对话区收起它（宽屏它占着流里的一栏，不需要遮罩） */}
+      {narrow && workOpen && <div className="wb-scrim" onClick={() => onCloseWork?.()} aria-hidden />}
       {/* 右侧「工作」抽屉：顶栏按钮开的，滑在主内容之上 */}
-      <WorkDrawer chatKey={current?.key} open={!!workOpen} onClose={() => onCloseWork?.()} ctxByModel={ctxByModel} />
+      <WorkDrawer chatKey={current?.key} open={!!workOpen} onClose={() => onCloseWork?.()} ctxByModel={ctxByModel} narrow={narrow} />
+
+      {zoom && (
+        <Modal title={zoom.name} wide onClose={() => setZoom(null)}>
+          <img className="sb-image" src={srcOf(zoom.rel)} alt={zoom.name} />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -713,34 +911,298 @@ const onTurnRiseEnd = (e: React.AnimationEvent<HTMLDivElement>) => {
   if (e.animationName === 'rise-in' && el.classList.contains('turn')) el.dataset.rise = 'done';
 };
 
+/** 群友头像：qlogo 取不到（离线/无效号）时回落首字，不留破图 */
+function Avatar({ userId }: { userId: string }) {
+  const [ok, setOk] = useState(true);
+  if (!ok) return <span className="turn-avatar turn-avatar-x">{(userId || '?').slice(0, 1)}</span>;
+  return <img className="turn-avatar" src={`/api/login/avatar/${encodeURIComponent(userId)}`} alt=""
+    loading="lazy" decoding="async" onError={() => setOk(false)} />;
+}
+
+/** 缩略图：消息会一直留着，图却可能被 TTL 清掉或从未落盘，取不到就整块不占位（不留破图）。
+ *  同时要报给所在的那一行，让它把 [图片] 字样留住——不然纯图片消息会一个字都不剩。 */
+function Thumb({ f, srcOf, onZoom, onDead }:
+  { f: { rel: string; name: string }; srcOf: (rel: string) => string; onZoom: (f: { rel: string; name: string }) => void; onDead: (rel: string) => void }) {
+  const [ok, setOk] = useState(true);
+  if (!ok) return null;
+  return <img className="thumb" src={srcOf(f.rel)} alt={f.name} title={f.name}
+    loading="lazy" decoding="async" onClick={() => onZoom(f)}
+    onError={() => { setOk(false); onDead(f.rel); }} />;
+}
+
+/** 图片已经以缩略图摆在面前了，文本里那个 [图片] 占位就删掉：只删这几个字（连同它前面那个空格），
+ *  其余文本一个字不动。适配器是每个图片段塞一个 ' [图片]'，所以连发多图会连着出现好几个。 */
+const stripImageMark = (t: string) => t.replace(/[ \t]*\[图片\]/g, '').replace(/^ +/, '');
+
+/** 适配器把 reply 段拼成 [回复:消息号]：内核已经查回原文（data.replyTo）时，这个占位就该让位给引用块 */
+const stripReplyMark = (t: string) => t.replace(/[ \t]*\[回复:[^\]]*\]/g, '').replace(/^ +/, '');
+
+/** 适配器把合并转发段拼成 [聊天记录]：内核取回了节点（data.forward）时，这个占位让位给卡片 */
+const stripForwardMark = (t: string) => t.replace(/[ \t]*\[聊天记录\]/g, '').replace(/^ +/, '');
+
+/** 协议端在 at 段里带了昵称（群里显示的那个名字）：文本里的 @号码 换成 @名字。
+ *  号码是给机器看的，人在群里看到的是名字；段里没给 name 就留着号码，不猜。 */
+function decorateAt(t: string, segs: { type: string; data?: Record<string, unknown> }[]): string {
+  const names: Record<string, string> = {};
+  for (const s of segs) {
+    const qq = s.type === 'at' ? String(s.data?.qq ?? '') : '';
+    if (qq && s.data?.name) names[qq] = String(s.data.name);
+  }
+  return Object.keys(names).length ? t.replace(/@(\d{4,})/g, (m, qq: string) => (names[qq] ? '@' + names[qq] : m)) : t;
+}
+
+/** 条目里的图片附件 → 沙箱内相对路径。data.files 有两种形状：10-10 之前只存名字，之后存 {name,rel,size} */
+function imageRefs(raw: unknown): { rel: string; name: string }[] {
+  const list: any[] = Array.isArray(raw) ? raw : [];
+  return list
+    .map((f: any): { rel: string; name: string } => (typeof f === 'string'
+      ? { name: f, rel: 'inbox/' + f }
+      : { name: String(f?.name ?? ''), rel: String(f?.rel ?? '') }))
+    .filter((f) => f.rel && /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(f.name || f.rel));
+}
+
+/** 内核取回来的聊天记录节点（合并转发正文）。老条目没这个字段，前端就什么都不画 */
+interface FwdNode { nickname?: string; userId?: string; text?: string; ts?: number; depth?: number; files?: unknown }
+interface FwdData { title?: string; nodes?: FwdNode[]; dropped?: number; failed?: boolean }
+interface FRef { rel: string; name: string }
+
+const AUDIO_EXT_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac|amr|silk|slk)$/i;
+const VIDEO_EXT_RE = /\.(mp4|mov|webm|mkv|avi)$/i;
+
+/** 节点附件按类型分堆：图走缩略图，语音/视频走播放器（同一批 inbox 文件，扩展名三类互不重叠） */
+function mediaRefs(raw: unknown): { imgs: FRef[]; audio: FRef[]; video: FRef[] } {
+  const all = normRefs(raw);
+  return {
+    imgs: imageRefs(raw),
+    audio: all.filter((f) => AUDIO_EXT_RE.test(f.name || f.rel)),
+    video: all.filter((f) => VIDEO_EXT_RE.test(f.name || f.rel)),
+  };
+}
+const normRefs = (raw: unknown): FRef[] => (Array.isArray(raw) ? raw : [])
+  .map((f: any): FRef => (typeof f === 'string' ? { name: f, rel: 'inbox/' + f } : { name: String(f?.name ?? ''), rel: String(f?.rel ?? '') }))
+  .filter((f) => f.rel);
+
+/** 有真内容就删占位：图/语音/视频各自渲染出来了，正文里那几个字样就是重复信息 */
+function stripMediaMarks(t: string, has: { img?: boolean; audio?: boolean; video?: boolean }): string {
+  let s = t;
+  if (has.img) s = s.replace(/[ \t]*\[图片\]/g, '');
+  if (has.audio) s = s.replace(/[ \t]*\[语音\]/g, '');
+  if (has.video) s = s.replace(/[ \t]*\[视频\]/g, '');
+  return s.replace(/^ +/, '');
+}
+
+const mmss = (s: number) => (Number.isFinite(s) && s > 0 ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : '');
+
+/**
+ * 语音条。浏览器自带的那枚控件是浅色的，压在这页的黑白底上不协调，所以自己画一条：
+ * 播放/暂停 + 进度（可点选位置）+ 时长。字节仍走 /api/sandbox/raw，服务端支持 Range。
+ * preload 关掉：一条记录里可能好几条语音，展开卡片不该顺手把它们全拉下来。
+ */
+function AudioRow({ f, srcOf, onDead }: { f: FRef; srcOf: (rel: string) => string; onDead: (rel: string) => void }) {
+  const ref = useRef<HTMLAudioElement | null>(null);
+  const [on, setOn] = useState(false);
+  const [t, setT] = useState(0);
+  const [dur, setDur] = useState(0);
+  const [dead, setDead] = useState(false);
+  if (dead) return null;
+  const drop = () => { setDead(true); setOn(false); onDead(f.rel); };
+  const toggle = () => {
+    const a = ref.current;
+    if (!a) return;
+    if (a.paused) { a.play().then(() => setOn(true), drop); } else { a.pause(); setOn(false); }
+  };
+  const seek = (e: React.MouseEvent<HTMLSpanElement>) => {
+    const a = ref.current;
+    if (!a || !dur) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    a.currentTime = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1) * dur;
+    setT(a.currentTime);
+  };
+  return (
+    <div className="media-audio">
+      <audio ref={ref} src={srcOf(f.rel)} preload="none" onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
+        onTimeUpdate={(e) => setT(e.currentTarget.currentTime)} onEnded={() => setOn(false)} onError={drop} />
+      <button type="button" className="media-play" onClick={toggle} aria-label={on ? '暂停' : '播放'}>
+        <Icon name={on ? 'pause' : 'play'} size={13} />
+      </button>
+      <span className="media-bar" onClick={seek}>
+        <span className="media-bar-f" style={{ width: `${dur ? Math.min(100, (t / dur) * 100) : 0}%` }} />
+      </span>
+      <span className="media-dur">{mmss(dur || t)}</span>
+    </div>
+  );
+}
+
+/** 视频：交给浏览器自带的控件（深色叠加条与本页不冲突），取不到就整块不占位、正文留着 [视频] */
+function VideoRow({ f, srcOf, onDead }: { f: FRef; srcOf: (rel: string) => string; onDead: (rel: string) => void }) {
+  const [dead, setDead] = useState(false);
+  if (dead) return null;
+  return <video className="media-video" src={srcOf(f.rel)} controls preload="metadata"
+    onError={() => { setDead(true); onDead(f.rel); }} />;
+}
+
+/** failed / 空节点都不算"有内容"：这时候正文里的 [聊天记录] 字样要留着 */
+const forwardOf = (e: Entry): FwdData | null => {
+  const f = e.data?.forward as FwdData | undefined;
+  return f && !f.failed && Array.isArray(f.nodes) && f.nodes.length ? f : null;
+};
+
+/**
+ * 聊天记录（合并转发）卡片：默认收起只报条数，点开才列逐条——
+ * 一次转发动辄上百条，全展开会把整屏会话挤走。展开区限高内部滚，不动会话流的位置。
+ * 外壳与 .bubble-user 同档（同底色、同圆角、同字号），它本身就是这条消息的正文。
+ */
+function ForwardCard({ fwd, srcOf, onZoom }:
+  { fwd: FwdData; srcOf: (rel: string) => string; onZoom: (f: { rel: string; name: string }) => void }) {
+  const [open, setOpen] = useState(false);
+  /** 取不到的图（被 TTL 删了/从未落盘）：那张不算已预览，[图片] 字样要留在正文里 */
+  const [dead, setDead] = useState<string[]>([]);
+  const onDead = useCallback((rel: string) => setDead((p) => (p.includes(rel) ? p : [...p, rel])), []);
+  const nodes = fwd.nodes ?? [];
+  const total = nodes.length + (fwd.dropped ?? 0);
+  return (
+    <div className={'fwd' + (open ? ' fwd-open' : '')}>
+      <button type="button" className="fwd-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name="chats" size={15} />
+        <span className="fwd-title">{fwd.title || '聊天记录'}</span>
+        <span className="fwd-cnt">{total} 条</span>
+        <span className="fwd-caret"><Icon name="chevron" size={14} /></span>
+      </button>
+      {open && (
+        <div className="fwd-list">
+          {nodes.map((n, i) => {
+            const m = mediaRefs(n.files);
+            const live = (list: FRef[]) => list.filter((f) => !dead.includes(f.rel));
+            const imgs = live(m.imgs), aud = live(m.audio), vid = live(m.video);
+            const text = stripMediaMarks(n.text || '', { img: imgs.length > 0, audio: aud.length > 0, video: vid.length > 0 });
+            return (
+              <div className={'fwd-row' + ((n.depth ?? 0) > 0 ? ' fwd-nested' : '')} key={i}>
+                <div className="fwd-who">
+                  <span className="fwd-name">{n.nickname || n.userId || '未知'}</span>
+                  {!!n.ts && <span className="fwd-time">{fmtTime(n.ts)}</span>}
+                </div>
+                {!!text && <div className="fwd-text">{text}</div>}
+                {imgs.length > 0 && (
+                  <div className="turn-thumbs fwd-thumbs">
+                    {imgs.map((f) => <Thumb key={f.rel} f={f} srcOf={srcOf} onZoom={onZoom} onDead={onDead} />)}
+                  </div>
+                )}
+                {aud.map((f) => <AudioRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
+                {vid.map((f) => <VideoRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
+              </div>
+            );
+          })}
+          {!!fwd.dropped && <div className="fwd-more">（另有 {fwd.dropped} 条超出上限，内核没留下）</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // memo：新消息到达时 entries 换了新数组，但旧条目还是同一批对象引用，
 // 于是只有真正新增/变化的那一行会重渲染（否则 300 行 + markdown 每次全跑一遍）
-const EntryRow = memo(function EntryRow({ e }: { e: Entry }) {
+const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, onZoom }:
+  {
+    e: Entry; preview: boolean; botId?: string; srcOf: (rel: string) => string; onZoom: (f: { rel: string; name: string }) => void;
+    findQuoted: (id: string) => Entry | undefined;
+  }) {
+  /** 取不到图的附件（被 TTL 删了/从未落盘）：这些不算"已预览"，[图片] 字样得留着 */
+  const [dead, setDead] = useState<string[]>([]);
+  const onDead = useCallback((rel: string) => setDead((p) => (p.includes(rel) ? p : [...p, rel])), []);
+
   if (e.type === 'message_in') {
+    const media = mediaRefs(e.data?.files);
+    const live = (list: FRef[]) => list.filter((f) => !dead.includes(f.rel));
+    // 预览开关只管头像与图片缩略图（设置页那条的原文就这么写的）；语音/视频是内容本体，不给关
+    const imgs = preview ? live(media.imgs) : [];
+    const aud = live(media.audio), vid = live(media.video);
+    const segs: { type: string; data?: Record<string, unknown> }[] = Array.isArray(e.data?.segments) ? e.data.segments : [];
+    const rid = String(segs.find((s) => s.type === 'reply')?.data?.id ?? '');
+    const src = rid ? findQuoted(rid) : undefined;
+    const snap = e.data?.replyTo as { userId?: string; nickname?: string; text?: string; files?: unknown } | undefined;
+    let quote = snap ?? (src && (src.text || src.data?.files)
+      ? { userId: src.userId, nickname: src.nickname, text: src.text, files: src.data?.files }
+      : undefined) as { userId?: string; nickname?: string; text?: string; files?: unknown } | undefined;
+    // 快照是落账那一刻抄的：带文件那轮之前的老快照没有 files，源条目还在就把它补齐
+    if (quote && !quote.files && src?.data?.files) quote = { ...quote, files: src.data.files };
+    const raw = e.text || '';
+    const fwd = forwardOf(e);
+    let text = stripMediaMarks(raw, { img: imgs.length > 0, audio: aud.length > 0, video: vid.length > 0 });
+    if (quote) text = stripReplyMark(text);
+    if (fwd) text = stripForwardMark(text);
+    text = decorateAt(text, segs);
+    // 附件里既不是图也不是音视频的那部分（比如文件）没有任何渲染形式，靠这句告诉人这轮带了东西
+    const played = new Set([...media.imgs, ...media.audio, ...media.video].map((f) => f.rel));
+    const otherFiles = normRefs(e.data?.files).filter((f) => !played.has(f.rel) && !dead.includes(f.rel));
+    // 被引用的常常是一张图：快照/源条目里的附件一起端上来，引用块里也出预览图，
+    // 出了图就把那句 [图片] 删掉（跟正文同一套口径）
+    const qImgs = quote ? imageRefs(quote.files).filter((f) => !dead.includes(f.rel)) : [];
+    const qTextRaw = quote?.text || '';
+    const qText = qImgs.length ? stripImageMark(qTextRaw) : qTextRaw;
     return (
       <div className="turn turn-user">
-        <div className="meta">{e.nickname || e.userId || ''} · {fmtTime(e.ts)}{e.data?.files?.length ? '（含附件）' : ''}</div>
-        <div className="bubble-user">{e.text || ''}</div>
+        {preview && e.userId ? <Avatar userId={e.userId} /> : null}
+        <div className="turn-body">
+          <div className="meta">{e.nickname || e.userId || ''} · {fmtTime(e.ts)}{otherFiles.length > 0 ? '（含附件）' : ''}</div>
+          {(!!text || quote) && (
+            <div className="bubble-user">
+              {quote && (
+                <div className="quote">
+                  <span className="q-nm">{quote.nickname || quote.userId || ''}</span>
+                  {!!qText && <span className="q-tx">{qText}</span>}
+                  {qImgs.length > 0 && (
+                    <span className="turn-thumbs q-imgs">
+                      {qImgs.map((f) => <Thumb key={f.rel} f={f} srcOf={srcOf} onZoom={onZoom} onDead={onDead} />)}
+                    </span>
+                  )}
+                </div>
+              )}
+              {!!text && <span className="q-body">{text}</span>}
+            </div>
+          )}
+          {fwd && <ForwardCard fwd={fwd} srcOf={srcOf} onZoom={onZoom} />}
+          {imgs.length > 0 && (
+            <div className="turn-thumbs">
+              {imgs.map((f) => <Thumb key={f.rel} f={f} srcOf={srcOf} onZoom={onZoom} onDead={onDead} />)}
+            </div>
+          )}
+          {/* 语音/视频与记录里同一套播放器：顶层消息以前只有 [语音] 三个字，等于没给 */}
+          {aud.map((f) => <AudioRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
+          {vid.map((f) => <VideoRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
+        </div>
       </div>
     );
   }
   if (e.type === 'message_out') {
     return (
       <div className="turn turn-assistant">
-        <div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') + (e.data?.simulated ? '<span class="muted"> （桌面端模拟）</span>' : '') }} />
+        {botId ? <Avatar userId={botId} /> : null}
+        <div className="turn-body">
+          <div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') + (e.data?.simulated ? '<span class="muted"> （桌面端模拟）</span>' : '') }} />
+        </div>
       </div>
     );
   }
   if (e.type === 'command') {
     return (
       <div className="turn turn-user">
-        <div className="meta">{e.nickname || e.userId || ''} · {fmtTime(e.ts)}</div>
-        <div className="bubble-user mono">/{e.text || ''}</div>
+        {preview && e.userId ? <Avatar userId={e.userId} /> : null}
+        <div className="turn-body">
+          <div className="meta">{e.nickname || e.userId || ''} · {fmtTime(e.ts)}</div>
+          <div className="bubble-user mono">/{e.text || ''}</div>
+        </div>
       </div>
     );
   }
   if (e.type === 'command_result') {
-    return <div className="turn turn-assistant"><div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') }} /></div>;
+    return (
+      <div className="turn turn-assistant">
+        {botId ? <Avatar userId={botId} /> : null}
+        <div className="turn-body">
+          <div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') }} />
+        </div>
+      </div>
+    );
   }
   return null;
 });
