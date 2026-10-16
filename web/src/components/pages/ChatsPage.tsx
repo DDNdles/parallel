@@ -38,7 +38,8 @@ const RAIL_PITCH = 14;
 /** 会话左侧日轨的一格（内核按本地日期聚合整份 jsonl 算出来的） */
 interface ChatDay { day: string; count: number; firstTs: number; lastTs: number }
 
-export default function ChatsPage({ masterId, botId, onNavigate, workOpen, onCloseWork, narrow, listOpen, onCloseList, cmd, onReview }: {
+export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, narrow, listOpen, onCloseList, cmd, onReview }: {
+  /** 保留给调用方传参兼容：输入框已改为 bot 身份发言，测试用户注入不再由页面发起 */
   masterId?: string;
   /** bot 自己的登录号：会话流里 bot 那条消息右侧的头像用它取图 */
   botId?: string;
@@ -598,13 +599,14 @@ export default function ChatsPage({ masterId, botId, onNavigate, workOpen, onClo
     inputRef.current?.focus();
   };
 
-  // 发送 = 以主人身份注入用户消息，走完整内核链路（模型回复照常回流到会话流）
+  // 发送 = 以 bot 身份发言（限速与会话日志照常，历史里也是它自己的回合）。
+  // 测试用户注入（/inject）保留在后端作调试接口，页面不再用。
   const send = async () => {
     const text = input.trim();
     if (!text || !current) return;
     setInput('');
     if (ac) setAc(null);
-    await post(`/api/chats/${current.key}/inject`, { text, userId: masterId || '10000', nickname: '桌面访客' })
+    await post(`/api/chats/${current.key}/send`, { text })
       .catch(() => {});
   };
 

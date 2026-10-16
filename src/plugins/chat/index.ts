@@ -171,6 +171,38 @@ export function setup(ctx: PluginContext): void {
     },
   });
 
+  // ---------- 引用回复（chat 面限定；work 子代理看不到这个工具） ----------
+  // 只在要回的那条消息被后面的新消息刷远（不是最新一条）时使用；发出去带引用段，
+  // 群里的新成员才知道在接哪条。普通回话直接输出正文，不必引用。
+
+  ctx.llm.registerTool({
+    name: 'reply_quote',
+    description: '引用回复某条消息：只当你要回的那条不是最近一条（被后面的新消息刷远了）才用；回最新消息直接输出正文即可，不要引用。调用后本轮别再重复输出这句正文。',
+    parameters: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: '目标消息行末尾 [#编号] 里的编号' },
+        text: { type: 'string', description: '要发出的正文' },
+      },
+      required: ['messageId', 'text'],
+    },
+    // 纯 chat 面工具：work 子代理严格看不见（ToolSurface 'chat'）
+    surface: 'chat',
+    handler: async (args, tctx): Promise<{ content: string; spoke: string }> => {
+      const mid = String(args.messageId ?? '').trim();
+      const text = String(args.text ?? '').trim();
+      if (!mid) return { content: '（没有给消息编号，发不出去）', spoke: '' };
+      if (!text) return { content: '（正文为空，发不出去）', spoke: '' };
+      if (!/^-?\d+$/.test(mid)) return { content: '（编号不像消息号，发不出去）', spoke: '' };
+      // 引用段必须在正文段之前——QQ 的引用块就靠这个顺序认
+      await ctx.chat.send(tctx.chat, [
+        { type: 'reply', data: { id: mid } },
+        { type: 'text', data: { text } },
+      ]);
+      return { content: `已带引用发出给编号 ${mid} 的那条。`, spoke: text };
+    },
+  });
+
   // ---------- 清除记忆的权限口径（设置·风控里的 forgetScope） ----------
 
   const ROLE_RANK: Record<string, number> = { member: 0, admin: 1, owner: 2 };
@@ -334,10 +366,11 @@ export function setup(ctx: PluginContext): void {
       }
       const busy = args.busy === true;
       const date = String(args.date ?? '').trim();
+      // days 提到外层：只给 date 的那调用里 days 为空集——别在回执里引用未定义的名字
+      const days = Array.isArray(args.days) ? args.days.map(Number).filter((d) => d >= 0 && d <= 6) : [];
       if (date) {
         plan.exceptions.push({ date, from, to, label, busy });
       } else {
-        const days = Array.isArray(args.days) ? args.days.map(Number).filter((d) => d >= 0 && d <= 6) : [];
         if (!days.length) return '（要么给 days（周几），要么给 date（某一天））';
         plan.rules.push({ days, from, to, label, busy });
       }

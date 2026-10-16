@@ -17,6 +17,8 @@ export interface InboundBits {
    * 每条都挂名字反而白吃 token。给模型的历史与当前轮都走 这里，同一口径见 pipeline / sessionlog 两个调用点。
    */
   nickname?: string;
+  /** 协议端消息号：有就盖到行尾（[#123]），是 reply_quote 引用回复的地址 */
+  messageId?: string;
   replyTo?: { nickname?: string; userId?: string; text?: string } | null;
   forward?: ForwardRecord | null;
 }
@@ -45,6 +47,8 @@ export function inboundModelText(b: InboundBits): string {
   const out = text.trim();
   if (!out) return out;
   const nick = String(b.nickname ?? '').trim();
+  const mid = String(b.messageId ?? '').trim();
+  const tagged = mid ? `${out} [#${mid}]` : out;
   // 群聊里「谁说的」只能靠这个前缀：配好名的消息流就是模型的群身份感知
-  return nick ? `${nick}：${out}` : out;
+  return nick ? `${nick}：${tagged}` : tagged;
 }

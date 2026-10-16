@@ -52,6 +52,8 @@ interface RunCapture {
   finalReply?: string;
   /** 收尾工具是否表示"活干完了"（pi-agent-core 自己也会据此早停，这里只为 LoopEvent 记一笔） */
   settled: boolean;
+  /** 引用工具这轮已代为发送的正文（取最后一次；有它就不走普通出站） */
+  toolSpoke?: string;
 }
 
 /** 音频/视频进请求体的条数上限：它们没有 pi-ai 的 content 块，只能整批补在最后一条 user 上，
@@ -81,7 +83,7 @@ export class AgentLoop {
       /** 结构化事件（work 侧栏的 loop 视图：轮次/思考/工具/用量） */
       onEvent?: (ev: LoopEvent) => void;
     },
-  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[] }> {
+  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[]; toolSpoke?: string }> {
     const { chat } = ctx;
     const chatKey = opts.chatKey;
     const chain: ModelChainKind = opts.chain ?? (ctx.workTurn ? 'work' : 'chat');
@@ -246,7 +248,7 @@ export class AgentLoop {
         text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
       });
       this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds: cap.rounds });
-      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps };
+      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps, toolSpoke: cap.toolSpoke };
     } catch (e) {
       const err = e as Error;
       this.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });
@@ -276,9 +278,12 @@ export class AgentLoop {
           const meta = typeof r === 'string' ? undefined : r.meta;
           const terminate = typeof r === 'string' ? undefined : r.terminate;
           const finalReply = typeof r === 'string' ? undefined : r.finalReply;
+          const spoke = typeof r === 'string' ? undefined : r.spoke;
           // 收尾工具的交付内容优先当最终回答（模型不必再复述一遍，也就不会走样）
           if (finalReply?.trim()) { cap.finalReply = finalReply.trim(); cap.settled = true; }
           else if (terminate) cap.settled = true;
+          // 引用工具已代为发送：本轮以那句收尾，内核对剩余正文不再补发
+          if (spoke?.trim()) cap.toolSpoke = spoke.trim();
           return { content: [{ type: 'text', text: truncate(text, 4000) }], details: meta, terminate };
         } catch (e) {
           const err = e as Error;

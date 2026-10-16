@@ -28,6 +28,10 @@ interface Humanlike {
   };
   merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number };
   backoff: { baseSeconds: number; capSeconds: number; startCount: number; bypassPendingCount: number };
+  /** 圈内黑话（表达学习）：先挖本群高频词再进 prompt 的参考节 */
+  jargon?: { enable: boolean };
+  /** 跟屏复读：>=N 位群友接连说同一句，bot 完整跟一条（纯程序，不走模型） */
+  repeat?: { enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number };
   proactive: { enable: boolean; idleSeconds: number };
   /** 聊天节奏反定型（HDSI ChatRhythm） */
   rhythm: { enable: boolean; mode: 'gentle' | 'balanced' | 'aggressive'; historyLimit: number; collapseMinSamples: number; exhaustLimit: number };
@@ -301,6 +305,43 @@ export default function SettingsPage() {
                     onChange={(v) => { const st = c.storage; if (!st) return; patch({ storage: { ...st, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />
                 </div>
               )}
+              {/* 跟屏复读：纯程序段，不走模型；旧内核没有这个键就不渲染 */}
+              {c.humanlike && c.humanlike.repeat && (
+                <>
+                  <div className="mset-models" style={{ marginTop: 14 }}>
+                    <div className="mset-mrow">
+                      <span className="plg-v">跟屏复读</span>
+                      <span className="mset-macts"><Switch on={c.humanlike.repeat.enable !== false}
+                        onChange={() => {
+                          const r = c.humanlike.repeat!;
+                          const nh = { ...c.humanlike, repeat: { ...r, enable: !(r.enable !== false) } };
+                          patch({ humanlike: nh as Config['humanlike'] });
+                          autoSave('humanlike', 0, { humanlike: { repeat: { enable: !(r.enable !== false) } } });
+                        }} /></span>
+                    </div>
+                  </div>
+                  <div className="set-grid" style={{ marginTop: 14 }}>
+                    <Num label="复读触发人数" value={c.humanlike.repeat.minPeople}
+                      onChange={(v) => {
+                        const r = { ...c.humanlike.repeat!, minPeople: v };
+                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
+                        autoSave('humanlike', 600, { humanlike: { repeat: { minPeople: v } } });
+                      }} />
+                    <Num label="复读延迟秒数" value={c.humanlike.repeat.delayMaxSec}
+                      onChange={(v) => {
+                        const r = { ...c.humanlike.repeat!, delayMaxSec: v };
+                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
+                        autoSave('humanlike', 600, { humanlike: { repeat: { delayMaxSec: v } } });
+                      }} />
+                    <Num label="复读冷却分钟" value={c.humanlike.repeat.cooldownMin}
+                      onChange={(v) => {
+                        const r = { ...c.humanlike.repeat!, cooldownMin: v };
+                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
+                        autoSave('humanlike', 600, { humanlike: { repeat: { cooldownMin: v } } });
+                      }} />
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -524,6 +565,11 @@ export default function SettingsPage() {
 
               <div className="mset-sec-h"><span>剧本体</span></div>
               <div className="mset-models">
+                <div className="mset-mrow">
+                  <span className="plg-v">圈内黑话<Hint text="先记本群高频词，判准了才进 prompt 参考" /></span>
+                  <span className="mset-macts"><Switch on={h.jargon?.enable !== false}
+                    onChange={() => patchH({ jargon: { enable: !(h.jargon?.enable !== false) } }, true)} /></span>
+                </div>
                 <div className="mset-mrow">
                   <span className="plg-v">节奏反定型<Hint text="回复结构固化时纠偏" /></span>
                   <span className="mset-macts"><Switch on={h.rhythm.enable}

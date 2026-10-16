@@ -223,15 +223,17 @@ export class SessionLog {
         // 落账的 text 是"给人看"的（界面靠它 + data 画引用块与记录卡），给模型要现净化一遍。
         // 群聊再把说话人拼进正文（昵称优先，无昵称给 QQ 号）——与 pipeline 的当前轮同一口径；
         // 私聊不带名，对面是谁 system 里已写明。
-        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[] } | undefined;
+        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[]; messageId?: string } | undefined;
         const m: { role: 'user'; content: string; ts?: number; attachments?: MessageAttachment[] } = {
           role: 'user',
-          content: inboundModelText({
-            text: e.text,
-            replyTo: d?.replyTo,
-            forward: d?.forward,
-            nickname: chatType === 'group' ? (e.nickname || String(e.userId ?? '') || undefined) : undefined,
-          }),
+        content: inboundModelText({
+          text: e.text,
+          replyTo: d?.replyTo,
+          forward: d?.forward,
+          nickname: chatType === 'group' ? (e.nickname || String(e.userId ?? '') || undefined) : undefined,
+          // 编号盖章与 pipeline 的当前轮同一口径：重启重建的窗口消息也要能被引用回复
+          messageId: String(d?.messageId ?? ''),
+        }),
         };
         if (Number.isFinite(e.ts)) m.ts = e.ts;
         const atts = inboundAttachments(d);

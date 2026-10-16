@@ -1,4 +1,4 @@
-import type { ChatEvent, CommandReply, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
+import type { ChatEvent, ChatRef, CommandReply, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
 import type { PluginContainer } from './container.ts';
 import type { AgentLoop, HistoryStore } from './agentloop.ts';
 import type { ChatService } from './services/chat.ts';
@@ -17,6 +17,10 @@ import { scriptFormatText, SILENT_MARKER, isSilentScene } from './humanlike/scri
 interface JargonHook {
   observe(event: ChatEvent): void;
   sections(chat: import('./types.ts').ChatRef): string | null;
+}
+/** 跟屏复读（repeat.ts）的 hook 面，同上：没接就旁路 */
+interface RepeatHook {
+  observe(event: ChatEvent): void;
 }
 import { AGENCY_REASON_ZH } from './humanlike/agency.ts';
 import { todayKey, newId } from './util/misc.ts';
@@ -99,11 +103,13 @@ function renderBatch(events: ChatEvent[]): string {
 function modelTextOf(event: ChatEvent): string {
   // 群聊把说话人放进正文：昵称优先、无昵称给 QQ 号——模型本来拿不到账号（ChatMessage 不存昵称），
   // 这是它「群里谁在说话」的唯一来源；私聊对面是谁 system 已写明，不画蛇添足。
+  // 行尾的 [#编号] 是引用回复的地址（reply_quote 工具照着填），有编号的才盖。
   return inboundModelText({
     text: event.text,
     replyTo: event.replyTo,
     forward: event.forward,
     nickname: event.type === 'group' ? (event.nickname || event.userId) : undefined,
+    messageId: event.messageId,
   });
 }
 
@@ -178,6 +184,7 @@ export class Pipeline {
     private selfNickname: () => string,
     private selfId: () => string,
     private jargon?: JargonHook,
+    private repeat?: RepeatHook,
   ) {}
 
   // ---------------------------------------------------------------- 入站
@@ -201,6 +208,8 @@ export class Pipeline {
     this.bumpUsage('messages_in');
 
     if (event.type === 'group') {
+      // 跟屏复读只看真实群消息，放在门控之前：拟人层要不要接话是另一件事
+      try { this.repeat?.observe(event); } catch { /* 复读观察出错不影响消息主流程 */ }
       const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
       if (r.action === 'handled') return;                    // 拟人层接管：攒着，攒够了它会回调 enqueueBatch
       this.enqueue(r.events);
@@ -252,6 +261,20 @@ export class Pipeline {
         if (this.queues.get(key) === job) this.queues.delete(key);
       });
     this.queues.set(key, job as Promise<void>);
+  }
+
+  /**
+   * 桌面端会话页输入框以 bot 身份发言。走完整发送链（限速与会话日志照常），发完
+   * 按 role=model（assistant）回灌历史——模型读上下文时才知道这句话是自己说的。
+   * 旧的测试用户注入（/api/chats/:key/inject）保留作调试，与这里不混用。
+   */
+  async sendAsBot(chat: ChatRef, text: string): Promise<void> {
+    const t = String(text ?? '');
+    await this.chat.sendText(chat, t);
+    if (t.trim()) {
+      this.history.pushAssistant(chat, t.trim());
+      this.humanlike.noteSpoke(chat, 1, [t.trim()]);
+    }
   }
 
   /** 中断当前轮（桌面端按钮） */
@@ -711,7 +734,7 @@ export class Pipeline {
       // 附件跟着入账：窗口内的历史消息要能重放"这条当时带了图/语音/视频"。
       if (!opts?.proactive) this.history.pushUser(chat, userText, ctx.attachments);
 
-      const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
+      const { reply, toolSpoke } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 
       // afterLLM 钩子（persona checker 插槽）
       let finalReply = reply;
@@ -724,6 +747,21 @@ export class Pipeline {
         } catch (e) {
           this.errors.record('warn', 'plugin', `afterLLM 出错（${lp.manifest.id}）: ${(e as Error).message}`, { pluginId: lp.manifest.id });
         }
+      }
+
+      // 引用工具这一轮已经把话发出去了：本轮到此为止，不再走普通出站。
+      // 模型若还在正文里写了话，整段丢弃——引用那次的正文就是它说的全部。
+      const quoted = (toolSpoke ?? '').trim();
+      if (quoted) {
+        if (finalReply.trim()) {
+          this.sessionLog.append(event.chatId, event.type, {
+            type: 'gate', role: 'system', text: '引用已发送完毕，正文不再补发',
+            data: { decision: 'quoted_reply_settled', dropped: true },
+          });
+        }
+        this.humanlike.noteSpoke(chat, 1, [quoted]);
+        this.history.pushAssistant(chat, quoted);
+        return;
       }
 
       // 没接模型 / 额度耗尽 / 链全挂会被吞成空回复：这轮一个字不发，只落 gate 条目。

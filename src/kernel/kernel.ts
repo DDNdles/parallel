@@ -30,6 +30,7 @@ import {
   buildJargonPrompt,
   parseJargonReply,
 } from './humanlike/jargon.ts';
+import { RepeatWatcher } from './humanlike/repeat.ts';
 import type { HumanlikeConfig } from './humanlike/types.ts';
 import { OneBot11Adapter } from './adapters/onebot11.ts';
 import { startApiServer } from './api/server.ts';
@@ -87,6 +88,7 @@ export class Kernel {
   history: HistoryStore;
   humanlike: HumanlikeService;
   jargon?: JargonService;
+  repeat?: RepeatWatcher;
   pipeline: Pipeline;
   adapter: OneBot11Adapter;
   dataDir: string;
@@ -201,6 +203,22 @@ export class Kernel {
         } catch { return null; }
       },
     });
+    // 跟屏复读（repeat.ts）：纯程序段。发送走 ChatService（限速/会话日志照常），
+    // 发完历史回灌 + 拟人层开口记账——两条回调都在闭包里惰性取，Timer 触发时内核早已装配好。
+    this.repeat = new RepeatWatcher({
+      config: () => this.config.config.humanlike.repeat,
+      send: (chat, text) => this.chat.sendText(chat, text),
+      onSent: (chat, text) => {
+        try {
+          this.history.pushAssistant(chat, text);
+          this.humanlike.noteSpoke(chat, 1, [text]);
+        } catch (e) {
+          this.errors.record('warn', 'kernel', `跟屏复读记账失败: ${(e as Error).message}`, { chatId: chat.chatId });
+        }
+      },
+      selfId: () => (this.adapter?.status() as { selfId?: string } | undefined)?.selfId ?? '',
+      log: makeLogger('repeat'),
+    });
     this.adapter = new OneBot11Adapter(
       this.config, this.errors, this.bus, this.sandbox,
       (e) => this.pipeline.submit(e),
@@ -220,6 +238,7 @@ export class Kernel {
       () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
       () => (this.adapter?.status() as { selfId?: string } | undefined)?.selfId ?? '',
       this.jargon,
+      this.repeat,
     );
 
     // 配置限速热更新
@@ -390,6 +409,7 @@ export class Kernel {
     }
     this.scheduler.dispose();
     this.humanlike.dispose();
+    this.repeat?.dispose();
     await this.adapter.stop();
     await this.llbot.stop().catch(() => {});
     await this.napcat.stop().catch(() => {});

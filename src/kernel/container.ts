@@ -316,8 +316,9 @@ export class PluginContainer {
       if (!this.effectiveEnabled(lp.manifest.id, chat.chatId)) continue;
       for (const t of lp.tools.values()) {
         if (allowSet && !allowSet.has(t.name)) continue;
-        // chat 面拿不到 work 面工具；work 面可以拿 both
+        // chat 面拿不到 work 面工具；work 面拿不到 chat 面工具
         if (surface === 'chat' && t.surface === 'work') continue;
+        if (surface === 'work' && t.surface === 'chat') continue;
         if (t.ownerOnly && role !== 'owner') continue;
         if (t.minRole && !roleAtLeast(role, t.minRole)) continue;
         out.push(t);

@@ -92,3 +92,21 @@ test('会话日志回读历史时走同一套净化（重启后那份记录仍�
     rmSync(d, { recursive: true, force: true });
   }
 });
+
+test('inboundModelText：带消息号就盖 [#编号]（引用回复的地址）', () => {
+  assert.equal(inboundModelText({ text: '收一下', nickname: '小明', messageId: '12345' }), '小明：收一下 [#12345]');
+  // 编号缺失/空白就不盖（桌面端注入、旧日志)
+  assert.equal(inboundModelText({ text: '收一下', nickname: '小明', messageId: '' }), '小明：收一下');
+  // 同一套口径在会话日志投影里也接上了：入账的 messageId 进 [#] 标记
+  const d = dir();
+  try {
+    const log = new SessionLog(d, new Bus());
+    log.append('300', 'group', {
+      type: 'message_in', role: 'user', nickname: '小明', text: '冲', data: { messageId: '9001' },
+    });
+    const p = log.project('300', 'group');
+    assert.equal(p.messages[0]?.content, '小明：冲 [#9001]', JSON.stringify(p.messages));
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});

@@ -212,9 +212,9 @@ function assertMedia(body) {
   const system = messages.filter((m) => m?.role === 'system').map((m) => String(m.content ?? '')).join('\n');
   say(system.includes('上下文时限'), 'system 含「上下文时限」（405 分节）');
   const tools = (body?.tools ?? []).map((t) => t.function?.name).filter(Boolean).sort();
-  const want = ['forget_me', 'plan_schedule', 'recall_facts', 'remember_fact', 'remember_setting', 'search_history', 'web_fetch', 'web_search'];
-  say(tools.length === 8 && JSON.stringify(tools) === JSON.stringify(want),
-    `工具恰好 8 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
+  const want = ['forget_me', 'plan_schedule', 'recall_facts', 'remember_fact', 'remember_setting', 'reply_quote', 'search_history', 'web_fetch', 'web_search'];
+  say(tools.length === 9 && JSON.stringify(tools) === JSON.stringify(want),
+    `工具恰好 9 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
   return fails;
 }
 

@@ -106,6 +106,8 @@ export const DEFAULT_CONFIG = {
     // 圈内黑话（表达学习，humanlike/jargon.ts）：挖本群高频词，判定为圈内含意时
     // 进 prompt 的「圈内黑话」参考——帮 bot 听懂，不改说话风格、不产数值
     jargon: { enable: true },
+    // 跟屏复读（humanlike/repeat.ts）：>=N 位群友接连说同一句就完整跟一条；纯程序不走模型
+    repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
     // ① 出站投递（HDSI `runtime`）：分隔标记切分 + 打字节奏 + 单条长度上限。
     // 字段名与默认值逐条对齐 HDSI；MaiBot 的分段器 / 错字 / 打字速度已整体删除。
     outgoing: {

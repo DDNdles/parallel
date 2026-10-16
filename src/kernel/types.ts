@@ -142,10 +142,11 @@ export interface ToolContext {
 /**
  * 工具在哪个面上可见（pi 的 tool surface 思想）：
  *  - `both`（默认）：chat 轮与 work 轮都能用；
- *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见。
+ *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见；
+ *  - `chat`：只给 chat 轮（如引用回复），work 面严格看不见。
  * 由 `toolsForChat(chat, role, surface)` 在收集阶段就过滤掉，不是"注册了但调用时拒绝"。
  */
-export type ToolSurface = 'both' | 'work';
+export type ToolSurface = 'both' | 'work' | 'chat';
 
 export interface ToolDef {
   name: string;
@@ -188,6 +189,11 @@ export interface ToolResult {
    * 避免再耗一轮让模型复述一遍（也就避免了复述时的走样）。
    */
   finalReply?: string;
+  /**
+   * 引用 reply_quote 用：工具已把这句话发到群里（带引用段）。
+   * 内核据此本轮不再走普通出站（剩余正文整段丢弃），并按 role=model 回灌历史。
+   */
+  spoke?: string;
 }
 
 /** 工具动作的结构化说明（UI 用来画 +N -M 与文件主体） */

@@ -481,8 +481,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         return send({ entries: kernel.sessionLog.readFromDisk(b, limit) });
       }
       if (c === 'send' && req.method === 'POST') {
-        // 以 bot 身份发言
-        await kernel.chat.sendText(chat, String(body.text ?? ''));
+        // 以 bot 身份发言：**真实发出**（platform=qq 走协议端），限速与会话日志照常，
+        // 发完按 role=model 回灌历史。测试用户注入走 /inject（platform=ui，
+        // 模型回复只在桌面端模拟落日志）——两条路不混，别把这里的平台改回 ui。
+        await kernel.pipeline.sendAsBot(
+          { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] },
+          String(body.text ?? ''),
+        );
         return send({ ok: true });
       }
       if (c === 'inject' && req.method === 'POST') {
@@ -1099,6 +1104,18 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   // 圈内黑话（表达学习）
   const jargon = body.jargon as Record<string, unknown> | undefined;
   if (jargon && typeof jargon === 'object') applyBool(target.jargon, jargon, 'enable');
+
+  // 跟屏复读（纯程序段）：开关 + 条数/秒数/冷却逐键收，范围在服务端也成立
+  const repeat = body.repeat as Record<string, unknown> | undefined;
+  if (repeat && typeof repeat === 'object') {
+    const t = target.repeat as {
+      enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number;
+    };
+    applyBool(t, repeat, 'enable');
+    if ('minPeople' in repeat) t.minPeople = Math.min(20, Math.max(2, Math.round(Number(repeat.minPeople) || 4)));
+    if ('delayMaxSec' in repeat) t.delayMaxSec = Math.min(30, Math.max(1, Math.round(Number(repeat.delayMaxSec) || 4)));
+    if ('cooldownMin' in repeat) t.cooldownMin = Math.min(120, Math.max(0, Math.round(Number(repeat.cooldownMin) || 3)));
+  }
 
   // 节奏反定型（HDSI ChatRhythm）
   const rhythm = body.rhythm as Record<string, unknown> | undefined;

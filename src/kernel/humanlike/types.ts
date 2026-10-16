@@ -13,6 +13,7 @@ import { DEFAULT_ALTER, type AlterConfig } from './alter.ts';
 import { DEFAULT_AGENCY, type AgencyConfig } from './agency.ts';
 import { DEFAULT_SCHEDULE, type ScheduleConfig } from './schedule.ts';
 import type { JargonConfig } from './jargon.ts';
+import type { RepeatConfig } from './repeat.ts';
 
 export type { OutgoingConfig } from './delivery.ts';
 export type { BackoffConfig, TalkRule, TalkValueConfig } from './frequency.ts';
@@ -21,6 +22,7 @@ export type { AlterConfig, AlterOffset, AlterState } from './alter.ts';
 export type { AgencyConfig, AgencyWindow, ProactiveContactCandidate, AgencyCapacity } from './agency.ts';
 export type { ScheduleConfig, SchedulePlan, ScheduleRule, ScheduleException } from './schedule.ts';
 export type { JargonConfig } from './jargon.ts';
+export type { RepeatConfig } from './repeat.ts';
 
 export interface TimingConfig {
   /**
@@ -60,6 +62,8 @@ export interface HumanlikeConfig {
   };
   /** 圈内黑话（表达学习，jargon.ts）：挖本群高频词 → 反事实判定 → prompt 参考节 */
   jargon: JargonConfig;
+  /** 跟屏复读（repeat.ts）：纯程序段，>=N 位群友说了同一句就完整跟一条 */
+  repeat: RepeatConfig;
   timing: TimingConfig;
   /** 出站投递（HDSI `runtime`）：分隔标记切分、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
@@ -93,6 +97,7 @@ export interface HumanlikeConfig {
 export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   script: { enable: true },
   jargon: { enable: true },
+  repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
   timing: {
     replyTriggerMode: 'likelihood',
     pendingThreshold: 12,
