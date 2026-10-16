@@ -43,6 +43,12 @@ async function quiesce(idleMs = 300, maxMs = 8000): Promise<void> {
   }
 }
 
+/** 用例之间共库：先把这个号的事实清干净，别拿"上一条用例留下的条数"当基线 */
+function wipeFacts(userId: number): void {
+  const ids = kernel.memory.topFacts(String(userId), 200).map((f) => f.id);
+  if (ids.length) kernel.memory.deleteFacts(String(userId), ids);
+}
+
 const ONEBOT_PORT = 30000 + (process.pid % 20000); // 随机端口避免并发测试/残留进程冲突
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-e2e-'));
@@ -115,27 +121,35 @@ test('拒绝错误 token 的协议端连接', async () => {
 // 2. 主流程：@机器人 → AgentLoop → 回复（含工具调用）
 // ============================================================
 
-test('群聊 @机器人触发完整 agent loop 并回复', async () => {
+test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', async () => {
   // 开启 chat + sandbox 插件（管理员通过模拟命令开，这里直接容器操作等价）
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   kernel.container.setGroupState('sandbox', String(GROUP), true, String(MASTER));
 
-  // 脚本：先调用沙箱工具，再回答
+  // chat 工具面 2026-10-17 起只留记忆读取：sandbox 这类行为工具在 chat 轮严格缺席
+  const chatTools = kernel.container
+    .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
+    .map((t) => t.name).sort();
+  assert.deepEqual(chatTools, ['recall_facts', 'search_history'], `chat 面只该有记忆读取: ${chatTools}`);
+
+  // 脚本：先调一次记忆查询（chat 面唯一的一类工具），拿到结果后作答
   mockProvider.script.push({
-    toolCalls: [{ name: 'run_python', args: { code: 'print(2**10)' } }],
+    toolCalls: [{ name: 'recall_facts', args: { query: '2^10' } }],
   }, {
     content: '喵！是 1024 哦～',
   });
 
+  const mark = mock.actions.length;
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: ' 帮我算下 2^10', atMe: true, nickname: '小明' });
-  const reply = await mock.waitForReply(GROUP);
+  const reply = await mock.waitForReply(GROUP, 8000, mark);
   assert.match(reply, /1024/);
   assert.match(reply, /喵/);
 
-  // 工具确实在沙箱里跑过：会话日志应有 tool_call/tool_result
+  // 工具确实跑过：会话日志应有 tool_call/tool_result
+  await quiesce();
   const tail = kernel.sessionLog.tail(String(GROUP), 'group', 50);
-  assert.ok(tail.some((e) => e.type === 'tool_call' && e.text === 'run_python'));
-  assert.ok(tail.some((e) => e.type === 'tool_result' && (e.data?.result as string)?.includes('1024')));
+  assert.ok(tail.some((e) => e.type === 'tool_call' && e.text === 'recall_facts'));
+  assert.ok(tail.some((e) => e.type === 'tool_result' && String(e.data?.result ?? '').includes('记忆')));
 });
 
 // ============================================================
@@ -144,16 +158,21 @@ test('群聊 @机器人触发完整 agent loop 并回复', async () => {
 
 test('群禁用的插件：工具缺席/命令不可用/普通成员不可见', async () => {
   mock.actions.length = 0;
-  // 未开启 web-search 的群：工具列表里没有 web_search
+  // 2026-10-17 起 chat 面只收记忆读取：插件工具（web_search 这类）一律不进 chat 轮，
+  // 分群开关只作用于 work 面 —— 这里两面分别验证。
   const chatRef = { platform: 'qq', type: 'group' as const, chatId: String(GROUP) };
   kernel.container.setGroupState('web-search', String(GROUP), false, String(MASTER));
-  const toolsOff = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
-  assert.ok(!toolsOff.includes('web_search'), `web_search 不应出现: ${toolsOff}`);
+  const chatToolsOff = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
+  assert.ok(!chatToolsOff.includes('web_search'), `chat 面不该有 web_search: ${chatToolsOff}`);
+  const workOff = kernel.container.toolsForChat(chatRef, 'member', 'work').map((t) => t.name);
+  assert.ok(!workOff.includes('web_search'), `未开启的插件其工具在 work 面也要缺席: ${workOff}`);
 
-  // 开启后出现
+  // 开启后：work 面出现；chat 面仍然没有（chat 面是白名单口径，恒不含插件工具）
   kernel.container.setGroupState('web-search', String(GROUP), true, String(MASTER));
-  const toolsOn = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
-  assert.ok(toolsOn.includes('web_search'));
+  const workOn = kernel.container.toolsForChat(chatRef, 'member', 'work').map((t) => t.name);
+  assert.ok(workOn.includes('web_search'), `开启后 work 面应出现: ${workOn}`);
+  const chatOn = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
+  assert.ok(!chatOn.includes('web_search'), `chat 面恒不含插件工具: ${chatOn}`);
 
   // 关闭后：普通成员 /帮助 完全看不到该插件命令；管理员可见（标未开启）
   kernel.container.setGroupState('web-search', String(GROUP), false, String(MASTER));
@@ -165,7 +184,7 @@ test('群禁用的插件：工具缺席/命令不可用/普通成员不可见', 
 
   // 全局运行时停用 → 所有群所有角色都不可见
   await kernel.container.setRuntimeEnabled('web-search', false);
-  assert.equal(kernel.container.toolsForChat(chatRef, 'owner').filter((t) => t.name === 'web_search').length, 0);
+  assert.equal(kernel.container.toolsForChat(chatRef, 'owner', 'work').filter((t) => t.name === 'web_search').length, 0);
   await kernel.container.setRuntimeEnabled('web-search', true);
 
   // /搜索 命令在该群不可用（普通成员视角=未知命令；不泄露存在性）
@@ -225,50 +244,80 @@ test('记忆服务：添加/检索/忘记', () => {
   assert.equal(kernel.memory.searchFacts(String(MEMBER), '乐队', 5).length, 0);
 });
 
-test('默认 admin_only：普通成员 /忘记我 被拒，管理员可清（含自己）', async () => {
-  mock.actions.length = 0;
+test('QQ 侧不再有清除记忆的入口：/忘记我 当未知命令处理，记忆不动', async () => {
   kernel.memory.addFact(String(MEMBER), { content: '爱吃香菜', sourcePlugin: 'test' });
+  mock.actions.length = 0;
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/忘记我', nickname: '小明' });
   const reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /只有管理员|权限不足/);
-  assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 1, '普通成员清不掉自己');
-
-  mock.actions.length = 0;
-  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: `/forget ${MEMBER}`, role: 'admin', nickname: '群管' });
-  const reply2 = await mock.waitForReply(GROUP);
-  assert.match(reply2, /已清除/);
-  assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 0);
+  assert.match(reply, /未知命令|没有这个命令|不认识/);
+  assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 1, '群里一句话清不掉记忆');
   mock.actions.length = 0;
 });
 
-test('/forget 指定别人：普通成员被拒，管理员可清除', async () => {
-  const OTHER = '777001';
-  kernel.memory.addFact(OTHER, { content: '别人的秘密', sourcePlugin: 'test' });
-  mock.actions.length = 0;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: `/forget ${OTHER}`, nickname: '小明' });
-  let reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /权限不足/);
-  assert.equal(kernel.memory.topFacts(OTHER, 10).length, 1, '普通成员清不动别人');
-
-  mock.actions.length = 0;
-  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: `/forget ${OTHER}`, role: 'admin', nickname: '群管' });
-  reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /已清除/);
-  assert.equal(kernel.memory.topFacts(OTHER, 10).length, 0);
-  mock.actions.length = 0;
+test('chat 工具面只剩记忆读取：forget_me / remember_* 这类行为工具已删（2026-10-17 收窄）', () => {
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  const names = kernel.container
+    .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
+    .map((t) => t.name).sort();
+  assert.deepEqual(names, ['recall_facts', 'search_history'], `chat 面只该有记忆读取: ${names}`);
+  // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；写事实由后台自动提炼承担
+  for (const gone of ['forget_me', 'remember_fact', 'remember_setting', 'plan_schedule', 'reply_quote']) {
+    assert.ok(!names.includes(gone), `${gone} 不该再出现在 chat 面`);
+  }
 });
 
-test('forgetScope=self_and_admin（config.json 手改口径）时本人可清自己的', async () => {
-  kernel.config.config.risk.forgetScope = 'self_and_admin';
+// ============================================================
+// 5.2 自动记忆提炼：攒够轮 + 静默够久 → 后台一发 → 落库（不进上下文）
+// ============================================================
+
+test('自动保存记忆：提炼出来的条权重 <1，且能经检索查回', async () => {
+  const U = '777888';
+  const p = kernel.config.config.persona as unknown as Record<string, unknown>;
+  const saved = { ...p };
+  p.memoryAutoSave = true; p.memoryMinTurns = 2; p.memoryIdleSeconds = 10; p.memoryMaxFacts = 5;
+  mockProvider.memoryReply = '- 喜欢的乐队是万人谜\n- 约定每周五一起打游戏';
   try {
-    mock.actions.length = 0;
-    kernel.memory.addFact(String(MEMBER), { content: '爱吃香菜', sourcePlugin: 'test' });
-    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/忘记我', nickname: '小明' });
-    const reply = await mock.waitForReply(GROUP);
-    assert.match(reply, /忘记|重新认识/);
-    assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 0);
+    wipeFacts(Number(U));
+    for (const text of ['我最近迷上万人谜了', '就这么说定 每周五一起打游戏']) {
+      const mark = mock.actions.length;
+      mock.sendGroupMessage({ groupId: GROUP, userId: Number(U), text, atMe: true, nickname: 'Auto' });
+      await mock.waitForReply(GROUP, 8000, mark);
+    }
+    // 静默门槛 10s + 扫描一拍 15s：轮询等它自己发生（不催、不改内部状态）
+    await until(() => kernel.memory.topFacts(U, 10).length >= 2, 25000, '自动记忆落库');
+    const facts = kernel.memory.topFacts(U, 10);
+    assert.ok(facts.every((f) => f.weight < 1), '自动提炼的都带 <1 权重（用户页据此打「自动」徽标）');
+    assert.ok(facts.some((f) => f.content.includes('万人谜')));
+    assert.equal(facts[0].sourcePlugin, 'chat');
+    // 检索得到（模型经 recall_facts 就是走这条路），而上下文里没有它们
+    assert.ok(kernel.memory.searchFacts(U, '万人谜', 5).length >= 1);
   } finally {
-    kernel.config.config.risk.forgetScope = 'admin_only';
+    for (const k of Object.keys(p)) delete p[k];
+    Object.assign(p, saved);
+    kernel.memory.forget(U);
+    mockProvider.memoryReply = 'NONE';
+    mock.actions.length = 0;
+  }
+});
+
+test('关掉自动保存后不再提炼（开关真管用）', async () => {
+  const U = '777889';
+  const p = kernel.config.config.persona as unknown as Record<string, unknown>;
+  const saved = { ...p };
+  p.memoryAutoSave = false; p.memoryMinTurns = 2; p.memoryIdleSeconds = 10;
+  mockProvider.memoryReply = '- 不该被记下来的一件事';
+  try {
+    for (const text of ['第一句', '第二句']) {
+      const mark = mock.actions.length;
+      mock.sendGroupMessage({ groupId: GROUP, userId: Number(U), text, atMe: true, nickname: 'Auto' });
+      await mock.waitForReply(GROUP, 8000, mark);
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(kernel.memory.topFacts(U, 10).length, 0, '关掉开关就不该写队列、更不该提炼');
+  } finally {
+    for (const k of Object.keys(p)) delete p[k];
+    Object.assign(p, saved);
+    mockProvider.memoryReply = 'NONE';
     mock.actions.length = 0;
   }
 });
@@ -456,8 +505,11 @@ test('私聊全收并回复', async () => {
   // 只认发给该用户(10001)的私聊，避免与其他用例的 owner 通知(9999)竞态
   const toMember = () => mock.actions.slice(mark).filter((a) => a.action === 'send_private_msg' && String(a.params.user_id) === String(MEMBER));
   await until(() => toMember().length > 0, 8000, '私聊回复');
-  const call = toMember().at(-1)!;
-  const text = (call.params.message ?? []).map((s: any) => s.data?.text ?? '').join('');
+  // 按句分条可能出两条：等分片发完（静默窗口）再把整段回复拼起来断言
+  await quiesce();
+  const text = toMember()
+    .map((call) => (call.params.message ?? []).map((s: any) => String(s.data?.text ?? '')).join(''))
+    .join('|');
   assert.match(text, /私聊/);
   mock.actions.length = 0;
 });
@@ -639,14 +691,14 @@ test('work 停下来提问：转述按"等你回答"口径；管理员回答后�
 // 17. 拟人层（chat 区全量替换）：分段发送 / 合批 / 主动发言
 // ============================================================
 
-test('拟人化：模型写了分隔标记才拆成多条；不写就整条发出（HDSI 口径）', async () => {
+test('拟人化：分条是纯程序 —— 句末标点/换行/旧分隔标记都分条，逗号不断句', async () => {
   await quiesce();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   const groupSends = () => mock.actions
     .filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP))
     .map((a) => (a.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join(''));
 
-  // ① 模型写了分隔标记 → 按标记分多条
+  // ① 旧分隔标记（剧本体时代的 <sep/>）仍当作换行：分条意图保留，记号不外发
   mock.actions.length = 0;
   mockProvider.script.push({ content: '今天去上课了<sep/>然后回来睡觉<sep/>睡醒吃了饭。' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
@@ -657,14 +709,49 @@ test('拟人化：模型写了分隔标记才拆成多条；不写就整条发�
     assert.ok(parts.some((t) => t.includes(piece)), `缺 ${piece}: ${JSON.stringify(parts)}`);
   }
 
-  // ② 不写分隔标记 → 整条发（不再自动断句，这是 HDSI 与 MaiBot 分段器的分水岭）
+  // ② 只有逗号与末尾句号的长句 → 一条（逗号不是句末标点，不分条）
   await quiesce();
   mock.actions.length = 0;
   mockProvider.script.push({ content: '今天去上课了，然后回来睡觉，睡醒吃了饭。' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
   await mock.waitForReply(GROUP);
   const one = groupSends();
-  assert.equal(one.length, 1, `没有分隔标记就该整条发，实际 ${one.length} 条: ${JSON.stringify(one)}`);
+  assert.equal(one.length, 1, `逗号不断句，实际 ${one.length} 条: ${JSON.stringify(one)}`);
+});
+
+test('拟人化：触发消息被后来的消息刷远时，回复自动挂引用（v1 程序锚定）', async () => {
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  mock.actions.length = 0;
+  const triggerId = 88001;
+  // 让模型"想一会儿"：生成期间再进一条消息，触发消息就不是最新一条了
+  mockProvider.script.push({ content: '收到', delayMs: 500 });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '看看这个', atMe: true, nickname: '小明', messageId: triggerId });
+  await new Promise((r) => setTimeout(r, 150));
+  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '啊这', nickname: '阿强' });
+  await mock.waitForReply(GROUP, 8000);
+  await quiesce();
+  const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
+  const quoted = sent.find((a) => (a.params.message ?? []).some((s: any) => s.type === 'reply'));
+  assert.ok(quoted, `回复应挂着触发消息的引用: ${JSON.stringify(sent)}`);
+  const replySeg = (quoted!.params.message ?? []).find((s: any) => s.type === 'reply');
+  assert.equal(String(replySeg.data?.id), String(triggerId), '引用的是触发那条消息');
+  // 引用块与正文必须在同一个消息里（曾把 reply 段拆成一条空消息 + 一条无引用的正文）
+  const text = (quoted!.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join('');
+  assert.match(text, /收到/);
+});
+
+test('拟人化：一问一答没被刷远时不挂引用（一般的消息不需要引用）', async () => {
+  await quiesce();
+  mock.actions.length = 0;
+  mockProvider.script.push({ content: '好' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明', messageId: 88002 });
+  await mock.waitForReply(GROUP, 8000);
+  await quiesce();
+  const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
+  assert.ok(sent.length >= 1, '回复照常发出');
+  assert.ok(sent.every((a) => !(a.params.message ?? []).some((s: any) => s.type === 'reply')),
+    `没有被刷远就不该挂引用: ${JSON.stringify(sent)}`);
 });
 
 test('拟人化：群里几条消息攒一起，一次交给模型（且带上说话人）', async () => {
@@ -750,13 +837,13 @@ test('拟人化：主动发言轮真说话时不往历史塞假用户消息', as
   }
 });
 
-test('拟人化：没有总开关可关（剧本体始终在生效）', async () => {
+test('拟人化：没有总开关可关（出站塑形始终在生效）', async () => {
   await quiesce();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   // 内核不提供关掉拟人化的入口：配置里没有 enabled 键，API 也不认
   assert.equal('enabled' in kernel.config.config.humanlike, false);
   mock.actions.length = 0;
-  // 没有分隔标记 → 整条发出（分不分条已改为由模型自己写标记决定）
+  // 一整句没有句末标点 → 一条发出（按句分条是程序在生效，但单句就是单条）
   mockProvider.script.push({ content: '第一句，第二句，第三句。' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
   await mock.waitForReply(GROUP, 8000);

@@ -124,3 +124,21 @@ test('重启后仍然尊重压缩（冷启动不会把历史又变回全文）',
     rmSync(d, { recursive: true, force: true });
   }
 });
+
+test('searchMessages：给了窗口起点就只翻它之前的（模型眼前那几条不该还回去）', () => {
+  const d = dir();
+  try {
+    const log = new SessionLog(d, new Bus());
+    const t0 = Date.parse('2026-10-16T10:00:00Z');
+    const put = (text: string, ts: number) => log.append('100', 'group', { type: 'message_in', role: 'user', text, ts } as never);
+    put('之前聊过张桓堉那个人', t0);
+    put('张桓堉', t0 + 60_000);
+    const win = t0 + 30_000;   // 窗口起点落在两条之间：第二条模型眼前就有
+    assert.deepEqual(log.searchMessages('100', 'group', { q: '张桓堉', beforeTs: win }).map((h) => h.text),
+      ['之前聊过张桓堉那个人']);
+    assert.deepEqual(log.searchMessages('100', 'group', { q: '张桓堉' }).map((h) => h.text),
+      ['之前聊过张桓堉那个人', '张桓堉'], '不给起点就照旧全搜（work 轮等别的调用方）');
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});

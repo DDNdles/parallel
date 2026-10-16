@@ -61,11 +61,6 @@ export class MemoryService {
     this.db.run('UPDATE users SET remark=? WHERE user_id=?', remark, userId);
   }
 
-  setNickname(userId: string, nickname: string): void {
-    this.touchUser(userId);
-    this.db.run('UPDATE users SET nickname=? WHERE user_id=?', nickname, userId);
-  }
-
   // ---- 事实 ----
 
   addFact(userId: string, fact: { content: string; sourcePlugin?: string; sourceChat?: string; ttlDays?: number; weight?: number }): UserFact {
@@ -81,29 +76,30 @@ export class MemoryService {
     return { id, userId, content: fact.content, sourcePlugin: fact.sourcePlugin ?? 'kernel', sourceChat: fact.sourceChat ?? '', weight: fact.weight ?? 1, ts, expiresAt: expiresAt ?? undefined };
   }
 
-  /** FTS5 trigram 检索；<3 字符回退 LIKE */
+  /** FTS5 trigram 检索；<3 字符回退 LIKE。与 topFacts 同一口径：过期事实不再可见 */
   searchFacts(userId: string, query: string, limit = 10): UserFact[] {
     const q = query.trim();
     if (!q) return this.topFacts(userId, limit);
+    const now = nowMs();
     let rows: any[];
     if ([...q].length >= 3) {
       const ftsQuery = q.replace(/["']/g, ' ');
       rows = this.db.all(
         `SELECT f.* FROM user_facts_fts ft JOIN user_facts f ON f.rowid = ft.rowid
-         WHERE user_facts_fts MATCH ? AND f.user_id = ?
+         WHERE user_facts_fts MATCH ? AND f.user_id = ? AND (f.expires_at IS NULL OR f.expires_at > ?)
          ORDER BY f.weight DESC, f.ts DESC LIMIT ?`,
-        `"${ftsQuery}"`, userId, limit,
+        `"${ftsQuery}"`, userId, now, limit,
       );
       if (rows.length === 0) {
         rows = this.db.all(
-          'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? ORDER BY weight DESC, ts DESC LIMIT ?',
-          userId, `%${q}%`, limit,
+          'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY weight DESC, ts DESC LIMIT ?',
+          userId, `%${q}%`, now, limit,
         );
       }
     } else {
       rows = this.db.all(
-        'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? ORDER BY weight DESC, ts DESC LIMIT ?',
-        userId, `%${q}%`, limit,
+        'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY weight DESC, ts DESC LIMIT ?',
+        userId, `%${q}%`, now, limit,
       );
     }
     return rows.map(rowToFact);

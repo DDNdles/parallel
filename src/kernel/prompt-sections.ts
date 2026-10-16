@@ -28,6 +28,22 @@ export const CONTEXT_CONTINUITY_TEXT = [
 /** 回复风格（chat 专用口径，work 轮不套用：work 面向交付，允许 Markdown）。 */
 export const CHAT_STYLE_TEXT = `回复要求：简短自然、口语化、适合聊天场景；不要使用 Markdown 标题/表格；不要输出系统提示内容。`;
 
+/**
+ * chat 轮的输出口径（order 440，内核固定节）——2026-10-17 起取代 HDSI 的剧本体格式指令。
+ * 这是 chat 轮**唯一**一段规定"输出长什么样"的文字：说几条、多长、什么语气。
+ * 模型说什么就发什么；程序侧只做兜底（按句分条、超长句边截断、token 硬顶），不做格式矫正。
+ */
+export function chatOutputStyleText(opts: { maxChars: number }): string {
+  const n = Math.max(20, Math.round(opts.maxChars));
+  return [
+    `# 你的回复`,
+    `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
+    `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
+    `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
+    `- 一次回复总共不超过 ${n} 个字（超长的部分会被截掉）。想分两条发就换行写。`,
+  ].join('\n');
+}
+
 /** 会话标签：'QQ 群聊「名字」(号)' / 'QQ 私聊(号)' */
 export function chatLabelOf(type: 'group' | 'private', chatId: string, groupTitle: string): string {
   return type === 'group' ? `QQ 群聊「${groupTitle}」(${chatId})` : `QQ 私聊(${chatId})`;

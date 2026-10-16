@@ -99,3 +99,13 @@ export function backoffBypassed(cfg: BackoffConfig, pendingCount: number): boole
   const bypass = Math.max(0, cfg.bypassPendingCount);
   return bypass > 0 && pendingCount >= bypass;
 }
+
+/**
+ * 轰炸降频惩罚（2026-10-17 用户裁定）：最近 10 秒的入站条数超过 5 条后，
+ * 每多一条给开口门槛 +0.05，封顶 +0.3。群里刷屏时她先看戏 —— 信息是过载的，
+ * 晚一点接反而接得准（配合"被刷远自动引用"）。只叠加在默认的 likelihood 模式上。
+ */
+export function burstGatePenalty(recentInbound10s: number): number {
+  const n = Math.max(0, Math.round(recentInbound10s));
+  return Math.min(0.3, Math.max(0, (n - 5) * 0.05));
+}

@@ -4,11 +4,11 @@
  * 对上下暴露三件事：
  *  1. `ingest()`  入站消息的门控：@/私聊/命令立刻放行，其余按必要性打分 + 空窗补偿攒着，
  *                 攒够了再由回调叫 pipeline 去跑一轮（这就是"会接话"与"会主动说话"）。
- *  2. `compose()` 出站回复的塑形：分段 → 注错字 → 逐条 + 打字停顿（这就是"单句单句发"）。
- *  3. 每会话一份心流状态：最近消息窗口（存在感惩罚用）、平均消息间隔（空窗补偿用）、
+ *  2. `compose()` 出站回复的塑形：按句分条 → 逐条打字停顿（纯程序，模型不写任何格式标记）。
+ *  3. 每会话一份心流状态：最近消息窗口（存在感惩罚 / 轰炸降频用）、平均消息间隔（空窗补偿用）、
  *                 连续不理人的计数（空闲退避用）。
  *
- * 这一层不在插件体系里：它是 chat 区行为本身，插件只能通过钩子微调（关分段/关错字）。
+ * 这一层不在插件体系里：它是 chat 区行为本身，插件只能通过钩子微调。
  */
 
 import type { ChatEvent, ChatRef, MsgSegment } from '../types.ts';
@@ -31,10 +31,8 @@ import {
   type GateSample,
   type GateWeights,
 } from './likelihood.ts';
-import { backoffBypassed, idleBackoffSeconds, talkValueFor } from './frequency.ts';
-import { normalizeVisibleContent, splitOutgoingMessage, typingDelayMs } from './delivery.ts';
-import { isSilentScene, readAuthoredActions, splitBubbles } from './script.ts';
-import { advanceAlter, alterOffsetForPrompt, createAlterState, readAlter, type AlterState } from './alter.ts';
+import { backoffBypassed, burstGatePenalty, idleBackoffSeconds, talkValueFor } from './frequency.ts';
+import { isSilentScene, normalizeVisibleContent, splitIntoBubbles, trimAtSentence, typingDelayMs } from './delivery.ts';
 import { detectCollapse, rhythmNudge, rhythmSignature } from './rhythm.ts';
 import { deriveWindow, evaluateAgency, nextRecheckAt, type ProactiveContactCandidate } from './agency.ts';
 import { currentActivity, emptyPlan, prunePlan, schedulePrompt, type SchedulePlan } from './schedule.ts';
@@ -70,9 +68,7 @@ interface ChatState {
   rhythmSigs: string[];
   /** 连续注入了提示但节奏没变好的次数（熔断用） */
   rhythmExhausted: number;
-  /** 情绪偏移状态（HDSI Alter） */
-  alter: AlterState;
-  /** 日程计划（HDSI Schedule Preplan） */
+  /** 日程计划（HDSI Schedule Preplan；写入入口已删，只剩读取与容量判断） */
   schedule: SchedulePlan;
   /** 上一次主动开口的时间（HDSI 用最小间隔挡频繁主动） */
   lastProactiveAt: number;
@@ -102,20 +98,13 @@ export interface HumanlikeServiceOptions {
   errors: ErrorCenter;
   /** 打字节奏与抖动在测试里要能关掉 */
   now?: () => number;
+  /** 合批起跳随机延时的随机源（测试注入用；缺省 Math.random） */
+  random?: () => number;
   /**
    * likelihood 模型的落盘位置（`data/gate-model.json`）。不传就只跑内存，
    * 冷启动从先验开始 —— 测试与 dump 场景用这个口。
    */
   modelFile?: string;
-  /**
-   * 侧端氛围分析（HDSI 的 Alter 分析任务）。命中阈值时异步跑一次，**不阻塞可见回复**；
-   * 回来之后写进氛围参考，之后几轮注入。拿不到（没接模型 / 失败）就当没这回事。
-   */
-  describeAlter?: (payload: {
-    value: number;
-    direction: 'serious' | 'relaxed';
-    recent: string[];
-  }) => Promise<{ direction: 'serious' | 'relaxed'; description: string; intensity: number } | null>;
 }
 
 export class HumanlikeService {
@@ -160,7 +149,7 @@ export class HumanlikeService {
         consecutiveNoAction: 0, backoffUntil: 0, lastWaitLoggedAt: 0,
         focused: false,
         rhythmSigs: [], rhythmExhausted: 0,
-        alter: createAlterState(), schedule: emptyPlan(), lastProactiveAt: 0,
+        schedule: emptyPlan(), lastProactiveAt: 0,
         gateThreshold: GATE_THRESHOLD_INIT, gateDecisions: [],
       };
       this.states.set(k, s);
@@ -217,12 +206,13 @@ export class HumanlikeService {
     st.buffer.push(event);
     if (!st.firstBufferedAt) st.firstBufferedAt = now;
 
-    // 防抖：静默 windowMs 后评估
+    // 防抖：静默 windowMs + 随机起跳延时后评估 —— 真人也是"看到 → 停半拍 → 开始打字"，
+    // 关窗就秒回显得太积极（2026-10-17 用户裁定：合批关窗后随机延时 0.5~2 秒起跳）。
     if (st.debounce) clearTimeout(st.debounce);
     st.debounce = this.timer(() => {
       st.debounce = undefined;
       this.evaluate(event, st, cfg, hasAt, hasMention);
-    }, cfg.merge.windowMs);
+    }, cfg.merge.windowMs + this.fireJitter(cfg));
 
     // 兜底：从第一条起最多攒 maxWaitMs（群里刷屏时 debounce 永远不触发）
     if (!st.maxWait) {
@@ -247,6 +237,32 @@ export class HumanlikeService {
 
   private bufferLen(st: ChatState): number {
     return st.buffer.length;
+  }
+
+  /**
+   * 合批关窗后的随机起跳延时（毫秒）：默认 0.5~2 秒。
+   * 等待期间新来的消息会重置防抖窗口（= 群里还在刷，她继续看戏），@/提及仍然直通。
+   */
+  private fireJitter(cfg: HumanlikeConfig): number {
+    const lo = Math.max(0, Math.round(Number(cfg.merge.fireDelayMinMs) || 0));
+    const hi = Math.max(lo, Math.round(Number(cfg.merge.fireDelayMaxMs) || 0));
+    if (hi <= 0) return 0;
+    const r = this.opts.random ?? Math.random;
+    return lo + Math.round(r() * (hi - lo));
+  }
+
+  /**
+   * 轰炸惩罚：最近 10 秒的入站条数交给 `burstGatePenalty` 折算成开口门槛的加项。
+   * 只叠加在默认的 likelihood 模式上（necessity/frequency 是对照模式，口径冻结）。
+   */
+  private burstPenalty(st: ChatState, now: number): number {
+    let n = 0;
+    for (let i = st.recent.length - 1; i >= 0; i--) {
+      const r = st.recent[i];
+      if (now - r.at > 10_000) break;
+      if (!r.self) n++;
+    }
+    return burstGatePenalty(n);
   }
 
   // ------------------------------------------------------------ 评估
@@ -344,10 +360,13 @@ export class HumanlikeService {
           return { feats, p: replyLikelihood(feats, this.gateWeights) };
         })()
       : null;
+    // 轰炸降频：刷屏时把开口门槛抬起来（只作用于 likelihood；对照模式口径冻结）
+    const burst = likelihood ? this.burstPenalty(st, now) : 0;
+    const gate = st.gateThreshold + burst;
     const mainGate = mode === 'frequency'
       ? pending >= cfg.timing.pendingThreshold
       : likelihood
-        ? likelihood.p >= st.gateThreshold
+        ? likelihood.p >= gate
         : scored.score >= threshold;
 
     let reason: TriggerBatch['reason'] | null = null;
@@ -357,7 +376,7 @@ export class HumanlikeService {
       detail = mode === 'frequency'
         ? `pending=${pending} >= ${cfg.timing.pendingThreshold}`
         : likelihood
-          ? `P=${likelihood.p.toFixed(2)} ≥ ${st.gateThreshold.toFixed(2)}｜${scored.detail}`
+          ? `P=${likelihood.p.toFixed(2)} ≥ ${gate.toFixed(2)}${burst > 0 ? `（含轰炸 +${burst.toFixed(2)}）` : ''}｜${scored.detail}`
           : scored.detail;
     } else if (comp.reached) {
       reason = 'idle';
@@ -399,7 +418,7 @@ export class HumanlikeService {
     if (likelihood) this.recordGate(st, now, false, likelihood.feats);
     this.armRecheck(carrier, st, delay);
     this.logWait(carrier, st, likelihood
-      ? `不说：P=${likelihood.p.toFixed(2)} < ${st.gateThreshold.toFixed(2)}｜${scored.detail}`
+      ? `不说：P=${likelihood.p.toFixed(2)} < ${gate.toFixed(2)}${burst > 0 ? `（含轰炸 +${burst.toFixed(2)}）` : ''}｜${scored.detail}`
       : `不说：${scored.detail}｜${comp.detail}`);
   }
 
@@ -543,11 +562,11 @@ export class HumanlikeService {
     this.state(chat).lastProactiveAt = this.now();
   }
 
-  // ------------------------------------------------------------ 三个 HDSI 子系统的注入
+  // ------------------------------------------------------------ 子系统的注入
 
   /**
-   * 这一轮要追加的 system 分节（顺序在剧本体之后、插件节之前）：
-   *   450 Alter 氛围参考 / 460 节奏提醒 / 470 日程
+   * 这一轮要追加的 system 分节（顺序在输出口径之后、插件节之前）：
+   *   460 节奏提醒 / 470 日程
    * 都只在真有内容时才出节 —— 空节只会白占 token 和注意力。
    */
   sceneSections(chat: ChatRef): { order: number; title: string; text: string }[] {
@@ -555,21 +574,6 @@ export class HumanlikeService {
     const st = this.state(chat);
     const now = this.now();
     const out: { order: number; title: string; text: string }[] = [];
-
-    // 450 氛围参考（HDSI Alter）
-    const offset = alterOffsetForPrompt(st.alter, cfg.alter);
-    if (offset) {
-      out.push({
-        order: 450,
-        title: 'alter',
-        text: [
-          '# 当前氛围（最近这段时间累积出来的，不是这一句的指令）',
-          `- 基调偏「${offset.direction === 'serious' ? '认真' : '放松'}」，强度 ${offset.intensity}/${cfg.alter.maxIntensity}（置信 ${offset.weight.toFixed(2)}）`,
-          `- ${offset.description}`,
-          '它只影响语气底色，别拿它当话题，也别说明它的存在。',
-        ].join('\n'),
-      });
-    }
 
     // 460 节奏提醒（HDSI ChatRhythm）
     if (cfg.rhythm.enable && st.rhythmExhausted < cfg.rhythm.exhaustLimit) {
@@ -610,7 +614,7 @@ export class HumanlikeService {
     return { allowed: cap.allowed, reason: cap.reason, recheckAt: nextRecheckAt(cap, nowDate, cfg.agency) };
   }
 
-  /** 日程计划读写（模型经 plan_schedule 工具写；写的时候顺手清过期项） */
+  /** 日程计划读写（模型侧的写入入口已随 chat 工具面收窄删除；这里留给 /日程 与容量判断） */
   planSchedule(chat: ChatRef, plan: SchedulePlan): SchedulePlan {
     const st = this.state(chat);
     st.schedule = prunePlan(plan, new Date(this.now()), this.config.schedule);
@@ -621,23 +625,7 @@ export class HumanlikeService {
     return this.state(chat).schedule;
   }
 
-  /** 侧端分析回来：写氛围参考（HDSI `completeAlterAnalysis`） */
-  noteAlterOffset(chat: ChatRef, offset: { direction: 'serious' | 'relaxed'; description: string; intensity: number }): void {
-    const st = this.state(chat);
-    const now = this.now();
-    const cfg = this.config.alter;
-    const intensity = Math.max(0, Math.min(cfg.maxIntensity, Math.round(offset.intensity)));
-    st.alter = {
-      ...st.alter,
-      value: 0,
-      weight: intensity > 0 ? Math.max(cfg.minWeight, intensity / cfg.maxIntensity) : 0,
-      offset: intensity > 0 ? { direction: offset.direction, description: offset.description.slice(0, 120), intensity, at: now } : null,
-      lastAnalyzeAt: now,
-      exhausted: 0,
-    };
-  }
-
-  /** 评估过了但最终没发（模型给了 SKIP） */
+  /** 评估过了但最终没发（模型给了沉默标记） */
   noteSilent(chat: ChatRef): void {
     const st = this.state(chat);
     st.consecutiveNoAction += 1;
@@ -660,94 +648,56 @@ export class HumanlikeService {
   // ------------------------------------------------------------ 出站塑形
 
   /**
-   * 一段剧本 → 待发气泡（HDSI 口径，见 delivery.ts 的说明）。**不做任何文字后处理清洗**：
-   *  - 剧本体开着且模型按格式写了 say 块：只有 say 块里的字进群；逐个 action 先归一化并按
-   *    `maxMessageCharacters` 截断，再按分隔标记切（HDSI 正是"先截断整条、再分段"）。
-   *  - 没有 say 块（模型没按格式来）：退回普通模式，整段当一个可见回复，同样先截断再切 ——
-   *    免得它彻底哑掉（对应 HDSI 的 legacy reply.content 路径）。
-   * 括号/星号动作描写不再被程序清洗，靠 `<say>` 结构与提示词约束（HDSI 同款）。
+   * 一段模型输出 → `{ plans, historyText, spoke }`。
+   *
+   * 2026-10-17 起没有剧本体：模型写的字就是话本身（不写动作描写靠 440 输出口径约束，
+   * 不再有 `<say>` 结构兜底）。三种情形：
+   *   ① 整段就是沉默标记 → 什么都不发（主动轮用它保持安静）；
+   *   ② 其余 → 归一化（剥占位/标签、单条上限硬截断）→ 按回复总长句边截断 → 按句/换行分条。
+   * `historyText` 就是真正发出去的气泡合并 —— 历史里模型自己的话与群里看到的同形态。
    */
-  private collectBubbles(scene: string, cfg: HumanlikeConfig): string[] {
-    const out = cfg.outgoing;
-    const norm = (s: string) => normalizeVisibleContent(s, out.maxMessageCharacters, out.messageSeparator);
-    if (cfg.script.enable) {
-      const { actions } = readAuthoredActions(scene);
-      if (actions.length) {
-        const bubbles: string[] = [];
-        for (const action of actions) {
-          bubbles.push(...splitBubbles(norm(action.content), out.messageSeparator, out.splitReplyMessages));
-        }
-        return bubbles.filter(Boolean);
-      }
-    }
-    return splitOutgoingMessage(norm(scene), out).filter(Boolean);
+  async composeScene(text: string): Promise<{ plans: SendPlan[]; historyText: string; spoke: boolean }> {
+    const cfg = this.config;
+    const scene = String(text ?? '');
+    if (isSilentScene(scene)) return { plans: [], historyText: '', spoke: false };
+
+    const bubbles = this.collectBubbles(scene, cfg);
+    return { plans: this.plan(bubbles), historyText: bubbles.join('\n'), spoke: bubbles.length > 0 };
   }
 
-  /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久（HDSI） */
+  /** 只要发送计划（不关心正文时用；测试与验收脚本走这里） */
+  async compose(chat: ChatRef, text: string): Promise<SendPlan[]> {
+    void chat;
+    return (await this.composeScene(text)).plans;
+  }
+
+  /** 单条文本的打字等待（秒），插件/命令想自己排节奏时用（下限 0.25s） */
+  typingSeconds(text: string): number {
+    return typingDelayMs(text, this.config.outgoing) / 1000;
+  }
+
+  // ------------------------------------------------------------ 出站塑形
+
+  /**
+   * 可见正文 → 待发气泡（纯程序，口径见 delivery.ts）：
+   * 归一化 → 句边截断（回复总长上限的兜底）→ 按换行与句末标点分条。
+   * 模型不写任何格式标记；关掉 `splitReplyMessages` 就整段一条发出去。
+   */
+  private collectBubbles(text: string, cfg: HumanlikeConfig): string[] {
+    const out = cfg.outgoing;
+    const t = trimAtSentence(normalizeVisibleContent(text, out.maxMessageCharacters), out.replyMaxCharacters);
+    if (!t) return [];
+    if (out.splitReplyMessages === false) return [t];
+    return splitIntoBubbles(t);
+  }
+
+  /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久 */
   private plan(bubbles: string[]): SendPlan[] {
     const cfg = this.config.outgoing;
     return bubbles.map((text, i) => ({
       segments: [{ type: 'text', data: { text } }] as MsgSegment[],
       pauseMs: i === 0 ? 0 : typingDelayMs(text, cfg),
     }));
-  }
-
-  /**
-   * 一段模型输出 → `{ plans, historyText, spoke }`。
-   *
-   * 剧本体开着时（默认）：模型写的是"小说的下一段"，**只有 `<say id>` 块里的字会变成 QQ 消息**；
-   * 旁白（动作/神态/环境）留在剧本里，从结构上就漏不出去。
-   *
-   * `historyText` 刻意用**带标签的原文**回灌历史：模型是照着自己上一轮的样子学的 ——
-   * 回灌摘掉标签的 prose，它下一轮就不再写 `<say>`，退化成大段旁白直发（实测第 3 轮就退化了）。
-   * 标签只在这一层被摘掉，不进历史。
-   *
-   * 三种情形：
-   *   ① 有 say 块 → 只发这些
-   *   ② 整段就是沉默标记 → 什么都不发（HDSI 的"不回"）
-   *   ③ 没有 say 块 → 模型没按格式来：退回普通模式把整段当一条台词发，免得它彻底哑掉
-   */
-  async composeScene(text: string, chat?: ChatRef): Promise<{ plans: SendPlan[]; historyText: string; spoke: boolean }> {
-    const cfg = this.config;
-    // Alter 标记是元数据，不进剧本也不进历史
-    const alterRead = readAlter(text);
-    const scene = alterRead.text;
-    if (chat && alterRead.value !== undefined && cfg.alter.enabled) this.advanceAlterFor(chat, alterRead.value, scene);
-
-    if (isSilentScene(scene)) return { plans: [], historyText: '', spoke: false };
-
-    const bubbles = this.collectBubbles(scene, cfg);
-    return { plans: this.plan(bubbles), historyText: scene, spoke: bubbles.length > 0 };
-  }
-
-  /** 推进 Alter：累计 + 判阈值；命中阈值就异步跑一次侧端分析（不阻塞本轮） */
-  private advanceAlterFor(chat: ChatRef, alter: number, scene: string): void {
-    const cfg = this.config;
-    const st = this.state(chat);
-    const now = this.now();
-    const out = advanceAlter(st.alter, alter, now, cfg.alter);
-    st.alter = out.state;
-    if (!out.thresholdReached || !this.opts.describeAlter) return;
-    if (st.alter.lastAnalyzeAt > 0 && now - st.alter.lastAnalyzeAt < 5 * 60_000) return;
-    const value = st.alter.value;
-    const direction: 'serious' | 'relaxed' = value >= 0 ? 'relaxed' : 'serious';
-    const recent = st.rhythmSigs.slice(-4);
-    st.alter = { ...st.alter, lastAnalyzeAt: now };
-    void this.opts.describeAlter({ value, direction, recent })
-      .then((r) => { if (r) this.noteAlterOffset(chat, r); })
-      .catch(() => { /* 侧端失败就当没这回事，下一轮会再试 */ });
-    void scene;
-  }
-
-  /** 只要发送计划（不关心剧本正文时用；测试与验收脚本走这里） */
-  async compose(chat: ChatRef, text: string): Promise<SendPlan[]> {
-    void chat;
-    return (await this.composeScene(text)).plans;
-  }
-
-  /** 单条文本的打字等待（秒），插件/命令想自己排节奏时用（HDSI 口径，下限 0.25s） */
-  typingSeconds(text: string): number {
-    return typingDelayMs(text, this.config.outgoing) / 1000;
   }
 
   // ------------------------------------------------------------ 状态维护

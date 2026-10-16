@@ -74,3 +74,14 @@ test('改过记忆后仍能删除，且检索跟得上改动（缺 AFTER UPDATE 
   assert.deepEqual(m.searchFacts('1001', '清晨').map((f) => f.content), ['喜欢在清晨写代码']);
   assert.deepEqual(m.searchFacts('1001', '听雨'), []);
 });
+
+test('过期事实对 topFacts 与 searchFacts 都不可见（FTS 与 LIKE 两条分支同一口径）', () => {
+  const m = mk();
+  m.touchUser('1001');
+  m.addFact('1001', { content: '喜欢在深夜写代码', ttlDays: -1 });   // 已过期
+  m.addFact('1001', { content: '喜欢在清晨写代码', ttlDays: 30 });
+  assert.deepEqual(m.searchFacts('1001', '在深夜').map((f) => f.content), [], '≥3 字走 FTS 分支：过期的不该命中');
+  assert.deepEqual(m.searchFacts('1001', '深夜').map((f) => f.content), [], '<3 字走 LIKE 分支：过期的不该命中');
+  assert.deepEqual(m.searchFacts('1001', '在清晨').map((f) => f.content), ['喜欢在清晨写代码'], '没过期的照常命中');
+  assert.deepEqual(m.topFacts('1001', 5).map((f) => f.content), ['喜欢在清晨写代码']);
+});

@@ -9,13 +9,11 @@ import { Icon } from '@/components/Icon';
 import { Switch } from '@/components/Modal';
 import Hint from '@/components/Hint';
 
-/** 拟人层配置（内核 humanlike 段）：开口时机对齐 MaiBot，发送方式对齐 HDSI */
+/** 拟人层配置（内核 humanlike 段）：开口时机对齐 MaiBot，发出去的样子是纯程序（按句分条 + 句边截断） */
 interface Humanlike {
-  /** 剧本体：模型写小说，仅 <say> 内的台词进 QQ */
-  script: { enable: boolean };
-  /** 出站投递（HDSI runtime）：分隔标记切分 + 打字节奏 + 单条长度上限 */
+  /** 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限 */
   outgoing: {
-    splitReplyMessages: boolean; messageSeparator: string;
+    splitReplyMessages: boolean; replyMaxCharacters: number; maxReplyTokens: number;
     typingBaseDelaySeconds: number; typingCharactersPerSecond: number;
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
@@ -26,7 +24,7 @@ interface Humanlike {
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
     mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
   };
-  merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number };
+  merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number; fireDelayMinMs: number; fireDelayMaxMs: number };
   backoff: { baseSeconds: number; capSeconds: number; startCount: number; bypassPendingCount: number };
   /** 圈内黑话（表达学习）：先挖本群高频词再进 prompt 的参考节 */
   jargon?: { enable: boolean };
@@ -35,8 +33,6 @@ interface Humanlike {
   proactive: { enable: boolean; idleSeconds: number };
   /** 聊天节奏反定型（HDSI ChatRhythm） */
   rhythm: { enable: boolean; mode: 'gentle' | 'balanced' | 'aggressive'; historyLimit: number; collapseMinSamples: number; exhaustLimit: number };
-  /** 情绪偏移（HDSI Alter） */
-  alter: { enabled: boolean; baseThreshold: number; densityFactor: number; sameDirectionBoost: number; oppositeDecay: number; minWeight: number; maxIntensity: number };
   /** 主体行动窗口（HDSI Agency） */
   agency: { enable: boolean; quietHours: string; minimumProactiveIntervalMinutes: number; maxWindowMinutes: number; maxCandidateHours: number };
   /** 日程（HDSI Schedule Preplan） */
@@ -54,14 +50,15 @@ interface Config {
   /** flavor（协议端）与 llbot.mode（接入方式）不再有界面入口，只认手改 config.json（重启生效） */
   onebot: { host: string; port: number; reverseWsPath: string };
   ui?: { expectedQq?: string; chatPreview?: boolean };
-  llm: { failoverThreshold: number; maxToolRounds?: number };
+  llm: { failoverThreshold: number };
   /** 每会话历史条数在 storage 段（历史环形缓冲真正读的键）；旧内核没这个段，可选 */
   storage?: { historyLimit: number; contextMinutes?: number };
   /** 收件文件保留天数：内核存的是小时，界面按天给 */
   sandbox?: { inboxKeepDays: number };
   work: Work;
   persona: {
-    memoryFactsTopK: number;
+    /** 自动记忆提炼：攒够几轮、静默多久才发那一发；结果只落库，不进上下文 */
+    memoryAutoSave: boolean; memoryMinTurns: number; memoryIdleSeconds: number; memoryMaxFacts: number;
   };
   humanlike: Humanlike;
 }
@@ -93,7 +90,7 @@ const RHYTHM_MODES: PillOpt[] = [
 const SECTIONS: { v: string; t: string; icon: string }[] = [
   { v: 'onebot', t: 'QQ 接入', icon: 'plug' },
   { v: 'chat', t: '会话', icon: 'chats' },
-  { v: 'model', t: '模型', icon: 'bolt' },
+  { v: 'model', t: '模型', icon: 'models' },
   { v: 'work', t: '工作', icon: 'work' },
   { v: 'sandbox', t: '沙箱', icon: 'file' },
   { v: 'search', t: '搜索', icon: 'globe' },
@@ -291,59 +288,47 @@ export default function SettingsPage() {
             </>
           )}
 
-          {sec === 'chat' && (
-            <div className="mset-models">
-              <div className="mset-mrow">
-                <span className="plg-v">群友头像与图片缩略图</span>
-                <span className="mset-macts"><Switch on={c.ui?.chatPreview !== false}
-                  onChange={() => { const on = !(c.ui?.chatPreview !== false); patch({ ui: { ...c.ui, chatPreview: on } }); autoSave('ui', 0, { ui: { chatPreview: on } }); }} /></span>
-              </div>
-              {/* 旧内核没有这个键就不渲染：重启内核后出现 */}
-              {c.storage && c.storage.contextMinutes !== undefined && (
-                <div className="set-grid" style={{ marginTop: 14 }}>
-                  <Num label="传入上下文时限分钟" value={c.storage.contextMinutes}
-                    onChange={(v) => { const st = c.storage; if (!st) return; patch({ storage: { ...st, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />
-                </div>
-              )}
-              {/* 跟屏复读：纯程序段，不走模型；旧内核没有这个键就不渲染 */}
-              {c.humanlike && c.humanlike.repeat && (
-                <>
-                  <div className="mset-models" style={{ marginTop: 14 }}>
+          {sec === 'chat' && (() => {
+            // 旧内核没有这些键就不渲染：重启内核后出现
+            const rp = h?.repeat;
+            const st = c.storage;
+            const cm = st?.contextMinutes;
+            const setRp = (p: Partial<NonNullable<Humanlike['repeat']>>, immediate = false) =>
+              rp && patchH({ repeat: { ...rp, ...p } }, immediate);
+            return (
+              <>
+                {(cm !== undefined || rp) && (
+                  <div className="set-grid">
+                    {cm !== undefined && st && (
+                      <Num label="传入上下文时限分钟" value={cm}
+                        onChange={(v) => { patch({ storage: { ...st, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />
+                    )}
+                    {rp && (<>
+                      <Num label="复读触发人数" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
+                      <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
+                      <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
+                    </>)}
+                  </div>
+                )}
+
+                <div className="mset-sec-h"><span>开关</span></div>
+                <div className="mset-models">
+                  <div className="mset-mrow">
+                    <span className="plg-v">群友头像与图片缩略图</span>
+                    <span className="mset-macts"><Switch on={c.ui?.chatPreview !== false}
+                      onChange={() => { const on = !(c.ui?.chatPreview !== false); patch({ ui: { ...c.ui, chatPreview: on } }); autoSave('ui', 0, { ui: { chatPreview: on } }); }} /></span>
+                  </div>
+                  {rp && (
                     <div className="mset-mrow">
                       <span className="plg-v">跟屏复读</span>
-                      <span className="mset-macts"><Switch on={c.humanlike.repeat.enable !== false}
-                        onChange={() => {
-                          const r = c.humanlike.repeat!;
-                          const nh = { ...c.humanlike, repeat: { ...r, enable: !(r.enable !== false) } };
-                          patch({ humanlike: nh as Config['humanlike'] });
-                          autoSave('humanlike', 0, { humanlike: { repeat: { enable: !(r.enable !== false) } } });
-                        }} /></span>
+                      <span className="mset-macts"><Switch on={rp.enable !== false}
+                        onChange={() => setRp({ enable: !(rp.enable !== false) }, true)} /></span>
                     </div>
-                  </div>
-                  <div className="set-grid" style={{ marginTop: 14 }}>
-                    <Num label="复读触发人数" value={c.humanlike.repeat.minPeople}
-                      onChange={(v) => {
-                        const r = { ...c.humanlike.repeat!, minPeople: v };
-                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
-                        autoSave('humanlike', 600, { humanlike: { repeat: { minPeople: v } } });
-                      }} />
-                    <Num label="复读延迟秒数" value={c.humanlike.repeat.delayMaxSec}
-                      onChange={(v) => {
-                        const r = { ...c.humanlike.repeat!, delayMaxSec: v };
-                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
-                        autoSave('humanlike', 600, { humanlike: { repeat: { delayMaxSec: v } } });
-                      }} />
-                    <Num label="复读冷却分钟" value={c.humanlike.repeat.cooldownMin}
-                      onChange={(v) => {
-                        const r = { ...c.humanlike.repeat!, cooldownMin: v };
-                        patch({ humanlike: { ...c.humanlike, repeat: r } as Config['humanlike'] });
-                        autoSave('humanlike', 600, { humanlike: { repeat: { cooldownMin: v } } });
-                      }} />
-                  </div>
-                </>
-              )}
-            </div>
-          )}
+                  )}
+                </div>
+              </>
+            );
+          })()}
 
           {sec === 'model' && (
             <>
@@ -372,8 +357,6 @@ export default function SettingsPage() {
               </div>
 
               <div className="set-grid" style={{ marginTop: 14 }}>
-                <Num label="chat 工具轮上限" value={c.llm.maxToolRounds ?? 8}
-                  onChange={(v) => { patch({ llm: { ...c.llm, maxToolRounds: v } }); autoSave('llm', 600, { llm: { maxToolRounds: v } }); }} />
                 {c.storage && <Num label="每会话历史条数" hint="模型每次读取的最近消息条数" value={c.storage.historyLimit}
                   onChange={(v) => { patch({ storage: { historyLimit: v } }); autoSave('storage', 600, { storage: { historyLimit: v } }); }} />}
               </div>
@@ -437,7 +420,7 @@ export default function SettingsPage() {
             </>
           )}
 
-          {sec === 'humanlike' && (!h.script || !h.outgoing || !h.rhythm || !h.alter || !h.agency || !h.schedule ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
+          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-field">
@@ -519,6 +502,10 @@ export default function SettingsPage() {
 
               <div className="mset-sec-h"><span>发送方式</span></div>
               <div className="set-grid" style={{ marginTop: 14 }}>
+                <Num label="回复最长字符数" value={h.outgoing.replyMaxCharacters}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
+                <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
                 <Num label="打字基础延迟（秒）" value={h.outgoing.typingBaseDelaySeconds}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingBaseDelaySeconds: v } })} />
                 <Num label="打字速度（字/秒）" value={h.outgoing.typingCharactersPerSecond}
@@ -551,6 +538,10 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ merge: { ...h.merge, maxWaitMs: v } })} />
                 <Num label="攒着消息作废（毫秒）" value={h.merge.bufferTtlMs}
                   onChange={(v) => patchH({ merge: { ...h.merge, bufferTtlMs: v } })} />
+                <Num label="起跳随机延时下限（毫秒）" value={h.merge.fireDelayMinMs}
+                  onChange={(v) => patchH({ merge: { ...h.merge, fireDelayMinMs: v } })} />
+                <Num label="起跳随机延时上限（毫秒）" value={h.merge.fireDelayMaxMs}
+                  onChange={(v) => patchH({ merge: { ...h.merge, fireDelayMaxMs: v } })} />
                 <Num label="主动发言所需静默时长（秒）" value={h.proactive.idleSeconds}
                   onChange={(v) => patchH({ proactive: { ...h.proactive, idleSeconds: v } })} />
                 <Num label="退避起点（轮）" hint="退避：连续多轮评估未发言后，下次评估前的等待逐轮翻倍" value={h.backoff.startCount}
@@ -563,7 +554,7 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ backoff: { ...h.backoff, bypassPendingCount: v } })} />
               </div>
 
-              <div className="mset-sec-h"><span>剧本体</span></div>
+              <div className="mset-sec-h"><span>群聊行为</span></div>
               <div className="mset-models">
                 <div className="mset-mrow">
                   <span className="plg-v">圈内黑话<Hint text="先记本群高频词，判准了才进 prompt 参考" /></span>
@@ -574,11 +565,6 @@ export default function SettingsPage() {
                   <span className="plg-v">节奏反定型<Hint text="回复结构固化时纠偏" /></span>
                   <span className="mset-macts"><Switch on={h.rhythm.enable}
                     onChange={() => patchH({ rhythm: { ...h.rhythm, enable: !h.rhythm.enable } }, true)} /></span>
-                </div>
-                <div className="mset-mrow">
-                  <span className="plg-v">情绪偏移<Hint text="长期氛围累积" /></span>
-                  <span className="mset-macts"><Switch on={h.alter.enabled}
-                    onChange={() => patchH({ alter: { ...h.alter, enabled: !h.alter.enabled } }, true)} /></span>
                 </div>
                 <div className="mset-mrow">
                   <span className="plg-v">行动容量<Hint text="日程与安静时段限制主动发言" /></span>
@@ -598,18 +584,6 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ rhythm: { ...h.rhythm, collapseMinSamples: v } })} />
                 <Num label="熔断轮数（3-12）" value={h.rhythm.exhaustLimit}
                   onChange={(v) => patchH({ rhythm: { ...h.rhythm, exhaustLimit: v } })} />
-                <Num label="氛围阈值（1-100）" value={h.alter.baseThreshold}
-                  onChange={(v) => patchH({ alter: { ...h.alter, baseThreshold: v } })} />
-                <Num label="氛围密度系数（%）" value={Math.round(h.alter.densityFactor * 100)}
-                  onChange={(v) => patchH({ alter: { ...h.alter, densityFactor: Math.min(100, Math.max(0, v)) / 100 } })} />
-                <Num label="氛围强度上限（1-5）" value={h.alter.maxIntensity}
-                  onChange={(v) => patchH({ alter: { ...h.alter, maxIntensity: v } })} />
-                <Num label="同向加成（%）" value={Math.round(h.alter.sameDirectionBoost * 100)}
-                  onChange={(v) => patchH({ alter: { ...h.alter, sameDirectionBoost: Math.min(100, Math.max(0, v)) / 100 } })} />
-                <Num label="反向衰减（%）" value={Math.round(h.alter.oppositeDecay * 100)}
-                  onChange={(v) => patchH({ alter: { ...h.alter, oppositeDecay: Math.min(100, Math.max(0, v)) / 100 } })} />
-                <Num label="权重过期线（%）" value={Math.round(h.alter.minWeight * 100)}
-                  onChange={(v) => patchH({ alter: { ...h.alter, minWeight: Math.min(100, Math.max(0, v)) / 100 } })} />
                 <Num label="主动最小间隔（分钟）" value={h.agency.minimumProactiveIntervalMinutes}
                   onChange={(v) => patchH({ agency: { ...h.agency, minimumProactiveIntervalMinutes: v } })} />
                 <Num label="行动窗口有效期（分钟）" value={h.agency.maxWindowMinutes}
@@ -623,12 +597,29 @@ export default function SettingsPage() {
             </>
           ))}
 
-          {sec === 'persona' && (
-            <div className="set-grid">
-              <Num label="每次注入记忆条数 Top-K" value={c.persona.memoryFactsTopK}
-                onChange={(v) => { const np = { ...c.persona, memoryFactsTopK: v }; patch({ persona: np }); autoSave('persona', 600, { persona: np }); }} />
-            </div>
-          )}
+          {sec === 'persona' && (() => {
+            const setP = (p: Partial<Config['persona']>, immediate = false) => {
+              const np = { ...c.persona, ...p };
+              patch({ persona: np });
+              autoSave('persona', immediate ? 0 : 600, { persona: np });
+            };
+            return (
+              <>
+                <div className="set-grid">
+                  <Num label="提炼所需轮数" value={c.persona.memoryMinTurns} onChange={(v) => setP({ memoryMinTurns: v })} />
+                  <Num label="对话静默秒数" value={c.persona.memoryIdleSeconds} onChange={(v) => setP({ memoryIdleSeconds: v })} />
+                  <Num label="每次最多记录条数" value={c.persona.memoryMaxFacts} onChange={(v) => setP({ memoryMaxFacts: v })} />
+                </div>
+                <div className="mset-models">
+                  <div className="mset-mrow">
+                    <span className="plg-v">自动保存记忆</span>
+                    <span className="mset-macts"><Switch on={c.persona.memoryAutoSave !== false}
+                      onChange={() => setP({ memoryAutoSave: c.persona.memoryAutoSave === false }, true)} /></span>
+                  </div>
+                </div>
+              </>
+            );
+          })()}
         </section>
       </div>
     </div>

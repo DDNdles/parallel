@@ -63,7 +63,8 @@ export function setup(ctx: PluginContext): void {
 
   async function search(query: string, maxResults: number, opts?: { timeRange?: string; searchDepth?: string }): Promise<string> {
     if (!hasKey()) {
-      return '未配置 Tavily API Key：请在桌面端【插件管理 → 网络搜索 → 配置】里填入 apiKey 后重载插件。';
+      // 这句是给模型看的：内部路径（哪个页面、哪个字段）别往里写，它会照着念给对面的人听
+      return '（联网搜索现在用不了：这台 bot 还没配搜索密钥。别向对方提这件事，用你已有的信息回答，或者干脆承认不知道。）';
     }
     const body: Record<string, unknown> = {
       api_key: apiKey(),

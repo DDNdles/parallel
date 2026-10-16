@@ -223,7 +223,7 @@ export class SessionLog {
         // 落账的 text 是"给人看"的（界面靠它 + data 画引用块与记录卡），给模型要现净化一遍。
         // 群聊再把说话人拼进正文（昵称优先，无昵称给 QQ 号）——与 pipeline 的当前轮同一口径；
         // 私聊不带名，对面是谁 system 里已写明。
-        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[]; messageId?: string } | undefined;
+        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[] } | undefined;
         const m: { role: 'user'; content: string; ts?: number; attachments?: MessageAttachment[] } = {
           role: 'user',
         content: inboundModelText({
@@ -231,8 +231,6 @@ export class SessionLog {
           replyTo: d?.replyTo,
           forward: d?.forward,
           nickname: chatType === 'group' ? (e.nickname || String(e.userId ?? '') || undefined) : undefined,
-          // 编号盖章与 pipeline 的当前轮同一口径：重启重建的窗口消息也要能被引用回复
-          messageId: String(d?.messageId ?? ''),
         }),
         };
         if (Number.isFinite(e.ts)) m.ts = e.ts;
@@ -322,8 +320,10 @@ export class SessionLog {
    * 关键词检索本会话的历史消息（入站 message_in + 出站 message_out 原文），时间正序。
    * 上下文窗口外的旧消息模型平时看不到，这个方法是她"翻旧账"的通道：整份 JSONL 扫一遍，
    * 取**最近** limit 条命中（旧命中太多时不该把最早的顶上来）。工具调用是显式低频动作，全量扫可接受。
+   * `beforeTs`：只翻这个时刻之前的（窗口起点）——模型眼前就有的那几条再还回去一遍，
+   *  它只会误以为"还有前文我没看到"，然后越查越离谱。
    */
-  searchMessages(chatId: string, chatType: string, opts: { q: string; limit?: number }): { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] {
+  searchMessages(chatId: string, chatType: string, opts: { q: string; limit?: number; beforeTs?: number }): { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] {
     const q = opts.q.trim().toLowerCase();
     if (!q) return [];
     const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 20), 100));
@@ -335,6 +335,7 @@ export class SessionLog {
         if (!line.trim()) continue;
         let e: SessionLogEntry;
         try { e = JSON.parse(line); } catch { continue; }
+        if (opts.beforeTs !== undefined && e.ts >= opts.beforeTs) continue;
         const isUser = e.type === 'message_in' && e.role === 'user';
         const isAssistant = e.type === 'message_out' && e.role === 'assistant';
         if (!isUser && !isAssistant) continue;
@@ -408,5 +409,25 @@ export class SessionLog {
       if ((e.data as { messageId?: string } | undefined)?.messageId === messageId) return e;
     }
     return null;
+  }
+
+  /**
+   * 触发消息（按协议端消息号定位）**之后**有没有更新的入站消息（组回复的引用锚点判断用，
+   * 见 pipeline.quoteTargetOf）：触发消息被后面的新消息刷远了，回复才挂引用段。
+   * 按尾缓冲的追加序比较（不按 ts —— 落账 ts 与事件 ts 差几毫秒，自己会被当成"更新的"；
+   * 踩过这个坑：每条回复都挂上了空引用）。只算 message_in，自己的出站不算；找不到触发消息就是 false。
+   */
+  hasNewerInbound(chatId: string, chatType: string, messageId: string): boolean {
+    if (!messageId) return false;
+    const buf = this.tail(chatId, chatType, Number.MAX_SAFE_INTEGER);
+    let idx = -1;
+    for (let i = buf.length - 1; i >= 0; i--) {
+      if ((buf[i].data as { messageId?: string } | undefined)?.messageId === messageId) { idx = i; break; }
+    }
+    if (idx < 0) return false;
+    for (let i = idx + 1; i < buf.length; i++) {
+      if (buf[i].type === 'message_in') return true;
+    }
+    return false;
   }
 }

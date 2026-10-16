@@ -162,12 +162,15 @@ function truncateStr(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
-/** 把文本段按长度切成多条，其余段保持独立（平台单条上限的硬兜底） */
+/** 把文本段按长度切成多条，其余段保持独立（平台单条上限的硬兜底）。
+ *  `reply` 段例外：它是**下一条正文的引用块**，必须和正文在同一个消息里（拆开就是一条空引用 +
+ *  一条无引用的正文）——挂进当前消息、跟着后面的文本走。 */
 export function splitSegments(segments: MsgSegment[], maxChars: number): MsgSegment[][] {
   const out: MsgSegment[][] = [];
   let cur: MsgSegment[] = [];
   let curLen = 0;
   for (const seg of segments) {
+    if (seg.type === 'reply') { cur.push(seg); continue; }
     if (seg.type === 'text' && typeof seg.data.text === 'string') {
       let text: string = seg.data.text;
       while (text.length > maxChars) {

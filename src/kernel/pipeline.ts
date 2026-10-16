@@ -11,7 +11,7 @@ import type { Bus } from './bus.ts';
 import type { Db } from './db.ts';
 import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
-import { scriptFormatText, SILENT_MARKER, isSilentScene } from './humanlike/script.ts';
+import { SILENT_MARKER, isSilentScene } from './humanlike/delivery.ts';
 
 /** 圈内黑话（表达学习）的 hook 面；可选依赖——没接（测试/降级）就整个旁路 */
 interface JargonHook {
@@ -25,7 +25,7 @@ interface RepeatHook {
 import { AGENCY_REASON_ZH } from './humanlike/agency.ts';
 import { todayKey, newId } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
-import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem } from './prompt-sections.ts';
+import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem, chatOutputStyleText } from './prompt-sections.ts';
 import { composeContinueTask, type PendingAsk } from './work-prompt.ts';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
@@ -103,13 +103,11 @@ function renderBatch(events: ChatEvent[]): string {
 function modelTextOf(event: ChatEvent): string {
   // 群聊把说话人放进正文：昵称优先、无昵称给 QQ 号——模型本来拿不到账号（ChatMessage 不存昵称），
   // 这是它「群里谁在说话」的唯一来源；私聊对面是谁 system 已写明，不画蛇添足。
-  // 行尾的 [#编号] 是引用回复的地址（reply_quote 工具照着填），有编号的才盖。
   return inboundModelText({
     text: event.text,
     replyTo: event.replyTo,
     forward: event.forward,
     nickname: event.type === 'group' ? (event.nickname || event.userId) : undefined,
-    messageId: event.messageId,
   });
 }
 
@@ -604,7 +602,6 @@ export class Pipeline {
       //   两次梳理之间消息只增不减，供应商前缀缓存才吃得动；跨格那一刻整段裁一次，
       //   实际覆盖在 N~2N 分钟之间。语义与"严格每轮 N 分钟"不同，这是用户点头换来的。
       const minutes = Math.max(1, Math.round(Number(this.config.config.storage.contextMinutes) || 5));
-      const span = Math.max(1, minutes) * 60_000;
       const sinceTs = windowAnchorTs(Date.now(), minutes);
       const windowHistory = this.history.snapshot(chat, sinceTs);
       if (!opts?.relay) {
@@ -613,8 +610,9 @@ export class Pipeline {
           text: [
             `# 上下文时限`,
             `- 你看得到最近这段会话的记录（按 ${minutes} 分钟的窗口对齐梳理点裁剪，实际覆盖最近 ${minutes}~${minutes * 2} 分钟）。`,
+            `- **窗口里这几条就是你全部可见的对话**。对方只丢来一个词、一句没头没尾的话，那就是真只有这一句：别脑补"前面还说过什么"，照字面接或者问清楚。`,
             `- 更早的消息不在上下文里（当时的图片、语音、视频也不会出现）；只有非常久远的话题才可能需要回查。`,
-            `- 回话前先掂量现有信息够不够：不够就用 search_history（翻本会话更早的原文）或 recall_facts（翻这位用户的长期记忆）查了再答；一轮之内查完就回，别连环查。`,
+            `- 回话前先掂量现有信息够不够：不够就查一次 —— search_history（只翻本会话窗口之外的旧原文）或 recall_facts（翻这位用户的长期记忆）；查完就必须作答，查不到就是真没有，别换个词接着查。`,
             `- 不要向用户提「时限、上下文、梳理、检索记录」这类内部词，查到就自然接上话。`,
           ].join('\n'),
         });
@@ -641,18 +639,18 @@ export class Pipeline {
           ].join('\n'),
         });
       }
-      // 剧本体（HDSI 的 <say> authored actions）：写小说、只有 <say> 里的台词进 QQ。
-      // 「说几条、多长、什么时候分条」也由这一段讲清楚（MaiBot 的 replyStyle 已随输出侧一起删除）。
-      // 转述轮不加：那轮要的是把工作结果讲清楚，不是演戏。
-      if (this.humanlike.config.script?.enable && !opts?.relay) {
+      // 输出口径（order 440）：chat 轮**唯一**一段规定"输出长什么样"的指令 ——
+      // 短句、镜像长度、不写动作描写，总长上限写进词里。剧本体（HDSI 的 <say> 小说格式）已删，
+      // 模型说什么就发什么，分条与截断由程序侧兜底（humanlike/delivery.ts）。
+      // 转述轮不加：那轮要的是把工作结果讲清楚，不是聊天。
+      if (!opts?.relay) {
         const out = this.humanlike.config.outgoing;
         systemSections.push({
-          order: 440, title: 'script-format',
-          text: scriptFormatText({ separator: out.messageSeparator, splitEnabled: out.splitReplyMessages }),
+          order: 440, title: 'chat-style',
+          text: chatOutputStyleText({ maxChars: out.replyMaxCharacters }),
         });
       }
-      // HDSI 的三个子系统：Alter 氛围参考(450) / ChatRhythm 节奏提醒(460) / 日程(470)。
-      // 转述轮同样不加：那轮不演戏。
+      // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。转述轮同样不加。
       if (!opts?.relay) {
         systemSections.push(...this.humanlike.sceneSections(chat));
       }
@@ -716,6 +714,8 @@ export class Pipeline {
       let ctx: LLMRequestContext = {
         chat, event, system, systemSections, messages, tools,
         attachments: turnAttachments,
+        // 窗口起点交给工具面：search_history 只该翻模型眼前没有的那部分
+        historyWindowStartTs: sinceTs,
       };
 
       // beforeLLM 钩子（人格插件五插槽注入点）
@@ -734,7 +734,7 @@ export class Pipeline {
       // 附件跟着入账：窗口内的历史消息要能重放"这条当时带了图/语音/视频"。
       if (!opts?.proactive) this.history.pushUser(chat, userText, ctx.attachments);
 
-      const { reply, toolSpoke } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
+      const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 
       // afterLLM 钩子（persona checker 插槽）
       let finalReply = reply;
@@ -749,21 +749,6 @@ export class Pipeline {
         }
       }
 
-      // 引用工具这一轮已经把话发出去了：本轮到此为止，不再走普通出站。
-      // 模型若还在正文里写了话，整段丢弃——引用那次的正文就是它说的全部。
-      const quoted = (toolSpoke ?? '').trim();
-      if (quoted) {
-        if (finalReply.trim()) {
-          this.sessionLog.append(event.chatId, event.type, {
-            type: 'gate', role: 'system', text: '引用已发送完毕，正文不再补发',
-            data: { decision: 'quoted_reply_settled', dropped: true },
-          });
-        }
-        this.humanlike.noteSpoke(chat, 1, [quoted]);
-        this.history.pushAssistant(chat, quoted);
-        return;
-      }
-
       // 没接模型 / 额度耗尽 / 链全挂会被吞成空回复：这轮一个字不发，只落 gate 条目。
       // 群里出现"没答好请再问一次"式的托词比沉默更伤人设，失败细节都在报错中心与会话流里。
       if (!finalReply.trim()) {
@@ -775,7 +760,7 @@ export class Pipeline {
         return;
       }
 
-      // 主动发言轮允许沉默（剧本体下的沉默就是只写旁白 / 给沉默标记）
+      // 主动发言轮允许沉默（[silent] 标记 = 模型选择这轮不说话）
       if (opts?.proactive && isSilentScene(finalReply)) {
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
@@ -785,7 +770,7 @@ export class Pipeline {
         return;
       }
 
-      await this.sendScene(chat, finalReply);
+      await this.sendScene(chat, finalReply, this.quoteTargetOf(event));
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
@@ -807,20 +792,42 @@ export class Pipeline {
   }
 
   /**
-   * 一轮剧本落地：
-   *  - **只有 `<say>` 里的台词**会被发出去（剧本体的核心；旁白/动作描写留在剧本里）
-   *  - 整段剧本**带标签**回灌历史 —— 模型照着自己上一轮的样子学，摘掉标签它下一轮就不写 `<say>` 了
-   *  - 这一轮没说话（只写旁白或给了沉默标记）：不发，但剧本照旧推进
+   * 组回复的引用锚点（v1，纯程序）：引用"这条回复是在回谁"的触发消息。
+   * 只在**发送那一刻**触发消息已被后面的新消息刷远时才挂 —— 群里安安静静的一问一答不加引用
+   * （口径：一般的消息不需要引用；引用只在"落点显错位"时补位）。
+   * 引用的正文段与发送由 ChatService 照常处理；模型全程零成本。
    */
-  private async sendScene(chat: { platform: string; type: 'group' | 'private'; chatId: string }, raw: string): Promise<void> {
-    const { plans, historyText, spoke } = await this.humanlike.composeScene(raw, chat);
-    if (!spoke || !plans.length) {
+  private quoteTargetOf(event: ChatEvent): string | undefined {
+    if (event.type !== 'group') return undefined;
+    const mid = String(event.messageId ?? '').trim();
+    if (!mid) return undefined;
+    try {
+      return this.sessionLog.hasNewerInbound(event.chatId, event.type, mid) ? mid : undefined;
+    } catch { return undefined; }
+  }
+
+  /**
+   * 一轮回复落地：模型说什么就发什么。
+   *  - 沉默标记 → 什么都不发；
+   *  - 其余：程序侧按句分条 + 句边截断（humanlike/delivery.ts），需要时给第一条挂引用段；
+   *  - 发出去的正文按 role=model 回灌历史 —— 模型读上下文时才知道这句话是自己说的
+   *    （跟屏复读、桌面端手动发言也是同一条口径，见 kernel/repeat 与 pipeline.sendAsBot）。
+   */
+  private async sendScene(
+    chat: { platform: string; type: 'group' | 'private'; chatId: string },
+    raw: string,
+    quoteTarget?: string,
+  ): Promise<void> {
+    const { plans, historyText } = await this.humanlike.composeScene(raw);
+    if (!plans.length) {
       this.humanlike.noteSilent(chat);
-      if (historyText.trim()) this.history.pushAssistant(chat, historyText);
       return;
     }
+    if (quoteTarget) plans[0].segments.unshift({ type: 'reply', data: { id: quoteTarget } });
     const { sent } = await this.chat.sendPlanned(chat, plans);
-    const bubbles = plans.map((p) => String(p.segments[0]?.data?.text ?? '')).filter(Boolean);
+    const bubbles = plans
+      .map((p) => p.segments.filter((s) => s.type === 'text').map((s) => String(s.data.text ?? '')).join(''))
+      .filter(Boolean);
     this.humanlike.noteSpoke(chat, sent > 0 ? sent : 1, bubbles);
     if (historyText.trim()) this.history.pushAssistant(chat, historyText);
   }

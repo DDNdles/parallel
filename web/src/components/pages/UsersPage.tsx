@@ -11,10 +11,10 @@ import { useSave } from '@/lib/useSave';
 
 interface U { userId: string; nickname: string; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
 interface UsersApi { users: U[]; masterIds: string[]; extraAdminIds: string[] }
-interface Fact { id: string; content: string; sourcePlugin: string; ts: number }
+interface Fact { id: string; content: string; sourcePlugin: string; weight: number; ts: number }
 interface Detail {
   profile: { userId: string; nickname: string; firstSeen: number; lastSeen: number; blocked: boolean };
-  facts: Fact[]; attrs: Record<string, unknown>;
+  facts: Fact[];
 }
 interface Op { ts: number; source: string; userId: string; op: string; payload: string }
 
@@ -133,7 +133,6 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState('');
   const p = detail?.profile;
-  const a = detail?.attrs ?? {};
 
   const block = async (to: boolean) => {
     setBusy(true);
@@ -255,6 +254,8 @@ function FactRow({ f, onSave, onDel }: { f: Fact; onSave: (f: Fact, v: string) =
       <BrandInput value={v} spellCheck={false} style={{ flex: 1, minWidth: 0 }}
         onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && dirty) onSave(f, v); }} />
       <span className="mset-badge">{f.sourcePlugin}</span>
+      {/* 权重 <1 = 后台自动提炼出来的（模型或人手动记的都是 1） */}
+      {f.weight < 1 && <span className="mset-badge">自动</span>}
       <span className="plg-hint">{fmtDT(f.ts)}</span>
       <span className="mset-macts">
         {dirty && <button className="mset-ibtn" title="保存" onClick={() => onSave(f, v)}><Icon name="check" size={14} /></button>}

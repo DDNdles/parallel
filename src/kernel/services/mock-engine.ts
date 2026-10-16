@@ -18,6 +18,8 @@ import { createAssistantMessageEventStream, getCurrentTools } from '@earendil-wo
 export interface MockScriptStep {
   content?: string;
   toolCalls?: { name: string; args: Record<string, unknown> }[];
+  /** 延迟这么久才吐字（毫秒）：给"生成期间群里又来了新消息"这类时序用例留窗口 */
+  delayMs?: number;
 }
 
 /** 固定的 usage：命中 80 / 未命中 20。测试只断言"有数且 prompt ≥ 命中"，不锁死具体值 */
@@ -106,6 +108,8 @@ function lastUserMedia(context: TranscriptContext): string[] {
 export class MockEngine {
   /** 脚本队列（测试往里 push） */
   script: MockScriptStep[] = [];
+  /** 后台「记忆整理」那一发的答复（一行一条事实，NONE = 不记）。默认什么都不写，免得无关用例被污染 */
+  memoryReply = 'NONE';
   /** 每次请求记一笔：条数、工具名、以及"最后一条 user + system 的摘要"（测试据此断言压缩是否真的生效） */
   calls: { messages: number; tools?: string[]; system?: string; lastUser?: string; usersJoined?: string; media?: string[] }[] = [];
   id = 'mock';
@@ -132,10 +136,9 @@ export class MockEngine {
       media: lastUserMedia(context),
     });
 
-    // 摘要请求（压缩自己发出来的那一发）没有工具，且系统提示词里带"压缩助手"。
-    // 这类请求不消耗 script 队列——否则测试没法把脚本对齐到"第几轮"。
-    if (!tools.length && sysText.includes('压缩助手')) {
-      const text = '## 目标\n（mock 摘要）把之前的事记成一段话';
+    // 内核/插件自己发出去的那一发旁路请求（上下文压缩摘要、自动记忆提炼）：特征是**没有工具**
+    // 且系统提示词里带各自的自认标记。这类请求不消耗 script 队列——否则测试没法把脚本对齐到"第几轮"。
+    const oneShot = (text: string) => {
       const message = assistantMessage({ model, content: [{ type: 'text', text }], stopReason: 'stop', usage: mockUsage(12) });
       const partial: any = { ...message, content: [] };
       stream.push({ type: 'start', partial } as AssistantMessageEvent);
@@ -145,7 +148,11 @@ export class MockEngine {
       stream.push({ type: 'done', reason: 'stop', message } as AssistantMessageEvent);
       stream.end(message);
       return stream;
+    };
+    if (!tools.length && sysText.includes('压缩助手')) {
+      return oneShot('## 目标\n（mock 摘要）把之前的事记成一段话');
     }
+    if (!tools.length && sysText.includes('记忆整理助手')) return oneShot(this.memoryReply);
 
     // 先把这一步的结果算出来（同步逻辑），再按事件顺序推出去
     const step = this.script.shift();
@@ -185,25 +192,31 @@ export class MockEngine {
     const message = assistantMessage({ model, content, stopReason, usage });
     const partial: any = { ...message, content: [] };
 
-    stream.push({ type: 'start', partial } as AssistantMessageEvent);
-    for (let i = 0; i < content.length; i++) {
-      const block = content[i];
-      if (block.type === 'text') {
-        stream.push({ type: 'text_start', contentIndex: i, partial: { ...partial, content: [...partial.content, { type: 'text', text: '' }] } } as AssistantMessageEvent);
-        // 一次性吐出整段（这里不模拟逐字；打字机效果由 UI 的 onDelta 收到一段文本渲染）
-        stream.push({ type: 'text_delta', contentIndex: i, delta: block.text, partial: message } as AssistantMessageEvent);
-        stream.push({ type: 'text_end', contentIndex: i, content: block.text, partial: message } as AssistantMessageEvent);
-      } else {
-        stream.push({ type: 'toolcall_start', contentIndex: i, partial: message } as AssistantMessageEvent);
-        stream.push({ type: 'toolcall_end', contentIndex: i, toolCall: block, partial: message } as AssistantMessageEvent);
+    const emit = () => {
+      stream.push({ type: 'start', partial } as AssistantMessageEvent);
+      for (let i = 0; i < content.length; i++) {
+        const block = content[i];
+        if (block.type === 'text') {
+          stream.push({ type: 'text_start', contentIndex: i, partial: { ...partial, content: [...partial.content, { type: 'text', text: '' }] } } as AssistantMessageEvent);
+          // 一次性吐出整段（这里不模拟逐字；打字机效果由 UI 的 onDelta 收到一段文本渲染）
+          stream.push({ type: 'text_delta', contentIndex: i, delta: block.text, partial: message } as AssistantMessageEvent);
+          stream.push({ type: 'text_end', contentIndex: i, content: block.text, partial: message } as AssistantMessageEvent);
+        } else {
+          stream.push({ type: 'toolcall_start', contentIndex: i, partial: message } as AssistantMessageEvent);
+          stream.push({ type: 'toolcall_end', contentIndex: i, toolCall: block, partial: message } as AssistantMessageEvent);
+        }
       }
-    }
-    stream.push({
-      type: 'done',
-      reason: stopReason === 'toolUse' ? 'toolUse' : stopReason === 'length' ? 'length' : 'stop',
-      message,
-    } as AssistantMessageEvent);
-    stream.end(message);
+      stream.push({
+        type: 'done',
+        reason: stopReason === 'toolUse' ? 'toolUse' : stopReason === 'length' ? 'length' : 'stop',
+        message,
+      } as AssistantMessageEvent);
+      stream.end(message);
+    };
+    // 时序用例可以要求"想一会儿再答"：延迟期内事件流空转，内核那一轮还在跑
+    const wait = Math.max(0, Math.round(step?.delayMs ?? 0));
+    if (wait > 0) setTimeout(emit, wait);
+    else emit();
     return stream;
   };
 }

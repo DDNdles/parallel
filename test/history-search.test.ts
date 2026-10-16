@@ -83,5 +83,42 @@ test('search_history：limit 取最近的命中；跨会话不串', async () => 
 
 test('search_history：空关键词与无命中', async () => {
   assert.match(String(tool('search_history').handler({ query: '  ' }, tctx())), /关键词为空/);
-  assert.match(String(tool('search_history').handler({ query: '绝对不存在的词xyz' }, tctx())), /没有找到/);
+  assert.match(String(tool('search_history').handler({ query: '绝对不存在的词xyz' }, tctx())), /没有相关消息|没在你们之前聊过/);
+});
+
+test('search_history：只翻窗口之外——模型眼前就有的那几条不该还回去', async () => {
+  const G = 412;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  const t0 = Date.now();
+  const put = (text: string, ts: number) => kernel.sessionLog.append(String(G), 'group', { type: 'message_in', role: 'user', userId: '10003', nickname: '小明', text, ts } as never);
+  put('上周说过张桓堉这个人', t0 - 40 * 60_000);
+  put('张桓堉', t0 - 20_000);                       // 窗口内：模型本轮就看着它
+  const ctx2 = { chat: { platform: 'qq', type: 'group' as const, chatId: String(G) },
+    event: { userId: String(MEMBER), chatId: String(G), type: 'group', platform: 'qq', id: 'turn-win-1', ts: t0 },
+    historyWindowStartTs: t0 - 5 * 60_000, role: 'member' } as never;
+  const def = kernel.container.toolsForChat({ platform: 'qq', type: 'group', chatId: String(G) }, 'member').find((t) => t.name === 'search_history')!;
+  const out = String(def.handler({ query: '张桓堉' }, ctx2));
+  assert.match(out, /找到 1 条/, '只该还给它窗口外那一条');
+  assert.ok(out.includes('上周说过张桓堉这个人'), '窗口外的旧命中要给');
+  assert.ok(!out.includes('：张桓堉'), '窗口内那条（模型眼前就有）不该再还回去');
+});
+
+test('一轮之内翻旧账有预算：查满就劝它照字面回答，别再连环查', async () => {
+  const G = 413;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  const ctx3 = { chat: { platform: 'qq', type: 'group' as const, chatId: String(G) },
+    event: { userId: String(MEMBER), chatId: String(G), type: 'group', platform: 'qq', id: 'turn-quota-1', ts: Date.now() },
+    role: 'member' } as never;
+  const chatRef = { platform: 'qq', type: 'group' as const, chatId: String(G) };
+  const hist = kernel.container.toolsForChat(chatRef, 'member').find((t) => t.name === 'search_history')!;
+  const recall = kernel.container.toolsForChat(chatRef, 'member').find((t) => t.name === 'recall_facts')!;
+  const outs: string[] = [];
+  for (let i = 0; i < 5; i++) outs.push(String(hist.handler({ query: '不存在的词' + i }, ctx3)));
+  outs.push(String(recall.handler({ query: '也不存在' }, ctx3)));
+  assert.ok(!/别再查/.test(outs.slice(0, 3).join('\n')), '前 3 次（预算内）正常检索');
+  assert.match(outs[3], /别再查/);
+  assert.match(outs[5], /别再查/, '两个工具共用一份预算');
+  // 换一轮（另一个事件 id）就该重新给预算
+  const ctx4 = { ...ctx3, event: { ...ctx3.event, id: 'turn-quota-2' } } as never;
+  assert.ok(!/别再查/.test(String(hist.handler({ query: '新话题' }, ctx4))), '预算按轮算，不按群累计');
 });

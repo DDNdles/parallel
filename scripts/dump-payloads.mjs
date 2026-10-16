@@ -13,7 +13,7 @@
  * 产物：data/debug/chat-request.json、data/debug/work-request.json、data/debug/chat-request-media.json
  * （data/ 不入库）只打印 body，不打印 Authorization 头，也不碰任何真 key。
  * chat-media 场景自带硬断言（见 assertMedia）：时间窗外那条漏进请求体、窗口内图片块没出现、
- * 语音块没挂到最后一条 user、system 少了「上下文时限」、工具面不是那 8 个，都会 exit 1。
+ * 语音块没挂到最后一条 user、system 少了「上下文时限」、工具面不是那 2 个（记忆读取），都会 exit 1。
  */
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -212,9 +212,11 @@ function assertMedia(body) {
   const system = messages.filter((m) => m?.role === 'system').map((m) => String(m.content ?? '')).join('\n');
   say(system.includes('上下文时限'), 'system 含「上下文时限」（405 分节）');
   const tools = (body?.tools ?? []).map((t) => t.function?.name).filter(Boolean).sort();
-  const want = ['forget_me', 'plan_schedule', 'recall_facts', 'remember_fact', 'remember_setting', 'reply_quote', 'search_history', 'web_fetch', 'web_search'];
-  say(tools.length === 9 && JSON.stringify(tools) === JSON.stringify(want),
-    `工具恰好 9 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
+  // chat 工具面 2026-10-17 起只留记忆读取（recall_facts / search_history）：
+  // 行为型工具全删，插件工具（web_search 等）也不再进 chat 轮 —— 多一个都算回归。
+  const want = ['recall_facts', 'search_history'];
+  say(tools.length === 2 && JSON.stringify(tools) === JSON.stringify(want),
+    `工具恰好 2 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
   return fails;
 }
 
@@ -233,6 +235,10 @@ try {
   };
   kernel.config.config.llm.activeProvider = 'stub';
   kernel.config.config.llm.chatChain = [{ provider: 'stub', model: 'stub-model' }];
+  // work 链不跟随 chat 链（产品口径：workChain 空 = /work 没有模型）——不显式配好，
+  // work 那一发根本发不出去，脚本只会打一句"没抓到"，而 data/debug/work-request.json
+  // 还留着上一次的旧报文冒充这次的结果。
+  kernel.config.config.llm.workChain = [{ provider: 'stub', model: 'stub-model' }];
   kernel.config.setProviderKey('stub', 'stub-not-a-real-key');
   kernel.config.saveConfig();
   kernel.llm.syncCustomProviders();
@@ -283,7 +289,8 @@ try {
   if (mediaBody) writeFileSync(join(outDir, 'chat-request-media.json'), JSON.stringify(mediaBody, null, 2));
 
   for (const [body, label] of [[chatBody, 'CHAT'], [workBody, 'WORK']]) {
-    if (!body) { console.log(`\n${label}: 没抓到\n`); continue; }
+    // 没抓到就判失败：否则磁盘上留着上一轮的旧报文，看的人以为这次也对账过了
+    if (!body) { failures.push(`${label} 没抓到报文`); console.log(`\n${label}: 没抓到\n`); continue; }
     const s = summarize(body, label);
     console.log(`\n${'='.repeat(78)}\n${label} 请求报文  model=${s.model} stream=${s.stream} max_tokens=${s.max_tokens} 消息 ${s.messageCount} 条 / 工具 ${s.toolCount} 个`);
     console.log(`工具：${s.tools.join(', ') || '（无）'}`);

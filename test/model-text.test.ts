@@ -93,11 +93,9 @@ test('会话日志回读历史时走同一套净化（重启后那份记录仍�
   }
 });
 
-test('inboundModelText：带消息号就盖 [#编号]（引用回复的地址）', () => {
-  assert.equal(inboundModelText({ text: '收一下', nickname: '小明', messageId: '12345' }), '小明：收一下 [#12345]');
-  // 编号缺失/空白就不盖（桌面端注入、旧日志)
-  assert.equal(inboundModelText({ text: '收一下', nickname: '小明', messageId: '' }), '小明：收一下');
-  // 同一套口径在会话日志投影里也接上了：入账的 messageId 进 [#] 标记
+test('inboundModelText：消息号只是落账字段，不进模型正文（引用回复已改程序自动锚定）', () => {
+  // 引用锚点由内核在发送时从事件上取，模型侧不再需要 [#编号] 地址
+  assert.equal(inboundModelText({ text: '收一下', nickname: '小明' }), '小明：收一下');
   const d = dir();
   try {
     const log = new SessionLog(d, new Bus());
@@ -105,7 +103,7 @@ test('inboundModelText：带消息号就盖 [#编号]（引用回复的地址）
       type: 'message_in', role: 'user', nickname: '小明', text: '冲', data: { messageId: '9001' },
     });
     const p = log.project('300', 'group');
-    assert.equal(p.messages[0]?.content, '小明：冲 [#9001]', JSON.stringify(p.messages));
+    assert.equal(p.messages[0]?.content, '小明：冲', JSON.stringify(p.messages));
   } finally {
     rmSync(d, { recursive: true, force: true });
   }

@@ -23,7 +23,6 @@ import { PluginContainer } from './container.ts';
 import { AgentLoop, HistoryStore } from './agentloop.ts';
 import { Pipeline, roleAtLeastRole } from './pipeline.ts';
 import { HumanlikeService } from './humanlike/index.ts';
-import { ALTER_ANALYSIS_SYSTEM, buildAlterPrompt, parseAlterAnalysis } from './humanlike/alter.ts';
 import {
   JargonService,
   JARGON_SYSTEM,
@@ -158,23 +157,6 @@ export class Kernel {
       config: () => this.config.config.humanlike as unknown as HumanlikeConfig,
       selfNickname: () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
       trigger: (batch) => this.pipeline.enqueueBatch(batch),
-      // Alter 的侧端氛围分析（HDSI 的分析任务）：异步跑、不阻塞可见回复；失败就当没这回事
-      describeAlter: async ({ value, direction, recent }) => {
-        try {
-          const resp = await this.llm.chat(
-            {
-              model: '',
-              messages: [
-                { role: 'system', content: ALTER_ANALYSIS_SYSTEM },
-                { role: 'user', content: buildAlterPrompt(value, recent) },
-              ],
-              stream: false,
-            },
-            { chatId: '', chain: 'chat' },
-          );
-          return parseAlterAnalysis(resp.content ?? '');
-        } catch { return null; }
-      },
       sessionLog: this.sessionLog,
       bus: this.bus,
       errors: this.errors,

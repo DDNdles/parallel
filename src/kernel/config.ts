@@ -75,7 +75,6 @@ export const DEFAULT_CONFIG = {
       'deepseek': 'deepseek-chat',
       'openai-compatible': 'gpt-4o-mini',
     } as Record<string, string>,
-    maxToolRounds: 8,
     // 供应商不再分聊天/工作用途：两条有序链各自列「供应商 + 模型」，靠前的优先，掉线自动接后一个
     chatChain: [] as ModelRef[],
     workChain: [] as ModelRef[],          // 工作链独立于聊天链（不跟随）；空 = /work 没有可用模型
@@ -93,31 +92,26 @@ export const DEFAULT_CONFIG = {
     },
   },
   // 拟人化层（chat 区行为本身，不是插件）。两侧来源分工明确：
-  // 「什么时候开口」对齐 MaiBot 的 ChatReplyTimingConfig / idle_backoff（保留）；
-  // 「怎么说 / 拆几条 / 隔多久」对齐 HDSI 的 runtime（见 humanlike/delivery.ts）——
-  // MaiBot 的分段器 / 错字 / 打字速度已整体删除。
+  // 「什么时候开口」对齐 MaiBot 的 ChatReplyTimingConfig / idle_backoff；
+  // 「怎么说 / 拆几条 / 隔多久」是**纯程序**出站（见 humanlike/delivery.ts）——
+  // 2026-10-17 起 HDSI 的小说格式层（script）与 Alter 情绪偏移整层已删。
   // 这里没有总开关：说几句、拆几条、隔多久、要不要理都调，但"她是不是这样活着"没有 off 档。
   humanlike: {
-    // 剧本体（HDSI 的 <say> authored actions）：模型写小说的下一段，只有 <say> 里的台词进 QQ，
-    // 旁白（动作/神态/环境）留在剧本里 —— 动作描写从结构上就漏不到群里。
-    script: {
-      enable: true,
-    },
     // 圈内黑话（表达学习，humanlike/jargon.ts）：挖本群高频词，判定为圈内含意时
     // 进 prompt 的「圈内黑话」参考——帮 bot 听懂，不改说话风格、不产数值
     jargon: { enable: true },
     // 跟屏复读（humanlike/repeat.ts）：>=N 位群友接连说同一句就完整跟一条；纯程序不走模型
     repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
-    // ① 出站投递（HDSI `runtime`）：分隔标记切分 + 打字节奏 + 单条长度上限。
-    // 字段名与默认值逐条对齐 HDSI；MaiBot 的分段器 / 错字 / 打字速度已整体删除。
+    // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
-      splitReplyMessages: true,           // 是否把回复里的分隔标记拆成多条 QQ 消息
-      messageSeparator: '<sep/>',         // 分段标记；模型需要多条气泡时输出它
+      splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
+      replyMaxCharacters: 120,            // 回复总长上限：超了在最后一个句末标点处截断
+      maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
       typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
       typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久
       typingMaxDelaySeconds: 12,          // 单条后续气泡的最长打字等待（秒）
       typingJitterRatio: 0.3,             // 打字延迟随机浮动比例（0 = 固定）；整体下限固定 250ms
-      maxMessageCharacters: 2000,         // 单条可见消息最大字符数（先截断整条、再分段）
+      maxMessageCharacters: 2000,         // 单条可见消息最大字符数（平台硬上限的安全垫）
     },
     // ② 什么时候开口（MaiBot ChatReplyTimingConfig + reply_necessity）
     timing: {
@@ -136,12 +130,14 @@ export const DEFAULT_CONFIG = {
       inevitableAtReply: true,            // 被 @ 必回（默认开）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
-    // ③ 多用户消息防抖合并
+    // ③ 多用户消息防抖合并（关窗后按随机延时起跳，见 service.ts）
     merge: {
       enable: true,
       windowMs: 1500,                     // 静默这么久就把攒着的消息一起处理
       maxWaitMs: 6000,                    // 群里刷屏时的兜底上限
       bufferTtlMs: 120000,                // 攒着的消息超过 2 分钟就丢掉（老话不值得再接）
+      fireDelayMinMs: 500,                // 关窗后的随机起跳延时下限
+      fireDelayMaxMs: 2000,               // 关窗后的随机起跳延时上限（0/0 = 关掉随机延时）
     },
     // ④ 空闲退避（MaiBot idle_backoff）
     backoff: {
@@ -163,17 +159,7 @@ export const DEFAULT_CONFIG = {
       collapseMinSamples: 5,            // 判定定型所需最少样本（宽限期，HDSI 3~10）
       exhaustLimit: 6,                  // 连续注入失败几次熔断（HDSI 3~12）
     },
-    // ⑦ 情绪偏移（HDSI Alter）：每轮 <alter>±n</alter>，累计到动态阈值后侧端分析出氛围参考
-    alter: {
-      enabled: true,
-      baseThreshold: 10,                // 基准阈值
-      densityFactor: 0.3,               // 聊天越密阈值越低
-      sameDirectionBoost: 0.05,         // 同向继续时权重每点涨多少
-      oppositeDecay: 0.15,              // 反向时每点衰减多少
-      minWeight: 0.2,                   // 权重低于它就过期
-      maxIntensity: 2,                  // 强度上限
-    },
-    // ⑧ 主体行动窗口（HDSI Agency）：日程/隐私/设备构成主动开口的容量
+    // ⑦ 主体行动窗口（HDSI Agency）：日程/隐私/设备构成主动开口的容量
     agency: {
       enable: true,
       quietHours: '00:30-07:30',        // 安静时段（她睡着，不主动开口）
@@ -181,7 +167,8 @@ export const DEFAULT_CONFIG = {
       maxWindowMinutes: 240,
       maxCandidateHours: 24,
     },
-    // ⑨ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
+    // ⑧ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
+    // （模型侧写入入口已随 chat 工具面收窄删除，只剩 /日程 查询与行动容量判断）
     schedule: {
       enable: false,
       horizonHours: 12,                 // 主动轮能看到的未来时长（HDSI 约半天）
@@ -260,7 +247,12 @@ export const DEFAULT_CONFIG = {
   },
   persona: {
     default: 'whale-girl',                 // 唯一人格：没有 /人格 锁定时的默认人设
-    memoryFactsTopK: 5,
+    // 自动记忆提炼：攒够 minTurns 轮、且对话安静满 idleSeconds，才单独发一次「记忆整理」请求。
+    // 提炼结果只落进 user_facts（不进上下文），模型经 recall_facts 现查。
+    memoryAutoSave: true,
+    memoryMinTurns: 6,
+    memoryIdleSeconds: 180,
+    memoryMaxFacts: 5,
   },
   storage: {
     historyLimit: 200,                    // 每会话保留的近端历史条数
@@ -343,6 +335,13 @@ export class ConfigStore {
     // 输出侧改用 HDSI 的 outgoing：MaiBot 的分段器/错字/打字速度与表达风格这四个旧键清掉，
     // 别让它们一直躺在文件里当死配置（老桌面端标签页回放的旧表单也写不回来 —— 白名单已同步）。
     for (const k of ['splitter', 'typo', 'typing'] as const) delete (this.config.humanlike as any)[k];
+    // 输出侧 2026-10-17 起全部改纯程序：剧本体（script）与情绪偏移（alter）整层删除、
+    // 分隔标记键（outgoing.messageSeparator）没人读、chat 工具轮上限（llm.maxToolRounds）
+    // 换成两轮硬上限 —— 老配置里这几个键一并清掉，白名单已同步。
+    delete (this.config.humanlike as any).script;
+    delete (this.config.humanlike as any).alter;
+    delete ((this.config.humanlike as any).outgoing ?? {}).messageSeparator;
+    delete (this.config.llm as any).maxToolRounds;
     const hlTiming = (this.config.humanlike as any).timing;
     if (hlTiming && typeof hlTiming === 'object') {
       // 开口侧 2026-10-16 换「日志拟合 + 动态门控」（MaiBot 主线路线）：老配置里
@@ -354,6 +353,8 @@ export class ConfigStore {
     delete (this.config.llm as any).historyLimit;
     // 好感度与心情整套删除（2026-10-16）：老配置里那个 affection 块（含段位表）清掉，别留死配置
     delete (this.config.persona as any).affection;
+    // 记忆不再随上下文注入（改成后台提炼 + recall_facts 现查），那个"注入条数 Top-K"从此没人读
+    delete (this.config.persona as any).memoryFactsTopK;
     atomicWriteJson(this.configFile, this.config);
     atomicWriteJson(this.secretsFile, this.secrets, { rotate: false });
   }

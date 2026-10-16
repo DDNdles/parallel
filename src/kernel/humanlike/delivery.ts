@@ -1,41 +1,39 @@
 /**
- * 出站投递 —— 移植 HDSI `koishi-plugin-hds-interlude` 的输出侧（`runtime` 段）。
+ * 出站投递 —— 「一段回复怎么变成几条 QQ 消息」。
  *
- * HDSI 把"一段回复怎么变成几条 QQ 消息"压到极简，只有三件事：
- *   1. `splitOutgoingMessage` 按分隔标记（默认 `<sep/>`）字面切开 —— 没有断句、概率合并、
- *      颜文字保护、标点随机、错字、也没有 LLM 语义断句，这些一个都不存在。
- *      "一条为默认，只有真有节奏需要时才分条"是**提示词**要求模型自己做的（见 script.ts 的
- *      `scriptFormatText`），不是程序后处理。
- *   2. `normalizeVisibleContent` 归一化分隔标记的写法、剥掉媒体占位符，并按 `maxMessageCharacters`
- *      硬截断 —— **先截断整条再分段**（HDSI 原样；截断点之后的尾巴连同后面的气泡会一起丢掉）。
- *   3. `typingDelayMs` 算"第二条及后续气泡"的打字等待：基础延迟 + 字数/速度，乘抖动，下限 250ms。
- *      首条不等（用户已经等过模型了）。
- *
- * 对应 HDSI bundle：`splitOutgoingMessage` :10013、`typingDelayMilliseconds` :10019、
- * `normalizeVisibleMessageContent` :12185、`clip` :12652、`splitBubbles` :4941，
- * schema 默认值取自 `Runtime` :13315-13337。字段名与默认值逐条对齐。
+ * 2026-10-17 起这一层是**纯程序**：模型输出什么就发什么。HDSI 的小说格式整层已删
+ * （`<say>` 台词块、`<sep/>` 分隔标记、旁白、字数预算、Alter 标记），
+ * 模型不再为格式多写一个字；"说几条、多长"由下面三步保证：
+ *   1. `normalizeVisibleContent` 剥掉媒体占位符与模型手滑输出的标签，并按单条上限硬截断；
+ *   2. `trimAtSentence` 句边截断兜底：回复超长时保留到最后一个句末标点，不把半句话拍出去；
+ *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 4 条，尾巴并进最后一条）；
+ *      `typingDelayMs` 算第二条及后续气泡的「正在输入」等待 —— 基础延迟 + 字数/速度，
+ *      乘抖动，下限 250ms。首条不等（用户已经等过模型了）。
  */
 
 export interface OutgoingConfig {
-  /** 是否把回复里的分隔标记拆成多条 QQ 消息（HDSI `runtime.splitReplyMessages`） */
+  /** 是否把回复按换行/句子拆成多条 QQ 消息（关掉 = 整段一条发出去） */
   splitReplyMessages: boolean;
-  /** 分段消息标记；模型在需要多条气泡时输出它（HDSI `runtime.messageSeparator`） */
-  messageSeparator: string;
-  /** 发送第二条及后续分段消息前的基础打字等待秒数（HDSI `runtime.typingBaseDelaySeconds`） */
+  /** 回复总长上限（字符）：超了在最后一个句末标点处截断 —— 「说得短」的硬兜底 */
+  replyMaxCharacters: number;
+  /** chat 轮单次请求的输出 token 硬顶（防止模型写小作文；<=0 = 不设） */
+  maxReplyTokens: number;
+  /** 发送第二条及后续分段消息前的基础打字等待秒数 */
   typingBaseDelaySeconds: number;
-  /** 模拟打字速度，每秒字符数；越小长消息等得越久（HDSI `runtime.typingCharactersPerSecond`） */
+  /** 模拟打字速度，每秒字符数；越小长消息等得越久 */
   typingCharactersPerSecond: number;
-  /** 单条后续分段消息的最长打字等待秒数（HDSI `runtime.typingMaxDelaySeconds`） */
+  /** 单条后续分段消息的最长打字等待秒数 */
   typingMaxDelaySeconds: number;
-  /** 打字延迟随机浮动比例，0 = 固定延迟（HDSI `runtime.typingJitterRatio`） */
+  /** 打字延迟随机浮动比例，0 = 固定延迟 */
   typingJitterRatio: number;
-  /** 单条可见消息的最大字符数（HDSI `runtime.maxMessageCharacters`） */
+  /** 单条可见消息的最大字符数（平台硬上限的安全垫） */
   maxMessageCharacters: number;
 }
 
 export const DEFAULT_OUTGOING: OutgoingConfig = {
   splitReplyMessages: true,
-  messageSeparator: '<sep/>',
+  replyMaxCharacters: 120,
+  maxReplyTokens: 400,
   typingBaseDelaySeconds: 1,
   typingCharactersPerSecond: 8,
   typingMaxDelaySeconds: 12,
@@ -43,30 +41,38 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   maxMessageCharacters: 2000,
 };
 
+/** 气泡数上限：再多就把尾巴并进最后一条 —— 打字等待按条累加，放任切分会把回复拖到半分钟 */
+export const MAX_BUBBLES = 4;
+
+/** 句末标点（切分与句边截断共用） */
+const ENDERS = new Set([...'。！？!?…；;']);
+
+/** 句末标点后面跟着的收尾符号（引号/括号等），跟同一句走 */
+const CLOSERS = new Set([...'」』"”’）)】]']);
+
 /**
- * HDSI `clip`（bundle :12652）：字符串则 trim 后截断，非字符串给空串。
- * 注意是 `slice` 硬截断，不重切、不丢弃整条。
+ * 字符串则 trim 后截断，非字符串给空串（硬截断，不重切、不丢弃整条）。
  */
 export function clip(value: unknown, length: number): string {
   return typeof value === 'string' ? value.trim().slice(0, Math.max(1, Math.floor(length))) : '';
 }
 
 /**
- * HDSI `normalizeVisibleMessageContent`（bundle :12185）。
- * 归一化分隔标记的各种写法（`<sep>` / `＜sep/＞` 等）到配置的 separator、剥掉媒体占位符，
- * 最后 trim + 按 `maxMessageCharacters` 截断。**调用方要先跑它、再分段**（HDSI 的顺序）。
+ * 归一化可见正文：剥媒体占位符、剥模型手滑输出的标签，最后 trim + 按 `maxMessageCharacters` 截断。
  *
- * 另加一条本项目自己的规则：**剥掉其它未知自闭标签**（模型会自己发明 `<set_mood mood="…"/>`
- * 这类记号写进台词里）。分隔标记本身不在此列——上面一步已把它归一成配置里的 separator，
- * 配置成 `<br/>` 这种自闭标签时也照样豁免（按标签名白名单，不写死 `sep`）。
+ * 两类标签要处理：
+ *  - **成对的 `say` 标记**：剧本体删除后模型有时还带着旧习惯（或读到窗口里没退干净的旧消息）写出
+ *    `<say id="s1">…</say>` —— 把它们剥掉、留着里面的话，这是迁移期的兜底，不是格式约定；
+ *  - 其它自闭标签（`<set_mood mood="…"/>` 这类模型自造的记号）一律整体剥掉。
  */
-export function normalizeVisibleContent(value: unknown, maxCharacters: number, separator: string): string {
-  const sep = String(separator ?? '').trim() || DEFAULT_OUTGOING.messageSeparator;
-  // 只认合法标识符形状，拼进正则前不必转义；认不出来就退回豁免 sep 这个词
-  const keepName = sep.match(/^<[ <]*([a-z_][a-z0-9_]*)/i)?.[1] ?? 'sep';
+export function normalizeVisibleContent(value: unknown, maxCharacters: number): string {
   return String(value ?? '')
-    .replace(/[<＜]\s*sep\s*\/?\s*[>＞]/gi, sep)
-    .replace(new RegExp(`<(?!${keepName}\\b)[a-z_][a-z0-9_]*(?:\\s[^>]*)?\\/>`, 'gi'), '')
+    // 成对的 say 标记（迁移期兜底）：剥掉标签、留着里面的话
+    .replace(/<\/?say\b[^>]*>/gi, '')
+    // 旧分隔标记（迁移期兜底）：模型偶尔还写 <sep/> / <br/>，当作换行——那是分条意图，别把记号发出去
+    .replace(/<\/?(?:sep|br)\b[^>]*\/?>/gi, '\n')
+    // 其它模型自造的（自闭）标签整体剥掉
+    .replace(/<[a-z_][a-z0-9_]*(?:\s[^>]*)?\/>/gi, '')
     .replace(/<\/?(?:file|img|image|audio|record|video|flash|mface)\b[^>]*\/?>/gi, '')
     .replace(/\[CQ:(?:file|image|record|video|flash|mface),[^\]]*\]/gi, '')
     .replace(/[\[【](?:表情包?|图片|动图|GIF)[\]】]/gi, '')
@@ -76,25 +82,59 @@ export function normalizeVisibleContent(value: unknown, maxCharacters: number, s
 }
 
 /**
- * HDSI `splitOutgoingMessage`（bundle :10013）：
- * 关掉拆分时整条返回；没有分隔标记时整条返回；否则按标记切、trim、去空。
- * 不做任何"自动断句"——模型没写分隔标记就是一条。
+ * 句边截断：超过 `maxChars` 时保留到最后一个句末标点（或换行）。
+ * 句边落在后半段才按句截（前半段就出现句号的话，截出来只剩一两句碎话，不如硬切）；
+ * 找不到像样的句边就硬切。**只在超长时触发** —— 正常轮碰不到它。
  */
-export function splitOutgoingMessage(content: string, cfg: Pick<OutgoingConfig, 'splitReplyMessages' | 'messageSeparator'>): string[] {
-  if (cfg.splitReplyMessages === false) return [content];
-  const separator = String(cfg.messageSeparator ?? '').trim() || DEFAULT_OUTGOING.messageSeparator;
-  if (!separator || !content.includes(separator)) return [content];
-  return content.split(separator).map((part) => part.trim()).filter(Boolean);
+export function trimAtSentence(text: string, maxChars: number): string {
+  const t = String(text ?? '').trim();
+  const limit = Math.max(1, Math.floor(maxChars));
+  if (t.length <= limit) return t;
+  const head = t.slice(0, limit);
+  let cut = -1;
+  for (const ch of ENDERS) {
+    const i = head.lastIndexOf(ch);
+    if (i > cut) cut = i;
+  }
+  const nl = head.lastIndexOf('\n');
+  if (nl > cut) cut = nl;
+  return cut >= Math.floor(limit / 2) ? head.slice(0, cut + 1).trim() : head.trim();
 }
 
 /**
- * HDSI `typingDelayMilliseconds`（bundle :10019），逐字照搬：
- *   nominal = min(cap, base + ceil(len / cps))     ← len 用 JS UTF-16 长度，与 HDSI 一致
+ * 按换行与句末标点把一段话切成气泡（最贴近真人"一句一条"的打字节奏）。
+ *  - 换行是最强的分条意图：模型自己换的行不合并；
+ *  - 句末标点后切；连续标点（？！？…）并作同一个句尾；引号/右括号跟着前一句走；
+ *  - 超过 `maxBubbles` 的尾巴并进最后一条：宁可最后一条长一点，也不丢字、不无限累加打字等待。
+ */
+export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES): string[] {
+  const out: string[] = [];
+  for (const line of String(text ?? '').split(/\r?\n+/)) {
+    let buf = '';
+    for (let i = 0; i < line.length; i++) {
+      buf += line[i];
+      if (!ENDERS.has(line[i])) continue;
+      // 连续标点与收尾符号（」』"）并进同一句
+      let j = i + 1;
+      while (j < line.length && (ENDERS.has(line[j]) || CLOSERS.has(line[j]))) { buf += line[j]; j++; }
+      i = j - 1;
+      if (buf.trim()) out.push(buf.trim());
+      buf = '';
+    }
+    if (buf.trim()) out.push(buf.trim());
+  }
+  const cap = Math.max(1, Math.floor(maxBubbles));
+  if (out.length <= cap) return out;
+  return [...out.slice(0, cap - 1), out.slice(cap - 1).join('')];
+}
+
+/**
+ * 「第二条及后续气泡」的打字等待（毫秒）：
+ *   nominal = min(cap, base + ceil(len / cps))     ← len 用 JS UTF-16 长度
  *   factor  = 1 ± jitter（jitter=0 时正好为 1）
  *   结果    = clamp(nominal × factor × 1000, 下限 250ms, 上限 cap)
  *
- * 与 MaiBot 的 0.3s/汉字公式不同：**没有"0 = 不模拟打字"这一档**，最低也有 250ms。
- * `rng` 只用于测试注入，默认 Math.random（HDSI 同款）。
+ * 没有"0 = 不模拟打字"这一档，最低也有 250ms。`rng` 只用于测试注入，默认 Math.random。
  */
 export function typingDelayMs(
   nextSegment: string,
@@ -108,4 +148,16 @@ export function typingDelayMs(
   const jitter = Math.max(0, Math.min(0.5, Number(cfg.typingJitterRatio ?? 0.3) || 0));
   const factor = jitter ? 1 + (rng() * 2 - 1) * jitter : 1;
   return Math.max(250, Math.min(maximumSeconds * 1000, Math.round(nominal * factor * 1000)));
+}
+
+/**
+ * 「这一轮不说话」的显式标记。
+ * 自由文本里用一个不会被误当台词的字面量等价表达（旧写法 `SKIP` 继续兼容）。
+ */
+export const SILENT_MARKER = '[silent]';
+
+export function isSilentScene(text: string): boolean {
+  // 只留字母/数字/汉字：方括号、句读、空白、星号一律无视（模型有时会写成"【silent】"）
+  const s = text.replace(/[^\w一-鿿]/g, '').toUpperCase();
+  return s === 'SKIP' || s === 'SILENT';
 }

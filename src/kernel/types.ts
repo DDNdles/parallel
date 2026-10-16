@@ -135,18 +135,24 @@ export interface ToolContext {
   event: ChatEvent;            // 触发本轮对话的事件
   chat: ChatRef;
   role: Role;                  // 调用者角色
+  /** 上下文窗口起点：search_history 用它把"模型眼前就有的那几条"排除掉（同 LLMRequestContext） */
+  historyWindowStartTs?: number;
   /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
   work?: { depth: number; runId?: string; agent?: string };
 }
 
 /**
  * 工具在哪个面上可见（pi 的 tool surface 思想）：
- *  - `both`（默认）：chat 轮与 work 轮都能用；
+ *  - `memory`：**记忆读取类**（recall_facts / search_history）。这是 chat 面唯一可见的一类工具：
+ *    2026-10-17 起 chat 轮不给行为型工具 —— 回复本身是一次普通生成，最多允许一轮记忆查询；
+ *    work 面照旧可见（work agent 白名单按名取用）。
  *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见；
- *  - `chat`：只给 chat 轮（如引用回复），work 面严格看不见。
+ *  - `chat`：只给 chat 轮、work 面严格看不见（目前没有工具用它，留给"只属于 chat 侧"的语义）；
+ *  - `both`（默认）：work 轮可用 —— 注意 **chat 轮不再有默认可见**：chat 面只收 `memory`，
+ *    其余一切（含 both）在 chat 轮严格缺席，新工具想进 chat 面必须显式标 `memory`。
  * 由 `toolsForChat(chat, role, surface)` 在收集阶段就过滤掉，不是"注册了但调用时拒绝"。
  */
-export type ToolSurface = 'both' | 'work' | 'chat';
+export type ToolSurface = 'both' | 'work' | 'chat' | 'memory';
 
 export interface ToolDef {
   name: string;
@@ -189,11 +195,6 @@ export interface ToolResult {
    * 避免再耗一轮让模型复述一遍（也就避免了复述时的走样）。
    */
   finalReply?: string;
-  /**
-   * 引用 reply_quote 用：工具已把这句话发到群里（带引用段）。
-   * 内核据此本轮不再走普通出站（剩余正文整段丢弃），并按 role=model 回灌历史。
-   */
-  spoke?: string;
 }
 
 /** 工具动作的结构化说明（UI 用来画 +N -M 与文件主体） */
@@ -256,15 +257,23 @@ export interface LLMRequestContext {
    * 分节注入（dsh 式 section 组装）：插件在 beforeLLM / beforeWorkLLM 里往这里 push 自己的节，
    * 不再整体覆盖 system。AgentLoop 组装时把 system 与 systemSections 按 order 稳定排序合并；
    * 带 `name` 的节渲染成 `<name>…</name>`（pi 式具名节，便于按节定位与差分）。
-   * order 参考：内核固定节 0-999（身份 0 / 会话 100 / 风格 200 / 安全 300 / 压缩 400，
-   * work 轮另有 任务 420 / 工具 600 / 规则 620 / 沙箱 700 / 交付 800），
-   * 插件节建议从 1000 起（人格 1000 / 世界书 1100 / 状态 1200 / 记忆 1300 / 子代理身份 1400）。
+   * order 参考：内核固定节 0-999（身份 0 / 会话 100 / 信任边界 300 / 压缩连续性 400，
+   * work 轮另有 任务 420 / 工具 600 / 规则 620 / 子代理 640 / 沙箱 700 / 交付 800），
+   * 插件节按**是否跨轮稳定**分档（2026-10-16 缓存裁量）：稳定节排 200~299（人格 200 / 演化 220 /
+   * 记忆指针 250 / 语气 260~280），每轮会变的排 450+（对方是谁 457 / 世界书命中 473）；
+   * work 轮的插件节走 1000+（不与 chat 的档位抢前缀）。
    */
   systemSections?: SystemSection[];
   messages: ChatMessage[];     // 不含 system
   tools: ToolDef[];            // 本群生效的工具集合
   /** 本轮消息携带的媒体（从消息段解析）；是否真发给模型取决于当前模型的 inputTypes */
   attachments?: MessageAttachment[];
+  /**
+   * 上下文窗口的起点时刻：`ts >= 这个值` 的消息**模型眼前就有**。
+   * search_history 据此只翻窗口外的旧消息——否则它会把模型刚看见的那句当"新线索"还回去，
+   * 模型于是认定还有前文没看到，越查越离谱（2026-10-16 活体报文实测）。
+   */
+  historyWindowStartTs?: number;
   /** 本轮由 /work <任务> 触发（work 子代理轮）：插件可据此接管 system；仅本轮有效 */
   workTurn?: boolean;
   /** /work 命令携带的任务原文（workTurn 时存在） */
@@ -479,7 +488,7 @@ export interface PluginContext {
   session: GatedSession;
   /** work 子代理委派（chat 模型把任务交给 work 模型执行；需 work.delegate 权限） */
   work: GatedWork;
-  /** 拟人层（内核自有）：日程读写 + 状态查询（HDSI Schedule/Alter/Rhythm） */
+  /** 拟人层（内核自有）：日程读写 + 状态查询（HDSI Schedule/Rhythm） */
   humanlike: GatedHumanlike;
   /** 会话历史检索（需 history.search 权限）：只能搜当前会话，不是全库 */
   history: GatedHistory;
@@ -646,8 +655,9 @@ export interface HistoryHit {
 }
 
 export interface GatedHistory {
-  /** 关键词检索**当前会话**的历史消息（入站+出站原文），按时间正序返回最近 limit 条命中 */
-  searchMessages(chat: ChatRef, q: string, limit?: number): HistoryHit[];
+  /** 关键词检索**当前会话**的历史消息（入站+出站原文），按时间正序返回最近 limit 条命中。
+   *  给了 `beforeTs` 就只翻这个时刻**之前**的（模型眼前那几条不必再还给它一遍）。 */
+  searchMessages(chat: ChatRef, q: string, limit?: number, beforeTs?: number): HistoryHit[];
 }
 
 export interface GatedWork {

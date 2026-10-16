@@ -473,8 +473,10 @@ function Share({ models, colorIdx }: { models: ModelRow[]; colorIdx: Map<string,
           acc += frac;
           return el;
         })}
-        <text x={130} y={124} textAnchor="middle" className="usage-donut-n">{fmtTok(total)}</text>
-        <text x={130} y={150} textAnchor="middle" className="usage-donut-t">tokens</text>
+        {/* 环心两行按**墨迹**整块对圆心 130 居中：基线手算（数字墨迹 112~132、tokens 138~148、中间留 6px），
+         *  中文「万」的墨迹会压到基线下方 3px，按 cap-height 排会让两行贴在一起。 */}
+        <text x={130} y={129} textAnchor="middle" className="usage-donut-n">{fmtTok(total)}</text>
+        <text x={130} y={148} textAnchor="middle" className="usage-donut-t">tokens</text>
       </svg>
       <div className="usage-legend">
         {rows.map((r) => {

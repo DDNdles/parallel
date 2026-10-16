@@ -1223,8 +1223,9 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .usage-heat rect.h4, .usage-heat-c.h4 { fill: var(--heat-4); background: var(--heat-4); }
 .usage-tick { font-size: 10.5px; fill: var(--faint); font-family: var(--sans); }
 .usage-donut { flex: none; }
-.usage-donut-n { font-size: 30px; font-weight: 600; fill: var(--text); font-family: var(--sans); }
-.usage-donut-t { font-size: 12.5px; fill: var(--faint); font-family: var(--sans); }
+/* 环心数字照 KPI 那一档（21px/600/tabular），别自成一档大字：30px 时中文「万」落到雅黑粗体，跟拉丁数字两种字形 */
+.usage-donut-n { font-size: 22px; font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; fill: var(--text); font-family: var(--sans); }
+.usage-donut-t { font-size: 12px; fill: var(--faint); font-family: var(--sans); }
 .usage-axis { display: flex; margin-top: 5px; }
 .usage-axis-i { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
 .usage-blank { padding: 16px 2px; font-size: 12.5px; color: var(--faint); }

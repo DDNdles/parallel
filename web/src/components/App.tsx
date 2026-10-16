@@ -42,7 +42,7 @@ export const PAGES: { id: string; name: string; nav: string; icon: string }[] = 
   { id: 'users', name: '用户', nav: '用户', icon: 'users' },
   { id: 'errors', name: '报错', nav: '报错', icon: 'errors' },
   { id: 'work', name: '工作', nav: '工作', icon: 'work' },
-  { id: 'sandbox', name: '沙箱', nav: '沙箱', icon: 'sandbox' },
+  { id: 'sandbox', name: '沙箱', nav: '沙箱', icon: 'file' },
   { id: 'settings', name: '设置', nav: '设置', icon: 'settings' },
 ];
 const ALL_PAGES = PAGES;

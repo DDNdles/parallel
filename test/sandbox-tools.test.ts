@@ -26,12 +26,14 @@ async function boot(group = '7001') {
       segments: [], text: '', isAtMe: true, isReplyToMe: false, senderRole: 'owner', raw: null, ts: 0, role: 'owner',
     },
   } as any;
-  const toolOf = (name: string, surface: 'chat' | 'work' = 'chat') => {
+  // 沙箱工具找的是 work 面：2026-10-17 起 chat 面只收记忆读取（surface:'memory'），
+  // 沙箱/委托这类工具在 chat 轮严格缺席
+  const toolOf = (name: string, surface: 'chat' | 'work' = 'work') => {
     const t = kernel.container.toolsForChat(chat, 'owner', surface).find((x) => x.name === name);
     assert.ok(t, `${surface} 面缺少工具 ${name}`);
     return t!;
   };
-  const call = async (name: string, args: Record<string, unknown>, surface: 'chat' | 'work' = 'chat'): Promise<string> => {
+  const call = async (name: string, args: Record<string, unknown>, surface: 'chat' | 'work' = 'work'): Promise<string> => {
     const r = await toolOf(name, surface).handler(args, tctx);
     return typeof r === 'string' ? r : r.content;
   };

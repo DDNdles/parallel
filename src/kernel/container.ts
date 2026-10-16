@@ -304,7 +304,8 @@ export class PluginContainer {
    * 该群 LLM 工具列表：禁用插件的工具严格缺席（不是注册了但拒绝）。
    *
    * `surface` 决定收集哪一面（pi 的 tool surface）：
-   *  - `'chat'`（默认，既有调用方语义不变）：排除 `surface:'work'` 的重工具；
+   *  - `'chat'`（默认）：**白名单口径（2026-10-17 起）**——chat 轮只收 `surface:'memory'`
+   *    的记忆读取工具；回复本身是一次普通生成，最多一轮记忆查询，不给任何行为型工具；
    *  - `'work'`：work 子代理取工具，含 work 面工具（仍受角色与 minRole 约束）。
    * 可选 `allow` 给出工具白名单（work agent 定义里的 `tools:`），不在名单里的严格缺席。
    */
@@ -316,8 +317,8 @@ export class PluginContainer {
       if (!this.effectiveEnabled(lp.manifest.id, chat.chatId)) continue;
       for (const t of lp.tools.values()) {
         if (allowSet && !allowSet.has(t.name)) continue;
-        // chat 面拿不到 work 面工具；work 面拿不到 chat 面工具
-        if (surface === 'chat' && t.surface === 'work') continue;
+        // chat 面只认记忆读取工具；work 面拿不到 chat 面工具
+        if (surface === 'chat' && t.surface !== 'memory') continue;
         if (surface === 'work' && t.surface === 'chat') continue;
         if (t.ownerOnly && role !== 'owner') continue;
         if (t.minRole && !roleAtLeast(role, t.minRole)) continue;
@@ -687,9 +688,9 @@ function makeGatedHistory(manifest: PluginManifest, sessionLog: SessionLog) {
     }
   };
   return {
-    searchMessages: (chat: ChatRef, q: string, limit?: number) => {
+    searchMessages: (chat: ChatRef, q: string, limit?: number, beforeTs?: number) => {
       can();
-      return sessionLog.searchMessages(chat.chatId, chat.type, { q, limit });
+      return sessionLog.searchMessages(chat.chatId, chat.type, { q, limit, beforeTs });
     },
   };
 }

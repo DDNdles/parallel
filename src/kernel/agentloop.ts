@@ -52,8 +52,6 @@ interface RunCapture {
   finalReply?: string;
   /** 收尾工具是否表示"活干完了"（pi-agent-core 自己也会据此早停，这里只为 LoopEvent 记一笔） */
   settled: boolean;
-  /** 引用工具这轮已代为发送的正文（取最后一次；有它就不走普通出站） */
-  toolSpoke?: string;
 }
 
 /** 音频/视频进请求体的条数上限：它们没有 pi-ai 的 content 块，只能整批补在最后一条 user 上，
@@ -74,7 +72,7 @@ export class AgentLoop {
     opts: {
       chatKey: string;
       abort?: AbortSignal;
-      /** 工具轮次上限（work 档无上限，缺省用 chat 的 maxToolRounds） */
+      /** 工具轮次上限（work 档无上限；chat 轮缺省两轮硬上限，见下） */
       maxRounds?: number;
       /** 走哪条模型优先级链（由 chainStreamFn 在链内部做降级） */
       chain?: ModelChainKind;
@@ -83,7 +81,7 @@ export class AgentLoop {
       /** 结构化事件（work 侧栏的 loop 视图：轮次/思考/工具/用量） */
       onEvent?: (ev: LoopEvent) => void;
     },
-  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[]; toolSpoke?: string }> {
+  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[] }> {
     const { chat } = ctx;
     const chatKey = opts.chatKey;
     const chain: ModelChainKind = opts.chain ?? (ctx.workTurn ? 'work' : 'chat');
@@ -98,11 +96,13 @@ export class AgentLoop {
       throw new Error('未安装 @earendil-works/pi-ai：agent loop 跑在它的引擎上，请先 `npm i`');
     }
 
-    // 轮次上限：opts.maxRounds 显式给出则生效；否则 work agent 定义里的 max_rounds（0/缺省 = 无上限），
-    // 再否则 chat 轮用配置值。work 的"无上限"是用户定稿的语义，这里保持。
+    // 轮次上限：opts.maxRounds 显式给出则生效；否则 work agent 定义里的 max_rounds（0/缺省 = 无上限）。
+    // **chat 轮是两轮硬上限（2026-10-17 用户裁定）**：第一轮允许走一次记忆查询（recall_facts /
+    // search_history，见 prepareNextTurn 第二轮摘工具），没查就一轮答完——旧的 llm.maxToolRounds
+    // 配置键已删：这是产品决定，不是旋钮。
     const agentRounds = ctx.workTurn ? ctx.workAgent?.maxRounds : undefined;
     const maxRounds = opts.maxRounds
-      ?? (ctx.workTurn ? (agentRounds && agentRounds > 0 ? agentRounds : Infinity) : this.config.config.llm.maxToolRounds);
+      ?? (ctx.workTurn ? (agentRounds && agentRounds > 0 ? agentRounds : Infinity) : 2);
     const compaction = ctx.workTurn ? this.compactionSettings() : null;
     const contextWindow = ctx.workTurn ? this.llm.contextWindow(chain) : undefined;
     let lastSummary: string | undefined;
@@ -186,6 +186,14 @@ export class AgentLoop {
       model: { id: chainModelId(this.config, ctx) },
     });
 
+    // chat 轮的输出 token 硬顶（humanlike.outgoing.maxReplyTokens）：短回复是产品口径，
+    // 抽风写小作文时由它 + 出站句边截断兜底。work 轮不设（交付多长都行，走模型页自己的 maxOutput）。
+    const replyCap = ctx.workTurn ? 0 : Math.round(Number(this.config.config.humanlike.outgoing.maxReplyTokens) || 0);
+    const rawStream = this.llm.chainStreamFn(chain, { attachments: media, chatId: chat.chatId });
+    const streamFn = (replyCap > 0
+      ? ((model: any, context: any, options: any) => rawStream(model, context, { ...(options ?? {}), maxTokens: replyCap }))
+      : rawStream) as never;
+
     const agent = new Agent({
       initialState: {
         systemPrompt: composeSystem(ctx.system, ctx.systemSections, seeded.extraSystem),
@@ -196,30 +204,38 @@ export class AgentLoop {
       },
       // 模型请求经内核的走链流函数：保住"一个模型挂了自动换下一个"。
       // 这里只交音频/视频（图片已按消息归位到种子上下文里，不再走这条补块的路）。
-      streamFn: this.llm.chainStreamFn(chain, { attachments: media, chatId: chat.chatId }) as never,
+      streamFn,
       getApiKey: (pid: string) => this.config.getProviderKey(pid),
       // 我们塞进去的都是标准消息，这里只挡掉未知角色（pi-agent-core 允许自定义类型）
       convertToLlm: (msgs: any[]) => msgs.filter((m) => ['system', 'user', 'assistant', 'toolResult'].includes(m?.role)),
       toolExecution: 'sequential',
-      // 上下文压缩：在每次要发请求之前换掉 context（pi-agent-core 给的边界）
-      prepareNextTurn: compaction
-        ? async () => {
-          // pi 的 token 账：estimateContextTokens 会优先采用最后一条 assistant 报的真实 usage，
-          // 再补上它之后的估算，所以不必自己维护 lastPromptTokens
-          const used = estimateContextTokens(agent.state.messages as never).tokens;
-          if (!contextWindow || !shouldCompact(used, contextWindow, compaction)) return undefined;
-          const done = await this.compactOnce({
-            messages: agent.state.messages as any[],
-            chat, summaryOf: lastSummary, reserveTokens: compaction.reserveTokens,
-            keepRecentTokens: compaction.keepRecentTokens, chain, signal: opts.abort, round: cap.rounds,
-          });
-          if (!done) return undefined;
-          lastSummary = done.summary;
-          compactions++;
-          event({ kind: 'compaction', round: cap.rounds, dropped: done.dropped, tokensBefore: done.tokensBefore, summary: truncate(done.summary, 600) });
-          return { context: { messages: done.messages as never, tools: tools as never }, model: agent.state.model };
-        }
-        : undefined,
+      // 每轮请求前的钩子（pi-agent-core 给的边界）：
+      //  - work 轮：上下文压缩（概率触发，见 compactOnce）；
+      //  - chat 轮：**工具面只给第一轮**——模型一旦调过工具（记忆查询），下一次请求直接摘掉
+      //    tools，只准输出正文。这就是"读取记忆工具完成后仅一轮 loop"，两轮封顶。
+      prepareNextTurn: ctx.workTurn
+        ? (compaction
+          ? async () => {
+              // pi 的 token 账：estimateContextTokens 会优先采用最后一条 assistant 报的真实 usage，
+              // 再补上它之后的估算，所以不必自己维护 lastPromptTokens
+              const used = estimateContextTokens(agent.state.messages as never).tokens;
+              if (!contextWindow || !shouldCompact(used, contextWindow, compaction)) return undefined;
+              const done = await this.compactOnce({
+                messages: agent.state.messages as any[],
+                chat, summaryOf: lastSummary, reserveTokens: compaction.reserveTokens,
+                keepRecentTokens: compaction.keepRecentTokens, chain, signal: opts.abort, round: cap.rounds,
+              });
+              if (!done) return undefined;
+              lastSummary = done.summary;
+              compactions++;
+              event({ kind: 'compaction', round: cap.rounds, dropped: done.dropped, tokensBefore: done.tokensBefore, summary: truncate(done.summary, 600) });
+              return { context: { messages: done.messages as never, tools: tools as never }, model: agent.state.model };
+            }
+          : undefined)
+        : (async () => {
+            if (cap.toolCalls === 0) return undefined;
+            return { context: { messages: agent.state.messages as never, tools: [] as never }, model: agent.state.model };
+          }),
     });
 
     const onAbort = () => agent.abort();
@@ -248,7 +264,7 @@ export class AgentLoop {
         text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
       });
       this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds: cap.rounds });
-      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps, toolSpoke: cap.toolSpoke };
+      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps };
     } catch (e) {
       const err = e as Error;
       this.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });
@@ -270,6 +286,7 @@ export class AgentLoop {
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
         const tctx: ToolContext = {
           event: ctx.event, chat: ctx.chat, role: ctx.event.role ?? 'member',
+          historyWindowStartTs: ctx.historyWindowStartTs,
           work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
         };
         try {
@@ -278,12 +295,9 @@ export class AgentLoop {
           const meta = typeof r === 'string' ? undefined : r.meta;
           const terminate = typeof r === 'string' ? undefined : r.terminate;
           const finalReply = typeof r === 'string' ? undefined : r.finalReply;
-          const spoke = typeof r === 'string' ? undefined : r.spoke;
           // 收尾工具的交付内容优先当最终回答（模型不必再复述一遍，也就不会走样）
           if (finalReply?.trim()) { cap.finalReply = finalReply.trim(); cap.settled = true; }
           else if (terminate) cap.settled = true;
-          // 引用工具已代为发送：本轮以那句收尾，内核对剩余正文不再补发
-          if (spoke?.trim()) cap.toolSpoke = spoke.trim();
           return { content: [{ type: 'text', text: truncate(text, 4000) }], details: meta, terminate };
         } catch (e) {
           const err = e as Error;

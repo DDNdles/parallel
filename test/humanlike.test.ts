@@ -5,20 +5,16 @@ import {
   NECESSITY_TRIGGER_SCORE, scoreReplyNecessity, idleCompensation, presencePenalty,
   isShortReactionBatch, stripNecessityNoise, looksLikeQuestion, pressureScore,
 } from '../src/kernel/humanlike/necessity.ts';
-import { talkValueFor, idleBackoffSeconds, backoffBypassed, inTimeWindow } from '../src/kernel/humanlike/frequency.ts';
+import { talkValueFor, idleBackoffSeconds, backoffBypassed, burstGatePenalty, inTimeWindow } from '../src/kernel/humanlike/frequency.ts';
 import {
-  splitOutgoingMessage, normalizeVisibleContent, typingDelayMs, clip, DEFAULT_OUTGOING,
+  normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
+  isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING,
 } from '../src/kernel/humanlike/delivery.ts';
 import { HumanlikeService } from '../src/kernel/humanlike/service.ts';
 import { DEFAULT_HUMANLIKE, type HumanlikeConfig } from '../src/kernel/humanlike/types.ts';
-import { readAuthoredActions, splitBubbles, hasSayBlocks, isSilentScene } from '../src/kernel/humanlike/script.ts';
 import {
   DEFAULT_RHYTHM, rhythmSignature, detectCollapse,
 } from '../src/kernel/humanlike/rhythm.ts';
-import {
-  DEFAULT_ALTER, createAlterState, advanceAlter, adjustAlterWeight, calculateAlterThreshold,
-  normalizeAlterValue, readAlter, applyAlterAnalysis, alterOffsetForPrompt, parseAlterAnalysis,
-} from '../src/kernel/humanlike/alter.ts';
 import { DEFAULT_AGENCY, deriveWindow, evaluateAgency } from '../src/kernel/humanlike/agency.ts';
 import {
   DEFAULT_SCHEDULE, currentActivity, upcoming, prunePlan, schedulePrompt,
@@ -212,42 +208,50 @@ test('空闲退避：从起点开始指数增长并封顶；积压够多就绕�
   assert.equal(backoffBypassed(cfg, 6), true);
 });
 
+test('频率：轰炸降频 —— 10 秒内超过 5 条后门槛递增，封顶 +0.3', () => {
+  assert.equal(burstGatePenalty(0), 0);
+  assert.equal(burstGatePenalty(5), 0, '5 条以内不罚');
+  assert.equal(burstGatePenalty(6), 0.05);
+  assert.ok(Math.abs(burstGatePenalty(11) - 0.3) < 1e-9, '11 条封顶');
+  assert.equal(burstGatePenalty(20), 0.3, '封顶不再涨');
+});
+
 // ============================================================
-// 4. 出站投递（移植 HDSI runtime：分隔标记切分 / 归一化截断 / 打字节奏）
+// 4. 出站投递（纯程序：归一化 / 句边截断 / 按句分条 / 打字节奏）
 // ============================================================
 
-test('投递：只按分隔标记切分，没有标记就整条 —— 不做任何自动断句', () => {
-  assert.deepEqual(splitOutgoingMessage('一<sep/>二<sep/>三', DEFAULT_OUTGOING), ['一', '二', '三']);
-  // 多句标点、没有分隔标记 → 仍然是一条（HDSI：一条为默认，分不分由模型决定）
-  assert.deepEqual(splitOutgoingMessage('第一句，第二句，第三句。', DEFAULT_OUTGOING), ['第一句，第二句，第三句。']);
+test('投递：按换行与句末标点分条；连续标点并作一个句尾；收尾引号跟着前一句', () => {
+  assert.deepEqual(splitIntoBubbles('在。有事说事。'), ['在。', '有事说事。']);
+  assert.deepEqual(splitIntoBubbles('在\n我先睡会儿'), ['在', '我先睡会儿'], '换行是最强的分条意图');
+  assert.deepEqual(splitIntoBubbles('真的吗？？'), ['真的吗？？'], '连续问号并作同一个句尾');
+  assert.deepEqual(splitIntoBubbles('他说「好。」然后走了'), ['他说「好。」', '然后走了'], '右引号跟着前一句');
+  assert.deepEqual(splitIntoBubbles('嗯嗯'), ['嗯嗯'], '没有句末标点就是一条');
 });
 
-test('投递：关掉拆分时整条返回；自定义分隔标记生效', () => {
-  const off = { ...DEFAULT_OUTGOING, splitReplyMessages: false };
-  assert.deepEqual(splitOutgoingMessage('一<sep/>二', off), ['一<sep/>二']);
-  const custom = { ...DEFAULT_OUTGOING, messageSeparator: '||' };
-  assert.deepEqual(splitOutgoingMessage('一||二||三', custom), ['一', '二', '三']);
+test('投递：最多 4 条气泡，尾巴并进最后一条（不丢字、不无限累加打字等待）', () => {
+  const out = splitIntoBubbles('一。二。三。四。五。六。');
+  assert.equal(out.length, 4);
+  assert.equal(out.join(''), '一。二。三。四。五。六。');
+  assert.equal(out[3], '四。五。六。');
 });
 
-test('投递：splitBubbles（剧本体逐 action 用）有标记按标记切、无标记整条；只有标记时切空', () => {
-  assert.deepEqual(splitBubbles('一<sep/>二'), ['一', '二']);
-  assert.deepEqual(splitBubbles('一整条没有标记'), ['一整条没有标记']);
-  assert.deepEqual(splitBubbles('一<sep/>二', '<sep/>', false), ['一\n二'], '关掉分条时标记换成换行，不把内部记号发进群');
-  assert.deepEqual(splitBubbles('<sep/>'), [], '只有标记 → 切空，不回退整条（免得把标记发进群）');
+test('投递：句边截断 —— 超长时保留到最后一个句末标点；句边靠前才按句截，否则硬切', () => {
+  assert.equal(trimAtSentence('第一句。第二句。第三句。', 8), '第一句。第二句。', '8 字内最后一个句号处截');
+  assert.equal(trimAtSentence('短短。然后是一大段没有标点的话', 8), '短短。然后是一大', '句边落在前半段 → 硬切');
+  assert.equal(trimAtSentence('没有标点的长句子xxxxxxxxxx', 5), '没有标点的', '找不到像样的句边就硬切');
+  assert.equal(trimAtSentence('本来就短。', 100), '本来就短。', '没超长原样返回');
 });
 
-test('投递：归一化分隔标记写法、剥媒体占位符，并硬截断（先截断整条）', () => {
-  // 全角/变体写法归一到配置的标记
-  assert.equal(normalizeVisibleContent('一＜sep/＞二', 100, '<sep/>'), '一<sep/>二');
-  assert.equal(normalizeVisibleContent('一<sep>二', 100, '<sep/>'), '一<sep/>二');
+test('投递：归一化剥媒体占位符与模型手滑标签；旧分隔标记当换行（迁移期兜底）；硬截断', () => {
   // 媒体占位符剥掉
-  assert.equal(normalizeVisibleContent('看图【图片】[CQ:image,file=x]好了', 100, '<sep/>'), '看图好了');
-  // 模型自己发明的内联记号（内核没有对应实现）不该被人看见，但分隔标记自己必须活着
-  assert.equal(normalizeVisibleContent('<set_mood mood="晕乎乎"/>你好<update_affection delta="1" reason="拌嘴"/>', 100, '<sep/>'), '你好');
-  assert.equal(normalizeVisibleContent('早<sep/>好', 100, '<sep/>'), '早<sep/>好');
-  assert.equal(normalizeVisibleContent('换行||分隔', 100, '||'), '换行||分隔');
+  assert.equal(normalizeVisibleContent('看图【图片】[CQ:image,file=x]好了', 100), '看图好了');
+  // 模型自己发明/残留的标签剥掉：自闭标签整体丢、成对的 say 标签留话
+  assert.equal(normalizeVisibleContent('<set_mood mood="晕乎乎"/>你好', 100), '你好');
+  assert.equal(normalizeVisibleContent('<say id="s1">在。</say>', 100), '在。');
+  // 旧分隔标记（剧本体时代）当换行：分条意图保留，记号不外发
+  assert.equal(normalizeVisibleContent('在。<sep/>有事说事。', 100), '在。\n有事说事。');
   // 截断是硬切尾巴，不重切、不丢整条
-  assert.equal(normalizeVisibleContent('一二三四五', 3, '<sep/>'), '一二三');
+  assert.equal(normalizeVisibleContent('一二三四五', 3), '一二三');
   assert.equal(clip('  abc  ', 2), 'ab');
   assert.equal(clip(undefined, 5), '');
 });
@@ -260,7 +264,7 @@ test('投递：打字延迟按字数/速度算；抖动 0 时确定；下限 250
   assert.equal(typingDelayMs('', base), 1000);
   // 上限封顶
   assert.equal(typingDelayMs('一二三四五六七八九十一二三四五六', { ...base, typingMaxDelaySeconds: 2 }), 2000);
-  // base=0 + max=0 → 落到 250ms 下限（HDSI 没有「0 = 关闭打字」这一档）
+  // base=0 + max=0 → 落到 250ms 下限（没有「0 = 关闭打字」这一档）
   assert.equal(typingDelayMs('随便什么', { ...base, typingBaseDelaySeconds: 0, typingMaxDelaySeconds: 0 }), 250);
   // 抖动落点由 rng 决定，但始终落在 [250, cap]
   const jit = { ...base, typingJitterRatio: 0.3 };
@@ -269,13 +273,22 @@ test('投递：打字延迟按字数/速度算；抖动 0 时确定；下限 250
   assert.ok(lo >= 250 && hi <= 12000 && lo < hi, `抖动区间异常: ${lo} / ${hi}`);
 });
 
-test('投递：分隔标记切出的气泡经归一化后逐条交付；括号动作不再被程序清洗', () => {
-  const raw = '在的<sep/>（笑）刚睡醒<sep/>你说';
-  const clipped = normalizeVisibleContent(raw, DEFAULT_OUTGOING.maxMessageCharacters, DEFAULT_OUTGOING.messageSeparator);
-  const bubbles = splitOutgoingMessage(clipped, DEFAULT_OUTGOING);
-  assert.deepEqual(bubbles, ['在的', '（笑）刚睡醒', '你说']);
-  // HDSI 不做括号清洗，旁白靠 <say> 结构与提示词约束
-  assert.ok(bubbles[1].includes('（笑）'));
+test('投递：完整流水线 —— 归一化 → 句边截断 → 按句分条（截掉的尾巴不会漏出去）', () => {
+  const raw = '（笑）刚睡醒。你说。<set_mood mood="x"/>';
+  const t = trimAtSentence(normalizeVisibleContent(raw, DEFAULT_OUTGOING.maxMessageCharacters), DEFAULT_OUTGOING.replyMaxCharacters);
+  assert.deepEqual(splitIntoBubbles(t), ['（笑）刚睡醒。', '你说。']);
+  const long = `${'很长的一段话'.repeat(30)}。尾巴一句。`;
+  const cut = trimAtSentence(normalizeVisibleContent(long, DEFAULT_OUTGOING.maxMessageCharacters), DEFAULT_OUTGOING.replyMaxCharacters);
+  assert.ok(cut.length <= DEFAULT_OUTGOING.replyMaxCharacters, `截断后不该超上限: ${cut.length}`);
+  assert.ok(splitIntoBubbles(cut).length >= 1);
+});
+
+test('投递：沉默标记（[silent]，兼容旧 SKIP）', () => {
+  assert.equal(isSilentScene('[silent]'), true);
+  assert.equal(isSilentScene(' [silent]。 '), true);
+  assert.equal(isSilentScene('SKIP'), true);
+  assert.equal(isSilentScene('知道了'), false);
+  assert.equal(SILENT_MARKER, '[silent]');
 });
 
 // ============================================================
@@ -307,6 +320,8 @@ function makeService(over: Partial<HumanlikeConfig> = {}, opts: { realClock?: bo
     trigger: (b) => triggers.push({ events: b.events, reason: b.reason }),
     sessionLog: { append: (_c, _t, e) => logs.push(e) } as never,
     bus, errors, now,
+    // 起跳随机延时用固定 0（= 取下限）：测试要确定性，抖动幅度由用例显式配置
+    random: rng0,
   });
   return { svc, cfg, triggers, logs, now, tick: (ms: number) => { fake += ms; } };
 }
@@ -374,6 +389,30 @@ test('服务：攒够条数（frequency 模式）后由定时器触发，而不�
   svc.dispose();
 });
 
+test('服务：合批关窗后按随机延时起跳，不是关窗就秒回', async () => {
+  const { svc, triggers } = makeService({
+    merge: { enable: true, windowMs: 10, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 40, fireDelayMaxMs: 40 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 1 },
+  });
+  svc.ingest(ev('在吗'), { isCommand: false });
+  await wait(25);
+  assert.equal(triggers.length, 0, '关窗（windowMs=10ms）之后还要等起跳延时（40ms）');
+  await wait(60);
+  assert.equal(triggers.length, 1, '延时一到就起跳');
+  svc.dispose();
+});
+
+test('服务：@ 直通不受合批与起跳延时影响（同步放行）', async () => {
+  const { svc, triggers } = makeService({
+    merge: { enable: true, windowMs: 10_000, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 5_000, fireDelayMaxMs: 5_000 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 1 },
+  });
+  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  assert.equal(at.action, 'pass', '@ 立即交回调用方，不走合批与延时');
+  assert.equal(triggers.length, 0, '直通路径由 pipeline 处理，不经过 trigger 回调');
+  svc.dispose();
+});
+
 test('服务：necessary 模式攒不够就沉默，且沉默会累加退避计数', async () => {
   const { svc, triggers, logs } = makeService({
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
@@ -436,18 +475,18 @@ test('服务：noteSpoke / noteSilent 维护存在感窗口与退避', () => {
   svc.dispose();
 });
 
-test('服务：compose 第一条不等、其余按打字延迟排停顿（HDSI 口径）', async () => {
-  // 模型自己写了分隔标记 → 三条；首条不等，其后按字数算
+test('服务：compose 第一条不等、其余按打字延迟排停顿（按句分条）', async () => {
   const { svc } = makeService({
     outgoing: { ...DEFAULT_OUTGOING, typingBaseDelaySeconds: 0, typingCharactersPerSecond: 1, typingMaxDelaySeconds: 30, typingJitterRatio: 0 },
   });
-  const plans = await svc.compose(chat, '在的<sep/>刚睡醒<sep/>你说');
-  assert.equal(plans.length, 3, `应按分隔标记拆成 3 条: ${plans.length}`);
+  // 三句话 → 三个气泡；首条不等，其后每条 = ceil(字数 / 每秒字数)
+  const plans = await svc.compose(chat, '在的。刚睡醒。你说。');
+  assert.equal(plans.length, 3, `应按句拆成 3 条: ${plans.length}`);
   assert.equal(plans[0].pauseMs, 0, '第一条立刻发');
-  assert.deepEqual(plans.slice(1).map((p) => p.pauseMs), [3000, 2000], '后续每条 = ceil(字数 / 每秒字数)');
-  // 没有分隔标记 → 一条、无停顿（不再自动断句）
+  assert.deepEqual(plans.slice(1).map((p) => p.pauseMs), [4000, 3000], '后续每条 = ceil(字数 / 每秒字数)');
+  // 逗号不断句：只有逗号的长句仍是一条
   const one = await svc.compose(chat, '第一句，第二句，第三句。');
-  assert.equal(one.length, 1, '不写分隔标记就是一条');
+  assert.equal(one.length, 1, '逗号不是句末标点');
   assert.equal(one[0].pauseMs, 0);
   svc.dispose();
 });
@@ -458,11 +497,11 @@ test('服务：群里的普通消息一律进门控（没有"全都放行"的旁
   svc.dispose();
 });
 
-test('服务：只有剧本体可单独关（关了退回整条发），其余部分不受影响', async () => {
-  // 剧本体是子开关，不是总开关：关掉只是"模型写什么就发什么"，门控与投递照旧
-  const off = makeService({ script: { enable: false } });
-  const plans = await off.svc.compose(chat, '第一句，第二句，第三句。');
-  assert.equal(plans.length, 1, '没有分隔标记就是一条');
+test('服务：关掉分条就整段一条发出去（分条是纯程序开关，门控照旧）', async () => {
+  const off = makeService({ outgoing: { ...DEFAULT_OUTGOING, splitReplyMessages: false } });
+  const plans = await off.svc.compose(chat, '第一句。第二句。');
+  assert.equal(plans.length, 1, '分条关掉 = 整段一条');
+  assert.equal(plans[0].segments[0].data.text, '第一句。第二句。');
   assert.equal(off.svc.ingest(ev('普通消息'), { isCommand: false }).action, 'handled', '门控仍然在');
   off.svc.dispose();
 });
@@ -502,99 +541,30 @@ test('配置：DEFAULT_CONFIG.humanlike 与 DEFAULT_HUMANLIKE 逐字段一致（
 });
 
 // ============================================================
-// 7. 剧本体（移植 HDSI 的 <say> authored actions）
+// 7. 出站落地（composeScene）：模型说什么就发什么
 // ============================================================
 
-test('剧本：say 块摘出台词，prose 里原话原位保留（HDSI "The original words survive."）', () => {
-  const script = '她懒洋洋地沉下去，只留眼睛在水面上。\n<say id="s1">在。</say>\n<say id="s2">有事说事。</say>';
-  const { prose, actions } = readAuthoredActions(script);
-  assert.deepEqual(actions.map((a) => a.content), ['在。', '有事说事。']);
-  assert.deepEqual(actions.map((a) => a.id), ['s1', 's2']);
-  // 标签没了，但台词原文留在原位 —— 小说读起来是连贯的
-  assert.equal(prose, '她懒洋洋地沉下去，只留眼睛在水面上。\n在。\n有事说事。');
-  assert.ok(!prose.includes('<say'), 'prose 里不该残留标签');
-  // start/end 指向 prose 里的对应区间
-  for (const a of actions) assert.equal(prose.slice(a.start, a.end), a.content);
-});
-
-test('剧本：同一个 id 出现多次时全部作废（HDSI 去重口径）', () => {
-  const { actions } = readAuthoredActions('<say id="s1">甲</say><say id="s1">乙</say><say id="s2">丙</say>');
-  assert.deepEqual(actions.map((a) => a.content), ['丙'], '重复 id 的引用不可执行');
-});
-
-test('剧本：没有 say 块时 actions 为空（绝不从旁白里猜台词）', () => {
-  const { actions, prose } = readAuthoredActions('她翻了个身，没说话。');
-  assert.equal(actions.length, 0);
-  assert.equal(prose, '她翻了个身，没说话。');
-  assert.equal(hasSayBlocks('她翻了个身。'), false);
-  assert.equal(hasSayBlocks('<say id="a">嗯</say>'), true);
-});
-
-test('剧本：<sep/> 把一个 say 块切成多个气泡', () => {
-  assert.deepEqual(splitBubbles('在。<sep/>有事说事。'), ['在。', '有事说事。']);
-  assert.deepEqual(splitBubbles('就一句'), ['就一句']);
-  assert.deepEqual(splitBubbles('  <sep/>  '), []);
-});
-
-test('剧本：沉默标记（[silent]，兼容旧 SKIP）', () => {
-  assert.equal(isSilentScene('[silent]'), true);
-  assert.equal(isSilentScene(' [silent]。 '), true);
-  assert.equal(isSilentScene('SKIP'), true);
-  assert.equal(isSilentScene('知道了'), false);
-  assert.equal(isSilentScene('<say id="s1">在。</say>'), false);
-});
-
-test('服务：composeScene —— 只发 say 块里的字，历史回灌带标签的原文', async () => {
+test('服务：composeScene —— 发出去的就是模型写的正文；历史回灌与发出去的气泡同形', async () => {
   const { svc } = makeService();
-  const scene = '她懒得抬头。\n<say id="s1">知道了，这就去。</say>\n<say id="s2">别催。</say>';
-  const { plans, historyText, spoke } = await svc.composeScene(scene);
-  assert.deepEqual(plans.map((p) => p.segments[0].data.text), ['知道了，这就去。', '别催。']);
+  const { plans, historyText, spoke } = await svc.composeScene('知道了。别催。');
+  assert.deepEqual(plans.map((p) => p.segments[0].data.text), ['知道了。', '别催。']);
+  assert.equal(historyText, '知道了。\n别催。', '历史与群里看到的同形（不再有带标签剧本）');
   assert.equal(spoke, true);
-  assert.equal(historyText, scene, '历史必须是带标签的原文，否则模型下一轮不再写 say');
-  assert.ok(!plans.some((p) => String(p.segments[0].data.text).includes('她懒得抬头')));
   svc.dispose();
 });
 
-test('服务：composeScene —— 旁白隔离只靠 <say> 结构，不做括号清洗（HDSI 口径）', async () => {
-  const { svc } = makeService();
-  // say 之外是旁白 → 永不外发；say 之内的字**原样**发出，哪怕它长着旁白的样子。
-  // HDSI 不做括号/星号清洗，靠的是"模型只把台词放进 <say>"这条结构约定与提示词约束。
-  const scene = '她懒得抬头。<say id="s1">在。</say><say id="s2">（打了个哈欠）</say>';
-  const { plans } = await svc.composeScene(scene);
-  const texts = plans.map((p) => p.segments[0].data.text);
-  assert.deepEqual(texts, ['在。', '（打了个哈欠）']);
-  assert.ok(!texts.some((t) => t.includes('她懒得抬头')), 'say 之外的旁白零泄漏');
-  svc.dispose();
-});
-
-test('服务：composeScene —— 沉默标记什么都不发；没有 say 块则退回普通模式', async () => {
-  const { svc, cfg } = makeService();
+test('服务：composeScene —— 超长按句边截断；沉默标记什么都不发', async () => {
+  const { svc } = makeService({ outgoing: { ...DEFAULT_OUTGOING, replyMaxCharacters: 12 } });
+  const cut = await svc.composeScene('第一句短。第二句也还行。第三句就开始啰嗦了要说个没完。');
+  const joined = cut.plans.map((p) => p.segments[0].data.text).join('');
+  assert.ok(joined.length <= 12, `截断后不该超上限: ${joined.length}`);
+  assert.ok(joined.startsWith('第一句短。'), joined);
   const silent = await svc.composeScene('[silent]');
   assert.equal(silent.plans.length, 0);
   assert.equal(silent.spoke, false);
   assert.equal(silent.historyText, '');
-
-  // 没有 say 块：模型没按格式来，退化成"整段当一条台词"（没有分隔标记就是一条），免得它彻底哑掉
-  const plain = await svc.composeScene('知道了，这就去。');
-  const joined = plain.plans.map((p) => p.segments[0].data.text).join('');
-  assert.ok(joined.includes('知道了') && joined.includes('这就去'), JSON.stringify(joined));
-  assert.equal(plain.spoke, true);
-  void cfg;
   svc.dispose();
 });
-
-test('服务：关掉剧本体后回到普通模式（整段塑形后发出）', async () => {
-  const { svc, cfg } = makeService();
-  cfg.script.enable = false;
-  const { plans, historyText } = await svc.composeScene('第一句。第二句。');
-  assert.ok(plans.length >= 1);
-  assert.equal(historyText, '第一句。第二句。');
-  svc.dispose();
-});
-
-// ============================================================
-// 8. HDSI 四件套：节奏反定型 / 情绪偏移 / 行动窗口 / 日程
-// ============================================================
 
 test('节奏：签名取「结构 | 尾段语气 | 字数箱体」三个维度', () => {
   assert.equal(rhythmSignature(['在。']), rhythmSignature(['好。']), '同结构的短句签名相同');
@@ -620,79 +590,6 @@ test('节奏：样本不够时不判定（宽限期）', () => {
   const few = ['1|。|xs', '1|。|xs'];
   assert.equal(detectCollapse(few, DEFAULT_RHYTHM).collapsed, false);
   assert.match(detectCollapse(few, DEFAULT_RHYTHM).detail, /样本 2\//);
-});
-
-test('情绪偏移：alter 取值钳到 -5..5 并取整', () => {
-  assert.equal(normalizeAlterValue(3.4), 3);
-  assert.equal(normalizeAlterValue(-9), -5);
-  assert.equal(normalizeAlterValue(99), 5);
-  assert.equal(normalizeAlterValue(Number.NaN), undefined);
-  assert.equal(normalizeAlterValue('2'), undefined);
-});
-
-test('情绪偏移：从剧本里摘出 <alter> 并把标记从正文里去掉', () => {
-  const r = readAlter('她翻了个身。<alter>+2</alter>\n<say id="s1">在。</say>');
-  assert.equal(r.value, 2);
-  assert.ok(!r.text.includes('<alter>'), r.text);
-  assert.ok(r.text.includes('<say id="s1">在。</say>'), '剧本本体不动');
-  assert.equal(readAlter('没有标记').value, undefined);
-});
-
-test('情绪偏移：同向加权、反向衰减，权重钳在 0..1', () => {
-  const cfg = DEFAULT_ALTER;
-  assert.ok(adjustAlterWeight(0.5, true, 2, cfg) > 0.5, '同向要涨');
-  assert.ok(adjustAlterWeight(0.5, false, 2, cfg) < 0.5, '反向要落');
-  assert.equal(adjustAlterWeight(0.9, true, 5, cfg), 1, '封顶 1');
-  assert.equal(adjustAlterWeight(0.05, false, 5, cfg), 0, '到底 0');
-});
-
-test('情绪偏移：聊天越密阈值越低（但不会低于基准的一半）', () => {
-  const cfg = DEFAULT_ALTER;
-  const now = Date.UTC(2026, 0, 1, 12, 0, 0);
-  const few = [{ at: now }];
-  const many = Array.from({ length: 10 }, (_, i) => ({ at: now - i * 1000 }));
-  const tFew = calculateAlterThreshold(few, cfg, now);
-  const tMany = calculateAlterThreshold(many, cfg, now);
-  assert.ok(tMany < tFew, `密的时候阈值应更低: ${tMany} < ${tFew}`);
-  assert.equal(tMany, cfg.baseThreshold * (1 - 1 * cfg.densityFactor));
-  assert.ok(calculateAlterThreshold([], cfg, now) >= cfg.baseThreshold * 0.5);
-});
-
-test('情绪偏移：累计到阈值才算命中；反向翻转会把权重衰减到过期', () => {
-  const cfg = DEFAULT_ALTER;
-  let now = 1_000_000;
-  let st = createAlterState();
-  let out = advanceAlter(st, 4, now, cfg);
-  assert.equal(out.state.value, 4);
-  assert.equal(out.thresholdReached, false, '4 < 阈值 10');
-  out = advanceAlter(out.state, 4, (now += 1000), cfg);
-  assert.equal(out.state.value, 8);
-  out = advanceAlter(out.state, 4, (now += 1000), cfg);
-  assert.equal(out.state.value, 12);
-  assert.equal(out.thresholdReached, true, '12 >= 10');
-
-  // 先建立一段氛围（高权重），再反复反向 → 权重掉到 minWeight 以下就过期
-  st = applyAlterAnalysis({ ...out.state }, { direction: 'relaxed', description: '聊得很松', intensity: 2 }, now, cfg);
-  assert.ok(alterOffsetForPrompt(st, cfg), '刚建立时应当可注入');
-  // 注意 HDSI 的语义：**稳定反向不会衰减**，只有来回翻转才衰减（同向是加权）。
-  // 所以一直给 -1 反而会把它养起来；要过期必须真的来回翻。
-  for (let i = 0; i < 3; i++) {
-    st = advanceAlter(st, -1, (now += 1000), cfg).state;
-  }
-  assert.ok(alterOffsetForPrompt(st, cfg), '一直同向（哪怕反向）只会加权，不会过期');
-  for (let i = 0; i < 8; i++) {
-    st = advanceAlter(st, i % 2 === 0 ? 1 : -1, (now += 1000), cfg).state;
-  }
-  assert.equal(alterOffsetForPrompt(st, cfg), null, '来回翻转够多就自然过期');
-  assert.equal(alterOffsetForPrompt(st, { ...cfg, enabled: false }), null, '关掉就不注入');
-});
-
-test('情绪偏移：侧端分析结果的解析与容错', () => {
-  const ok = parseAlterAnalysis('```json\n{"direction":"relaxed","description":"整体轻松","intensity":1}\n```');
-  assert.deepEqual(ok, { direction: 'relaxed', description: '整体轻松', intensity: 1 });
-  assert.equal(parseAlterAnalysis('不是 JSON'), null);
-  assert.equal(parseAlterAnalysis('{"direction":"weird","description":"x","intensity":1}'), null);
-  assert.equal(parseAlterAnalysis('{"direction":"serious","intensity":1}'), null, '没有描述不算');
 });
 
 test('行动窗口：安静时段 → 设备不可用，并给出下一个机会点', () => {

@@ -953,11 +953,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
                 }
               }
             } else {
-              // persona 走逐键白名单：整段 assign 会让过期页面把已删除的键（好感度那套）写回配置
+              // persona 走逐键白名单：整段 assign 会让过期页面把已删除的键（好感度那套、注入 Top-K）写回配置
               const p = body[section] as Record<string, unknown>;
               if (typeof p.default === 'string' && /^[\w-]{1,64}$/.test(p.default.trim())) cfg.persona.default = p.default.trim();
-              if (Number.isFinite(Number(p.memoryFactsTopK))) {
-                cfg.persona.memoryFactsTopK = Math.min(20, Math.max(1, Math.round(Number(p.memoryFactsTopK))));
+              if (typeof p.memoryAutoSave === 'boolean') (cfg.persona as any).memoryAutoSave = p.memoryAutoSave;
+              for (const [k, lo, hi] of [['memoryMinTurns', 2, 40], ['memoryIdleSeconds', 10, 3600], ['memoryMaxFacts', 1, 10]] as const) {
+                const n = Number(p[k]);
+                if (Number.isFinite(n)) (cfg.persona as any)[k] = Math.min(hi, Math.max(lo, Math.round(n)));
               }
             }
           }
@@ -972,20 +974,14 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         if (body.ui && typeof body.ui === 'object' && 'chatPreview' in (body.ui as object)) {
           cfg.ui.chatPreview = !!(body.ui as Record<string, unknown>).chatPreview;
         }
-        // llm 段只放行掉线阈值与工具轮上限：模型链本身走 /api/providers/chain。
-        // 每一项都**独立可选**：工作页只发 maxToolRounds，模型页只发 failoverThreshold，
-        // 谁都不该因为对方缺席而被判 400（踩过：把 failoverThreshold 当必填，工作页保存直接 400）。
+        // llm 段只放行掉线阈值：模型链本身走 /api/providers/chain。
+        // （chat 工具轮上限 maxToolRounds 已删——chat 轮两轮硬上限是产品决定，不是旋钮。）
         if (body.llm && typeof body.llm === 'object') {
           if ((body.llm as any).failoverThreshold !== undefined) {
             const n = Number((body.llm as any).failoverThreshold);
             if (!Number.isFinite(n) || n < 1 || n > 10) return send({ error: '掉线阈值需要是 1~10 的整数' }, 400);
             cfg.llm.failoverThreshold = Math.round(n);
             kernel.llm.resetFailover();
-          }
-          if ((body.llm as any).maxToolRounds !== undefined) {
-            const v = Number((body.llm as any).maxToolRounds);
-            if (!Number.isInteger(v) || v < 1 || v > 32) return send({ error: 'chat 工具轮上限需要是 1~32 的整数' }, 400);
-            cfg.llm.maxToolRounds = v;
           }
         }
         // storage 段：每会话历史条数（HistoryStore 环形缓冲真正读的键），保存后立即生效
@@ -1095,11 +1091,8 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   };
 
   // 刻意没有 `enabled` 总开关：拟人化不是可关的功能，POST 里带这个键也不认（直接忽略）。
-  // 各子项（剧本体/节奏/情绪/行动容量/日程…）仍是独立开关，逐项收。
-
-  // 剧本体（HDSI <say>）
-  const script = body.script as Record<string, unknown> | undefined;
-  if (script && typeof script === 'object') applyBool(target.script, script, 'enable');
+  // 各子项（节奏/行动容量/日程…）仍是独立开关，逐项收；2026-10-17 删掉的剧本体与情绪偏移
+  // 不再收任何键——老桌面端标签页回放旧表单也写不回来。
 
   // 圈内黑话（表达学习）
   const jargon = body.jargon as Record<string, unknown> | undefined;
@@ -1131,19 +1124,6 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     e = applyNum(t, rhythm, 'exhaustLimit', 3, 12, '熔断轮数'); if (e) return e;
   }
 
-  // 情绪偏移（HDSI Alter）
-  const alter = body.alter as Record<string, unknown> | undefined;
-  if (alter && typeof alter === 'object') {
-    const t = target.alter;
-    applyBool(t, alter, 'enabled');
-    let e = applyNum(t, alter, 'baseThreshold', 1, 100, '氛围阈值'); if (e) return e;
-    e = applyNum(t, alter, 'densityFactor', 0, 1, '密度系数'); if (e) return e;
-    e = applyNum(t, alter, 'sameDirectionBoost', 0, 1, '同向加成'); if (e) return e;
-    e = applyNum(t, alter, 'oppositeDecay', 0, 1, '反向衰减'); if (e) return e;
-    e = applyNum(t, alter, 'minWeight', 0, 1, '最小权重'); if (e) return e;
-    e = applyNum(t, alter, 'maxIntensity', 1, 5, '强度上限'); if (e) return e;
-  }
-
   // 行动窗口（HDSI Agency）
   const agency = body.agency as Record<string, unknown> | undefined;
   if (agency && typeof agency === 'object') {
@@ -1169,17 +1149,14 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     e = applyNum(t, schedule, 'maxExceptions', 1, 200, '例外上限'); if (e) return e;
   }
 
-  // 出站投递（HDSI `runtime`）：分隔标记切分 + 打字节奏 + 单条长度上限
+  // 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
   const outgoing = body.outgoing as Record<string, unknown> | undefined;
   if (outgoing && typeof outgoing === 'object') {
     const t = target.outgoing;
     applyBool(t, outgoing, 'splitReplyMessages');
-    if ('messageSeparator' in outgoing) {
-      const sepStr = String(outgoing.messageSeparator ?? '').trim();
-      if (!sepStr || sepStr.length > 16) return '分段标记需要是 1~16 个字符';
-      t.messageSeparator = sepStr;
-    }
-    let e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
+    let e = applyNum(t, outgoing, 'replyMaxCharacters', 20, 2000, '回复最长字符数'); if (e) return e;
+    e = applyNum(t, outgoing, 'maxReplyTokens', 0, 8000, '回复 token 上限'); if (e) return e;
+    e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
     e = applyNum(t, outgoing, 'typingCharactersPerSecond', 1, 100, '打字速度'); if (e) return e;
     e = applyNum(t, outgoing, 'typingMaxDelaySeconds', 0, 120, '单条最长打字等待'); if (e) return e;
     e = applyNum(t, outgoing, 'typingJitterRatio', 0, 0.5, '打字抖动比例'); if (e) return e;
@@ -1235,6 +1212,9 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     let e = applyNum(t, merge, 'windowMs', 0, 60_000, '合并窗口'); if (e) return e;
     e = applyNum(t, merge, 'maxWaitMs', 0, 300_000, '合并兜底上限'); if (e) return e;
     e = applyNum(t, merge, 'bufferTtlMs', 0, 3_600_000, '攒货过期时间'); if (e) return e;
+    e = applyNum(t, merge, 'fireDelayMinMs', 0, 10_000, '起跳随机延时下限'); if (e) return e;
+    e = applyNum(t, merge, 'fireDelayMaxMs', 0, 10_000, '起跳随机延时上限'); if (e) return e;
+    if (t.fireDelayMaxMs < t.fireDelayMinMs) t.fireDelayMaxMs = t.fireDelayMinMs;
   }
 
   const backoff = body.backoff as Record<string, unknown> | undefined;
