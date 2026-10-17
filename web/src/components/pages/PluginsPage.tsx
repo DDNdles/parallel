@@ -277,7 +277,7 @@ function MatrixModal({ plugins, chats, onClose, onChanged }: {
     <Modal title="分群开关矩阵" wide onClose={onClose}>
       {saveErr && <div className="mset-err">{saveErr}</div>}
       {!chats.length ? (
-        <div className="mset-group-e">还没有任何群的开关记录。在群内让管理员发送 /插件 开启 &lt;id&gt;，或等该群来一条消息。</div>
+        <div className="mset-group-e">还没有任何群的开关记录。等该群来一条消息后，就能在这里为它单独开关。</div>
       ) : (
         <>
           <div className="matrix">

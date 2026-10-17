@@ -32,22 +32,6 @@ export function setup(ctx: PluginContext): void {
     return `⛏ [MC ${h.project_type === 'modpack' ? '整合包' : 'Mod'}] ${h.title}\n${h.description.slice(0, 100)}\n⬇ ${h.downloads}  https://modrinth.com/${h.project_type}/${h.slug}`;
   }
 
-  ctx.registerCommand({
-    name: 'mc推荐',
-    aliases: ['mc', 'MC推荐'],
-    description: '每日推荐 MC 整合包/Mod：/mc推荐 [modpack|mod]',
-    handler: async (args) => {
-      const type = args[0] === 'mod' ? 'mod' : 'modpack';
-      try {
-        const h = await fetchRandom(type);
-        if (!h) return { text: '今天没找到合适的推荐，明天再来看看喵。' };
-        return { text: fmt(h) };
-      } catch (e) {
-        return { text: `推荐获取失败：${(e as Error).message}\n（TODO: CurseForge 备源）` };
-      }
-    },
-  });
-
   ctx.llm.registerTool({
     name: 'mc_recommend',
     description: '推荐一个 Minecraft 整合包或 Mod。',

@@ -293,12 +293,12 @@ export class Kernel {
     }
     this.setupKernelRpc();
     const masterHint = this.config.config.masterIds.length === 0
-      ? '⚠ 尚未配置主人 QQ（config.masterIds），人设切换等主人专属能力将不可用。'
+      ? '⚠ 尚未配置主人 QQ（config.masterIds），报错通知等主人专属能力将不可用。'
       : '';
     if (masterHint) this.log.warn(masterHint);
   }
 
-  /** kernel.rpc：插件（如 plugin-manager）经事件总线请求内核能力 */
+  /** kernel.rpc：插件经事件总线向内核请求能力（桌面端 commands_visible 走 HTTP 直调，不在此处） */
   private setupKernelRpc(): void {
     this.bus.on('kernel.rpc', (req: any) => {
       void Promise.resolve()
@@ -315,7 +315,7 @@ export class Kernel {
             }
             case 'plugins_visible': {
               const chat = { platform: 'qq', type: req.chatType ?? 'group', chatId };
-              // hidden 插件只是不在桌面端「插件」页出现；群内 /插件 仍可开关（chat/sandbox/web-search 默认关，
+              // hidden 只是不在桌面端「插件」页的列表里出现；分群开关仍要能开关（chat/sandbox 默认关，
               // 全靠这里启用，滤掉就等于谁也开不了）
               return this.container.list()
                 .filter((lp) => this.container.isPluginVisibleToChat(lp.manifest.id, chatId, role))

@@ -115,8 +115,8 @@ export interface PluginManifest {
   permissions: PluginPermission[];
   personas?: string[];           // persona 类插件：提供的人格 id
   locked?: boolean;              // 锁定：仅主人可开关/查看详情（persona 类默认 true）
-  core?: boolean;                // core：不可被卸载/运行时停用（如 plugin-manager）
-  /** 不在插件页/`/插件 列表`里出现：能力已集成到别的页面（人格/设置/沙箱/工作），插件本身照常运行 */
+  core?: boolean;                // core：不可被卸载/运行时停用
+  /** 不在插件页的列表里出现：能力已集成到别的页面（人格/设置/沙箱/工作），插件本身照常运行；分群开关仍可在开关矩阵里调整 */
   hidden?: boolean;
   defaultGroupState: 'on' | 'off';
   userConfig?: Record<string, UserConfigField>;
@@ -213,14 +213,16 @@ export interface ToolMeta {
 }
 
 // ---------------- 聊天命令 ----------------
+// 2026-10-17 起内建指令面清空：QQ 侧只剩内核拦截的 /work <任务>（管理员），
+// 其余命令全部删除。这套注册表留给插件（含 data/plugins 的用户插件）自用。
 
 export interface CommandDef {
-  name: string;                 // '/插件' 的 '插件'，不带斜杠
+  name: string;                 // 命令名，不带斜杠
   aliases?: string[];
   description: string;
   usage?: string;
   minRole?: Role;
-  hidden?: boolean;             // 不出现在帮助里（如 owner 专属工具命令）
+  hidden?: boolean;             // 不出现在命令列表里（如主人专属命令）
   handler(args: string[], event: ChatEvent): Promise<CommandReply> | CommandReply;
 }
 

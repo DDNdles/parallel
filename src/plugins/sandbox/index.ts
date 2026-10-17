@@ -357,28 +357,6 @@ export function setup(ctx: PluginContext): void {
       }
     },
   });
-
-  ctx.registerCommand({
-    name: '沙箱',
-    description: '查看/清空本会话沙箱（清空需管理员）',
-    usage: '/沙箱 [查看|清空]',
-    handler: async (args, event) => {
-      const chat: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
-      const sub = args[0] ?? '查看';
-      if (sub === '清空') {
-        if (event.role === 'member') return { text: '权限不足：清空沙箱需要群管理员/主人。' };
-        sb.clear(chat);
-        return { text: '本会话沙箱已清空。' };
-      }
-      const stats = sb.stats().find((s) => s.chat === `${event.type}_${event.chatId}`);
-      if (!stats || stats.files === 0) return { text: '本会话沙箱为空。LLM 可通过工具读写文件、运行脚本；聊天收到的文件也会落在这里。' };
-      const entries = sb.list(chat);
-      const lines = entries.slice(0, 20).map((e) => `${e.type === 'dir' ? '📁' : '📄'} ${e.relPath} (${e.size}B)`);
-      return {
-        text: `本会话沙箱（${stats.files} 个文件，共 ${(stats.bytes / 1024).toFixed(1)}KB）：\n${lines.join('\n')}\n\n临时文件超期自动清理。${event.role !== 'member' ? '\n管理员可发 /沙箱 清空' : ''}`,
-      };
-    },
-  });
 }
 
 function joinPath(root: string, rel: string): string {

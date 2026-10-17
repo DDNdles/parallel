@@ -156,7 +156,7 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
 // 3. 分群开关后果严格成立（红线 §2.4）
 // ============================================================
 
-test('群禁用的插件：工具缺席/命令不可用/普通成员不可见', async () => {
+test('群禁用的插件：工具缺席（命令面已整体清空）', async () => {
   mock.actions.length = 0;
   // 2026-10-17 起 chat 面只收记忆读取：插件工具（web_search 这类）一律不进 chat 轮，
   // 分群开关只作用于 work 面 —— 这里两面分别验证。
@@ -174,59 +174,56 @@ test('群禁用的插件：工具缺席/命令不可用/普通成员不可见', 
   const chatOn = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
   assert.ok(!chatOn.includes('web_search'), `chat 面恒不含插件工具: ${chatOn}`);
 
-  // 关闭后：普通成员 /帮助 完全看不到该插件命令；管理员可见（标未开启）
+  // 关闭后：连命令表里也查不到它的命令（2026-10-17 指令面整体清空后，内建命令表本就是空的）
   kernel.container.setGroupState('web-search', String(GROUP), false, String(MASTER));
-  const memberCmds = kernel.container.commandsForChat(chatRef, 'member').filter((c) => c.pluginId === 'web-search');
-  assert.equal(memberCmds.length, 0, '普通成员不应看到被禁用插件的命令');
-  const adminCmds = kernel.container.commandsForChat(chatRef, 'admin').filter((c) => c.pluginId === 'web-search');
-  assert.equal(adminCmds.length, 1);
-  assert.equal(adminCmds[0].enabled, false);
+  assert.equal(
+    kernel.container.commandsForChat(chatRef, 'member').filter((c) => c.pluginId === 'web-search').length,
+    0, 'web-search 的 /搜索 已随指令面清空删除',
+  );
 
   // 全局运行时停用 → 所有群所有角色都不可见
   await kernel.container.setRuntimeEnabled('web-search', false);
   assert.equal(kernel.container.toolsForChat(chatRef, 'owner', 'work').filter((t) => t.name === 'web_search').length, 0);
   await kernel.container.setRuntimeEnabled('web-search', true);
-
-  // /搜索 命令在该群不可用（普通成员视角=未知命令；不泄露存在性）
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/搜索 猫', nickname: '小明' });
-  const reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /未知命令/);
   mock.actions.length = 0;
 });
 
 // ============================================================
-// 4. 权限边界（红线 §3.5）：人设切换仅主人
+// 4. 指令面（2026-10-17 用户明令）：/work 以外全删
 // ============================================================
 
-test('普通成员/管理员不能切换人格，主人可以', async () => {
+test('QQ 指令面只剩 /work：旧的 /帮助 /人格 /设定 /搜索 一律未知命令', async () => {
   mock.actions.length = 0;
-  // 普通成员
+
+  // 内建命令表已清空（注册表留着给用户插件用；本仓库没有注册命令的用户插件）
+  const cmds = kernel.container.commandsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'owner');
+  assert.equal(cmds.length, 0, `内建命令表应为空，实得: ${cmds.map((c) => c.def.name).join(', ')}`);
+
+  // 主人发旧指令也只是「未知命令」——没有哪个被留成隐藏入口
+  for (const text of ['/帮助', '/人格', '/设定', '/搜索 猫']) {
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text, nickname: '主人' });
+    const reply = await mock.waitForReply(GROUP, 8000, mark);
+    assert.match(reply, /未知命令/, `${text} 该按未知命令处理：${reply}`);
+  }
+
+  // 普通成员视角同样只有「未知命令」（不泄露存在性）
   let mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/人格', role: 'member', nickname: '小明' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/帮助', nickname: '小明' });
   let reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /权限不足/);
+  assert.equal(reply.trim(), '未知命令', `普通成员旧指令该得到统一未知命令：${reply}`);
 
-  // 管理员（群管理员角色）
+  // /work 仍在：管理员门槛 + 空任务给用法
   mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '/人格', role: 'admin', nickname: '群管' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/work 算点什么', nickname: '小明' });
   reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /权限不足/);
+  assert.match(reply, /权限不足/, `/work 仍要管理员：${reply}`);
 
-  // 主人（config.masterIds）：能拿到人格列表（人格显示名是人格文件里的内容，会变，这里只认 id）
   mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/人格', role: 'member', nickname: '主人' });
+  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/work', nickname: '主人' });
   reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /whale-girl/);
-  assert.ok(!reply.includes('权限不足'), `主人不该被拒：${reply}`);
-
-  // 主人切换人格（当前只有这一个）
-  mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/人格 切换 whale-girl', nickname: '主人' });
-  reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /已切换人格/);
-  mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/人格 auto', nickname: '主人' });
-  await mock.waitForReply(GROUP, 8000, mark);
+  assert.match(reply, /用法：\/work/, `/work 无任务该给用法：${reply}`);
+  mock.actions.length = 0;
 });
 
 // ============================================================
@@ -413,14 +410,29 @@ test('发文件仅限沙箱内（发送服务强校验）', async () => {
 // 8. 人格插件内容保护 + provider→人格 绑定
 // ============================================================
 
-test('persona 插件对非主人脱敏（普通成员不可套取人设内容）', () => {
+test('persona 插件对非主人脱敏（普通成员不可套取人设内容）', async () => {
   const chatRef = { platform: 'qq', type: 'group' as const, chatId: String(GROUP) };
-  // chat 是 persona 类且 locked：commandsForChat 对 member 只在启用时可见（本群已启用）
-  const memberView = kernel.container.commandsForChat(chatRef, 'member');
-  assert.ok(memberView.every((c) => c.pluginId !== 'chat' || c.def.name !== '人格'), '/人格 是 owner 专属命令，不应出现在普通成员命令集');
-  // owner 视图包含 /人格
-  const ownerView = kernel.container.commandsForChat(chatRef, 'owner').map((c) => c.def.name);
-  assert.ok(ownerView.includes('人格'));
+  // chat 是 persona 类且 locked：2026-10-17 指令面清空后它不再注册任何 QQ 命令
+  const cmds = kernel.container.commandsForChat(chatRef, 'member').filter((c) => c.pluginId === 'chat');
+  assert.equal(cmds.length, 0, '人格插件不该再有 QQ 命令入口');
+
+  // 剩下的人设内容出口是内核 RPC 的插件详情：非主人读必须脱敏
+  const ask = (role: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('内核响应超时')), 4000);
+    kernel.bus.once('kernel.rpc.reply', (res: { ok: boolean; data?: unknown; error?: string }) => {
+      clearTimeout(timer);
+      if (res.ok) resolve(res.data as Record<string, unknown>);
+      else reject(new Error(res.error ?? '内核错误'));
+    });
+    kernel.bus.emit('kernel.rpc', { type: 'plugin_detail', pluginId: 'chat', chatId: String(GROUP), chatType: 'group', role });
+  });
+  const memberView = await ask('member');
+  assert.equal(memberView.redacted, true, '普通成员看人格插件要脱敏');
+  assert.equal(memberView.description, '（人格插件内容不公开）');
+  assert.deepEqual(memberView.permissions, []);
+  const ownerView = await ask('owner');
+  assert.equal(ownerView.redacted, false, '主人可以看全部');
+  assert.notEqual(ownerView.description, '（人格插件内容不公开）');
 });
 
 // ============================================================

@@ -36,16 +36,6 @@ export function setup(ctx: PluginContext): void {
     },
   });
 
-  ctx.registerCommand({
-    name: '今日诗',
-    aliases: ['每日诗'],
-    description: '看看今天的诗',
-    handler: () => {
-      const p = pickOfTheDay();
-      return { text: `📜【${p.title}】${p.dynasty}·${p.author}\n${p.lines}\n\n—— ${p.note}` };
-    },
-  });
-
   ctx.schedule.register({
     id: 'push',
     dailyAt: '21:00',

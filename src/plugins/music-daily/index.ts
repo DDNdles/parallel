@@ -52,17 +52,6 @@ export function setup(ctx: PluginContext): void {
     },
   });
 
-  ctx.registerCommand({
-    name: '今日音乐',
-    aliases: ['每日音乐'],
-    description: '看看今天的推荐曲',
-    handler: () => {
-      const s = pickOfTheDay();
-      if (!s) return { text: '曲库为空：主人可在桌面端【插件管理 → 每日推荐音乐】维护曲库（每行：歌名|歌手|推荐语）。' };
-      return { text: fmt(s) + '\n（TODO: 外链卡片）' };
-    },
-  });
-
   ctx.schedule.register({
     id: 'push',
     dailyAt: '09:00',

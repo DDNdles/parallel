@@ -475,10 +475,9 @@ export class Pipeline {
     this.sessionLog.append(event.chatId, event.type, { type: 'command', role: 'user', userId: event.userId, text: `/${cmdText}` });
 
     if (!found) {
-      // 不泄露命令是否存在：统一未知命令
-      await this.chat.reply(event, roleAtLeastRole(role, 'admin')
-        ? `未知命令：/${name}。发送 /帮助 查看可用命令。`
-        : '未知命令，发送 /帮助 查看可用命令。');
+      // 内建指令面 2026-10-17 清空（QQ 侧只剩 /work，走上面的拦截），这里只会是用户插件注册过的命令；
+      // 不泄露其存在性：普通成员统一「未知命令」，管理员多带一个命令名（他没在套话）
+      await this.chat.reply(event, roleAtLeastRole(role, 'admin') ? `未知命令：/${name}` : '未知命令');
       return;
     }
 
@@ -489,10 +488,10 @@ export class Pipeline {
         if (lp.manifest.locked && !roleAtLeastRole(role, 'owner')) {
           await this.chat.reply(event, `插件 ${lp.manifest.name} 在本群未开启，人设类插件仅主人可操作。`);
         } else {
-          await this.chat.reply(event, `插件「${lp.manifest.name}」在本群未开启。管理员可发送 /插件 开启 ${found.pluginId}`);
+          await this.chat.reply(event, `插件「${lp.manifest.name}」在本群未开启。管理员可在桌面端「插件」页为本群开启。`);
         }
       } else {
-        await this.chat.reply(event, '未知命令，发送 /帮助 查看可用命令。');
+        await this.chat.reply(event, '未知命令');
       }
       return;
     }
@@ -569,7 +568,7 @@ export class Pipeline {
           const last = this.adminHintAt.get(chatKey) ?? 0;
           if (Date.now() - last > 10 * 60_000) {
             this.adminHintAt.set(chatKey, Date.now());
-            await this.chat.reply(event, '本群还没有开启任何插件。管理员可发送 /插件 查看并开启（如：/插件 开启 chat）。');
+            await this.chat.reply(event, '本群还没有开启任何插件。管理员可在桌面端「插件」页为本群开启。');
           }
         }
         // 普通成员：完全静默（严格不可见性）

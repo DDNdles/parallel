@@ -47,13 +47,13 @@ npm start           # = node bin/parallel.js
 1. 桌面端「设置 → QQ 接入」选协议端（LuckyLilliaBot / NapCat）：两端都由内核内嵌托管——自动下载发行包、预写反向 WS 配置（token 自动注入）、拉起并守护，QQ 路径自动探测
 2. 在弹出的 QQ 窗口扫码登录**专用小号**。LLBot 有头模式要先填「账号」（bot 的 QQ 号），否则拒绝启动，免得顶掉你本机登录的号
 3. 用你自己起的协议端也行：在其 WebUI 添加反向 WS 客户端 `ws://127.0.0.1:3001/onebot` + accessToken（见上）
-4. 桌面端「设置」配置主人 QQ（`masterIds`）；群聊里让管理员发 `/插件 开启 chat` 激活聊天
+4. 桌面端「设置」配置主人 QQ（`masterIds`）；在桌面端「插件」页为群开启 `chat`（QQ 侧不再有插件指令，全部开关都在桌面端）
 
 ## 功能地图
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 角色化聊天 | ✅ 完整 | **设定层照 HDSI（HDS Interlude）分层**，替代原「人设卡 + 世界书 + few-shot」三件套：`canon.json` 一份装 **Canon**（主角记号 / 世界 / 配角 / 语言，剧情起点，只由人写）/ **Perspective**（独立于 Canon 的个体价值观）/ **Voice**（说话方式与语气样例，样例本身写成小说片段）/ **Lore**（关键词命中的世界事实）；运行时演化出的稳定变化落 **Overlay 层**（模型经 `remember_setting` 写入，可追溯来源，`/设定` 与人格页可查看/清空，不动 Canon）。注入顺序 剧本(1000) → 看世界的方式(1040) → 长期演化(1050) → 世界事实(1100) → 关系状态(1200) → 记忆(1300)。内置人格 **CETACEA_MOLI**（`personas/whale-girl/canon.json`），「人格」页可新建 |
+| 角色化聊天 | ✅ 完整 | **设定层照 HDSI（HDS Interlude）分层**，替代原「人设卡 + 世界书 + few-shot」三件套：`canon.json` 一份装 **Canon**（主角记号 / 世界 / 配角 / 语言，剧情起点，只由人写）/ **Perspective**（独立于 Canon 的个体价值观）/ **Voice**（说话方式与语气样例）/ **Lore**（关键词命中的世界事实）；运行时演化出的稳定变化落 **Overlay 层**（模型经 `remember_setting` 写入，可追溯来源，桌面端人格页可查看/清空，不动 Canon）。内置人格 **CETACEA_MOLI**（`personas/whale-girl/canon.json`），「人格」页可新建 |
 | 好感度 | ✅ 完整 | LLM 工具自更新（防刷：单日±15封顶、60s冷却），分段解锁称呼语气（阈值可配），每轮注入 |
 | 人格=插件 | ✅ 完整 | persona 类插件 `locked`：QQ 侧仅主人可切换/查看，普通成员不可套取内容；改剧本文件（`canon.json`）与清演化层同样仅主人 |
 | 模型优先链 | ✅ 完整 | 供应商统一登记，聊天 / 工作各一条优先链，连续失败到达阈值自动降级下一个（`llm.chatChain` / `workChain`） |
@@ -63,13 +63,13 @@ npm start           # = node bin/parallel.js
 | 模型层 | ✅ 交给 pi-ai | 三种连接方式（Chat Completions / OpenAI Responses / Anthropic Messages）全部由 `@earendil-works/pi-ai` 实现：请求整形、SSE 解析、工具调用聚合、各家缓存字段折算都不再由内核自己写。内核只保留自己的价值面——供应商配置、聊天/工作两条优先链与降级阈值、用量账、模型页契约、附件按 `inputTypes` 整形 |
 | work 子代理（pi） | ✅ 完整 | 管理员 `/work <任务>` 触发，work 模型在隔离上下文里跑 agent loop（常驻 Python / 浏览器 / shell / 文件 / 联网），用 `work_finish` 交回结构化结论，chat 模型再用自己的人格转述；信息不足且猜错代价明显时用 `work_ask` 停下来提问——转述按「等你回答」口径（不再说成已完成），管理员回一句 `/work <回答>`（30 分钟内有效）就把上次的问题与这次的回答拼成新任务交回去接着干（run 之间不保留上下文，产物留在会话沙箱里）。身份与工具白名单在 `src/plugins/work/agents/*.md`（内置 work / research / data，`<data>/agents/` 可自加并同名覆盖；`tools:` 不写 = 不设白名单，拿到全部 work 面工具）；system 由内核按「agent 定义 + 具名分节 + 各工具自带的 promptSnippet/promptGuidelines」组装（工具面一变规则自动跟着变，不会漂移）；上下文超窗自动压缩（`work.compaction`）。设置页「工作」分节可改：入口 agent、子代理目录、嵌套上限、压缩开关与两个 token 预算，以及 pi 内核的 chat 工具轮上限/每会话历史条数 |
 | work→子代理 | ✅ 完整 | work 模型可用 `delegate` 把子任务派给专职子代理（`{agent, task}` 单个，或 `{tasks: [...]}` 并行，上限 4）；每个子代理**独立上下文 + 各自的窄工具白名单**，完成后把结论/产物/备注交回父代理。嵌套深度上限 `work.maxDepth`（默认 2），到顶那层 `delegate` 在收集阶段就不存在 |
-| 拟人化（chat 区） | ✅ 完整 | 内核自有的一层（不是插件），chat 区的行为就是它：**⓪剧本体** 模型写的是**小说的下一段**——旁白写动作/神态/环境，主角要说出口的话用 `<say id="s1">…</say>` 包住，**只有 say 块里的字进 QQ**；旁白留在剧本里并**带标签**回灌历史（摘掉标签模型下一轮就不写 say 了，实测退化）。动作描写于是从结构上漏不到群里，不是靠过滤。沉默用 `[silent]`。**①分段发送** 一段回复按语义拆成几条短消息（规则断句或再叫一次模型、逐字校验不改写；`？！` 单独成条且语气标点保留，`？！` 与换行是硬边界不参与概率合并；`maxSentenceNum`/`maxSplitNum`/颜文字保护），**②打字节奏** 第一条立刻发、之后每条按字数等"正在输入"（中文 0.3s/字、单字×3、emoji 1s，可封顶），**③会接话** 必要性打分决定开不开口（@=100/提及=80/私聊=40 + 内容分 + 积压压力 − 自己占最近 5 分钟发言比的存在感惩罚，×频率系数后过阈值），**④会主动** 沉默够久按群平均节奏折算"等效消息数"补上阈值（封顶保证必须有真实积压消息），连续不理人则指数退避，**⑤防抖合批** 群里几条消息攒一起再回（老话过了 TTL 就丢），**⑥频率** 全局/按群/按时段三层 + **表达风格**（`timing.replyStyle`，MaiBot `personality.reply_style` 原值：让模型自己就写平淡短句——分段器只负责把写短的话切开）+ 错字自纠（错字后引用自己回一条纠正）。移植自 MaiBot 的 `reply_necessity` / `turn_gates` / `idle_backoff` / 响应分段器 / `typing_speed` / `reply_style`，参数名与默认值对齐；**两处刻意偏离**见 `src/kernel/humanlike/splitter.ts`（`？！` 补进分隔符集；`maxSentenceNum/maxSplitNum` 8/3 → 12/6）。**⑦HDSI 四件套**：**节奏反定型**（连着几轮回复结构同构 → 以角色视角注入纠偏；gentle/balanced/aggressive 三档，熔断可配）、**情绪偏移 Alter**（每轮 `<alter>±n</alter>` 净变化，动态阈值+同向加权/反向衰减，命中阈值后由侧端模型写一段氛围描述注入，不阻塞可见回复）、**主体行动窗口 Agency**（日程负荷/隐私/设备三样构成主动开口的容量，安静时段直接不开口，判据顺序与理由字符串照搬 HDSI）、**日程 Schedule Preplan**（周规律+日期例外，供容量判断与主动轮参考，注入时明确标注"是计划不是已发生的事实"）。设置页「拟人化」分节可调全部参数，`GET /api/humanlike/status` 看某会话当前为什么不出声；`/设定` 看演化层、`/日程` 看日程 |
+| 拟人化（chat 区） | ✅ 完整 | 内核自有的一层（不是插件），chat 区的行为就是它：**⓪剧本体** 模型写的是**小说的下一段**——旁白写动作/神态/环境，主角要说出口的话用 `<say id="s1">…</say>` 包住，**只有 say 块里的字进 QQ**；旁白留在剧本里并**带标签**回灌历史（摘掉标签模型下一轮就不写 say 了，实测退化）。动作描写于是从结构上漏不到群里，不是靠过滤。沉默用 `[silent]`。**①分段发送** 一段回复按语义拆成几条短消息（规则断句或再叫一次模型、逐字校验不改写；`？！` 单独成条且语气标点保留，`？！` 与换行是硬边界不参与概率合并；`maxSentenceNum`/`maxSplitNum`/颜文字保护），**②打字节奏** 第一条立刻发、之后每条按字数等"正在输入"（中文 0.3s/字、单字×3、emoji 1s，可封顶），**③会接话** 必要性打分决定开不开口（@=100/提及=80/私聊=40 + 内容分 + 积压压力 − 自己占最近 5 分钟发言比的存在感惩罚，×频率系数后过阈值），**④会主动** 沉默够久按群平均节奏折算"等效消息数"补上阈值（封顶保证必须有真实积压消息），连续不理人则指数退避，**⑤防抖合批** 群里几条消息攒一起再回（老话过了 TTL 就丢），**⑥频率** 全局/按群/按时段三层 + **表达风格**（`timing.replyStyle`，MaiBot `personality.reply_style` 原值：让模型自己就写平淡短句——分段器只负责把写短的话切开）+ 错字自纠（错字后引用自己回一条纠正）。移植自 MaiBot 的 `reply_necessity` / `turn_gates` / `idle_backoff` / 响应分段器 / `typing_speed` / `reply_style`，参数名与默认值对齐；**两处刻意偏离**见 `src/kernel/humanlike/splitter.ts`（`？！` 补进分隔符集；`maxSentenceNum/maxSplitNum` 8/3 → 12/6）。**⑦HDSI 四件套**：**节奏反定型**（连着几轮回复结构同构 → 以角色视角注入纠偏；gentle/balanced/aggressive 三档，熔断可配）、**情绪偏移 Alter**（每轮 `<alter>±n</alter>` 净变化，动态阈值+同向加权/反向衰减，命中阈值后由侧端模型写一段氛围描述注入，不阻塞可见回复）、**主体行动窗口 Agency**（日程负荷/隐私/设备三样构成主动开口的容量，安静时段直接不开口，判据顺序与理由字符串照搬 HDSI）、**日程 Schedule Preplan**（周规律+日期例外，供容量判断与主动轮参考，注入时明确标注"是计划不是已发生的事实"）。设置页「拟人化」分节可调全部参数，`GET /api/humanlike/status` 看某会话当前为什么不出声（演化层在桌面端人格页查看/清空，QQ 侧指令面已清空） |
 | gemini-3.8-flash | ⛔ 占位 | Provider 抽象完整（流式+工具调用）；gemini 只有接口与配置占位 `enabled=false`，UI 显示"未接入"，实现位在 `src/kernel/services/llm.ts` 的 TODO |
 | 沙箱 | ✅ 完整 | 每会话独立目录（防路径穿越强校验）、Python/JS 受限执行（超时/输出截断/并发与频率配额）、TTL 自动清理、收发文件仅限沙箱 |
 | 插件系统 | ✅ 完整 | 热插拔（不重启进程）、三类来源、四贡献面（tools/commands/userConfig/mcpServers）、声明式权限门控 |
 | 分群开关 | ✅ 完整 | 默认全部关闭；禁用的插件在该群工具列表缺席、命令不可用、普通成员完全不可见；开关权限=群管理员/群主/主人 |
 | 用户记忆 | ✅ 完整 | 按 QQ 号：昵称/事实(FTS 检索)/状态(好感度)；插件按权限读写；"忘记我"；UI 管理+导入导出+审计 |
-| 表情包 | ✅ 可用 | 群级库：收图建库/搜索/随机/LLM 调用发图 |
+| 表情包 | ✅ 可用 | 群级库：搜索/随机/LLM 调用发图（QQ 侧指令已随指令面清空删除，暂无收图入口） |
 | 网络搜索 | ✅ 可用 | Tavily REST 封装（MCP 等价封装），未配 key 自检提示 |
 | 每日一题 / MC 推荐 / 每日音乐 / 每日诗 / 链接解析 | 🚧 骨架 | 能装、能开关、命令可触发、留清晰 TODO |
 | 桌面端 UI | ✅ 完整 | Next.js 15 静态导出（`web/` 源码 → `ui/` 产物，内核自托管）：黑白双主题、40rem 居中会话列、工具调用折叠行、毛玻璃顶栏+模型选择器、大圆角 composer、全站品牌光标；全部操控面 |
@@ -107,7 +107,7 @@ src/kernel/humanlike/ 拟人化层（chat 区行为本身，不在插件体系�
                      types.ts     humanlike 配置形状（字段名与 MaiBot 对齐）+ TriggerBatch
 src/kernel/adapters/  OneBot 11 反向 WS 适配器
 src/kernel/api/       REST API + 事件 WS + 静态 UI 服务
-src/plugins/          内置插件 11 个（chat / plugin-manager / sandbox / web-search / work 是底座，不在插件页显示；
+src/plugins/          内置插件 10 个（chat / sandbox / web-search / work 是底座，不在插件页列表显示；
                       daily-question / link-parser / mc-daily / music-daily / poem-daily / sticker 可玩）
 src/plugins/work/agents/  子代理定义（work.md 入口 / research.md / data.md：工具白名单 + 身份正文；
                       用户可在 <data>/agents/ 自加，同名覆盖内置）

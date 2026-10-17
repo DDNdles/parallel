@@ -3,7 +3,7 @@ import { todayKey } from '../../kernel/util/misc.ts';
 
 // ============================================================
 // daily-question —— 每日一题（todo 骨架）
-// 默认被动：/今日一题 命令触发。主动推送需主人开启（schedule 权限 + proactive 开关）。
+// 主动推送需主人开启（schedule 权限 + proactive 开关）。2026-10-17 QQ 指令面清空：/今日一题 已删。
 // TODO: 接入 LeetCode 每日一题公开接口 / 更大题库；晚间公布答案的独立任务
 // ============================================================
 
@@ -41,17 +41,6 @@ export function setup(ctx: PluginContext): void {
     description: '获取今天每日一题的答案。',
     parameters: { type: 'object', properties: {} },
     handler: () => pickOfTheDay().a,
-  });
-
-  ctx.registerCommand({
-    name: '今日一题',
-    aliases: ['每日一题'],
-    description: '查看今天的每日一题（再发一次看答案）',
-    handler: (args) => {
-      const item = pickOfTheDay();
-      if (args[0] === '答案') return { text: `答案：${item.a}` };
-      return { text: `【今日一题】\n${item.q}\n\n（想知道答案？再发一次 /今日一题 答案）` };
-    },
   });
 
   // 主动推送：默认关闭（proactive 由主人开关控制）

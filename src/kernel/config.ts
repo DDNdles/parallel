@@ -168,7 +168,7 @@ export const DEFAULT_CONFIG = {
       maxCandidateHours: 24,
     },
     // ⑧ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
-    // （模型侧写入入口已随 chat 工具面收窄删除，只剩 /日程 查询与行动容量判断）
+    // （模型与 QQ 侧的读写入口都已删除，现在只剩主动开口的行动容量判断在用）
     schedule: {
       enable: false,
       horizonHours: 12,                 // 主动轮能看到的未来时长（HDSI 约半天）
@@ -246,7 +246,7 @@ export const DEFAULT_CONFIG = {
     },
   },
   persona: {
-    default: 'whale-girl',                 // 唯一人格：没有 /人格 锁定时的默认人设
+    default: 'whale-girl',                 // 唯一人格：没被手动锁定（active_persona 状态）时的默认人设
     // 自动记忆提炼：攒够 minTurns 轮、且对话安静满 idleSeconds，才单独发一次「记忆整理」请求。
     // 提炼结果只落进 user_facts（不进上下文），模型经 recall_facts 现查。
     memoryAutoSave: true,

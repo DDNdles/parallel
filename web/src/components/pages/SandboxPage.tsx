@@ -192,7 +192,7 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
           <div className="mset-mrow" style={{ border: '1px solid var(--border)', borderRadius: 11, marginTop: 4 }}>
             <span className="plg-v">沙箱工具（新群默认开启）</span>
             <span className="mset-macts">
-              <Switch on={sbGlobal} title="群内在 /插件 里单独开关" onChange={() => setSbGlobal((v) => !v)} />
+              <Switch on={sbGlobal} title="按群开关在「插件」页的开关矩阵里设置" onChange={() => setSbGlobal((v) => !v)} />
             </span>
           </div>
           <div className="mset-mfoot">

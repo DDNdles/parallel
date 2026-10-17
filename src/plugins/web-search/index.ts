@@ -150,20 +150,4 @@ export function setup(ctx: PluginContext): void {
       return await fetchPages(urls);
     },
   });
-
-  ctx.registerCommand({
-    name: '搜索',
-    aliases: ['search'],
-    description: '联网搜索：/搜索 关键词',
-    handler: async (args) => {
-      const q = args.join(' ').trim();
-      if (!q) return { text: '用法：/搜索 关键词' };
-      if (!hasKey()) return { text: '搜索功能未配置 Tavily API Key，请主人在桌面端插件配置中填写后重载本插件。' };
-      try {
-        return { text: await search(q, 3) };
-      } catch (e) {
-        return { text: `搜索失败：${(e as Error).message}` };
-      }
-    },
-  });
 }

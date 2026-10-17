@@ -14,7 +14,7 @@ import {
 //   Canon       —— 初始设定（主角记号 / 世界 / 配角 / 语言），剧情起点，只由人写
 //   Perspective —— 独立于 Canon 的个体价值观：「她怎么看待世界」，不是设定条目
 //   Overlay     —— **演化层**：长期剧情里渐进形成的稳定变化（性格/世界/关系），非破坏性；
-//                  模型侧写入 = remember_setting（chat 面专用），读/清在桌面端人格页与 /设定
+//                  模型侧写入 = remember_setting（chat 面专用），读/清只在桌面端人格页
 //   Voice       —— 说话方式与语气样例（原 few-shot）
 //   Lore        —— 关键词命中的世界事实（保留：HDSI 的 Canon 里也有世界事实）
 // 注入顺序（2026-10-16 缓存裁量后的实际档位）：稳定区 script(200) → perspective(210) → overlay(220)
@@ -220,39 +220,11 @@ export function setup(ctx: PluginContext): void {
 
   // ---------- 命令 ----------
   // 清除记忆**不再提供 QQ 侧入口**（2026-10-16 用户明令）：群里一句话就能清掉一个人的全部记忆，
-  // 既容易被套也容易被自己手滑。入口只剩桌面端用户页（⋯ → 忘记我）与模型的 forget_me 工具。
-
-  ctx.registerCommand({
-    name: '人格',
-    description: '（主人）查看/切换当前人格',
-    usage: '/人格 [列表|切换 <人格名>]',
-    minRole: 'owner',
-    handler: (args, _event) => {
-      const sub = args[0] ?? '列表';
-      if (sub === '切换' || sub === 'switch') {
-        const key = (args[1] ?? '').toLowerCase();
-        const found = [...personas.values()].find((p) => p.id === key || p.canon.name === args[1]);
-        if (!found) return { text: `没有这个人格。可用：${[...personas.values()].map((p) => `${p.canon.name}(${p.id})`).join('、')}，或 auto（用默认人格）` };
-        ctx.state.set('active_persona', found.id);
-        return { text: `已切换人格为「${found.canon.name}」（手动锁定）。发 /人格 auto 可恢复默认。` };
-      }
-      if (sub === 'auto') {
-        ctx.state.set('active_persona', 'auto');
-        const bound = personas.get(activePersonaId());
-        return { text: `已恢复 auto 模式，当前人格「${bound?.canon.name ?? '默认'}」。` };
-      }
-      const activeId = activePersonaId();
-      const mode = ctx.state.get<string>('active_persona', 'auto');
-      const lines = [...personas.values()].map((p) => `${p.id === activeId ? '▶' : '　'} ${p.canon.name} (${p.id})`);
-      return {
-        text: `当前模式：${mode === 'auto' ? 'auto（默认人格）' : '手动锁定'}\n${lines.join('\n')}\n切换：/人格 切换 <人格名>`,
-      };
-    },
-  });
+  // 既容易被套也容易被自己手滑。入口只剩桌面端用户页（⋯ → 忘记我）。
 
   // ---------- Overlay 层（HDSI 的演化层） ----------
   // Canon 只由人写；长期剧情里渐进形成的稳定变化写在这里，非破坏性、可清、可追溯来源。
-  // 写入由模型在聊天里随手提议（remember_setting），读/清在桌面端人格页与 /设定 命令。
+  // 写入由模型在聊天里随手提议（remember_setting），读/清在桌面端人格页（2026-10-17 QQ 指令面清空）。
 
   function overlayOf(personaId: string): OverlayEntry[] {
     const raw = ctx.state.get<OverlayEntry[]>(`overlay:${personaId}`, []);
@@ -310,49 +282,6 @@ export function setup(ctx: PluginContext): void {
         content: String(args.content ?? ''),
         source: String(args.source ?? '').slice(0, 120),
       });
-    },
-  });
-
-  ctx.registerCommand({
-    name: '日程',
-    aliases: ['schedule'],
-    description: '查看当前的日程计划（周规律 + 日期例外）',
-    handler: (_args, event) => {
-      const plan = ctx.humanlike.scheduleOf({ platform: event.platform, type: event.type, chatId: event.chatId });
-      const lines: string[] = [];
-      if (plan.rules.length) {
-        lines.push('周规律：', ...plan.rules.map((r) => `- 周${r.days.join('/')} ${r.from}-${r.to} ${r.label}${r.busy ? '（忙）' : ''}`));
-      }
-      if (plan.exceptions.length) {
-        lines.push('日期例外：', ...plan.exceptions.map((e) => `- ${e.date} ${e.from}-${e.to} ${e.label}${e.busy ? '（忙）' : ''}`));
-      }
-      return { text: lines.length ? lines.join("\n") : '还没有日程。' };
-    },
-  });
-
-  ctx.registerCommand({
-    name: '设定',
-    aliases: ['overlay'],
-    description: '（主人）查看/清空人格的演化层（长期剧情里形成的稳定变化）',
-    usage: '/设定　/设定 清空 [性格|世界|关系|价值观]',
-    minRole: 'owner',
-    handler: (args) => {
-      const pid = activePersonaId();
-      const list = overlayOf(pid);
-      const sub = args[0] ?? '';
-      if (sub === '清空' || sub === 'clear') {
-        const want = args[1];
-        const layer = want ? Object.entries(OVERLAY_LAYER_LABEL).find(([, v]) => v === want)?.[0] : undefined;
-        if (want && !layer) return { text: `要清哪一层？可选：${Object.values(OVERLAY_LAYER_LABEL).join('、')}` };
-        const n = clearOverlay(pid, layer);
-        return { text: layer ? `已清空「${want}」层的 ${n} 条演化。` : `已清空全部 ${n} 条演化。` };
-      }
-      if (!list.length) return { text: '当前演化层是空的。长期剧情里稳定形成的设定会自动写进来。' };
-      return {
-        text: `演化层（${list.length}/${OVERLAY_MAX}）：\n` + list
-          .map((e, i) => `${i + 1}. [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`)
-          .join('\n'),
-      };
     },
   });
 

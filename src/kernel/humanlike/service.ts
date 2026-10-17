@@ -614,7 +614,7 @@ export class HumanlikeService {
     return { allowed: cap.allowed, reason: cap.reason, recheckAt: nextRecheckAt(cap, nowDate, cfg.agency) };
   }
 
-  /** 日程计划读写（模型侧的写入入口已随 chat 工具面收窄删除；这里留给 /日程 与容量判断） */
+  /** 日程计划读写（模型与 QQ 侧的入口都已删除；这里留给主动开口的容量判断） */
   planSchedule(chat: ChatRef, plan: SchedulePlan): SchedulePlan {
     const st = this.state(chat);
     st.schedule = prunePlan(plan, new Date(this.now()), this.config.schedule);

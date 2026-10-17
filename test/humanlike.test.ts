@@ -351,7 +351,7 @@ test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消
 
 test('服务：命令与私聊一律立即放行，且不参与打分', () => {
   const { svc } = makeService();
-  assert.equal(svc.ingest(ev('/帮助'), { isCommand: true }).action, 'pass');
+  assert.equal(svc.ingest(ev('/work 算一下昨天的账'), { isCommand: true }).action, 'pass');
   assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'pass');
   svc.dispose();
 });
