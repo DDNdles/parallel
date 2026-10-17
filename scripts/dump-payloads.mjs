@@ -13,7 +13,7 @@
  * 产物：data/debug/chat-request.json、data/debug/work-request.json、data/debug/chat-request-media.json
  * （data/ 不入库）只打印 body，不打印 Authorization 头，也不碰任何真 key。
  * chat-media 场景自带硬断言（见 assertMedia）：时间窗外那条漏进请求体、窗口内图片块没出现、
- * 语音块没挂到最后一条 user、system 少了「上下文时限」、工具面不是那 2 个（记忆读取），都会 exit 1。
+ * 语音块没挂到最后一条 user、system 少了「上下文时限」、工具面不是那 3 个（记忆读写），都会 exit 1。
  */
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -212,11 +212,11 @@ function assertMedia(body) {
   const system = messages.filter((m) => m?.role === 'system').map((m) => String(m.content ?? '')).join('\n');
   say(system.includes('上下文时限'), 'system 含「上下文时限」（405 分节）');
   const tools = (body?.tools ?? []).map((t) => t.function?.name).filter(Boolean).sort();
-  // chat 工具面 2026-10-17 起只留记忆读取（recall_facts / search_history）：
+  // chat 工具面 2026-10-17 起 = 记忆读写三件套（recall_facts / search_history / remember_setting）：
   // 行为型工具全删，插件工具（web_search 等）也不再进 chat 轮 —— 多一个都算回归。
-  const want = ['recall_facts', 'search_history'];
-  say(tools.length === 2 && JSON.stringify(tools) === JSON.stringify(want),
-    `工具恰好 2 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
+  const want = ['recall_facts', 'remember_setting', 'search_history'];
+  say(tools.length === 3 && JSON.stringify(tools) === JSON.stringify(want),
+    `工具恰好 3 个（实得 ${tools.length} 个：${tools.join(', ') || '无'}）`);
   return fails;
 }
 

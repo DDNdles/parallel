@@ -126,13 +126,13 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   kernel.container.setGroupState('sandbox', String(GROUP), true, String(MASTER));
 
-  // chat 工具面 2026-10-17 起只留记忆读取：sandbox 这类行为工具在 chat 轮严格缺席
+  // chat 工具面 2026-10-17 起 = 记忆读写三件套：sandbox 这类行为工具在 chat 轮严格缺席
   const chatTools = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
-  assert.deepEqual(chatTools, ['recall_facts', 'search_history'], `chat 面只该有记忆读取: ${chatTools}`);
+  assert.deepEqual(chatTools, ['recall_facts', 'remember_setting', 'search_history'], `chat 面只该有记忆读写: ${chatTools}`);
 
-  // 脚本：先调一次记忆查询（chat 面唯一的一类工具），拿到结果后作答
+  // 脚本：先调一次记忆查询（chat 面的工具），拿到结果后作答
   mockProvider.script.push({
     toolCalls: [{ name: 'recall_facts', args: { query: '2^10' } }],
   }, {
@@ -254,16 +254,58 @@ test('QQ 侧不再有清除记忆的入口：/忘记我 当未知命令处理，
   mock.actions.length = 0;
 });
 
-test('chat 工具面只剩记忆读取：forget_me / remember_* 这类行为工具已删（2026-10-17 收窄）', () => {
+test('chat 工具面 = 记忆读写三件套：行为型工具（forget_me / remember_fact / plan_schedule / reply_quote）已删', () => {
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   const names = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
-  assert.deepEqual(names, ['recall_facts', 'search_history'], `chat 面只该有记忆读取: ${names}`);
-  // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；写事实由后台自动提炼承担
-  for (const gone of ['forget_me', 'remember_fact', 'remember_setting', 'plan_schedule', 'reply_quote']) {
+  assert.deepEqual(names, ['recall_facts', 'remember_setting', 'search_history'], `chat 面只该有记忆读写: ${names}`);
+  // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；用户事实写入由后台自动提炼承担
+  for (const gone of ['forget_me', 'remember_fact', 'plan_schedule', 'reply_quote']) {
     assert.ok(!names.includes(gone), `${gone} 不该再出现在 chat 面`);
   }
+});
+
+test('演化层：remember_setting 写得进、一轮只收一条，work 面严格缺席', async () => {
+  // work 面（入口 agent 的取法，不挂白名单）也不该看见它——work 轮不套人格，演化层在那种语境里没有意义
+  const workNames = kernel.container
+    .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member', 'work')
+    .map((t) => t.name);
+  assert.ok(!workNames.includes('remember_setting'), `work 面不该有 remember_setting: ${workNames}`);
+
+  const key = 'overlay:whale-girl';
+  kernel.db.run('DELETE FROM plugin_kv WHERE plugin_id=? AND key=?', 'chat', key);   // 清干净再看写入
+  const overlay = () => {
+    const row = kernel.db.get<{ value: string }>('SELECT value FROM plugin_kv WHERE plugin_id=? AND key=?', 'chat', key);
+    return row ? (JSON.parse(row.value) as { layer: string; content: string; at: number }[]) : [];
+  };
+
+  // 一轮里写两条：第一条收下，第二条被按轮预算拒掉（演化层容量 24，一口气刷满会把 Canon 挤没）
+  mockProvider.script.push({
+    toolCalls: [
+      { name: 'remember_setting', args: { layer: 'character', content: '她开始接受被叫小肥鱼', source: '群友反复这么叫' } },
+      { name: 'remember_setting', args: { layer: 'world', content: '群里养了一只猫', source: '跟着一块儿起哄' } },
+    ],
+  }, {
+    content: '记住啦',
+  });
+  const mark = mock.actions.length;
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '以后就叫你小肥鱼了', atMe: true, nickname: '小明' });
+  const reply = await mock.waitForReply(GROUP, 8000, mark);
+  assert.match(reply, /记住啦/, '写完演化照常把话说出来');
+
+  await quiesce();
+  const list = overlay();
+  assert.equal(list.length, 1, `一轮只该落一条演化: ${JSON.stringify(list)}`);
+  assert.equal(list[0].layer, 'character');
+  assert.match(list[0].content, /小肥鱼/);
+  assert.ok(list[0].at > 0, '带写入时间（桌面端人格页按它排序）');
+  // 两条回执都真的回给了模型（会话语义：写入回执 + 超预算的拒绝理由）
+  const results = kernel.sessionLog.tail(String(GROUP), 'group', 80)
+    .filter((e) => e.type === 'tool_result').map((e) => String(e.data?.result ?? ''));
+  assert.ok(results.some((r) => r.includes('已写入')), `该有一条写入回执: ${JSON.stringify(results)}`);
+  assert.ok(results.some((r) => r.includes('已经写过一条')), `该有一条超预算回执: ${JSON.stringify(results)}`);
+  mock.actions.length = 0;
 });
 
 // ============================================================

@@ -14,13 +14,13 @@ import {
 //   Canon       —— 初始设定（主角记号 / 世界 / 配角 / 语言），剧情起点，只由人写
 //   Perspective —— 独立于 Canon 的个体价值观：「她怎么看待世界」，不是设定条目
 //   Overlay     —— **演化层**：长期剧情里渐进形成的稳定变化（性格/世界/关系），非破坏性；
-//                  模型侧的写入入口已删（2026-10-17 随 chat 工具面收窄），只剩展示与清空
+//                  模型侧写入 = remember_setting（chat 面专用），读/清在桌面端人格页与 /设定
 //   Voice       —— 说话方式与语气样例（原 few-shot）
 //   Lore        —— 关键词命中的世界事实（保留：HDSI 的 Canon 里也有世界事实）
 // 注入顺序（2026-10-16 缓存裁量后的实际档位）：稳定区 script(200) → perspective(210) → overlay(220)
 //   → memory(250，只给指针不给事实) → voice-style(260) / voice-examples(270) → post-history(280)；
 //   变量区 ≥450：speaker-role(457) → lorebook 命中(473)
-// 工具面（2026-10-17）：chat 轮只剩记忆读取（recall_facts / search_history，surface:'memory'）。
+// 工具面（2026-10-17）：chat 轮 = 记忆读写三件套（recall_facts / search_history / remember_setting）。
 // ============================================================
 
 interface LorebookEntry {
@@ -113,31 +113,48 @@ export function setup(ctx: PluginContext): void {
   }
 
   // ---------- 工具 ----------
-  // 2026-10-17 起 chat 工具面只留**记忆读取**（recall_facts / search_history，surface:'memory'）：
-  // remember_fact / remember_setting / forget_me / plan_schedule / reply_quote 全部删除——
-  //   · 事实写入由后台自动提炼（memory-extract）承担；忘记走桌面端用户页；
-  //   · 演化层（Overlay）的内容、展示与清空照旧，但模型不再有写入入口；
-  //   · 引用回复改由内核程序自动锚定触发消息（pipeline.quoteTargetOf），模型零成本。
+  // 2026-10-17 起 chat 工具面收窄为**记忆读写**（recall_facts / search_history / remember_setting）：
+  // remember_fact / forget_me / plan_schedule / reply_quote 仍删除——
+  //   · 用户事实的写入由后台自动提炼（memory-extract）承担；忘记走桌面端用户页；
+  //   · 引用回复改由内核程序自动锚定触发消息（pipeline.quoteTargetOf），模型零成本；
+  //   · 演化层（Overlay）的写入入口 2026-10-17 晚按用户要求加回（remember_setting，surface:'chat'：
+  //     chat 面可见、work 面严格缺席——work 轮不套人格，演化层在那种语境里没有意义）。
+
+  /**
+   * 一轮之内的调用计数（键 = 会话 + 本轮事件 id/ts）。
+   * 认不出是哪一轮就别计数（返回 1），否则这个群会被永久卡住。
+   * 条数上限只防 Map 泄漏。
+   */
+  function perTurn(map: Map<string, number>, tctx: { chat: { chatId: string }; event: { id?: string; ts?: number } }): number {
+    const turn = tctx.event.id ?? tctx.event.ts;
+    if (turn === undefined) return 1;
+    const tk = `${tctx.chat.chatId}|${turn}`;
+    const n = (map.get(tk) ?? 0) + 1;
+    map.set(tk, n);
+    if (map.size > 400) map.clear();
+    return n;
+  }
 
   /**
    * 一轮之内的"查资料"预算（recall_facts + search_history 合计）。
    * 活体报文实测：模型会为了一句裸名字连查 5 次（每查多吃一轮），回复迟到半分钟，
    * 到达时对面已经换了话题。chat 轮现在两轮封顶（第二轮摘工具），预算再兜一层：
-   * 超预算直接回一句劝它照字面回答。键里带本轮事件 id，天然按轮分开；条数上限只防 Map 泄漏。
+   * 超预算直接回一句劝它照字面回答。
    */
   const probeTurns = new Map<string, number>();
   const PROBE_MAX = 3;
-  function probeQuota(tctx: { chat: { chatId: string }; event: { id?: string; ts?: number } }): number {
-    const turn = tctx.event.id ?? tctx.event.ts;
-    if (turn === undefined) return 1;   // 认不出是哪一轮就别计数，否则这个群会被永久卡住
-    const tk = `${tctx.chat.chatId}|${turn}`;
-    const n = (probeTurns.get(tk) ?? 0) + 1;
-    probeTurns.set(tk, n);
-    if (probeTurns.size > 400) probeTurns.clear();
-    return n;
-  }
+  const probeQuota = (tctx: { chat: { chatId: string }; event: { id?: string; ts?: number } }) => perTurn(probeTurns, tctx);
   const overQuota = (n: number) => n > PROBE_MAX
     ? `（这一轮已经查过 ${PROBE_MAX} 次了，别再查：手上没有的信息就是没有，照对方这句的字面回答，或者反问一句。）` : '';
+
+  /**
+   * 一轮最多写一条演化：第一轮的并行工具调用可能一次带好几条，后面的直接拒掉——
+   * 演化层容量 24 条，一口气刷满就把 Canon 挤没了。
+   */
+  const writeTurns = new Map<string, number>();
+  const WRITE_MAX = 1;
+  const overWriteQuota = (n: number) => n > WRITE_MAX
+    ? '（这一轮已经写过一条演化了，别再写；把该说的话继续说完。）' : '';
 
   ctx.llm.registerTool({
     name: 'recall_facts',
@@ -234,8 +251,8 @@ export function setup(ctx: PluginContext): void {
   });
 
   // ---------- Overlay 层（HDSI 的演化层） ----------
-  // Canon 只由人写；这里剩下**读取与清空**（桌面端人格页 / /设定 命令）。
-  // 模型侧的写入入口（remember_setting 工具）已删（2026-10-17，随 chat 工具面收窄）。
+  // Canon 只由人写；长期剧情里渐进形成的稳定变化写在这里，非破坏性、可清、可追溯来源。
+  // 写入由模型在聊天里随手提议（remember_setting），读/清在桌面端人格页与 /设定 命令。
 
   function overlayOf(personaId: string): OverlayEntry[] {
     const raw = ctx.state.get<OverlayEntry[]>(`overlay:${personaId}`, []);
@@ -244,12 +261,57 @@ export function setup(ctx: PluginContext): void {
       && (OVERLAY_LAYERS as readonly string[]).includes(String(e.layer)));
   }
 
+  /** 写一条演化。同一层同一句话不重复记；超上限挤掉最旧的（Canon 不能被淹没）。 */
+  function addOverlay(personaId: string, entry: { layer: OverlayEntry['layer']; targetId?: string; content: string; source?: string }): string {
+    const content = entry.content.trim().slice(0, 160);
+    if (!content) return '（内容为空，未写入）';
+    const list = overlayOf(personaId);
+    if (list.some((e) => e.layer === entry.layer && e.content === content)) return '（这句已经记过了）';
+    list.push({ ...entry, content, at: Date.now() });
+    while (list.length > OVERLAY_MAX) list.shift();
+    ctx.state.set(`overlay:${personaId}`, list);
+    return `（已写入「${OVERLAY_LAYER_LABEL[entry.layer]}」演化层：${content}）`;
+  }
+
   function clearOverlay(personaId: string, layer?: string): number {
     const list = overlayOf(personaId);
     const kept = layer ? list.filter((e) => e.layer !== layer) : [];
     ctx.state.set(`overlay:${personaId}`, kept);
     return list.length - kept.length;
   }
+
+  ctx.llm.registerTool({
+    name: 'remember_setting',
+    description: [
+      '把长期聊天里稳定形成的新设定写进演化层。',
+      '适用：性格被磨出了新的一面、和某人的关系定型、世界/环境有了既定变化。',
+      '不适用：一次性的情绪、闲聊、你当场编的东西。写之前先问自己「这件事之后还成立吗」。',
+      '每条要说得出来是从哪句话/哪件事推出来的，一句话讲完。一轮最多写一条，写完照常把该说的话说完。',
+    ].join('\n'),
+    parameters: {
+      type: 'object',
+      properties: {
+        layer: { type: 'string', enum: [...OVERLAY_LAYERS], description: 'character 性格 / world 世界 / relationship 关系 / perspective 价值观' },
+        content: { type: 'string', description: '一句话，第三人称陈述句，如「她开始接受被叫小名」' },
+        source: { type: 'string', description: '从哪句话或哪件事推出来的' },
+      },
+      required: ['layer', 'content'],
+    },
+    // chat 专用（surface:'chat'）：work 轮不套人格，演化层在那种语境里没有意义，必须严格缺席
+    surface: 'chat',
+    handler: (args, tctx) => {
+      const layer = String(args.layer ?? '');
+      if (!(OVERLAY_LAYERS as readonly string[]).includes(layer)) return `（layer 只能是 ${OVERLAY_LAYERS.join('/')}）`;
+      const stop = overWriteQuota(perTurn(writeTurns, tctx));
+      if (stop) return stop;
+      return addOverlay(activePersonaId(), {
+        layer: layer as OverlayEntry['layer'],
+        targetId: layer === 'relationship' ? String(tctx.event.userId) : undefined,
+        content: String(args.content ?? ''),
+        source: String(args.source ?? '').slice(0, 120),
+      });
+    },
+  });
 
   ctx.registerCommand({
     name: '日程',
@@ -333,16 +395,19 @@ export function setup(ctx: PluginContext): void {
       });
     }
 
-    // Overlay：演化层（长期剧情里稳定下来的变化；按既定事实对待，不要逐条念出来）
+    // Overlay：演化层（长期剧情里稳定下来的变化；按既定事实对待，不要逐条念出来）。
+    // 常驻（哪怕是空的）：模型得先知道这一层存在、入口是什么，才可能在合适的时候往里写。
     const own = overlayOf(persona.id).filter((e) => e.layer !== 'relationship' || !e.targetId || e.targetId === userId);
-    if (own.length) {
-      sections.push({
-        order: 220,
-        title: 'overlay',
-        text: '# 长期演化（已经稳定形成的变化，按既定事实对待）\n'
-          + own.map((e) => `- [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`).join('\n'),
-      });
-    }
+    sections.push({
+      order: 220,
+      title: 'overlay',
+      text: [
+        '# 长期演化',
+        '- 长期相处里稳定形成的变化（性格磨出新的一面、关系定型、世界既定变化）记在这一层；下面已有的按既定事实对待，不要逐条念出来。',
+        '- 确实沉淀出这种稳定变化时，用 remember_setting 写进来：一轮最多一条，每条要说得出来是从哪句话推出来的。一次性的情绪、闲聊、你当场编的东西不要写。',
+        ...own.map((e) => `- [${OVERLAY_LAYER_LABEL[e.layer]}] ${e.content}`),
+      ].join('\n'),
+    });
 
     // 记忆（250，稳定区）：**事实列表不再随上下文给出**（2026-10-16 用户裁定）——长期事实由后台
     //  提炼落库，模型要用时经 recall_facts 现查，语义与压缩掉的旧历史一致：不在眼前，但查得到。

@@ -1,5 +1,5 @@
 {
-  "_comment": "HDSI 式分层：canon（初始设定，剧情起点）/ perspective（独立于 canon 的个体价值观）/ voice（说话方式与语气样例）/ lore（关键词命中的世界事实）。运行时演化出来的稳定变化不进这里 —— 它们落在 Overlay 层，由桌面端人格页或 /设定 查看与清空（模型侧的写入入口 2026-10-17 已随 chat 工具面收窄删除）。",
+  "_comment": "HDSI 式分层：canon（初始设定，剧情起点）/ perspective（独立于 canon 的个体价值观）/ voice（说话方式与语气样例）/ lore（关键词命中的世界事实）。运行时演化出来的稳定变化不进这里 —— 它们落在 Overlay 层：模型用 remember_setting 提议写入，桌面端人格页或 /设定 查看与清空。",
   "name": "蓝色大肥鱼",
   "canon": {
     "protagonist": [

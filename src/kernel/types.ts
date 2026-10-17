@@ -143,12 +143,12 @@ export interface ToolContext {
 
 /**
  * 工具在哪个面上可见（pi 的 tool surface 思想）：
- *  - `memory`：**记忆读取类**（recall_facts / search_history）。这是 chat 面唯一可见的一类工具：
- *    2026-10-17 起 chat 轮不给行为型工具 —— 回复本身是一次普通生成，最多允许一轮记忆查询；
+ *  - `memory`：**记忆读取类**（recall_facts / search_history）。chat 面只收这一类和 `chat`：
+ *    2026-10-17 起 chat 轮不给行为型工具 —— 回复本身是一次普通生成，最多一轮记忆读写；
  *    work 面照旧可见（work agent 白名单按名取用）。
  *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见；
- *  - `chat`：只给 chat 轮、work 面严格看不见（目前没有工具用它，留给"只属于 chat 侧"的语义）；
- *  - `both`（默认）：work 轮可用 —— 注意 **chat 轮不再有默认可见**：chat 面只收 `memory`，
+ *  - `chat`：只给 chat 轮、work 面严格看不见（人格演化层 remember_setting 这类只在 chat 语境里成立的工具用它）；
+ *  - `both`（默认）：work 轮可用 —— 注意 **chat 轮不再有默认可见**：chat 面只收 `memory`/`chat`，
  *    其余一切（含 both）在 chat 轮严格缺席，新工具想进 chat 面必须显式标 `memory`。
  * 由 `toolsForChat(chat, role, surface)` 在收集阶段就过滤掉，不是"注册了但调用时拒绝"。
  */

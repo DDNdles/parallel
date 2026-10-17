@@ -305,7 +305,8 @@ export class PluginContainer {
    *
    * `surface` 决定收集哪一面（pi 的 tool surface）：
    *  - `'chat'`（默认）：**白名单口径（2026-10-17 起）**——chat 轮只收 `surface:'memory'`
-   *    的记忆读取工具；回复本身是一次普通生成，最多一轮记忆查询，不给任何行为型工具；
+   *    的记忆类工具与 `surface:'chat'` 的 chat 专用工具；回复本身是一次普通生成，
+   *    最多一轮记忆读写，不给任何行为型工具；
    *  - `'work'`：work 子代理取工具，含 work 面工具（仍受角色与 minRole 约束）。
    * 可选 `allow` 给出工具白名单（work agent 定义里的 `tools:`），不在名单里的严格缺席。
    */
@@ -317,8 +318,8 @@ export class PluginContainer {
       if (!this.effectiveEnabled(lp.manifest.id, chat.chatId)) continue;
       for (const t of lp.tools.values()) {
         if (allowSet && !allowSet.has(t.name)) continue;
-        // chat 面只认记忆读取工具；work 面拿不到 chat 面工具
-        if (surface === 'chat' && t.surface !== 'memory') continue;
+        // chat 面只认记忆类与 chat 专用工具（2026-10-17 白名单口径）；work 面拿不到 chat 面工具
+        if (surface === 'chat' && t.surface !== 'memory' && t.surface !== 'chat') continue;
         if (surface === 'work' && t.surface === 'chat') continue;
         if (t.ownerOnly && role !== 'owner') continue;
         if (t.minRole && !roleAtLeast(role, t.minRole)) continue;
