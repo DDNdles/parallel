@@ -143,8 +143,8 @@ function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachmen
 
 /**
  * 消息流水线（AstrBot 式分层 + 内置拟人层）：
- * 入站归一化 → 黑名单 → **拟人层门控**（@/私聊直通；群聊按必要性打分 + 防抖合并）→ 插件钩子
- * → 命令分发 / AgentLoop → **逐条分段发送**。
+ * 入站归一化 → 黑名单 → **拟人层门控**（@ 直通；群聊按必要性打分 + 防抖合并；私聊不打分但同样合批）
+ * → 插件钩子 → 命令分发 / AgentLoop → **逐条分段发送**。
  *
  * 与重构前的差别只在 chat 区：唤醒判定从「@ 或唤醒词」换成 MaiBot 那套打分，
  * 出站从「整条发」换成「按语义拆成几条短消息 + 打字停顿」。命令与 work 链路一行未动。
@@ -213,9 +213,11 @@ export class Pipeline {
       this.enqueue(r.events);
       return;
     }
-    // 私聊无条件立即处理（拟人层只更新它的统计，不做门控）
-    this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
-    this.enqueue([event]);
+    // 私聊：必回，但同样经拟人层攒批（连发几句合成一个请求；单条时与旧的秒回等价）。
+    // 它不评估开口，只借合批那一层，攒够后回调 enqueueBatch。
+    const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
+    if (r.action === 'handled') return;
+    this.enqueue(r.events);
   }
 
   /** 拟人层攒够消息后的回调（也用于主动发言轮：events 为空） */

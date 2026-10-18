@@ -349,9 +349,35 @@ test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消
   svc.dispose();
 });
 
-test('服务：命令与私聊一律立即放行，且不参与打分', () => {
+test('服务：命令立即放行；私聊不进打分但同样攒批', () => {
   const { svc } = makeService();
   assert.equal(svc.ingest(ev('/work 算一下昨天的账'), { isCommand: true }).action, 'pass');
+  // 私聊 2026-10-18 起借合批那一层（连发几句合成一个请求），因此这里返回 handled
+  assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'handled');
+  svc.dispose();
+});
+
+test('服务：私聊连发几句合成一个批次，且不做开口打分', async () => {
+  const { svc, triggers, logs } = makeService({
+    merge: { enable: true, windowMs: 10, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
+  });
+  const priv = { type: 'private' as const, chatId: '777' };
+  svc.ingest(ev('在吗', priv), { isCommand: false });
+  svc.ingest(ev('问你个事', priv), { isCommand: false });
+  svc.ingest(ev('算了没事', priv), { isCommand: false });
+  await wait(60);
+  assert.equal(triggers.length, 1, '三条连发只起一轮');
+  assert.equal(triggers[0].events.length, 3, '三条一起交出去');
+  assert.equal(triggers[0].reason, 'private');
+  // 私聊必回：不该留下任何「不说」的判定记录（那是群聊开口门控的产物）
+  assert.equal(logs.filter((l) => /不说/.test(l.text ?? '')).length, 0, '私聊不做开口打分');
+  svc.dispose();
+});
+
+test('服务：私聊关掉合批时仍逐条直通（与旧行为一致）', () => {
+  const { svc } = makeService({
+    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+  });
   assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'pass');
   svc.dispose();
 });

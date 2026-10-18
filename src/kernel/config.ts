@@ -130,11 +130,12 @@ export const DEFAULT_CONFIG = {
       inevitableAtReply: true,            // 被 @ 必回（默认开）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
-    // ③ 多用户消息防抖合并（关窗后按随机延时起跳，见 service.ts）
+    // ③ 消息防抖合并（关窗后按随机延时起跳，见 service.ts）。
+    //    群聊与私聊共用这把尺子：私聊不打分（必回），但同样攒批 —— 对面连发几句是一个请求。
     merge: {
       enable: true,
       windowMs: 1500,                     // 静默这么久就把攒着的消息一起处理
-      maxWaitMs: 6000,                    // 群里刷屏时的兜底上限
+      maxWaitMs: 6000,                    // 刷屏/连发时的兜底上限（群聊与私聊同一把尺子）
       bufferTtlMs: 120000,                // 攒着的消息超过 2 分钟就丢掉（老话不值得再接）
       fireDelayMinMs: 500,                // 关窗后的随机起跳延时下限
       fireDelayMaxMs: 2000,               // 关窗后的随机起跳延时上限（0/0 = 关掉随机延时）

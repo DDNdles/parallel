@@ -2,7 +2,8 @@
  * 拟人化服务 —— 内核里"什么时候说、怎么说"的那一半。
  *
  * 对上下暴露三件事：
- *  1. `ingest()`  入站消息的门控：@/私聊/命令立刻放行，其余按必要性打分 + 空窗补偿攒着，
+ *  1. `ingest()`  入站消息的门控：命令立刻放行；私聊必回但也攒批（连发几句合成一个请求）；
+ *                 群聊按必要性打分 + 空窗补偿攒着，
  *                 攒够了再由回调叫 pipeline 去跑一轮（这就是"会接话"与"会主动说话"）。
  *  2. `compose()` 出站回复的塑形：按句分条 → 逐条打字停顿（纯程序，模型不写任何格式标记）。
  *  3. 每会话一份心流状态：最近消息窗口（存在感惩罚 / 轰炸降频用）、平均消息间隔（空窗补偿用）、
@@ -174,8 +175,30 @@ export class HumanlikeService {
 
     // 命令是显式意图，任何时候都不参与拟人化门控
     if (opts.isCommand) return { action: 'pass', events: [event], merged: false };
-    // 私聊一律立即处理（不攒、不打分）——对齐"私聊频率"只影响主动发言的语义
-    if (event.type === 'private') return { action: 'pass', events: [event], merged: false };
+    // 私聊：**必回，但同样攒批**（2026-10-18 用户裁定）。
+    // 打分与开口判定一概不做（私聊频率只影响主动发言，这条语义不变），只借合批那一层：
+    // 对面连发三句是一件事，不该拆成三轮、每轮各起一组气泡（实测每条入站一个请求、
+    // 平均 3.07 条气泡）。攒够 windowMs + 起跳延时后一次性交出去；只有一条时与旧的秒回等价。
+    if (event.type === 'private') {
+      if (!cfg.merge.enable) return { action: 'pass', events: [event], merged: false };
+      const chat: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
+      st.buffer.push(event);
+      if (!st.firstBufferedAt) st.firstBufferedAt = now;
+      if (st.debounce) clearTimeout(st.debounce);
+      st.debounce = this.timer(() => {
+        st.debounce = undefined;
+        this.flushPrivate(chat, st);
+      }, cfg.merge.windowMs + this.fireJitter(cfg));
+      // 兜底与群聊同一把尺子：从第一条起最多攒 maxWaitMs
+      if (!st.maxWait) {
+        st.maxWait = this.timer(() => {
+          st.maxWait = undefined;
+          this.flushPrivate(chat, st);
+        }, cfg.merge.maxWaitMs);
+      }
+      this.armIdleTimer(chat, st, cfg);
+      return { action: 'handled' };
+    }
 
     const hasAt = event.isAtMe;
     const hasMention = this.mentioned(event);
@@ -237,6 +260,18 @@ export class HumanlikeService {
 
   private bufferLen(st: ChatState): number {
     return st.buffer.length;
+  }
+
+  /**
+   * 私聊合批到点：整批交回内核，**不评估、不打分、不过 TTL**。
+   * 与群聊 `evaluate` 的区别就是这三件都不做——私聊必回，"该不该说话"在这里不是问题，
+   * 攒批只为把对面连发的几句拼成一个请求。
+   */
+  private flushPrivate(chat: ChatRef, st: ChatState): void {
+    if (this.disposed || !st.buffer.length) return;
+    const events = this.drain(st);
+    if (!events.length) return;
+    this.opts.trigger({ chat, events, reason: 'private', detail: `私聊合批 ${events.length} 条` });
   }
 
   /**

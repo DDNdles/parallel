@@ -568,6 +568,34 @@ test('私聊全收并回复', async () => {
   mock.actions.length = 0;
 });
 
+test('私聊连发几句合成一个请求（2026-10-18：私聊也借合批那一层）', async () => {
+  mock.actions.length = 0;
+  const PRIVATE_USER = '10002';
+  kernel.container.setGroupState('chat', PRIVATE_USER, true, String(MASTER));
+  const before = mockProvider.calls.length;
+  mockProvider.script.push({ content: '收到，我看看。' });
+  // 连发三句（模拟"打完一句又想起来一句"）：默认 merge 窗口 1.5s + 起跳 ≤2s 足够覆盖
+  mock.sendPrivateMessage({ userId: Number(PRIVATE_USER), text: '在吗', nickname: '小刚' });
+  await new Promise((r) => setTimeout(r, 120));
+  mock.sendPrivateMessage({ userId: Number(PRIVATE_USER), text: '问你个事', nickname: '小刚' });
+  await new Promise((r) => setTimeout(r, 120));
+  mock.sendPrivateMessage({ userId: Number(PRIVATE_USER), text: '算了也没啥', nickname: '小刚' });
+
+  const toUser = () => mock.actions.filter((a) => a.action === 'send_private_msg' && String(a.params.user_id) === PRIVATE_USER);
+  await until(() => toUser().length > 0, 8000, '私聊回复');
+  await quiesce();
+
+  // 三轮对话轮（tool 调用/记忆提炼那种旁路请求不算：它们没有工具且带自认标记，走 script 队列的才算）
+  const chatCalls = mockProvider.calls.slice(before).filter((c) => (c.tools?.length ?? 0) > 0);
+  assert.equal(chatCalls.length, 1, `三句连发只该发一个请求，实得 ${chatCalls.length} 个`);
+  // 三条正文都进了同一个请求（renderBatch 各带说话人前缀拼成一段）
+  const joined = String(chatCalls[0].usersJoined ?? '');
+  assert.match(joined, /在吗/);
+  assert.match(joined, /问你个事/);
+  assert.match(joined, /算了也没啥/);
+  mock.actions.length = 0;
+});
+
 // ============================================================
 // 12. 登录页数据：协议端登录号/昵称 + lastLogin 持久化
 // ============================================================

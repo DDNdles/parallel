@@ -55,12 +55,12 @@ export interface HumanlikeConfig {
   timing: TimingConfig;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
-  /** 多用户消息防抖合并 */
+  /** 消息防抖合并（群聊与私聊共用：私聊不打分，但同样攒批） */
   merge: {
     enable: boolean;
     /** 静默多久就把攒着的消息处理掉 */
     windowMs: number;
-    /** 从第一条起最多攒多久（群里刷屏时兜底） */
+    /** 从第一条起最多攒多久（刷屏/连发时兜底；群聊与私聊同一把尺子） */
     maxWaitMs: number;
     /** 攒着的消息超过这个年龄就丢掉：隔了半小时的老话不值得再接 */
     bufferTtlMs: number;
@@ -119,6 +119,10 @@ export interface TriggerBatch {
   /** 目标会话（主动发言轮没有事件，只有这个） */
   chat: import('../types.ts').ChatRef;
   events: import('../types.ts').ChatEvent[];
-  reason: 'at' | 'mention' | 'likelihood' | 'necessity' | 'frequency' | 'idle' | 'proactive';
+  /**
+   * 触发原因。`private` = 私聊合批到点：只说明"攒够了"，**不代表做过开口判定**
+   * （私聊必回、不参与打分，见 service.ingest 的私聊分支）。
+   */
+  reason: 'at' | 'mention' | 'likelihood' | 'necessity' | 'frequency' | 'idle' | 'proactive' | 'private';
   detail: string;
 }
