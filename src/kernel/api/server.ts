@@ -1205,6 +1205,14 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     }
   }
 
+  // 出站打断（纯程序）：她还在发气泡时对面又开口，按概率把剩下的气泡砍掉
+  const interrupt = body.interrupt as Record<string, unknown> | undefined;
+  if (interrupt && typeof interrupt === 'object') {
+    const t = target.interrupt;
+    applyBool(t, interrupt, 'enable');
+    const e = applyNum(t, interrupt, 'probability', 0, 1, '打断概率'); if (e) return e;
+  }
+
   const merge = body.merge as Record<string, unknown> | undefined;
   if (merge && typeof merge === 'object') {
     const t = target.merge;

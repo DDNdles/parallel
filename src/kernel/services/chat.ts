@@ -27,6 +27,8 @@ export class ChatService implements ChatSendService {
   private adapter?: TransportAdapter;
   /** 出站单条消息字节数上限（平台硬限制；超过按长度兜底再切） */
   maxSegmentChars = 1800;
+  /** 在途的可打断发送（按 chatKey）：同一会话同时只会有一条（pipeline 的队列保证） */
+  private outbound = new Map<string, OutboundRun>();
 
   constructor(
     private bus: Bus,
@@ -59,9 +61,13 @@ export class ChatService implements ChatSendService {
    * - 限速**按条计费**（`plans.length` 个令牌），配额不够就截断成前几条，而不是整批丢弃
    * - `pauseMs` 是这条发出前的停顿（模拟"正在输入"）——**回复前的等待只有这一个来源**
    *   （拟人化 `outgoing` / `merge`），风控不再另设随机抖动，两处叠加会把节奏调不准
+   * - `interruptible` = 这条回复允许被 `interrupt()` 打断：打断只砍**还没发**的气泡，
+   *   等待中的停顿立刻结束（不留残余 timer），返回的 `sentTexts` 是真正发出去的那几条
    */
-  async sendPlanned(chat: ChatRef, plans: SendPlan[]): Promise<{ sent: number; ids: string[] }> {
-    if (!plans.length) return { sent: 0, ids: [] };
+  async sendPlanned(chat: ChatRef, plans: SendPlan[], opts: { interruptible?: boolean } = {}): Promise<{
+    sent: number; ids: string[]; aborted: boolean; sentTexts: string[];
+  }> {
+    if (!plans.length) return { sent: 0, ids: [], aborted: false, sentTexts: [] };
 
     // 风控：限速。一轮回复拆成几条就该吃几个令牌 —— 否则 12 条/分钟能变成 70+ 条/分钟。
     const rl = this.limiter.tryTake(`${chat.platform}:${chat.type}:${chat.chatId}`, plans.length);
@@ -72,7 +78,7 @@ export class ChatService implements ChatSendService {
         text: `发送被限速丢弃（等待 ${rl.waitMs}ms 超过上限），内容: ${summarize(plans.flatMap((p) => p.segments))}`,
         data: { decision: 'rate_limited', waitMs: rl.waitMs, dropped: plans.length },
       });
-      return { sent: 0, ids: [] };
+      return { sent: 0, ids: [], aborted: false, sentTexts: [] };
     }
     if (rl.granted < plans.length) {
       queue = plans.slice(0, rl.granted);
@@ -84,45 +90,89 @@ export class ChatService implements ChatSendService {
     }
 
     const ids: string[] = [];
+    const sentTexts: string[] = [];
+    const chatKey = `${chat.platform}:${chat.type}:${chat.chatId}`;
+    let run: OutboundRun | undefined;
+    if (opts.interruptible) {
+      run = { total: queue.length, sent: 0, aborted: false, wake: () => {}, wakePromise: Promise.resolve() };
+      // 唤醒口：打断时 resolve，让正在等打字停顿的那一觉立刻醒
+      let wake!: () => void;
+      run.wakePromise = new Promise<void>((r) => { wake = r; });
+      run.wake = wake;
+      this.outbound.set(chatKey, run);
+    }
+    const done = () => ({ sent: ids.length, ids, aborted: !!run?.aborted, sentTexts: [...sentTexts] });
 
-    for (const plan of queue) {
-      if (plan.pauseMs > 0) await sleep(plan.pauseMs);
-      // 条与条之间的硬长度兜底（平台单条上限）；拟人层已按分隔标记切过，这里基本不会触发
-      for (const part of splitSegments(plan.segments, this.maxSegmentChars)) {
-        const segments = part;
+    try {
+      for (const plan of queue) {
+        if (run?.aborted) break;
+        if (plan.pauseMs > 0) {
+          await (run ? Promise.race([sleep(plan.pauseMs), run.wakePromise]) : sleep(plan.pauseMs));
+        }
+        if (run?.aborted) break;                    // 打断落在停顿里：这条连同后面的一起不发
+        // 条与条之间的硬长度兜底（平台单条上限）；拟人层已按分隔符切过，这里基本不会触发
+        for (const part of splitSegments(plan.segments, this.maxSegmentChars)) {
+          const segments = part;
 
-        // 桌面端注入的会话（platform=ui）：无外部协议端，仅落日志与事件流
-        if (chat.platform === 'ui') {
+          // 桌面端注入的会话（platform=ui）：无外部协议端，仅落日志与事件流
+          if (chat.platform === 'ui') {
+            this.opts.onUsage('out');
+            this.opts.sessionLog.append(chat.chatId, chat.type, {
+              type: 'message_out', role: 'assistant', text: textOf(segments),
+              data: { segments, simulated: true },
+            });
+            this.bus.emit(busEvents.chatOut, { chat, segments, text: textOf(segments), ts: Date.now(), simulated: true });
+            sentTexts.push(textOf(segments));
+            if (run) run.sent++;
+            continue;
+          }
+          if (!this.adapter?.connected()) {
+            this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: '协议端未连接，消息未能发出' });
+            if (!ids.length) throw new Error('协议端未连接');
+            return done();   // 已经发出去几条就不再抛，免得用户看到"整条失败"
+          }
+          try {
+            const id = await this.adapter.send(chat, segments);
+            if (id) ids.push(id);
+          } catch (e) {
+            this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `发送失败: ${(e as Error).message}` });
+            if (!ids.length) throw e;
+            return done();   // 已经发出去几条就不再抛，免得用户看到"整条失败"
+          }
           this.opts.onUsage('out');
           this.opts.sessionLog.append(chat.chatId, chat.type, {
             type: 'message_out', role: 'assistant', text: textOf(segments),
-            data: { segments, simulated: true },
+            data: { segments, part: ids.length, parts: queue.length },
           });
-          this.bus.emit(busEvents.chatOut, { chat, segments, text: textOf(segments), ts: Date.now(), simulated: true });
-          continue;
+          this.bus.emit(busEvents.chatOut, { chat, segments, text: textOf(segments), ts: Date.now() });
+          sentTexts.push(textOf(segments));
+          if (run) run.sent++;
         }
-        if (!this.adapter?.connected()) {
-          this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: '协议端未连接，消息未能发出' });
-          if (!ids.length) throw new Error('协议端未连接');
-          return { sent: ids.length, ids };
-        }
-        try {
-          const id = await this.adapter.send(chat, segments);
-          if (id) ids.push(id);
-        } catch (e) {
-          this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `发送失败: ${(e as Error).message}` });
-          if (!ids.length) throw e;
-          return { sent: ids.length, ids };   // 已经发出去几条就不再抛，免得用户看到"整条失败"
-        }
-        this.opts.onUsage('out');
-        this.opts.sessionLog.append(chat.chatId, chat.type, {
-          type: 'message_out', role: 'assistant', text: textOf(segments),
-          data: { segments, part: ids.length, parts: queue.length },
-        });
-        this.bus.emit(busEvents.chatOut, { chat, segments, text: textOf(segments), ts: Date.now() });
       }
+      return done();
+    } finally {
+      // 只清自己那份：万一同一会话已经排了下一轮，别把它登记表里的现场删掉
+      if (run && this.outbound.get(chatKey) === run) this.outbound.delete(chatKey);
     }
-    return { sent: ids.length, ids };
+  }
+
+  /**
+   * 打断该会话在途的回复（纯程序，零模型调用）：把 `aborted` 立起来并唤醒等待中的停顿，
+   * 循环下一行就退出，**剩下的气泡一个字都不发**。返回还剩几条没发（没有在途发送返回 undefined）。
+   */
+  interrupt(chat: ChatRef): { remaining: number } | undefined {
+    const run = this.outbound.get(`${chat.platform}:${chat.type}:${chat.chatId}`);
+    if (!run || run.aborted) return undefined;
+    run.aborted = true;
+    run.wake();
+    return { remaining: Math.max(0, run.total - run.sent) };
+  }
+
+  /** 该会话有没有在途的可打断发送（还剩几条）；没有返回 undefined */
+  pendingOutbound(chat: ChatRef): { remaining: number } | undefined {
+    const run = this.outbound.get(`${chat.platform}:${chat.type}:${chat.chatId}`);
+    if (!run) return undefined;
+    return { remaining: Math.max(0, run.total - run.sent) };
   }
 
   async sendText(chat: ChatRef, text: string): Promise<void> {
@@ -144,6 +194,18 @@ export class ChatService implements ChatSendService {
   async reply(event: { chatId: string; type: 'group' | 'private'; platform: string }, text: string): Promise<void> {
     await this.sendText({ platform: event.platform, type: event.type, chatId: event.chatId }, text);
   }
+}
+
+/** 一条在途的可打断发送（sendPlanned 登记，interrupt() 打断） */
+interface OutboundRun {
+  /** 这一轮计划发几条 */
+  total: number;
+  /** 已经发出去几条 */
+  sent: number;
+  aborted: boolean;
+  /** 唤醒正在等打字停顿的那一觉 */
+  wake: () => void;
+  wakePromise: Promise<void>;
 }
 
 function sleep(ms: number): Promise<void> {

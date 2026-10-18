@@ -25,6 +25,8 @@ interface Humanlike {
     mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
   };
   merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number; fireDelayMinMs: number; fireDelayMaxMs: number };
+  /** 出站打断（纯程序）：她还在发气泡时对面插话，按概率把剩下的气泡砍掉 */
+  interrupt?: { enable: boolean; probability: number };
   backoff: { baseSeconds: number; capSeconds: number; startCount: number; bypassPendingCount: number };
   /** 圈内黑话（表达学习）：先挖本群高频词再进 prompt 的参考节 */
   jargon?: { enable: boolean };
@@ -291,13 +293,16 @@ export default function SettingsPage() {
           {sec === 'chat' && (() => {
             // 旧内核没有这些键就不渲染：重启内核后出现
             const rp = h?.repeat;
+            const it = h?.interrupt;
             const st = c.storage;
             const cm = st?.contextMinutes;
             const setRp = (p: Partial<NonNullable<Humanlike['repeat']>>, immediate = false) =>
               rp && patchH({ repeat: { ...rp, ...p } }, immediate);
+            const setIt = (p: Partial<NonNullable<Humanlike['interrupt']>>, immediate = false) =>
+              it && patchH({ interrupt: { ...it, ...p } }, immediate);
             return (
               <>
-                {(cm !== undefined || rp) && (
+                {(cm !== undefined || rp || it) && (
                   <div className="set-grid">
                     {cm !== undefined && st && (
                       <Num label="传入上下文时限分钟" value={cm}
@@ -308,6 +313,10 @@ export default function SettingsPage() {
                       <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
                       <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
                     </>)}
+                    {it && (
+                      <Num label="插话打断概率（%）" value={Math.round(it.probability * 100)}
+                        onChange={(v) => setIt({ probability: Math.min(100, Math.max(0, v)) / 100 })} />
+                    )}
                   </div>
                 )}
 
@@ -323,6 +332,13 @@ export default function SettingsPage() {
                       <span className="plg-v">跟屏复读</span>
                       <span className="mset-macts"><Switch on={rp.enable !== false}
                         onChange={() => setRp({ enable: !(rp.enable !== false) }, true)} /></span>
+                    </div>
+                  )}
+                  {it && (
+                    <div className="mset-mrow">
+                      <span className="plg-v">说话时被插话就停下</span>
+                      <span className="mset-macts"><Switch on={it.enable !== false}
+                        onChange={() => setIt({ enable: !(it.enable !== false) }, true)} /></span>
                     </div>
                   )}
                 </div>

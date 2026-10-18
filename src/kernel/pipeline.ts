@@ -12,6 +12,7 @@ import type { Db } from './db.ts';
 import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
 import { SILENT_MARKER, isSilentScene } from './humanlike/delivery.ts';
+import { shouldInterrupt } from './humanlike/interrupt.ts';
 
 /** 圈内黑话（表达学习）的 hook 面；可选依赖——没接（测试/降级）就整个旁路 */
 interface JargonHook {
@@ -193,6 +194,10 @@ export class Pipeline {
     // 附件的下载也在适配器那头就挡掉了；解除隐藏后只恢复"此后的"入站，不补历史。
     if (this.chatHidden(event)) return;
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
+    // 她还在发气泡时对面又开口：按打断口径把**剩下的气泡**砍掉（纯程序，零模型调用）。
+    // 必须放在落账与门控之前 —— 要求是"对面发完立刻生效"，排在后面就白等了。
+    // 这条消息本身照常入账、照常进攒批，成为下一轮的输入；被砍掉的正文不进历史（见 sendScene）。
+    this.maybeInterrupt(chat, event);
     // 先把该会话的历史缓存暖起来（首次会从会话日志重建）。**必须在 logInbound 之前**：
     // 否则重建时会把本条消息也读成"历史"，而 agentTurn 又会把它当"本轮输入"再追加一次，
     // 于是首轮请求里同一条用户消息出现两遍（抓报文时肉眼可见）。
@@ -280,6 +285,39 @@ export class Pipeline {
   /** 中断当前轮（桌面端按钮） */
   abortChat(chatId: string): void {
     this.aborts.get(chatId)?.abort();
+  }
+
+  /**
+   * 出站打断：她还在发气泡时对面又开口，按口径把**剩下的气泡**砍掉（2026-10-18 用户裁定）。
+   *
+   * 三条判据（`humanlike/interrupt.ts`）：制止语必断、@/引用必断、其余按 `interrupt.probability`
+   * 掷一次（默认 0.8）。**纯程序**，不叫模型 —— 要求是"对面发完立刻生效"，走一趟模型
+   * 那几条早就发完了。命令不算插话（`/work` 是显式意图，不该把话说一半截断）。
+   *
+   * 只有 chat 轮的回复登记了在途（`sendScene` 传 `interruptible`）：命令回执、跟屏复读、
+   * 桌面端手动发言都打断不到 —— 那些是"必须说完"的话。
+   */
+  private maybeInterrupt(chat: ChatRef, event: ChatEvent): void {
+    const cfg = this.humanlike.config.interrupt;
+    if (!cfg?.enable) return;
+    const pending = this.chat.pendingOutbound(chat);
+    if (!pending || pending.remaining <= 0) return;
+    if (isCommandText(event.text)) return;
+    const d = shouldInterrupt({
+      text: event.text,
+      isAtMe: event.isAtMe,
+      isReplyToMe: event.isReplyToMe,
+      remaining: pending.remaining,
+      probability: cfg.probability,
+    });
+    if (!d.interrupt) return;
+    const r = this.chat.interrupt(chat);
+    if (!r) return;
+    this.sessionLog.append(event.chatId, event.type, {
+      type: 'gate', role: 'system',
+      text: `被打断：还剩 ${r.remaining} 条没发（${d.reason}）`,
+      data: { decision: 'interrupted', reason: d.reason, remaining: r.remaining, by: event.userId },
+    });
   }
 
   /** 桌面端「已隐藏」的会话 = bot 收不到它（口径与实现在 ConfigStore.chatHidden） */
@@ -813,6 +851,10 @@ export class Pipeline {
    *  - 其余：程序侧按句分条 + 句边截断（humanlike/delivery.ts），需要时给第一条挂引用段；
    *  - 发出去的正文按 role=model 回灌历史 —— 模型读上下文时才知道这句话是自己说的
    *    （跟屏复读、桌面端手动发言也是同一条口径，见 kernel/repeat 与 pipeline.sendAsBot）。
+   *
+   * **被插话打断时（`interruptible`）只回灌真发出去的那几条**（2026-10-18 用户裁定）：
+   * 砍掉的气泡一个字都不进历史 —— 她下一轮不该记得自己"本来还想说"那几句，
+   * 否则模型会接着被截断的话头往下讲，等于打断没生效。
    */
   private async sendScene(
     chat: { platform: string; type: 'group' | 'private'; chatId: string },
@@ -825,10 +867,17 @@ export class Pipeline {
       return;
     }
     if (quoteTarget) plans[0].segments.unshift({ type: 'reply', data: { id: quoteTarget } });
-    const { sent } = await this.chat.sendPlanned(chat, plans);
+    const { sent, aborted, sentTexts } = await this.chat.sendPlanned(chat, plans, { interruptible: true });
     const bubbles = plans
       .map((p) => p.segments.filter((s) => s.type === 'text').map((s) => String(s.data.text ?? '')).join(''))
       .filter(Boolean);
+    if (aborted) {
+      // 一条都没发出去就被打断：不记 spoke（打断不是她的犹豫，不该推进空闲退避），也不回灌历史
+      if (sent <= 0) return;
+      this.humanlike.noteSpoke(chat, sent, sentTexts);
+      this.history.pushAssistant(chat, sentTexts.join('\n'));
+      return;
+    }
     this.humanlike.noteSpoke(chat, sent > 0 ? sent : 1, bubbles);
     if (historyText.trim()) this.history.pushAssistant(chat, historyText);
   }

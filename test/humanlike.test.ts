@@ -10,6 +10,7 @@ import {
   normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
   isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING,
 } from '../src/kernel/humanlike/delivery.ts';
+import { shouldInterrupt, isStopPhrase } from '../src/kernel/humanlike/interrupt.ts';
 import { HumanlikeService } from '../src/kernel/humanlike/service.ts';
 import { DEFAULT_HUMANLIKE, type HumanlikeConfig } from '../src/kernel/humanlike/types.ts';
 import {
@@ -779,4 +780,78 @@ test('发送服务：停顿只来自计划本身（风控不再另加随机抖�
   const t1 = Date.now();
   await noPause.svc.sendPlanned(chat, [bubble('整条回复')]);
   assert.ok(Date.now() - t1 < 100, '无停顿的回复不该被风控延迟');
+});
+
+// ============================================================
+// 出站打断（2026-10-18）：她还在发气泡时对面插话，把剩下的气泡砍掉
+// ============================================================
+
+test('打断判定：制止语必打断，且不消耗随机数', () => {
+  for (const t of ['等等', '等一下！', '别说了', '闭嘴', '算了', '先别说了', '停一下', '打住。']) {
+    assert.equal(isStopPhrase(t), true, `应判为制止语: ${t}`);
+  }
+  // 长句里的"算了"是在换话题，不算叫停
+  assert.equal(isStopPhrase('这事算了吧以后再说，我先去吃饭了'), false);
+  assert.equal(isStopPhrase('今天天气不错'), false);
+  let calls = 0;
+  const rng = () => { calls++; return 0.99; };
+  const d = shouldInterrupt({ text: '等等', remaining: 3, probability: 0.8 }, rng);
+  assert.equal(d.interrupt, true);
+  assert.equal(d.reason, '制止语');
+  assert.equal(calls, 0, '硬规则不该消耗随机数（测试要能钉值）');
+});
+
+test('打断判定：@ 与引用必打断，其余按概率掷', () => {
+  assert.equal(shouldInterrupt({ text: '你刚说什么', isAtMe: true, remaining: 2, probability: 0 }, rng1).interrupt, true);
+  assert.equal(shouldInterrupt({ text: '你刚说什么', isReplyToMe: true, remaining: 2, probability: 0 }, rng1).interrupt, true);
+  // 概率 0：除硬规则外一律不打断
+  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0 }, rng0).interrupt, false);
+  // 概率 0.8：rng=0 掷中、rng=0.999 掷不中
+  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0.8 }, rng0).interrupt, true);
+  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0.8 }, rng1).interrupt, false);
+  // 没有待发气泡时一律不打断
+  assert.equal(shouldInterrupt({ text: '等等', remaining: 0, probability: 1 }, rng0).interrupt, false);
+});
+
+test('发送服务：可打断发送被 interrupt 后剩下的气泡不发，且只回报已发的正文', async () => {
+  const { svc, sent } = makeChat({ ratePerMin: 10 });
+  // 第二条前停 5 秒：足够在它发出去之前打断
+  const p = svc.sendPlanned(chat, [bubble('一'), bubble('二', 5000), bubble('三', 5000)], { interruptible: true });
+  // 等第一条真发出去
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(sent, ['一']);
+  const pending = svc.pendingOutbound(chat);
+  assert.ok(pending, '第一条发出后应还有在途登记');
+  assert.equal(pending!.remaining, 2);
+  const cut = svc.interrupt(chat);
+  assert.equal(cut?.remaining, 2);
+  const r = await p;
+  assert.equal(r.aborted, true);
+  assert.equal(r.sent, 1);
+  assert.deepEqual(r.sentTexts, ['一']);
+  assert.deepEqual(sent, ['一'], '被打断后不该再发后面两条');
+  assert.equal(svc.pendingOutbound(chat), undefined, '发完要把登记清掉');
+});
+
+test('发送服务：打断落在停顿里 —— 立刻返回，不把停顿等完', async () => {
+  const { svc, sent } = makeChat({ ratePerMin: 10 });
+  const t0 = Date.now();
+  const p = svc.sendPlanned(chat, [bubble('一'), bubble('二', 3000)], { interruptible: true });
+  await new Promise((r) => setTimeout(r, 50));
+  svc.interrupt(chat);
+  const r = await p;
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1000, `打断后不该继续等 3 秒停顿，实际 ${elapsed}ms`);
+  assert.equal(r.aborted, true);
+  assert.deepEqual(sent, ['一']);
+});
+
+test('发送服务：不可打断的发送登记不到，interrupt 打不动它', async () => {
+  const { svc, sent } = makeChat({ ratePerMin: 10 });
+  const p = svc.sendPlanned(chat, [bubble('一'), bubble('二', 120)]);
+  assert.equal(svc.pendingOutbound(chat), undefined, '不传 interruptible 就不登记');
+  assert.equal(svc.interrupt(chat), undefined);
+  const r = await p;
+  assert.equal(r.aborted, false);
+  assert.deepEqual(sent, ['一', '二'], '命令回执这类话必须说完');
 });

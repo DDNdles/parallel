@@ -55,6 +55,15 @@ export interface HumanlikeConfig {
   timing: TimingConfig;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
+  /**
+   * 出站打断（interrupt.ts）：她还在发气泡时对面又开口，按概率把**剩下的气泡**砍掉。
+   * 纯程序、不叫模型 —— 要求是"对面发完立刻生效"，走模型那一趟早就发完了。
+   */
+  interrupt: {
+    enable: boolean;
+    /** 插话打断的概率（0~1）；制止语与 @/引用 不受它约束（那两条必打断） */
+    probability: number;
+  };
   /** 消息防抖合并（群聊与私聊共用：私聊不打分，但同样攒批） */
   merge: {
     enable: boolean;
@@ -103,7 +112,8 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
     focusMode: false,
   },
   outgoing: { ...DEFAULT_OUTGOING },
-  merge: { enable: true, windowMs: 1500, maxWaitMs: 6000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },
+  interrupt: { enable: true, probability: 0.8 },
+  merge: { enable: true, windowMs: 2000, maxWaitMs: 6000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },
   backoff: { baseSeconds: 15, capSeconds: 300, startCount: 2, bypassPendingCount: 6 },
   proactive: { enable: false, idleSeconds: 3600 },
   rhythm: { ...DEFAULT_RHYTHM },

@@ -79,7 +79,7 @@ npm start           # = node bin/parallel.js
 
 1. **接入**：QQ 接入经 LuckyLilliaBot 或 NapCat 协议端（两端都内嵌托管、常驻拉起）；都以 OneBot 11 反向 WS 连回，access token 强制鉴权（`src/kernel/adapters/onebot11.ts`）。
 2. **沙箱边界**：`SandboxService.resolveInside` 把一切路径解析后强校验在会话沙箱根内；`ChatService.sendFile` 只发沙箱内文件；聊天收到文件落沙箱 `inbox/`。
-3. **风控克制**：`risk` 段只设内核红线，`humanlike` 段管行为人格，两边不重复设同一个旋钮。令牌桶限速**按条计费**（`ChatService.sendPlanned` 拿 `plans.length` 个令牌，配额不够就截断成前几条而不是整批丢弃）；主动消息默认关闭（`Scheduler` proactive 门控，UI 标注风险）；本群没开任何插件时普通成员彻底静默（不暴露"这是个机器人"）。回复前的等待只有拟人化一个来源（打字节奏 `humanlike.typing` / 合批 `humanlike.merge`），"要不要理这条"也只有拟人层一处判（群聊走必要性打分 / `@` 必回；私聊必回、不打分，但同样攒批——连发几句合成一个请求，命令直通）—— 风控里不再留第二套唤醒与抖动旋钮。拟人层的"主动开口"同样是显式开关：空窗补偿只补真实积压、连续不理人指数退避、`humanlike.proactive` 默认关。
+3. **风控克制**：`risk` 段只设内核红线，`humanlike` 段管行为人格，两边不重复设同一个旋钮。令牌桶限速**按条计费**（`ChatService.sendPlanned` 拿 `plans.length` 个令牌，配额不够就截断成前几条而不是整批丢弃）；主动消息默认关闭（`Scheduler` proactive 门控，UI 标注风险）；本群没开任何插件时普通成员彻底静默（不暴露"这是个机器人"）。回复前的等待只有拟人化一个来源（打字节奏 `humanlike.typing` / 合批 `humanlike.merge`），"要不要理这条"也只有拟人层一处判（群聊走必要性打分 / `@` 必回；私聊必回、不打分，但同样攒批——连发几句合成一个请求，命令直通）—— 风控里不再留第二套唤醒与抖动旋钮。**出站可被打断**（`humanlike/interrupt` + `ChatService.interrupt`）：她还在发气泡时对面又开口，制止语与 `@`/引用必断、其余按 `interrupt.probability`（默认 0.8）掷一次，砍掉的是**还没发的气泡**（纯程序，零模型调用），被砍掉的正文也不回灌历史。拟人层的"主动开口"同样是显式开关：空窗补偿只补真实积压、连续不理人指数退避、`humanlike.proactive` 默认关。
 4. **健壮性**：配置原子落盘 `.tmp→rename→.bak×3`（`util/fsutil.ts`）；插件回调全部过 `guarded()` 隔离，同错 3 次自动停用并私聊主人；卸载走统一 deactivate 协议（定时器/子进程/监听器经 disposers 逆序清理，调度任务一并注销）。
 5. **权限**：主人>群管理员/群主>普通用户；越权在容器/命令/工具层被拒绝（`PermissionDeniedError`），不靠提示词自觉。工具还按**可见面**（`ToolDef.surface`）在收集阶段切分：`surface:'work'` 的重工具（常驻 Python / 浏览器 / shell）在 chat 轮的工具列表里根本不存在，work 轮再受 agent 定义的白名单约束。
 6. **可测试**：模拟协议端（test/mock-onebot）+ 桌面注入双通道，无需真号。

@@ -130,29 +130,35 @@ export const DEFAULT_CONFIG = {
       inevitableAtReply: true,            // 被 @ 必回（默认开）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
-    // ③ 消息防抖合并（关窗后按随机延时起跳，见 service.ts）。
+    // ③ 出站打断（纯程序，见 humanlike/interrupt.ts）：她还在发气泡时对面又开口，
+    //    按概率把剩下的气泡砍掉；制止语与 @/引用 不受概率约束（那两条必打断）。
+    interrupt: {
+      enable: true,
+      probability: 0.8,                   // 插话打断概率（0~1）
+    },
+    // ④ 消息防抖合并（关窗后按随机延时起跳，见 service.ts）。
     //    群聊与私聊共用这把尺子：私聊不打分（必回），但同样攒批 —— 对面连发几句是一个请求。
     merge: {
       enable: true,
-      windowMs: 1500,                     // 静默这么久就把攒着的消息一起处理
+      windowMs: 2000,                     // 静默这么久就把攒着的消息一起处理
       maxWaitMs: 6000,                    // 刷屏/连发时的兜底上限（群聊与私聊同一把尺子）
       bufferTtlMs: 120000,                // 攒着的消息超过 2 分钟就丢掉（老话不值得再接）
       fireDelayMinMs: 500,                // 关窗后的随机起跳延时下限
       fireDelayMaxMs: 2000,               // 关窗后的随机起跳延时上限（0/0 = 关掉随机延时）
     },
-    // ④ 空闲退避（MaiBot idle_backoff）
+    // ⑤ 空闲退避（MaiBot idle_backoff）
     backoff: {
       baseSeconds: 15,
       capSeconds: 300,
       startCount: 2,
       bypassPendingCount: 6,
     },
-    // ⑤ 真正的主动发言：没人说话也起话头。默认关（主动发言属于主动推送，要显式开启）
+    // ⑥ 真正的主动发言：没人说话也起话头。默认关（主动发言属于主动推送，要显式开启）
     proactive: {
       enable: false,
       idleSeconds: 3600,
     },
-    // ⑥ 聊天节奏反定型（HDSI ChatRhythm）：回复结构定型时，以角色视角注入纠偏
+    // ⑦ 聊天节奏反定型（HDSI ChatRhythm）：回复结构定型时，以角色视角注入纠偏
     rhythm: {
       enable: true,
       mode: 'balanced' as 'gentle' | 'balanced' | 'aggressive',
@@ -160,7 +166,7 @@ export const DEFAULT_CONFIG = {
       collapseMinSamples: 5,            // 判定定型所需最少样本（宽限期，HDSI 3~10）
       exhaustLimit: 6,                  // 连续注入失败几次熔断（HDSI 3~12）
     },
-    // ⑦ 主体行动窗口（HDSI Agency）：日程/隐私/设备构成主动开口的容量
+    // ⑧ 主体行动窗口（HDSI Agency）：日程/隐私/设备构成主动开口的容量
     agency: {
       enable: true,
       quietHours: '00:30-07:30',        // 安静时段（她睡着，不主动开口）
@@ -168,7 +174,7 @@ export const DEFAULT_CONFIG = {
       maxWindowMinutes: 240,
       maxCandidateHours: 24,
     },
-    // ⑧ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
+    // ⑨ 日程（HDSI Schedule Preplan）：周规律 + 日期例外；只作计划，不当已发生的事实
     // （模型与 QQ 侧的读写入口都已删除，现在只剩主动开口的行动容量判断在用）
     schedule: {
       enable: false,

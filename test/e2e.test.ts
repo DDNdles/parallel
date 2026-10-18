@@ -947,3 +947,44 @@ test('拟人化：首轮请求不会把同一条用户消息发两遍', async ()
   const hits = joined.split('独一无二的一句话').length - 1;
   assert.equal(hits, 1, `同一条消息只该出现一次，实际 ${hits} 次: ${joined}`);
 });
+
+test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发也不进历史', async () => {
+  await quiesce();
+  const G = 4580;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  const hl = kernel.config.config.humanlike;
+  const savedOut = { ...hl.outgoing };
+  const savedIt = { ...hl.interrupt };
+  // 每条后续气泡等 2 秒（真实默认是"基础 1s + 字数/8"）：给打断留一个确定的窗口
+  hl.outgoing.typingBaseDelaySeconds = 2;
+  hl.outgoing.typingMaxDelaySeconds = 2;
+  hl.outgoing.typingJitterRatio = 0;
+  hl.interrupt.enable = true;
+  hl.interrupt.probability = 0.8;
+  const chat = { platform: 'qq', type: 'group' as const, chatId: String(G) };
+  try {
+    mock.actions.length = 0;
+    mockProvider.script.push({ content: '第一句。第二句。第三句。第四句。' });
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    const sendsOf = () => mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(G));
+    // 等第一条气泡落地：此刻循环正卡在"第二条之前的 2 秒打字停顿"里
+    await until(() => sendsOf().length === 1, 8000, '第一条气泡');
+    // 插话（制止语必打断，不掷骰子）
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '等等', nickname: '小明' });
+    // 打断是同步的：再等一小段（短于 2s 合批窗口）确认后面的气泡真没来
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(sendsOf().length, 1, `打断后不该再发后面的气泡，实际发了 ${sendsOf().length} 条`);
+
+    const assistants = kernel.history.snapshot(chat).filter((m) => m.role === 'assistant');
+    assert.equal(assistants.length, 1, '被打断这一轮只该回灌一条 assistant');
+    assert.equal(String(assistants[0].content), '第一句。', '被砍掉的气泡一个字都不该进历史');
+
+    // 会话流里留一条 gate 说明为什么话说一半（桌面端据此排障）
+    const gates = kernel.sessionLog.tail(G, 'group', 60)
+      .filter((e) => (e.data as any)?.decision === 'interrupted');
+    assert.ok(gates.length >= 1, '被打断要在会话日志里留 gate');
+  } finally {
+    Object.assign(hl.outgoing, savedOut);
+    Object.assign(hl.interrupt, savedIt);
+  }
+});

@@ -535,6 +535,10 @@ export interface ChatSendService {
   sendFile(chat: ChatRef, sandboxPath: string): Promise<void>;
   /** 直接回复某个事件（省去构造 ChatRef） */
   reply(event: ChatEvent, text: string): Promise<void>;
+  /** 该会话有没有在途的可打断发送（还剩几条）；没有返回 undefined */
+  pendingOutbound?(chat: ChatRef): { remaining: number } | undefined;
+  /** 打断该会话在途的回复：剩下的气泡不发，返回还剩几条（没有在途返回 undefined） */
+  interrupt?(chat: ChatRef): { remaining: number } | undefined;
 }
 
 /** 协议端给出的登录二维码（WebUI 代理或 OneBot 扩展动作） */
