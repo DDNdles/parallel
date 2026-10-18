@@ -264,6 +264,8 @@ export class LlmService {
         lastErr = err;
         this.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
           chatId: meta.chatId, pluginId: meta.pluginId, stack: err.stack,
+          // 模型失败彻底沉默：只进报错中心与会话日志（这条也走 QQ 私聊通知，一并关掉）
+          notifyOwner: false,
         });
         // 用户主动打断、或者已经往外吐过字了：换模型只会重复输出或违背中断，直接抛
         if (req.signal?.aborted || streamed) throw err;
@@ -432,7 +434,12 @@ export class LlmService {
           } catch (e) {
             const err = e as Error;
             lastErr = err;
-            self.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, { stack: err.stack });
+            self.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
+              stack: err.stack,
+              // 模型失败彻底沉默：只进报错中心与会话日志。私聊里那条 "[parallel 报错]"
+              // 会被当成 bot 自己说的话发出去（2026-10-18 用户看到过），所以这里不通知主人。
+              notifyOwner: false,
+            });
             // 用户打断、或已经往外吐过字：换模型只会重复输出/违背中断，直接终结
             if (options?.signal?.aborted || streamed) { fail(err); return; }
             if (list.length > 1) self.markFail(kind, idx, list, err);

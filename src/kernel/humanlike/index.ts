@@ -17,7 +17,7 @@ export {
   type BackoffConfig, type TalkRule, type OutgoingConfig,
 } from './types.ts';
 export { NECESSITY_TRIGGER_SCORE, scoreReplyNecessity, idleCompensation, presencePenalty } from './necessity.ts';
-export { shouldInterrupt, isStopPhrase, type InterruptInput, type InterruptDecision } from './interrupt.ts';
+export { shouldInterrupt, type InterruptInput, type InterruptDecision } from './interrupt.ts';
 export { talkValueFor, idleBackoffSeconds, backoffBypassed, inTimeWindow } from './frequency.ts';
 export {
   DEFAULT_RHYTHM, rhythmSignature, detectCollapse, rhythmNudge, type RhythmConfig,

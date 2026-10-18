@@ -65,6 +65,9 @@ before(async () => {
   hlOut.typingBaseDelaySeconds = 0;
   hlOut.typingMaxDelaySeconds = 0;
   hlOut.typingJitterRatio = 0;
+  // 重复消息去重默认 2 分钟：本文件的用例普遍在同一个群反复用「在吗」触发，这里整体关掉，
+  // 只让专门测去重的那一条自己打开。
+  kernel.pipeline.duplicateWindowMs = 0;
   kernel.config.config.onebot.port = ONEBOT_PORT;
   // 协议端托管只在带桌面端的内核里跑（见 kernel.boot 的 noApi 判断）：测试内核用 MockOneBot
   // 顶替，真托管会在临时目录下载 89MB 发行包，抢磁盘/网络并在首个 agent loop 窗口里制造偶发超时（历史 flake 根因）。
@@ -960,7 +963,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   hl.outgoing.typingMaxDelaySeconds = 2;
   hl.outgoing.typingJitterRatio = 0;
   hl.interrupt.enable = true;
-  hl.interrupt.probability = 0.8;
+  hl.interrupt.probability = 1;      // 测试要确定性：概率 1 = 一定打断
   const chat = { platform: 'qq', type: 'group' as const, chatId: String(G) };
   try {
     mock.actions.length = 0;
@@ -969,7 +972,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
     const sendsOf = () => mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(G));
     // 等第一条气泡落地：此刻循环正卡在"第二条之前的 2 秒打字停顿"里
     await until(() => sendsOf().length === 1, 8000, '第一条气泡');
-    // 插话（制止语必打断，不掷骰子）
+    // 插话：任何一条新消息都算（不看内容语义），概率 1 时必打断
     mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '等等', nickname: '小明' });
     // 打断是同步的：再等一小段（短于 2s 合批窗口）确认后面的气泡真没来
     await new Promise((r) => setTimeout(r, 1200));
@@ -986,5 +989,39 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   } finally {
     Object.assign(hl.outgoing, savedOut);
     Object.assign(hl.interrupt, savedIt);
+  }
+});
+
+test('拟人化：同一句隔开 2 秒以上又说一遍，不再另起一轮重答', async () => {
+  await quiesce();
+  const G = 4581;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  const hl = kernel.config.config.humanlike;
+  const savedIt = { ...hl.interrupt };
+  hl.interrupt.enable = false;              // 这条测的是重复消息，别让打断掺进来
+  kernel.pipeline.duplicateWindowMs = 120_000;
+  try {
+    mock.actions.length = 0;
+    mockProvider.script.push({ content: '在的。' });
+    const callsBefore = mockProvider.calls.length;
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '一模一样的这一句', atMe: true, nickname: '小明' });
+    await mock.waitForReply(G);
+    await quiesce();
+    const firstCalls = mockProvider.calls.length;
+    assert.ok(firstCalls > callsBefore, '第一遍应该真叫了模型');
+
+    // 隔开 2 秒以上再说一遍同样的话（超过合批窗口，本来会另起一轮）
+    await new Promise((r) => setTimeout(r, 2200));
+    mockProvider.script.push({ content: '又说一遍干嘛。' });
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '一模一样的这一句', atMe: true, nickname: '小明' });
+    await new Promise((r) => setTimeout(r, 1500));
+
+    assert.equal(mockProvider.calls.length, firstCalls, '同样的话不该再叫一次模型');
+    const gate = kernel.sessionLog.tail(G, 'group', 60)
+      .find((e) => (e.data as any)?.decision === 'duplicate_ignored');
+    assert.ok(gate, '要在会话日志里留一条 duplicate_ignored');
+  } finally {
+    Object.assign(hl.interrupt, savedIt);
+    kernel.pipeline.duplicateWindowMs = 0;
   }
 });

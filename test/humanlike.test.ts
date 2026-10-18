@@ -10,7 +10,7 @@ import {
   normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
   isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING,
 } from '../src/kernel/humanlike/delivery.ts';
-import { shouldInterrupt, isStopPhrase } from '../src/kernel/humanlike/interrupt.ts';
+import { shouldInterrupt } from '../src/kernel/humanlike/interrupt.ts';
 import { HumanlikeService } from '../src/kernel/humanlike/service.ts';
 import { DEFAULT_HUMANLIKE, type HumanlikeConfig } from '../src/kernel/humanlike/types.ts';
 import {
@@ -786,31 +786,21 @@ test('发送服务：停顿只来自计划本身（风控不再另加随机抖�
 // 出站打断（2026-10-18）：她还在发气泡时对面插话，把剩下的气泡砍掉
 // ============================================================
 
-test('打断判定：制止语必打断，且不消耗随机数', () => {
-  for (const t of ['等等', '等一下！', '别说了', '闭嘴', '算了', '先别说了', '停一下', '打住。']) {
-    assert.equal(isStopPhrase(t), true, `应判为制止语: ${t}`);
-  }
-  // 长句里的"算了"是在换话题，不算叫停
-  assert.equal(isStopPhrase('这事算了吧以后再说，我先去吃饭了'), false);
-  assert.equal(isStopPhrase('今天天气不错'), false);
+test('打断判定：只看「还有没有气泡没发」+ 概率，不看内容', () => {
+  // 硬边界：没有待发气泡 / 概率为 0 —— 都不打断，且不消耗随机数
   let calls = 0;
   const rng = () => { calls++; return 0.99; };
-  const d = shouldInterrupt({ text: '等等', remaining: 3, probability: 0.8 }, rng);
-  assert.equal(d.interrupt, true);
-  assert.equal(d.reason, '制止语');
-  assert.equal(calls, 0, '硬规则不该消耗随机数（测试要能钉值）');
-});
-
-test('打断判定：@ 与引用必打断，其余按概率掷', () => {
-  assert.equal(shouldInterrupt({ text: '你刚说什么', isAtMe: true, remaining: 2, probability: 0 }, rng1).interrupt, true);
-  assert.equal(shouldInterrupt({ text: '你刚说什么', isReplyToMe: true, remaining: 2, probability: 0 }, rng1).interrupt, true);
-  // 概率 0：除硬规则外一律不打断
-  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0 }, rng0).interrupt, false);
-  // 概率 0.8：rng=0 掷中、rng=0.999 掷不中
-  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0.8 }, rng0).interrupt, true);
-  assert.equal(shouldInterrupt({ text: '嗯', remaining: 2, probability: 0.8 }, rng1).interrupt, false);
-  // 没有待发气泡时一律不打断
-  assert.equal(shouldInterrupt({ text: '等等', remaining: 0, probability: 1 }, rng0).interrupt, false);
+  assert.equal(shouldInterrupt({ remaining: 0, probability: 0.8 }, rng).interrupt, false);
+  assert.equal(shouldInterrupt({ remaining: 3, probability: 0 }, rng).interrupt, false);
+  assert.equal(calls, 0, '硬边界不该消耗随机数（测试要能钉值）');
+  // 概率 1 = 一律打断（不消耗随机数）
+  assert.equal(shouldInterrupt({ remaining: 2, probability: 1 }, rng).interrupt, true);
+  assert.equal(calls, 0);
+  // 其余按概率掷：0.8 下 rng=0 掷中、rng=0.999 掷不中
+  assert.equal(shouldInterrupt({ remaining: 2, probability: 0.8 }, () => 0).interrupt, true);
+  assert.equal(shouldInterrupt({ remaining: 2, probability: 0.8 }, () => 0.999).interrupt, false);
+  // 内容不参与判定：同一句话、同一概率，结果只由骰子决定
+  assert.equal(shouldInterrupt({ remaining: 1, probability: 0.8 }, () => 0).interrupt, true);
 });
 
 test('发送服务：可打断发送被 interrupt 后剩下的气泡不发，且只回报已发的正文', async () => {

@@ -156,6 +156,14 @@ function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachmen
  */
 const PENDING_WORK_TTL_MS = 30 * 60_000;
 
+/** 重复消息的去重窗口：上一轮刚答过同一句，这段时间内一字不差的重发不再另起一轮 */
+const DUPLICATE_WINDOW_MS = 2 * 60_000;
+
+/** 去重用的正文口径：去掉首尾空白、把连续空白折成一个空格（表情/标点原样保留，不做语义归一） */
+function dupText(text: string): string {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
 export class Pipeline {
   private queues = new Map<string, Promise<void>>();
   private aborts = new Map<string, AbortController>();
@@ -164,6 +172,17 @@ export class Pipeline {
   private queueLens = new Map<string, number>();
   /** 每个会话一条"work 问了还没答"的现场（chatKey → 现场） */
   private pendingWork = new Map<string, PendingAsk>();
+  /**
+   * 每个会话上一轮**真正处理过**的用户输入（去重「同一句话又说了一遍」）。
+   * 2026-10-18 用户反馈：同样两句隔开 2 秒以上再说时，它会像忘了一样从头重答一遍。
+   * 这里记住上一轮的正文与结果，短时间内一字不差的重发不再另起一轮。
+   */
+  private lastTurn = new Map<string, { text: string; at: number; spoke: boolean }>();
+  /**
+   * 重复消息去重窗口（毫秒）：上一轮刚答过同一句，这段时间内一字不差的重发不再另起一轮。
+   * `0` = 关掉去重（测试里同一个群里反复用同一句话触发时用）。
+   */
+  duplicateWindowMs = DUPLICATE_WINDOW_MS;
 
   constructor(
     private plugins: PluginContainer,
@@ -288,12 +307,13 @@ export class Pipeline {
   }
 
   /**
-   * 出站打断：她还在发气泡时对面又开口，按口径把**剩下的气泡**砍掉（2026-10-18 用户裁定）。
+   * 出站打断：她还在一条条发气泡，对面又说话了 —— 把**剩下没发的气泡**砍掉（2026-10-18 用户口径）。
    *
-   * 三条判据（`humanlike/interrupt.ts`）：制止语必断、@/引用必断、其余按 `interrupt.probability`
-   * 掷一次（默认 0.8）。**纯程序**，不叫模型 —— 要求是"对面发完立刻生效"，走一趟模型
-   * 那几条早就发完了。命令不算插话（`/work` 是显式意图，不该把话说一半截断）。
+   * 触发条件只有两件：① 还有气泡没发出去；② 按下 `interrupt.probability`（默认 0.8）掷一次。
+   * **不看内容语义**（不认制止语、不看是不是 @）、不走模型 —— 要求是"对面发完立刻生效"，
+   * 走一趟模型，剩下那几条早就按打字停顿发完了。
    *
+   * 命令（`/work`）是显式意图，不掷骰子：它本身就该立刻执行，顺手把没说完的话截断。
    * 只有 chat 轮的回复登记了在途（`sendScene` 传 `interruptible`）：命令回执、跟屏复读、
    * 桌面端手动发言都打断不到 —— 那些是"必须说完"的话。
    */
@@ -302,14 +322,10 @@ export class Pipeline {
     if (!cfg?.enable) return;
     const pending = this.chat.pendingOutbound(chat);
     if (!pending || pending.remaining <= 0) return;
-    if (isCommandText(event.text)) return;
-    const d = shouldInterrupt({
-      text: event.text,
-      isAtMe: event.isAtMe,
-      isReplyToMe: event.isReplyToMe,
-      remaining: pending.remaining,
-      probability: cfg.probability,
-    });
+    const isCommand = isCommandText(event.text);
+    const d = isCommand
+      ? { interrupt: true, reason: '命令插话' }
+      : shouldInterrupt({ remaining: pending.remaining, probability: cfg.probability });
     if (!d.interrupt) return;
     const r = this.chat.interrupt(chat);
     if (!r) return;
@@ -438,7 +454,21 @@ export class Pipeline {
 
     // ---- Agent 对话轮（多用户消息合并进来时，把它们一起交给模型） ----
     // 整批事件一起带进去：文本由 renderBatch 拼，媒体按各自的来源聚合（附件要跟着批次走，不能只看 carrier）
-    await this.agentTurn(event, role, chatKey, { userText: renderBatch(allowed), batch: allowed });
+    const userText = renderBatch(allowed);
+    // 同一句话短时间内又说了一遍（上一轮已经答过）→ 不再另起一轮重答一遍。
+    // 2026-10-18 用户反馈：隔开 2 秒以上再说同样的两句时，它会像忘了一样从头重答。
+    // 只在上一轮**真说了话**时才拦：上一轮如果没出声（沉默/失败/被打断），重发可能是催它，照常回。
+    const prev = this.lastTurn.get(chatKey);
+    if (prev && prev.spoke && this.duplicateWindowMs > 0 && Date.now() - prev.at <= this.duplicateWindowMs && dupText(userText) === prev.text) {
+      this.sessionLog.append(event.chatId, event.type, {
+        type: 'gate', role: 'system',
+        text: `重复消息（与 ${Math.max(1, Math.round((Date.now() - prev.at) / 1000))} 秒前那轮一字不差），不再重复回答`,
+        data: { decision: 'duplicate_ignored' },
+      });
+      return;
+    }
+    this.lastTurn.set(chatKey, { text: dupText(userText), at: Date.now(), spoke: false });
+    await this.agentTurn(event, role, chatKey, { userText, batch: allowed });
   }
 
   // ---------------- 命令 ----------------
@@ -876,10 +906,19 @@ export class Pipeline {
       if (sent <= 0) return;
       this.humanlike.noteSpoke(chat, sent, sentTexts);
       this.history.pushAssistant(chat, sentTexts.join('\n'));
+      // 故意不标 spoke：被打断的那轮不算"答过了"，同一句重发应该照常回答
       return;
     }
     this.humanlike.noteSpoke(chat, sent > 0 ? sent : 1, bubbles);
     if (historyText.trim()) this.history.pushAssistant(chat, historyText);
+    this.markTurnSpoke(chat);
+  }
+
+  /** 这一轮真说出去了：给上一轮留的「重复消息」现场打上标记（下一句一字不差的重发才拦得住）。
+   *  不动 `at`：窗口从**用户发那句话**算起，否则她答得慢时窗口会被悄悄拉长。 */
+  private markTurnSpoke(chat: { type: 'group' | 'private'; chatId: string }): void {
+    const rec = this.lastTurn.get(`${chat.type}_${chat.chatId}`);
+    if (rec) rec.spoke = true;
   }
 
   /** 按天记消息条数（「用量」页的入站/出站来自这里）。出站由 ChatService 每条回调。
