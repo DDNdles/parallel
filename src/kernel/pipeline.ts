@@ -1,7 +1,9 @@
-import type { ChatEvent, ChatRef, CommandReply, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
+import type { ChatEvent, ChatRef, ChatMessage, CommandReply, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
+import { composeSystem } from './types.ts';
 import type { PluginContainer } from './container.ts';
 import type { AgentLoop, HistoryStore } from './agentloop.ts';
 import type { ChatService } from './services/chat.ts';
+import type { LlmService } from './services/llm.ts';
 import type { MemoryService } from './services/memory.ts';
 import type { SessionLog } from './sessionlog.ts';
 import type { WorkRunner } from './services/work.ts';
@@ -13,11 +15,13 @@ import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
 import { SILENT_MARKER, isSilentScene } from './humanlike/delivery.ts';
 import { shouldInterrupt } from './humanlike/interrupt.ts';
+import { repetitionRetryConstraint } from './humanlike/repetition.ts';
 
 /** 圈内黑话（表达学习）的 hook 面；可选依赖——没接（测试/降级）就整个旁路 */
 interface JargonHook {
   observe(event: ChatEvent): void;
-  sections(chat: import('./types.ts').ChatRef): string | null;
+  /** 给了 recentText 就只注入当前上下文里真出现的词 */
+  sections(chat: import('./types.ts').ChatRef, recentText?: string): string | null;
 }
 /** 跟屏复读（repeat.ts）的 hook 面，同上：没接就旁路 */
 interface RepeatHook {
@@ -167,6 +171,16 @@ function dupText(text: string): string {
 export class Pipeline {
   private queues = new Map<string, Promise<void>>();
   private aborts = new Map<string, AbortController>();
+  /**
+   * 在途轮次的阶段：`generating` = 模型还没吐完；`sending` = 已经开始发气泡。
+   * 生成期打断只 abort 模型（新消息会导致这一轮作废），气泡期打断交给 ChatService。
+   */
+  private turnMeta = new Map<string, {
+    chatKey: string;
+    phase: 'generating' | 'sending';
+    interruptible: boolean;
+    abortReason?: 'user' | 'generation';
+  }>();
   private activeTurns = new Map<string, number>();
   private adminHintAt = new Map<string, number>();
   private queueLens = new Map<string, number>();
@@ -187,6 +201,7 @@ export class Pipeline {
   constructor(
     private plugins: PluginContainer,
     private agentLoop: AgentLoop,
+    private llm: LlmService,
     private history: HistoryStore,
     private chat: ChatService,
     private memory: MemoryService,
@@ -230,6 +245,9 @@ export class Pipeline {
     this.bumpUsage('messages_in');
 
     if (event.type === 'group') {
+      // 黑话观察放在门控之前：她"没接话"的群消息同样要算进频次，否则只学得到被回复的那一小撮。
+      // 观察是同步内存记账，真正的模型判定在后面异步跑。
+      try { this.jargon?.observe(event); } catch { /* 挖词失败不影响消息主流程 */ }
       // 跟屏复读只看真实群消息，放在门控之前：拟人层要不要接话是另一件事
       try { this.repeat?.observe(event); } catch { /* 复读观察出错不影响消息主流程 */ }
       const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
@@ -247,10 +265,10 @@ export class Pipeline {
   /** 拟人层攒够消息后的回调（也用于主动发言轮：events 为空） */
   enqueueBatch(batch: TriggerBatch): void {
     if (!batch.events.length) {
-      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail });
+      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail, gateId: batch.gateId });
       return;
     }
-    this.enqueue(batch.events);
+    this.enqueue(batch.events, { gateId: batch.gateId });
   }
 
   /** 主动发言轮没有真实消息，构造一个只用来承载"哪个会话"的空事件 */
@@ -264,7 +282,7 @@ export class Pipeline {
     };
   }
 
-  private enqueue(events: ChatEvent[], opts: { proactive?: string } = {}): void {
+  private enqueue(events: ChatEvent[], opts: { proactive?: string; gateId?: string } = {}): void {
     const carrier = events[events.length - 1];
     if (!carrier) return;
     const key = `${carrier.type}_${carrier.chatId}`;
@@ -273,6 +291,7 @@ export class Pipeline {
       // 已有轮次在跑：入队（队列长度受限防堆积）
       if (this.queueLen(key) > 5) {
         this.sessionLog.append(carrier.chatId, carrier.type, { type: 'system', role: 'system', text: '消息积压，已丢弃' });
+        this.humanlike.dropGate(carrier, opts.gateId);
         return;
       }
     }
@@ -303,6 +322,8 @@ export class Pipeline {
 
   /** 中断当前轮（桌面端按钮） */
   abortChat(chatId: string): void {
+    const meta = this.turnMeta.get(chatId);
+    if (meta) meta.abortReason = 'user';
     this.aborts.get(chatId)?.abort();
   }
 
@@ -320,9 +341,31 @@ export class Pipeline {
   private maybeInterrupt(chat: ChatRef, event: ChatEvent): void {
     const cfg = this.humanlike.config.interrupt;
     if (!cfg?.enable) return;
+    const isCommand = isCommandText(event.text);
+
+    // ① 模型还在生成：新消息直接 abort 这一轮，已经想了一半的回复整段作废。
+    //    "对面发完立刻生效"只能走 abort；等模型吐完再丢弃，人已经看到延迟了。
+    //    转述轮（work 结果回讲）不登记 interruptible：那是必须说完、也不该被闲聊插掉的话。
+    const turn = this.turnMeta.get(chat.chatId);
+    if (turn && turn.phase === 'generating' && turn.interruptible) {
+      const d = isCommand
+        ? { interrupt: true, reason: '命令插话' }
+        : shouldInterrupt({ remaining: 1, probability: cfg.probability });
+      if (d.interrupt) {
+        turn.abortReason = 'generation';
+        this.aborts.get(chat.chatId)?.abort();
+        this.sessionLog.append(event.chatId, event.type, {
+          type: 'gate', role: 'system',
+          text: `生成期被打断：这一轮回复作废（${d.reason}）`,
+          data: { decision: 'generation_interrupted', reason: d.reason, by: event.userId },
+        });
+        return;
+      }
+    }
+
+    // ② 已经在发气泡：把剩下没发的砍掉（纯程序，零模型调用）。
     const pending = this.chat.pendingOutbound(chat);
     if (!pending || pending.remaining <= 0) return;
-    const isCommand = isCommandText(event.text);
     const d = isCommand
       ? { interrupt: true, reason: '命令插话' }
       : shouldInterrupt({ remaining: pending.remaining, probability: cfg.probability });
@@ -367,14 +410,17 @@ export class Pipeline {
 
   // ---------------------------------------------------------------- 处理
 
-  private async process(events: ChatEvent[], opts: { proactive?: string } = {}): Promise<void> {
+  private async process(events: ChatEvent[], opts: { proactive?: string; gateId?: string } = {}): Promise<void> {
     if (!events.length) return;
     const event = events[events.length - 1];
     const chatKey = `${event.type}_${event.chatId}`;
 
     // 隐藏会话兜底：主动发言轮不经过 submit()，隐藏之前攒下的批次也会流到这里。
     // 静默丢弃、不写会话流（隐藏是主人自己的动作，不需要每轮解释"为什么没说话"）。
-    if (this.chatHidden(event)) return;
+    if (this.chatHidden(event)) {
+      this.humanlike.dropGate(event, opts.gateId);
+      return;
+    }
 
     // ---- 主动发言轮：先过一遍行动容量（HDSI Agency），再进对话轮 ----
     // 容量不足（她在睡觉 / 日程忙 / 距上次主动还没到最小间隔）就不叫模型，省一次调用也少一次打扰。
@@ -401,15 +447,12 @@ export class Pipeline {
     const allowed = events.filter((e) => !this.memory.getProfile(e.userId).blocked);
     if (!allowed.length) {
       this.sessionLog.append(event.chatId, event.type, { type: 'system', role: 'system', text: `黑名单用户 ${event.userId}，忽略` });
+      this.humanlike.dropGate(event, opts.gateId);
       return;
     }
 
-    // 圈内黑话（表达学习）：本群高频词的频次记账在这边走（判定是异步侧端，不阻塞回话）
-    if (this.jargon) {
-      for (const e of allowed) {
-        try { this.jargon.observe(e); } catch { /* 挖词失败不影响消息主流程 */ }
-      }
-    }
+    // 圈内黑话（表达学习）：上面 submit() 已在门控之前观察过，这里不再重复记账；
+    // 只有真正走到对话轮的群消息才需要把"本群词表"拼进 system。
 
     const role = this.resolveRole(event);
     event.role = role;
@@ -465,10 +508,11 @@ export class Pipeline {
         text: `重复消息（与 ${Math.max(1, Math.round((Date.now() - prev.at) / 1000))} 秒前那轮一字不差），不再重复回答`,
         data: { decision: 'duplicate_ignored' },
       });
+      this.humanlike.dropGate(event, opts.gateId);
       return;
     }
     this.lastTurn.set(chatKey, { text: dupText(userText), at: Date.now(), spoke: false });
-    await this.agentTurn(event, role, chatKey, { userText, batch: allowed });
+    await this.agentTurn(event, role, chatKey, { userText, batch: allowed, gateId: opts.gateId });
   }
 
   // ---------------- 命令 ----------------
@@ -620,6 +664,8 @@ export class Pipeline {
       proactive?: boolean;
       /** 本轮合并进来的整批事件（媒体按各自的来源聚合；不给就按 carrier 单事件取） */
       batch?: ChatEvent[];
+      /** 拟人层开口时发的样本回执号（pipeline 用它回报模型最终有没有真说话） */
+      gateId?: string;
     },
   ): Promise<void> {
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
@@ -633,6 +679,8 @@ export class Pipeline {
       (lp) => lp.manifest.category === 'persona' && lp.state === 'loaded' && this.plugins.effectiveEnabled(lp.manifest.id, event.chatId),
     );
     if (tools.length === 0 && !anyToolsInGroup && !anyChatPersona) {
+      // 这一轮不会叫模型：把开口样本回执掉，别让它挂到下一轮
+      this.humanlike.dropGate(event, opts?.gateId);
       if (event.type === 'group' && this.config.config.risk.silentWhenNothingEnabled) {
         if (roleAtLeastRole(role, 'admin')) {
           const last = this.adminHintAt.get(chatKey) ?? 0;
@@ -648,6 +696,12 @@ export class Pipeline {
 
     const ac = new AbortController();
     this.aborts.set(event.chatId, ac);
+    this.turnMeta.set(event.chatId, {
+      chatKey,
+      phase: 'generating',
+      // 转述轮不参与生成期打断：work 的结论必须讲完；普通聊天与主动轮都可以被新消息打断
+      interruptible: !opts?.relay,
+    });
     this.activeTurns.set(chatKey, active + 1);
 
     try {
@@ -724,8 +778,10 @@ export class Pipeline {
         systemSections.push(...this.humanlike.sceneSections(chat));
       }
       // 圈内黑话（472）：本群学来的词与含意，帮 bot 听懂对方；转述轮同样不加。
+      // 只注入当前上下文里真的出现的词（8 个不相干的词每轮塞进去只会让模型硬用）。
       if (!opts?.relay) {
-        const jargonSection = this.jargon?.sections(chat);
+        const recentForJargon = [event.text, ...windowHistory.slice(-8).map((m) => m.content)].join('\n');
+        const jargonSection = this.jargon?.sections(chat, recentForJargon);
         if (jargonSection) systemSections.push({ order: 472, title: 'jargon', text: jargonSection });
       }
       // 有一件活停在这位管理员这里（work 停下来提问了）：让她知道，并在主人随口回答时提醒他走 /work。
@@ -805,22 +861,25 @@ export class Pipeline {
 
       const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 
-      // afterLLM 钩子（persona checker 插槽）
-      let finalReply = reply;
-      for (const lp of this.plugins.list()) {
-        if (lp.state !== 'loaded') continue;
-        if (!this.plugins.effectiveEnabled(lp.manifest.id, event.chatId)) continue;
-        if (!lp.hooks.afterLLM) continue;
-        try {
-          finalReply = await lp.hooks.afterLLM(ctx, finalReply);
-        } catch (e) {
-          this.errors.record('warn', 'plugin', `afterLLM 出错（${lp.manifest.id}）: ${(e as Error).message}`, { pluginId: lp.manifest.id });
-        }
+      // 生成期被新消息打断：模型即使把结果吐完了也整段作废（新消息会成为下一轮的输入）。
+      // abort 是否被 pi-agent-core 立刻兑现因供应商而异，所以这里再兜一层。
+      const turn = this.turnMeta.get(event.chatId);
+      if (turn?.abortReason === 'generation') {
+        this.humanlike.dropGate(event, opts?.gateId);
+        this.sessionLog.append(event.chatId, event.type, {
+          type: 'gate', role: 'system',
+          text: '生成期被打断：模型输出已丢弃，等下一轮',
+          data: { decision: 'generation_aborted' },
+        });
+        return;
       }
+      // afterLLM 钩子（persona checker 插槽）
+      let finalReply = await this.applyAfterLLM(ctx, reply, event);
 
       // 没接模型 / 额度耗尽 / 链全挂会被吞成空回复：这轮一个字不发，只落 gate 条目。
       // 群里出现"没答好请再问一次"式的托词比沉默更伤人设，失败细节都在报错中心与会话流里。
       if (!finalReply.trim()) {
+        this.humanlike.noteTurnOutcome(chat, opts?.gateId, false);
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system', text: '本轮没有产出内容（模型未接入或请求失败），保持沉默',
@@ -831,6 +890,7 @@ export class Pipeline {
 
       // 主动发言轮允许沉默（[silent] 标记 = 模型选择这轮不说话）
       if (opts?.proactive && isSilentScene(finalReply)) {
+        this.humanlike.noteTurnOutcome(chat, opts?.gateId, false);
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system', text: '主动发言：模型选择这次不说话',
@@ -839,10 +899,64 @@ export class Pipeline {
         return;
       }
 
+      // 重复惩罚：冷却词在这条回复里又出现 → 严格重写一次（relay 不重写）。
+      // 重写走独立的一次 llm.chat，不跑第二个 agent loop；期间仍可被新消息 abort。
+      if (!opts?.relay && !isSilentScene(finalReply)) {
+        const hit = this.humanlike.repetitionHit(chat, finalReply);
+        if (hit) {
+          const retried = await this.rewriteRepetition(ctx, finalReply, hit.phrase, event, ac.signal);
+          if (ac.signal.aborted || this.turnMeta.get(event.chatId)?.abortReason === 'generation') {
+            this.humanlike.dropGate(event, opts?.gateId);
+            return;
+          }
+          if (retried && !isSilentScene(retried)) {
+            const checked = await this.applyAfterLLM(ctx, retried, event, false);
+            if (checked.trim() && !isSilentScene(checked)) {
+              const still = this.humanlike.repetitionHit(chat, checked);
+              this.humanlike.noteRepetitionRetry(chat, hit.phrase, !still);
+              this.sessionLog.append(event.chatId, event.type, {
+                type: 'gate', role: 'system',
+                text: `重复惩罚：重写${still ? '后仍含' : '去掉了'}「${hit.phrase}」`,
+                data: {
+                  decision: 'repetition_retry', phrase: hit.phrase, ok: !still,
+                  from: finalReply.slice(0, 200), to: checked.slice(0, 200),
+                },
+              });
+              finalReply = checked;
+            } else {
+              this.humanlike.noteRepetitionRetry(chat, hit.phrase, false);
+              this.sessionLog.append(event.chatId, event.type, {
+                type: 'gate', role: 'system',
+                text: `重复惩罚：重写为空或被判沉默（${hit.phrase}）`,
+                data: { decision: 'repetition_retry', phrase: hit.phrase, ok: false, reason: 'rewrite_empty' },
+              });
+            }
+          } else {
+            this.humanlike.noteRepetitionRetry(chat, hit.phrase, false);
+            this.sessionLog.append(event.chatId, event.type, {
+              type: 'gate', role: 'system',
+              text: `重复惩罚：重写失败，保留原回复（${hit.phrase}）`,
+              data: { decision: 'repetition_retry', phrase: hit.phrase, ok: false, reason: 'rewrite_failed' },
+            });
+          }
+        }
+      }
+
+      // 重写结束、真正进入发送阶段：之后的插话交给气泡级打断，不再 abort 模型
+      if (turn) turn.phase = 'sending';
+
+      // 模型最终有没有真说话：以 afterLLM 之后的可见正文为准。回 [silent] / 空输出都记 0，
+      // 不再把"门开了"当成"模型开口了"（2026-10-18 修）。
+      this.humanlike.noteTurnOutcome(chat, opts?.gateId, !isSilentScene(finalReply));
       await this.sendScene(chat, finalReply, this.quoteTargetOf(event));
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
+      const turn = this.turnMeta.get(event.chatId);
+      // 打断/异常结束：样本丢掉，别把"没来得及回"当成"模型不想回"
+      this.humanlike.dropGate(event, opts?.gateId);
+      // 生成期打断是预期内的事件，不是模型故障：静默收尾，别往报错中心写
+      if (ac.signal.aborted && turn?.abortReason === 'generation') return;
       // 模型请求失败（没接模型/额度不足/链全挂）等异常一律不在群里出声：
       // 原来那句"（处理这条消息时出错了：…）"会把内部报错泄漏给普通群员，改记报错中心。
       this.errors.record('error', 'kernel', `本轮对话处理失败（群里保持沉默）: ${msg}`, {
@@ -855,8 +969,64 @@ export class Pipeline {
     } finally {
       this.activeTurns.set(chatKey, Math.max(0, (this.activeTurns.get(chatKey) ?? 1) - 1));
       this.aborts.delete(event.chatId);
+      this.turnMeta.delete(event.chatId);
       // 重新武装主动发言计时器：这一轮不管说没说话，都从"现在"重新起算静默时长
       this.humanlike.afterTurn(chat);
+    }
+  }
+
+  /** afterLLM 钩子循环：原回复与重复惩罚重写共用；重写只校验，不重复入记忆队列 */
+  private async applyAfterLLM(
+    ctx: LLMRequestContext,
+    reply: string,
+    event: ChatEvent,
+    sideEffects = true,
+  ): Promise<string> {
+    let out = reply;
+    for (const lp of this.plugins.list()) {
+      if (lp.state !== 'loaded') continue;
+      if (!this.plugins.effectiveEnabled(lp.manifest.id, event.chatId)) continue;
+      if (!lp.hooks.afterLLM) continue;
+      try {
+        out = await lp.hooks.afterLLM(ctx, out, { sideEffects });
+      } catch (e) {
+        this.errors.record('warn', 'plugin', `afterLLM 出错（${lp.manifest.id}）: ${(e as Error).message}`, { pluginId: lp.manifest.id });
+      }
+    }
+    return out;
+  }
+
+  /** 重复惩罚的一次重写：带草稿与命中词，只输出正文；不跑第二个 agent loop */
+  private async rewriteRepetition(
+    ctx: LLMRequestContext,
+    draft: string,
+    phrase: string,
+    event: ChatEvent,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const system = composeSystem(ctx.system, [
+      ...(ctx.systemSections ?? []),
+      { order: 463, name: 'repetition-rewrite', text: repetitionRetryConstraint(draft, [phrase]) },
+    ]);
+    const messages: ChatMessage[] = [
+      { role: 'system', content: system },
+      ...ctx.messages,
+      { role: 'assistant', content: draft },
+      { role: 'user', content: `重写上面这条回复：不要出现「${phrase}」，保持原意，短一点；只输出正文，不要解释。` },
+    ];
+    const cap = Math.round(Number(this.config.config.humanlike.outgoing.maxReplyTokens) || 0);
+    try {
+      const resp = await this.llm.chat({
+        model: '',
+        messages,
+        stream: false,
+        signal,
+        ...(cap > 0 ? { maxTokens: cap } : {}),
+      }, { chatId: event.chatId, chain: 'chat' });
+      return String(resp.content ?? '').trim();
+    } catch (e) {
+      this.errors.record('warn', 'provider', `重复惩罚重写失败：${(e as Error).message}`, { chatId: event.chatId });
+      return '';
     }
   }
 
@@ -891,16 +1061,13 @@ export class Pipeline {
     raw: string,
     quoteTarget?: string,
   ): Promise<void> {
-    const { plans, historyText } = await this.humanlike.composeScene(raw);
+    const { plans } = await this.humanlike.composeScene(raw);
     if (!plans.length) {
       this.humanlike.noteSilent(chat);
       return;
     }
     if (quoteTarget) plans[0].segments.unshift({ type: 'reply', data: { id: quoteTarget } });
     const { sent, aborted, sentTexts } = await this.chat.sendPlanned(chat, plans, { interruptible: true });
-    const bubbles = plans
-      .map((p) => p.segments.filter((s) => s.type === 'text').map((s) => String(s.data.text ?? '')).join(''))
-      .filter(Boolean);
     if (aborted) {
       // 一条都没发出去就被打断：不记 spoke（打断不是她的犹豫，不该推进空闲退避），也不回灌历史
       if (sent <= 0) return;
@@ -909,8 +1076,9 @@ export class Pipeline {
       // 故意不标 spoke：被打断的那轮不算"答过了"，同一句重发应该照常回答
       return;
     }
-    this.humanlike.noteSpoke(chat, sent > 0 ? sent : 1, bubbles);
-    if (historyText.trim()) this.history.pushAssistant(chat, historyText);
+    // 只记**真正发出去**的气泡：限速截断时没发的那几条不能算进重复惩罚/节奏签名/历史
+    this.humanlike.noteSpoke(chat, sent > 0 ? sent : 1, sentTexts);
+    if (sentTexts.length) this.history.pushAssistant(chat, sentTexts.join('\n'));
     this.markTurnSpoke(chat);
   }
 

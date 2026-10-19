@@ -961,6 +961,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
                 const n = Number(p[k]);
                 if (Number.isFinite(n)) (cfg.persona as any)[k] = Math.min(hi, Math.max(lo, Math.round(n)));
               }
+              if (typeof p.profileAuto === 'boolean') (cfg.persona as any).profileAuto = p.profileAuto;
+              if (typeof p.midtermSummary === 'boolean') (cfg.persona as any).midtermSummary = p.midtermSummary;
             }
           }
         }
@@ -1098,6 +1100,21 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   const jargon = body.jargon as Record<string, unknown> | undefined;
   if (jargon && typeof jargon === 'object') applyBool(target.jargon, jargon, 'enable');
 
+  // 表达学习（chat 插件后台）：页面只给开关，批次阈值走代码默认值
+  const expression = body.expression as Record<string, unknown> | undefined;
+  if (expression && typeof expression === 'object') applyBool(target.expression, expression, 'enable');
+
+  // 重复惩罚：开关 + 三个数值（窗口/判定条数/冷却）；重写与熔断走代码默认
+  const repetition = body.repetition as Record<string, unknown> | undefined;
+  if (repetition && typeof repetition === 'object') {
+    const t = target.repetition;
+    applyBool(t, repetition, 'enable');
+    let e = applyNum(t, repetition, 'windowMessages', 5, 100, '重复判定窗口'); if (e) return e;
+    e = applyNum(t, repetition, 'minMessages', 2, 10, '重复判定条数'); if (e) return e;
+    e = applyNum(t, repetition, 'cooldownMinutes', 5, 240, '重复冷却分钟'); if (e) return e;
+    if (t.minMessages > t.windowMessages) t.minMessages = t.windowMessages;
+  }
+
   // 跟屏复读（纯程序段）：开关 + 条数/秒数/冷却逐键收，范围在服务端也成立
   const repeat = body.repeat as Record<string, unknown> | undefined;
   if (repeat && typeof repeat === 'object') {
@@ -1154,8 +1171,10 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   if (outgoing && typeof outgoing === 'object') {
     const t = target.outgoing;
     applyBool(t, outgoing, 'splitReplyMessages');
+    applyBool(t, outgoing, 'typingEnabled');
     let e = applyNum(t, outgoing, 'replyMaxCharacters', 20, 2000, '回复最长字符数'); if (e) return e;
     e = applyNum(t, outgoing, 'maxReplyTokens', 0, 8000, '回复 token 上限'); if (e) return e;
+    e = applyNum(t, outgoing, 'bubbleSoftMaxCharacters', 10, 80, '单条气泡目标字数'); if (e) return e;
     e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
     e = applyNum(t, outgoing, 'typingCharactersPerSecond', 1, 100, '打字速度'); if (e) return e;
     e = applyNum(t, outgoing, 'typingMaxDelaySeconds', 0, 120, '单条最长打字等待'); if (e) return e;

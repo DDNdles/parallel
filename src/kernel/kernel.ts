@@ -26,7 +26,10 @@ import { HumanlikeService } from './humanlike/index.ts';
 import {
   JargonService,
   JARGON_SYSTEM,
+  JARGON_MINE_SYSTEM,
   buildJargonPrompt,
+  buildJargonMinePrompt,
+  parseJargonMineReply,
   parseJargonReply,
 } from './humanlike/jargon.ts';
 import { RepeatWatcher } from './humanlike/repeat.ts';
@@ -129,6 +132,19 @@ export class Kernel {
     });
     this.llm = new LlmService(this.config, this.errors, this.db, this.bus);
     this.llbot = new LLBotManager(this.config, this.errors, this.bus, makeLogger);
+    // 拟人层必须先于插件容器装配：createContext 直接把 this.humanlike 传进插件上下文，
+    // 晚了插件拿到的就是 undefined（ctx.humanlike.scheduleOf() 直接炸）。trigger/selfNickname
+    // 等回调都惰性取，真正调用发生在定时器/消息触发时，那时 pipeline 与适配器早已就绪。
+    this.humanlike = new HumanlikeService({
+      config: () => this.config.config.humanlike as unknown as HumanlikeConfig,
+      selfNickname: () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
+      trigger: (batch) => this.pipeline.enqueueBatch(batch),
+      sessionLog: this.sessionLog,
+      bus: this.bus,
+      errors: this.errors,
+      // likelihood 模型的权重与样本池（开口拟合回归），跟 data/ 一起走
+      modelFile: join(this.dataDir, 'gate-model.json'),
+    });
     // agent loop 与 work 子代理执行器需先于插件容器创建（插件 setup 时会取 ctx.work.modelLabel）
     this.agentLoop = new AgentLoop(this.llm, this.sessionLog, this.bus, this.config, this.errors);
     this.workRunner = new WorkRunner(this.agentLoop, this.llm, this.bus, this.db, this.config, this.errors, this.sandbox);
@@ -151,18 +167,6 @@ export class Kernel {
       },
     );
     this.history = new HistoryStore(this.sessionLog, this.config.config.storage.historyLimit);
-    // 拟人层：chat 区行为本身（分段发送 / 接话打分 / 主动发言 / 频率）。
-    // trigger 回调要等到定时器触发才用得上，那时 pipeline 早已装配好，所以这里可以惰性取。
-    this.humanlike = new HumanlikeService({
-      config: () => this.config.config.humanlike as unknown as HumanlikeConfig,
-      selfNickname: () => (this.adapter?.status() as { selfNickname?: string } | undefined)?.selfNickname ?? '',
-      trigger: (batch) => this.pipeline.enqueueBatch(batch),
-      sessionLog: this.sessionLog,
-      bus: this.bus,
-      errors: this.errors,
-      // likelihood 模型的权重与样本池（开口拟合回归），跟 data/ 一起走
-      modelFile: join(this.dataDir, 'gate-model.json'),
-    });
     // 圈内黑话（表达学习）：侧端反事实判定走 chat 链，失败就当没这回事
     this.jargon = new JargonService({
       db: this.db,
@@ -182,6 +186,23 @@ export class Kernel {
             { chatId: '', chain: 'chat' },
           );
           return parseJargonReply(resp.content ?? '');
+        } catch { return null; }
+      },
+      // 中文候选：无分词器时代让模型从一批群消息里挑词，频次/反事实判定仍走同一套
+      mine: async ({ texts }) => {
+        try {
+          const resp = await this.llm.chat(
+            {
+              model: '',
+              messages: [
+                { role: 'system', content: JARGON_MINE_SYSTEM },
+                { role: 'user', content: buildJargonMinePrompt(texts) },
+              ],
+              stream: false,
+            },
+            { chatId: '', chain: 'chat' },
+          );
+          return parseJargonMineReply(resp.content ?? '');
         } catch { return null; }
       },
     });
@@ -213,7 +234,7 @@ export class Kernel {
       return { connected: !!s.connected, selfId: s.selfId ?? '', nickname: s.selfNickname ?? '' };
     });
     this.pipeline = new Pipeline(
-      this.container, this.agentLoop, this.history, this.chat, this.memory, this.sessionLog,
+      this.container, this.agentLoop, this.llm, this.history, this.chat, this.memory, this.sessionLog,
       this.config, this.errors, this.bus, this.db, this.workRunner, this.humanlike,
       (event) => this.resolveRole(event),
       (chatId) => this.adapter.groupName(chatId) || `群${chatId}`,
@@ -301,6 +322,11 @@ export class Kernel {
   /** kernel.rpc：插件经事件总线向内核请求能力（桌面端 commands_visible 走 HTTP 直调，不在此处） */
   private setupKernelRpc(): void {
     this.bus.on('kernel.rpc', (req: any) => {
+      // 并发调用要能对上各自的回执：请求带 id 就在 reply 里原样带回；
+      // 不带 id 的旧调用方（bus.once 监听）不受影响。
+      const reqId = req?.id;
+      const back = (payload: Record<string, unknown>) =>
+        this.bus.emit('kernel.rpc.reply', reqId !== undefined ? { ...payload, reqId } : payload);
       void Promise.resolve()
         .then(async () => {
           const role: Role = req.role ?? 'member';
@@ -380,8 +406,8 @@ export class Kernel {
               throw new Error(`未知内核 RPC: ${req.type}`);
           }
         })
-        .then((data) => this.bus.emit('kernel.rpc.reply', { ok: true, data }))
-        .catch((e) => this.bus.emit('kernel.rpc.reply', { ok: false, error: (e as Error).message }));
+        .then((data) => back({ ok: true, data }))
+        .catch((e) => back({ ok: false, error: (e as Error).message }));
     });
   }
 

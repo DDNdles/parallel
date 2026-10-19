@@ -2,10 +2,22 @@ import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PluginContext, LLMRequestContext, ChatMessage } from '../../kernel/types.ts';
+import type { SessionLogEntry } from '../../kernel/sessionlog.ts';
 import {
   EXTRACT_SYSTEM, buildExtractPrompt, claimTurns, dueGroups, parseFacts, pushTurn, settle,
   type ExtractCfg, type ExtractQueue,
 } from './memory-extract.ts';
+import {
+  EXPRESSION_SYSTEM, buildExpressionPrompt, expressionDue, expressionSection,
+  mergeExpressions, parseExpressions, selectExpressions,
+  EXPRESSION_BATCH_MAX, EXPRESSION_MAX_FAILS, EXPRESSION_QUEUE_MAX,
+  type ExpressionCfg, type ExpressionEntry, type ExpressionMessage, type ExpressionQueue,
+} from './expression.ts';
+import {
+  PROFILE_SYSTEM, MIDTERM_SYSTEM, buildProfilePrompt, buildMidtermPrompt,
+  midtermSection, parseMidterm, parseProfile, profileSection,
+  type MidtermEntry, type MidtermMessage,
+} from './notes.ts';
 
 // ============================================================
 // chat —— 角色化聊天（人格即插件）
@@ -110,6 +122,331 @@ export function setup(ctx: PluginContext): void {
     const selected = ctx.state.get<string>('active_persona', 'auto');
     if (selected && selected !== 'auto' && personas.has(selected)) return selected;
     return String((ctx.config as any)?.persona?.default ?? 'whale-girl');
+  }
+
+  // ---------- 后台学习：表达 / 画像 / 聊天回想 ----------
+  // 三条通道共用「session.log」这一份入站/出站流水：
+  //  - 表达学习：只拿群聊里群友的消息，学「情境 → 说法」；
+  //  - 中期回想：把已经滑出上下文时间窗的聊天压成一段背景摘要；
+  //  - 用户画像：从长期事实生成一段短印象（在记忆提炼成功后刷新）。
+  // 状态落在插件 KV（小、可清、随插件卸载保留），写盘只在 10s 扫描时发生一次。
+
+  const EXPR_STORE_KEY = 'expressions';
+  const EXPR_QUEUE_KEY = 'expression_queue';
+  const MIDTERM_STORE_KEY = 'midterm_notes';
+  const MIDTERM_QUEUE_KEY = 'midterm_queue';
+  const PROFILE_ATTR = 'profile';
+  const PROFILE_GAP_MS = 30 * 60_000;
+  const EXPR_LEARN_GAP_MS = 5 * 60_000;
+  const MIDTERM_GAP_MS = 10 * 60_000;
+  const MIDTERM_MIN_MESSAGES = 24;
+  const MIDTERM_QUEUE_MAX = 120;
+
+  const clampInt = (v: unknown, lo: number, hi: number, def: number) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
+  };
+  const chatKeyOf = (chat: { type: string; chatId: string }) => `${chat.type}_${chat.chatId}`;
+
+  const objOr = <T>(v: T, def: T): T => (v && typeof v === 'object' && !Array.isArray(v) ? v : def);
+  const exprStore = objOr<Record<string, ExpressionEntry[]>>(ctx.state.get(EXPR_STORE_KEY, {}), {});
+  const exprQueue = objOr<ExpressionQueue>(ctx.state.get(EXPR_QUEUE_KEY, {}), {});
+  const midtermStore = objOr<Record<string, MidtermEntry>>(ctx.state.get(MIDTERM_STORE_KEY, {}), {});
+  const midtermQueue = objOr<Record<string, { messages: MidtermMessage[]; lastSummaryAt: number; fails: number }>>(
+    ctx.state.get(MIDTERM_QUEUE_KEY, {}), {},
+  );
+
+  const activeChats = new Set<string>();
+  const runningExpr = new Set<string>();
+  const runningMid = new Set<string>();
+  const profileBusy = new Set<string>();
+  const profileLastAt = new Map<string, number>();
+  let lastProfileSweep = 0;
+  let learningDirty = false;
+  let disposed = false;
+
+  function saveLearning(): void {
+    if (!learningDirty) return;
+    learningDirty = false;
+    try {
+      ctx.state.set(EXPR_STORE_KEY, exprStore);
+      ctx.state.set(EXPR_QUEUE_KEY, exprQueue);
+      ctx.state.set(MIDTERM_STORE_KEY, midtermStore);
+      ctx.state.set(MIDTERM_QUEUE_KEY, midtermQueue);
+    } catch (e) {
+      ctx.log.warn(`学习状态写盘失败：${(e as Error).message}`);
+    }
+  }
+  ctx.onDispose(() => { disposed = true; saveLearning(); });
+
+  function exprCfg(): ExpressionCfg {
+    const p = (ctx.config as any)?.humanlike?.expression ?? {};
+    return {
+      enable: p.enable !== false,
+      minMessages: clampInt(p.minMessages, 4, 200, 20),
+      idleSeconds: clampInt(p.idleSeconds, 0, 3600, 120),
+      maxPerChat: clampInt(p.maxPerChat, 4, 100, 24),
+      injectMax: clampInt(p.injectMax, 1, 10, 4),
+    };
+  }
+  function notesCfg(): { profileAuto: boolean; midtermSummary: boolean } {
+    const p = (ctx.config as any)?.persona ?? {};
+    return { profileAuto: p.profileAuto !== false, midtermSummary: p.midtermSummary !== false };
+  }
+  function contextMinutes(): number {
+    return clampInt((ctx.config as any)?.storage?.contextMinutes, 1, 720, 5);
+  }
+
+  /** 学习素材清洗：去掉引用/记录/媒体占位，命令与纯符号不进入学习 */
+  function learningText(raw: unknown): string {
+    const t = String(raw ?? '')
+      .replace(/\[回复[^\]]*\]/g, ' ')
+      .replace(/\[聊天记录[^\]]*\]/g, ' ')
+      .replace(/\[(?:图片|语音|视频|文件|表情包?|动图|GIF|卡片)[^\]]*\]/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!t || t.length < 2 || t.length > 300) return '';
+    if (t.startsWith('/') || t.startsWith('／')) return '';
+    if (!/[0-9A-Za-z\u4e00-\u9fff]/.test(t)) return '';
+    return t;
+  }
+
+  function markActive(chat: { type: string; chatId: string }): void {
+    activeChats.add(chatKeyOf(chat));
+  }
+
+  /** 取最近的一批、但总字数不超过预算（表达学习用：宁可少学几条，也别把请求顶爆） */
+  function tailByChars<T extends { text: string }>(list: T[], maxChars: number): T[] {
+    const out: T[] = [];
+    let n = 0;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const t = list[i];
+      if (out.length && n + t.text.length > maxChars) break;
+      out.unshift(t);
+      n += t.text.length;
+    }
+    return out;
+  }
+
+  /** 取最旧的一批、但总字数不超过预算（中期回想用：老的先总结，剩下的下一轮继续） */
+  function headByChars<T extends { text: string }>(list: T[], maxChars: number): T[] {
+    const out: T[] = [];
+    let n = 0;
+    for (const t of list) {
+      if (out.length && n + t.text.length > maxChars) break;
+      out.push(t);
+      n += t.text.length;
+    }
+    return out;
+  }
+
+  /** 转述轮（work 结果回讲）不注入"本群说法 / 画像 / 回想"：那轮要讲清楚事，不是闲聊 */
+  function isRelayTurn(req: LLMRequestContext): boolean {
+    for (let i = req.messages.length - 1; i >= 0; i--) {
+      const m = req.messages[i];
+      if (m.role !== 'user') continue;
+      return String(m.content ?? '').includes('【工作子代理');
+    }
+    return false;
+  }
+
+  function observeLearning(entry: SessionLogEntry): void {
+    if (disposed) return;
+    if (entry.type !== 'message_in' && entry.type !== 'message_out') return;
+    if (entry.role !== 'user' && entry.role !== 'assistant') return;
+    const key = `${entry.chatType}_${entry.chatId}`;
+    if (!activeChats.has(key)) return;
+    const text = learningText(entry.text);
+    if (!text) return;
+
+    // 表达学习：只要群聊里群友说的话
+    if (entry.chatType === 'group' && entry.type === 'message_in' && entry.role === 'user' && exprCfg().enable) {
+      const g = exprQueue[key] ?? { messages: [], lastLearnAt: 0, fails: 0 };
+      g.messages.push({
+        ts: Number(entry.ts) || Date.now(),
+        userId: String(entry.userId ?? ''),
+        nickname: String(entry.nickname ?? '') || String(entry.userId ?? '群友'),
+        text,
+      });
+      if (g.messages.length > EXPRESSION_QUEUE_MAX) g.messages.splice(0, g.messages.length - EXPRESSION_QUEUE_MAX);
+      exprQueue[key] = g;
+      learningDirty = true;
+    }
+
+    // 中期回想：入站与出站都收（bot 自己的话也要在背景里对得上）
+    if (notesCfg().midtermSummary) {
+      const g = midtermQueue[key] ?? { messages: [], lastSummaryAt: 0, fails: 0 };
+      g.messages.push({
+        ts: Number(entry.ts) || Date.now(),
+        role: entry.type === 'message_out' ? 'assistant' : 'user',
+        who: entry.type === 'message_out' ? '我' : (entry.nickname || String(entry.userId ?? '') || '群友'),
+        text,
+      });
+      if (g.messages.length > MIDTERM_QUEUE_MAX) g.messages.splice(0, g.messages.length - MIDTERM_QUEUE_MAX);
+      midtermQueue[key] = g;
+      learningDirty = true;
+    }
+
+    // 到达即试着扫一遍：静默/条数门槛在 due 判定里，平时只是一次读内存
+    void sweepExpressions();
+    void sweepMidterm();
+  }
+
+  async function sweepExpressions(): Promise<void> {
+    if (disposed) return;
+    const cfg = exprCfg();
+    if (!cfg.enable) return;
+    const now = Date.now();
+    for (const [key, g] of Object.entries(exprQueue)) {
+      if (runningExpr.has(key)) continue;
+      if (!Array.isArray(g?.messages) || !expressionDue(g.messages, cfg, now)) continue;
+      if (now - (g.lastLearnAt || 0) < EXPR_LEARN_GAP_MS) continue;
+      const snapshot = tailByChars(g.messages.slice(-EXPRESSION_BATCH_MAX), 8000);
+      if (!snapshot.length) continue;
+      runningExpr.add(key);
+      try {
+        const existing = Array.isArray(exprStore[key]) ? exprStore[key] : [];
+        const resp = await ctx.llm.chat({
+          model: '',
+          messages: [
+            { role: 'system', content: EXPRESSION_SYSTEM },
+            { role: 'user', content: buildExpressionPrompt(snapshot, existing.map((e) => e.style)) },
+          ],
+          stream: false,
+        });
+        if (disposed) return;
+        const learned = parseExpressions(resp.content ?? '', existing, 6, now);
+        if (learned.length) {
+          exprStore[key] = mergeExpressions(existing, learned, cfg.maxPerChat);
+          ctx.log.info(`表达学习：${key} 学到 ${learned.length} 条`);
+        }
+        const lastTs = snapshot[snapshot.length - 1].ts;
+        g.messages = g.messages.filter((m) => m.ts > lastTs);
+        g.lastLearnAt = now;
+        g.fails = 0;
+        learningDirty = true;
+      } catch (e) {
+        g.lastLearnAt = now;   // 失败也退避 5 分钟，别每 10s 再打一次
+        g.fails = (g.fails || 0) + 1;
+        if (g.fails >= EXPRESSION_MAX_FAILS) {
+          g.messages.splice(0, Math.ceil(g.messages.length / 2));
+          g.fails = 0;
+        }
+        ctx.log.warn(`表达学习失败（${key}）：${(e as Error).message}`);
+      } finally {
+        runningExpr.delete(key);
+        if (!disposed) {
+          if (!g.messages.length) delete exprQueue[key];
+          saveLearning();
+        }
+      }
+    }
+  }
+
+  async function sweepMidterm(): Promise<void> {
+    if (disposed || !notesCfg().midtermSummary) return;
+    const now = Date.now();
+    // 窗口起点按 2 倍 contextMinutes 保守后移：宁可晚一点总结，也别把模型眼前的消息又还给它
+    const cutoff = now - Math.max(1, contextMinutes()) * 2 * 60_000;
+    for (const [key, g] of Object.entries(midtermQueue)) {
+      if (runningMid.has(key)) continue;
+      if (!Array.isArray(g?.messages) || !g.messages.length) continue;
+      const eligible = g.messages.filter((m) => m.ts <= cutoff);
+      if (eligible.length < MIDTERM_MIN_MESSAGES) continue;
+      const last = eligible[eligible.length - 1];
+      if (now - last.ts < 60_000) continue;
+      if (now - (g.lastSummaryAt || 0) < MIDTERM_GAP_MS) continue;
+      const snapshot = headByChars(eligible, 12000);
+      if (!snapshot.length) continue;
+      runningMid.add(key);
+      try {
+        const previous = midtermStore[key];
+        const resp = await ctx.llm.chat({
+          model: '',
+          messages: [
+            { role: 'system', content: MIDTERM_SYSTEM },
+            { role: 'user', content: buildMidtermPrompt(snapshot, previous) },
+          ],
+          stream: false,
+        });
+        if (disposed) return;
+        const parsed = parseMidterm(resp.content ?? '');
+        const lastTs = snapshot[snapshot.length - 1].ts;
+        if (parsed?.summary) {
+          midtermStore[key] = {
+            summary: parsed.summary,
+            cues: parsed.cues,
+            fromTs: snapshot[0].ts,
+            toTs: lastTs,
+            updatedAt: now,
+          };
+          ctx.log.info(`聊天回想：${key} 总结 ${snapshot.length} 条`);
+        }
+        g.messages = g.messages.filter((m) => m.ts > lastTs);
+        g.lastSummaryAt = now;
+        g.fails = 0;
+        learningDirty = true;
+      } catch (e) {
+        g.lastSummaryAt = now;   // 失败也退避 10 分钟
+        g.fails = (g.fails || 0) + 1;
+        if (g.fails >= 3) {
+          g.messages.splice(0, Math.ceil(g.messages.length / 2));
+          g.fails = 0;
+        }
+        ctx.log.warn(`聊天回想失败（${key}）：${(e as Error).message}`);
+      } finally {
+        runningMid.delete(key);
+        if (!disposed) {
+          if (!g.messages.length) delete midtermQueue[key];
+          saveLearning();
+        }
+      }
+    }
+  }
+
+  async function refreshProfile(userId: string, now = Date.now()): Promise<void> {
+    if (disposed || !notesCfg().profileAuto) return;
+    if (!userId || profileBusy.has(userId)) return;
+    const prev = ctx.memory.getAttr<{ text?: string; at?: number }>(userId, PROFILE_ATTR);
+    // 内存里的节流 + 落库时间一起看：插件重载后不会把刚生成的画像再花一次模型重做
+    const lastAt = Math.max(profileLastAt.get(userId) ?? 0, Number(prev?.at) || 0);
+    if (now - lastAt < PROFILE_GAP_MS) return;
+    const facts = ctx.memory.topFacts(userId, 20);
+    if (facts.length < 3) return;
+    profileBusy.add(userId);
+    profileLastAt.set(userId, now);
+    try {
+      const resp = await ctx.llm.chat({
+        model: '',
+        messages: [
+          { role: 'system', content: PROFILE_SYSTEM },
+          { role: 'user', content: buildProfilePrompt(facts.map((f) => f.content), prev?.text) },
+        ],
+        stream: false,
+      });
+      if (disposed) return;
+      const text = parseProfile(resp.content ?? '');
+      if (text) {
+        ctx.memory.setAttr(userId, PROFILE_ATTR, { text, at: now, facts: facts.length });
+        ctx.log.info(`用户画像：${userId} 已更新`);
+      }
+    } catch (e) {
+      ctx.log.warn(`用户画像生成失败（${userId}）：${(e as Error).message}`);
+    } finally {
+      profileBusy.delete(userId);
+    }
+  }
+
+  async function sweepProfiles(): Promise<void> {
+    if (disposed || !notesCfg().profileAuto) return;
+    const now = Date.now();
+    if (now - lastProfileSweep < 10 * 60_000) return;
+    lastProfileSweep = now;
+    for (const u of ctx.memory.listUsers().slice(0, 50)) {
+      if (disposed) break;
+      if (u.blocked) continue;
+      await refreshProfile(u.userId, Date.now());
+    }
   }
 
   // ---------- 工具 ----------
@@ -292,6 +629,7 @@ export function setup(ctx: PluginContext): void {
     if (!persona) return req;
     const userId = req.event.userId;
     const role = req.event.role ?? 'member';
+    markActive(req.chat);
 
     // 设定层按 HDSI 分层追加到 systemSections，各自独立节
     // （不整体覆盖 system：内核固定节——身份/会话/回复风格/剧本体/信任边界/压缩说明——全部保留）
@@ -374,14 +712,47 @@ export function setup(ctx: PluginContext): void {
       });
     }
     if (voice.post_history?.trim()) {
-      sections.push({
-        order: 280,
-        title: 'post-history',
-        text: voice.post_history.trim(),
-      });
+      // 2026-10-18 反重复：当前 canon 的 protagonist 与 post_history 是同一整段，
+      // 逐字注入两次会把「梁文峰」这类人设名字强化两遍。归一化后相同/互为子串就跳过尾部强化；
+      // 以后把 post_history 改成真正的短强化语时照常注入。
+      const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase();
+      const post = norm(voice.post_history.trim());
+      const main = norm(canon.protagonist.join('\n'));
+      const duplicate = !!post && (post === main || main.includes(post) || post.includes(main));
+      if (!duplicate) {
+        sections.push({
+          order: 280,
+          title: 'post-history',
+          text: voice.post_history.trim(),
+        });
+      }
     }
 
     // 变量区（≥450，每一轮都可能变的前置排完，稳定前缀吃到这一节为止）：
+
+    // 458 用户画像：当前发言者的背景印象（不是事实列表；事实仍走 recall_facts 现查）
+    const relayTurn = isRelayTurn(req);
+    if (!relayTurn && notesCfg().profileAuto) {
+      const prof = ctx.memory.getAttr<{ text?: string }>(userId, PROFILE_ATTR);
+      const text = profileSection(prof?.text ?? '');
+      if (text) sections.push({ order: 458, title: 'user-profile', text });
+    }
+
+    // 465 中期回想：已经滑出时间窗的那段聊天，只当背景
+    if (!relayTurn && notesCfg().midtermSummary) {
+      const text = midtermSection(midtermStore[chatKeyOf(req.chat)]);
+      if (text) sections.push({ order: 465, title: 'midterm-recall', text });
+    }
+
+    // 474 表达学习：本群真实出现过的说法，参考口吻，不照抄
+    if (!relayTurn && exprCfg().enable) {
+      const entries = exprStore[chatKeyOf(req.chat)] ?? [];
+      if (Array.isArray(entries) && entries.length) {
+        const recent = [req.event.text, ...req.messages.slice(-8).map((m) => m.content)].join('\n');
+        const text = expressionSection(selectExpressions(entries, recent, exprCfg().injectMax));
+        if (text) sections.push({ order: 474, title: 'expressions', text });
+      }
+    }
 
     // Lore：关键词命中的世界事实（常驻 + 命中）——按轮命中，是变量
     const recentText = [req.event.text, ...req.messages.slice(-8).map((m) => m.content)].join('\n');
@@ -412,7 +783,7 @@ export function setup(ctx: PluginContext): void {
 
   // ---------- afterLLM：L6 输出校验插槽 ----------
 
-  ctx.hooks.afterLLM = (req: LLMRequestContext, reply: string): string => {
+  ctx.hooks.afterLLM = (req: LLMRequestContext, reply: string, opts?: { sideEffects?: boolean }): string => {
     // 规则式轻校验：阻止配置内容外泄的兜底（LLM 校验器插槽留待接入轻量模型）
     let out = reply;
     const leakPatterns = [
@@ -428,7 +799,8 @@ export function setup(ctx: PluginContext): void {
       }
     }
     // TODO: L6 完整实现——用轻量模型按人设卡核对语气/称呼/越界内容后重写
-    queueTurn(req, out);
+    // 重复惩罚的重写只借用校验；原回复已经入过队，别把重写再算一轮记忆
+    if (opts?.sideEffects !== false) queueTurn(req, out);
     return out;
   };
 
@@ -438,10 +810,6 @@ export function setup(ctx: PluginContext): void {
   // 与上下文压缩同一条思路：原文不长期留着，摘要进可检索的库，用的时候现查。
 
   const MEMQ_KEY = 'memory_queue';
-  const clampInt = (v: unknown, lo: number, hi: number, def: number) => {
-    const n = Math.round(Number(v));
-    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
-  };
   function memCfg(): ExtractCfg {
     const p = (ctx.config as any)?.persona ?? {};
     return {
@@ -489,7 +857,11 @@ export function setup(ctx: PluginContext): void {
         const facts = parseFacts(resp.content ?? '', existing, cfg.maxFacts);
         for (const c of facts) ctx.memory.addFact(g.userId, { content: c, sourceChat: g.chatId, weight: AUTO_FACT_WEIGHT });
         ok = true;
-        if (facts.length) ctx.log.info(`自动记忆：为 ${g.userId} 记下 ${facts.length} 条`);
+        if (facts.length) {
+          ctx.log.info(`自动记忆：为 ${g.userId} 记下 ${facts.length} 条`);
+          // 事实变了就顺手刷新画像（内部有 30 分钟节流；失败不影响记忆主流程）
+          void refreshProfile(g.userId);
+        }
       } catch (e) {
         ctx.log.warn(`自动记忆提炼失败（${g.userId}，第 ${g.fails + 1} 次）：${(e as Error).message}`);
       }
@@ -590,6 +962,40 @@ export function setup(ctx: PluginContext): void {
       done(false, (e as Error).message);
     }
   });
+
+  // ---------- 后台学习接线 ----------
+  // onChatMessage 只在本插件对这群生效时触发；用它把"活跃会话"圈出来，
+  // 后续 session.log 再按这个集合过滤——不学没在聊的群，也不替别人攒数据。
+  ctx.hooks.onChatMessage = (event) => { markActive(event); };
+  // 群里把 chat 插件关掉后就不再学习：activeChats 只是"学习范围"，不是权限本身，
+  // 但它不清会让关掉的群继续被后台摘要/学说法。
+  ctx.on('plugin.state_changed', (p: { id?: string; chatId?: string; enabled?: boolean }) => {
+    if (p?.id !== 'chat') return;
+    if (!p.chatId) { activeChats.clear(); return; }
+    activeChats.delete(`group_${p.chatId}`);
+    activeChats.delete(`private_${p.chatId}`);
+    if (p.enabled === false && p.chatId) {
+      // 关掉就停学：丢掉未消化的队列；已经学到的说法/回想留着，重新打开还能用
+      delete exprQueue[`group_${p.chatId}`];
+      delete midtermQueue[`group_${p.chatId}`];
+      delete midtermQueue[`private_${p.chatId}`];
+      learningDirty = true;
+      saveLearning();
+    }
+  });
+  ctx.on('session.log', (entry: SessionLogEntry) => {
+    try { observeLearning(entry); } catch (e) {
+      ctx.log.warn(`学习观察失败：${(e as Error).message}`);
+    }
+  });
+  // 10s 一拍：只做内存判定（条数/静默/间隔），到点才发模型请求；学习状态顺带落盘。
+  ctx.setInterval(() => {
+    void sweepExpressions();
+    void sweepMidterm();
+    saveLearning();
+  }, 10_000);
+  ctx.setTimeout(() => { void sweepProfiles(); }, 30_000);
+  ctx.setInterval(() => { void sweepProfiles(); }, 10 * 60_000);
 
   ctx.state.set('_personas_ready', true);
 }

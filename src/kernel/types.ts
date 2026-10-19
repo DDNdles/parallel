@@ -245,8 +245,8 @@ export interface PluginHooks {
    * 只有 work 轮会跑这条链；chat 轮跑 beforeLLM。插件往 req.systemSections 里 push 自己的节。
    */
   beforeWorkLLM?(req: LLMRequestContext): Promise<LLMRequestContext> | LLMRequestContext;
-  /** 模型产出后、发送前：可校验/改写 */
-  afterLLM?(req: LLMRequestContext, reply: string): Promise<string> | string;
+  /** 模型产出后、发送前：可校验/改写。`sideEffects:false` 用于重复惩罚重写——只校验，不重复入记忆队列。 */
+  afterLLM?(req: LLMRequestContext, reply: string, opts?: { sideEffects?: boolean }): Promise<string> | string;
   /** 插件卸载前最后清理机会 */
   onUnload?(): void | Promise<void>;
 }
@@ -572,7 +572,7 @@ export interface ProtocolEnd {
 
 export interface GatedMemory {
   getProfile(userId: string): UserProfile;
-  addFact(userId: string, fact: { content: string; ttlDays?: number; weight?: number }): void;
+  addFact(userId: string, fact: { content: string; sourceChat?: string; ttlDays?: number; weight?: number }): void;
   searchFacts(userId: string, query: string, limit?: number): UserFact[];
   topFacts(userId: string, limit?: number): UserFact[];
   getAttr<T = unknown>(userId: string, key: string): T | undefined;

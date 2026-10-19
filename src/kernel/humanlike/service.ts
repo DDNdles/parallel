@@ -33,7 +33,18 @@ import {
   type GateWeights,
 } from './likelihood.ts';
 import { backoffBypassed, burstGatePenalty, idleBackoffSeconds, talkValueFor } from './frequency.ts';
-import { isSilentScene, normalizeVisibleContent, splitIntoBubbles, trimAtSentence, typingDelayMs } from './delivery.ts';
+import {
+  activeAntiRepeat,
+  detectRepetition,
+  markRepetitionNudged,
+  markRepetitionRetry,
+  repetitionHitInText,
+  repetitionNudgeDue,
+  repetitionSection,
+  touchAntiRepeat,
+  type AntiRepeatEntry,
+} from './repetition.ts';
+import { MAX_BUBBLES, isSilentScene, normalizeVisibleContent, splitIntoBubbles, trimAtSentence, typingDelayMs } from './delivery.ts';
 import { detectCollapse, rhythmNudge, rhythmSignature } from './rhythm.ts';
 import { deriveWindow, evaluateAgency, nextRecheckAt, type ProactiveContactCandidate } from './agency.ts';
 import { currentActivity, emptyPlan, prunePlan, schedulePrompt, type SchedulePlan } from './schedule.ts';
@@ -63,12 +74,16 @@ interface ChatState {
   consecutiveNoAction: number;
   backoffUntil: number;
   lastWaitLoggedAt: number;
-  /** 当前被"专注"的会话（focusMode） */
-  focused: boolean;
   /** 最近若干轮的「节奏签名」（HDSI ChatRhythm 的窗口） */
   rhythmSigs: string[];
   /** 连续注入了提示但节奏没变好的次数（熔断用） */
   rhythmExhausted: number;
+  /** 最近 bot 实际说出去的整轮文本（重复惩罚用；每轮一条） */
+  selfTexts: { at: number; text: string }[];
+  /** 最近入站文本（重复惩罚用：群里也在聊的词不罚） */
+  inboundTexts: { at: number; text: string }[];
+  /** 重复惩罚的冷却状态（词 → 冷却/连击） */
+  antiRepeat: AntiRepeatEntry[];
   /** 日程计划（HDSI Schedule Preplan；写入入口已删，只剩读取与容量判断） */
   schedule: SchedulePlan;
   /** 上一次主动开口的时间（HDSI 用最小间隔挡频繁主动） */
@@ -77,6 +92,11 @@ interface ChatState {
   gateThreshold: number;
   /** likelihood 模式：最近 20 分钟的评估/开口记录（阈值控制器用） */
   gateDecisions: { at: number; spoke: boolean }[];
+  /**
+   * likelihood 的待回执样本（gateId → 特征）。开口那一刻只登记、不落样本；
+   * 等 pipeline 把「模型最终有没有真说话」回报回来才记 y。避免把 [silent]/失败也记成开口。
+   */
+  pendingGates: Map<string, { feats: GateFeatures; at: number; frequency: number }>;
 }
 
 const INTERVAL_SAMPLE = 20;
@@ -148,10 +168,10 @@ export class HumanlikeService {
         recent: [], intervals: [],
         lastInboundAt: 0, lastSpokeAt: 0,
         consecutiveNoAction: 0, backoffUntil: 0, lastWaitLoggedAt: 0,
-        focused: false,
         rhythmSigs: [], rhythmExhausted: 0,
+        selfTexts: [], inboundTexts: [], antiRepeat: [],
         schedule: emptyPlan(), lastProactiveAt: 0,
-        gateThreshold: GATE_THRESHOLD_INIT, gateDecisions: [],
+        gateThreshold: GATE_THRESHOLD_INIT, gateDecisions: [], pendingGates: new Map(),
       };
       this.states.set(k, s);
     }
@@ -172,23 +192,28 @@ export class HumanlikeService {
 
     // 统计：平均间隔 + 存在感窗口（命令也计入群节奏，因为它同样是"群里有动静"）
     this.recordInbound(st, now);
+    // 重复惩罚的入站对照：命令不算"群里在聊这个词"
+    if (!opts.isCommand) this.recordInboundText(st, now, event.text);
 
     // 命令是显式意图，任何时候都不参与拟人化门控
     if (opts.isCommand) return { action: 'pass', events: [event], merged: false };
     // 私聊：**必回，但同样攒批**（2026-10-18 用户裁定）。
     // 打分与开口判定一概不做（私聊频率只影响主动发言，这条语义不变），只借合批那一层：
     // 对面连发三句是一件事，不该拆成三轮、每轮各起一组气泡（实测每条入站一个请求、
-    // 平均 3.07 条气泡）。攒够 windowMs + 起跳延时后一次性交出去；只有一条时与旧的秒回等价。
+    // 平均 3.07 条气泡）。攒够 windowMs 就一次性交出去（不起跳：起跳抖动只属于群聊）；
+    // 只有单条时与旧的秒回等价。
     if (event.type === 'private') {
       if (!cfg.merge.enable) return { action: 'pass', events: [event], merged: false };
       const chat: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
       st.buffer.push(event);
       if (!st.firstBufferedAt) st.firstBufferedAt = now;
       if (st.debounce) clearTimeout(st.debounce);
+      // 攒批只为拼请求，**不起跳**（2026-10-19 用户裁定）：私聊单独一条也要快，
+      // 群聊那 0.5~2s 起跳抖动只属于群聊门控。攒够 windowMs 就交出去。
       st.debounce = this.timer(() => {
         st.debounce = undefined;
         this.flushPrivate(chat, st);
-      }, cfg.merge.windowMs + this.fireJitter(cfg));
+      }, cfg.merge.windowMs);
       // 兜底与群聊同一把尺子：从第一条起最多攒 maxWaitMs
       if (!st.maxWait) {
         st.maxWait = this.timer(() => {
@@ -202,22 +227,25 @@ export class HumanlikeService {
 
     const hasAt = event.isAtMe;
     const hasMention = this.mentioned(event);
+    const chatRef: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
 
     // 被 @ 必回：立刻放行，但把已经攒着的消息一起带上（让模型看到完整上下文）
     if (hasAt && cfg.timing.inevitableAtReply) {
       const merged = this.bufferLen(st) > 0;
       const events = this.drain(st, event);
-      this.armIdleTimer({ platform: event.platform, type: event.type, chatId: event.chatId }, st, cfg);
+      this.noteForcedTurn(chatRef);
+      this.armIdleTimer(chatRef, st, cfg);
       return { action: 'pass', events, merged };
     }
     if (hasMention && cfg.timing.mentionedBotReply) {
       const merged = this.bufferLen(st) > 0;
       const events = this.drain(st, event);
-      this.armIdleTimer({ platform: event.platform, type: event.type, chatId: event.chatId }, st, cfg);
+      this.noteForcedTurn(chatRef);
+      this.armIdleTimer(chatRef, st, cfg);
       return { action: 'pass', events, merged };
     }
 
-    this.armIdleTimer({ platform: event.platform, type: event.type, chatId: event.chatId }, st, cfg);
+    this.armIdleTimer(chatRef, st, cfg);
 
     if (!cfg.merge.enable) {
       // 不合并时仍然逐个走门控：攒 1 条就评估
@@ -275,7 +303,8 @@ export class HumanlikeService {
   }
 
   /**
-   * 合批关窗后的随机起跳延时（毫秒）：默认 0.5~2 秒。
+   * 合批关窗后的随机起跳延时（毫秒）：默认 0.5~2 秒。**只用于群聊门控**——
+   * 私聊攒批不起跳（单独一条也要快，关即处理）。
    * 等待期间新来的消息会重置防抖窗口（= 群里还在刷，她继续看戏），@/提及仍然直通。
    */
   private fireJitter(cfg: HumanlikeConfig): number {
@@ -331,6 +360,15 @@ export class HumanlikeService {
     }
     const chat: ChatRef = { platform: carrier.platform, type: carrier.type, chatId: carrier.chatId };
 
+    // 专注模式（setting: timing.focusMode）：普通群聊不参与打分，只接 @/提及。
+    // 不是"开口过一次就永久 focus"——那个旧行为（st.focused=true 从不复位）已在 2026-10-18 删掉。
+    // 仍然保留 TTL 清理：@/提及来了会把还没过期的攒货一起带上。
+    if (cfg.timing.focusMode && carrier.type === 'group' && !hasAt && !hasMention) {
+      this.armRecheck(carrier, st, 30_000);
+      this.logWait(carrier, st, '专注模式：普通群聊不参与打分，只接 @/提及');
+      return;
+    }
+
     const pending = st.buffer.length;
     const idleSeconds = st.lastInboundAt ? Math.max(0, (now - st.lastInboundAt) / 1000) : 0;
     const avgInterval = this.averageInterval(st);
@@ -369,7 +407,6 @@ export class HumanlikeService {
       hasAt,
       hasMention,
       isGroupChat: carrier.type === 'group',
-      focusActive: st.focused,
       recentSelfReplies: recentSelf,
       recentWindowMessages: recentTotal,
       effectiveFrequency: frequency,
@@ -397,8 +434,14 @@ export class HumanlikeService {
       : null;
     // 轰炸降频：刷屏时把开口门槛抬起来（只作用于 likelihood；对照模式口径冻结）
     const burst = likelihood ? this.burstPenalty(st, now) : 0;
-    const gate = st.gateThreshold + burst;
-    const mainGate = mode === 'frequency'
+    // 频率直接进门槛：talkValue 不再是"模型特征里权重 0.55 的一项"。
+    // 1 = 不偏移；越低门槛越高（0 直接静默），让设置页的频率旋钮真的变安静。
+    const freq = Math.min(1, Math.max(0, Number(frequency) || 0));
+    const freqOffset = (1 - freq) * 0.4;
+    const gate = st.gateThreshold + burst + freqOffset;
+    // talkValue=0 = 这个会话现在不说话（@/提及仍由上面的硬规则直通）
+    const silentByFrequency = freq <= 0;
+    const mainGate = silentByFrequency ? false : mode === 'frequency'
       ? pending >= cfg.timing.pendingThreshold
       : likelihood
         ? likelihood.p >= gate
@@ -411,9 +454,9 @@ export class HumanlikeService {
       detail = mode === 'frequency'
         ? `pending=${pending} >= ${cfg.timing.pendingThreshold}`
         : likelihood
-          ? `P=${likelihood.p.toFixed(2)} ≥ ${gate.toFixed(2)}${burst > 0 ? `（含轰炸 +${burst.toFixed(2)}）` : ''}｜${scored.detail}`
+          ? `P=${likelihood.p.toFixed(2)} ≥ ${gate.toFixed(2)}${burst > 0 ? `（含轰炸 +${burst.toFixed(2)}）` : ''}${freqOffset > 0 ? `（含频率 +${freqOffset.toFixed(2)}）` : ''}｜${scored.detail}`
           : scored.detail;
-    } else if (comp.reached) {
+    } else if (!silentByFrequency && comp.reached) {
       reason = 'idle';
       detail = `${comp.detail}｜必要性 ${scored.detail}`;
     }
@@ -422,20 +465,25 @@ export class HumanlikeService {
       const events = this.drain(st);
       st.consecutiveNoAction = 0;
       st.backoffUntil = 0;
-      st.focused = true;
       st.lastSpokeAt = now;
       this.absorbSelf(st, now);
+      // likelihood 的样本先挂起：等 pipeline 回报"模型最终有没有真说话"再记 y。
+      // 旧行为是门一开就记 y=1，模型回 [silent] 也记成开口——那学的是门控自己。
+      const gateId = likelihood ? this.newGateId() : undefined;
+      if (likelihood && gateId) {
+        st.pendingGates.set(gateId, { feats: likelihood.feats, at: now, frequency: freq });
+        while (st.pendingGates.size > 8) st.pendingGates.delete(st.pendingGates.keys().next().value as string);
+      }
       this.opts.sessionLog.append(carrier.chatId, carrier.type, {
         type: 'gate', role: 'system',
         text: `开口（${reason}）：${detail}`,
         data: {
           reason, detail, score: scored.score, pending, frequency,
-          ...(likelihood ? { p: Number(likelihood.p.toFixed(3)), gate: Number(st.gateThreshold.toFixed(3)) } : {}),
+          ...(likelihood ? { p: Number(likelihood.p.toFixed(3)), gate: Number(gate.toFixed(3)) } : {}),
+          ...(gateId ? { gateId } : {}),
         },
       });
-      // 开口也要给样本池记 y=1，并让阈值控制器抬头（说过头了自动收敛）
-      if (likelihood) this.recordGate(st, now, true, likelihood.feats);
-      this.opts.trigger({ chat, events, reason, detail });
+      this.opts.trigger({ chat, events, reason, detail, gateId });
       return;
     }
 
@@ -479,15 +527,20 @@ export class HumanlikeService {
 
   // ------------------------------------------------------------ 拟合闭环（likelihood 模式）
 
+  private gateSeq = 0;
+  private newGateId(): string {
+    return `g_${++this.gateSeq}_${this.now().toString(36)}`;
+  }
+
   /**
    * 一次 likelihood 评估的记账：样本池 + 阈值控制器。
    * 阈值只在「沉默」一侧收放：开口方向靠控制器看窗口里的开口次数（说过头就在下一次评估时上抬），
    * 窗口径「最近 20 分钟」——刚好压得住热群，也放得开冷群。
+   * `decisionAt` 用评估时刻，而不是回执时刻（模型可能跑了几十秒，窗口不该被悄悄拉长）。
    */
-  private recordGate(st: ChatState, now: number, spoke: boolean, feats: GateFeatures): void {
-    st.gateDecisions.push({ at: now, spoke });
-    const cut = now - 20 * 60_000;
-    while (st.gateDecisions.length && st.gateDecisions[0].at < cut) st.gateDecisions.shift();
+  private recordGate(st: ChatState, now: number, spoke: boolean, feats: GateFeatures, decisionAt = now): void {
+    st.gateDecisions.push({ at: decisionAt, spoke });
+    this.trimGateDecisions(st, now);
 
     this.gateRows.push(gateSampleOf(feats, spoke ? 1 : 0));
     if (this.gateRows.length > GATE_ROW_CAP) this.gateRows.splice(0, this.gateRows.length - GATE_ROW_CAP);
@@ -498,6 +551,43 @@ export class HumanlikeService {
       const adj = nextGateThreshold(st.gateThreshold, win);
       if (adj.changed) st.gateThreshold = adj.next;
     }
+  }
+
+  private trimGateDecisions(st: ChatState, now: number): void {
+    const cut = now - 20 * 60_000;
+    while (st.gateDecisions.length && st.gateDecisions[0].at < cut) st.gateDecisions.shift();
+  }
+
+  /**
+   * 被 @/提及强制触发的一次回复：只计入 20 分钟窗口的"开口额"，不进训练样本。
+   * 这就是 MaiBot 把 @ 强制轮按预算折进动态门的那一层——@ 多了，后面主动接话就该收一点。
+   */
+  noteForcedTurn(chat: ChatRef): void {
+    if (this.config.timing.replyTriggerMode !== 'likelihood') return;
+    const st = this.state(chat);
+    const now = this.now();
+    st.gateDecisions.push({ at: now, spoke: true });
+    this.trimGateDecisions(st, now);
+  }
+
+  /**
+   * 回合结束回执：模型最终有没有真说话。只有拿到这个回执才落 y，
+   * 模型回 [silent]、空输出、失败都不再被记成"开口"。
+   */
+  noteTurnOutcome(chat: ChatRef, gateId: string | undefined, spoke: boolean): void {
+    if (!gateId) return;
+    const st = this.state(chat);
+    const p = st.pendingGates.get(gateId);
+    if (!p) return;
+    st.pendingGates.delete(gateId);
+    if (this.config.timing.replyTriggerMode !== 'likelihood') return;
+    this.recordGate(st, this.now(), spoke, p.feats, p.at);
+  }
+
+  /** 这一轮被打断/异常结束：样本直接丢掉，不把"没来得及回"当成模型不想回 */
+  dropGate(chat: ChatRef, gateId: string | undefined): void {
+    if (!gateId) return;
+    this.state(chat).pendingGates.delete(gateId);
   }
 
   private gateWindowOf(st: ChatState, now: number): { evaluations: number; spoke: number } {
@@ -589,7 +679,27 @@ export class HumanlikeService {
       const cfg = this.config.rhythm;
       st.rhythmSigs.push(rhythmSignature(bubbles));
       while (st.rhythmSigs.length > Math.max(5, cfg.historyLimit)) st.rhythmSigs.shift();
+      // 重复惩罚按"轮"记：一轮多条气泡合成一条，避免一次回复里多说两遍就被算成两轮。
+      const said = bubbles.map((b) => String(b ?? '').trim()).filter(Boolean).join('\n');
+      if (said) {
+        st.selfTexts.push({ at: now, text: said.slice(0, 300) });
+        this.trimTexts(st.selfTexts, now);
+      }
     }
+  }
+
+  /** 重复惩罚的最终回复检查：只在当前生效的冷却词里找，不重新扫全量 */
+  repetitionHit(chat: ChatRef, reply: string): { phrase: string } | null {
+    const cfg = this.config.repetition;
+    if (!cfg.enable || !cfg.retry) return null;
+    const hit = repetitionHitInText(reply, this.state(chat).antiRepeat, this.now());
+    return hit ? { phrase: hit.phrase } : null;
+  }
+
+  /** 重写回执：成功解除冷却；失败累加 strike，到上限后不再重写 */
+  noteRepetitionRetry(chat: ChatRef, phrase: string, ok: boolean): void {
+    const st = this.state(chat);
+    st.antiRepeat = markRepetitionRetry(st.antiRepeat, phrase, ok, this.now(), this.config.repetition);
   }
 
   /** 主动开口记一笔（HDSI Agency 的最小间隔判据要用） */
@@ -618,6 +728,27 @@ export class HumanlikeService {
         out.push({ order: 460, title: 'rhythm', text: rhythmNudge(r.detail, cfg.rhythm.mode) });
       } else if (st.rhythmExhausted > 0) {
         st.rhythmExhausted = 0;       // 节奏变好了，解除熔断计数
+      }
+    }
+
+    // 462 重复提醒（词面级，和上面的结构级 rhythm 互补）
+    if (cfg.repetition.enable) {
+      const hits = detectRepetition(st.selfTexts, st.inboundTexts, cfg.repetition);
+      st.antiRepeat = hits.length
+        ? touchAntiRepeat(st.antiRepeat, hits, now, cfg.repetition)
+        : st.antiRepeat.filter((e) => e.untilAt > now);
+      const active = activeAntiRepeat(st.antiRepeat, now);
+      if (active.length && repetitionNudgeDue(st.antiRepeat, now)) {
+        const text = repetitionSection(active, Math.min(cfg.repetition.windowMessages, st.selfTexts.length));
+        if (text) {
+          out.push({ order: 462, title: 'repetition', text });
+          st.antiRepeat = markRepetitionNudged(st.antiRepeat, now);
+          this.opts.sessionLog.append(chat.chatId, chat.type, {
+            type: 'gate', role: 'system',
+            text: `重复提醒：${active.slice(0, 3).map((e) => e.phrase).join('、')}`,
+            data: { decision: 'repetition_nudge', phrases: active.slice(0, 3).map((e) => e.phrase) },
+          });
+        }
       }
     }
 
@@ -674,12 +805,6 @@ export class HumanlikeService {
     this.armIdleTimer(chat, st, this.config);
   }
 
-  /** 让某个会话参与/退出 focus（focusMode 打开时只有一个会话被专注） */
-  setFocus(chat: ChatRef, on: boolean): void {
-    const st = this.state(chat);
-    st.focused = on;
-  }
-
   // ------------------------------------------------------------ 出站塑形
 
   /**
@@ -723,7 +848,7 @@ export class HumanlikeService {
     const t = trimAtSentence(normalizeVisibleContent(text, out.maxMessageCharacters), out.replyMaxCharacters);
     if (!t) return [];
     if (out.splitReplyMessages === false) return [t];
-    return splitIntoBubbles(t);
+    return splitIntoBubbles(t, MAX_BUBBLES, out.bubbleSoftMaxCharacters);
   }
 
   /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久 */
@@ -731,7 +856,7 @@ export class HumanlikeService {
     const cfg = this.config.outgoing;
     return bubbles.map((text, i) => ({
       segments: [{ type: 'text', data: { text } }] as MsgSegment[],
-      pauseMs: i === 0 ? 0 : typingDelayMs(text, cfg),
+      pauseMs: i === 0 || !cfg.typingEnabled ? 0 : typingDelayMs(text, cfg),
     }));
   }
 
@@ -749,6 +874,20 @@ export class HumanlikeService {
     st.lastInboundAt = now;
     st.recent.push({ at: now, self: false });
     this.trimRecent(st, now);
+  }
+
+  /** 重复惩罚的入站对照：记录群里最近在聊什么（命令与空文本不算） */
+  private recordInboundText(st: ChatState, now: number, text: unknown): void {
+    const t = String(text ?? '').trim();
+    if (!t) return;
+    st.inboundTexts.push({ at: now, text: t.slice(0, 300) });
+    this.trimTexts(st.inboundTexts, now);
+  }
+
+  /** 文本环统一上限：40 条 / 40 分钟；判定窗口（默认 20 轮）再从中截 */
+  private trimTexts(list: { at: number; text: string }[], now: number): void {
+    const cut = now - 40 * 60_000;
+    while (list.length && (list[0].at < cut || list.length > 40)) list.shift();
   }
 
   private absorbSelf(st: ChatState, now: number): void {
@@ -817,7 +956,8 @@ export class HumanlikeService {
     const cfg = this.config;
     for (const [k, st] of this.states) {
       const [type, ...rest] = k.split('_');
-      const chat: ChatRef = { platform: '', type: type as 'group' | 'private', chatId: rest.join('_') };
+      // platform 不在会话键里；按本体系唯一的真实传输端补齐 qq（UI 注入只是视图，不是会话来源）
+      const chat: ChatRef = { platform: 'qq', type: type as 'group' | 'private', chatId: rest.join('_') };
       this.armIdleTimer(chat, st, cfg);
     }
   }

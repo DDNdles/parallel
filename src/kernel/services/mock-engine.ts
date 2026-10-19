@@ -110,6 +110,14 @@ export class MockEngine {
   script: MockScriptStep[] = [];
   /** 后台「记忆整理」那一发的答复（一行一条事实，NONE = 不记）。默认什么都不写，免得无关用例被污染 */
   memoryReply = 'NONE';
+  /** 后台「表达学习」的答复（JSON；默认空数组，免得无关用例被污染） */
+  expressionReply = '{"expressions":[]}';
+  /** 后台「用户画像」的答复（纯文本；NONE = 不生成） */
+  profileReply = 'NONE';
+  /** 后台「聊天回想」的答复（JSON；空摘要 = 不落库） */
+  midtermReply = '{"summary":"","cues":[]}';
+  /** 后台「黑话候选」的答复（JSON；默认空数组） */
+  jargonMineReply = '{"terms":[]}';
   /** 每次请求记一笔：条数、工具名、以及"最后一条 user + system 的摘要"（测试据此断言压缩是否真的生效） */
   calls: { messages: number; tools?: string[]; system?: string; lastUser?: string; usersJoined?: string; media?: string[] }[] = [];
   id = 'mock';
@@ -130,7 +138,7 @@ export class MockEngine {
     const sysText = systemTextOf(context);
     this.calls.push({
       messages: (context.messages as any[]).length, tools,
-      system: sysText.slice(0, 200), lastUser: lastUserText(context).slice(0, 200),
+      system: sysText.slice(0, 8000), lastUser: lastUserText(context).slice(0, 200),
       // 所有 user 消息拼起来（压缩摘要会插在工具结果之前，"最后一条 user"看不到它）
       usersJoined: allUserText(context).slice(0, 600),
       media: lastUserMedia(context),
@@ -153,6 +161,11 @@ export class MockEngine {
       return oneShot('## 目标\n（mock 摘要）把之前的事记成一段话');
     }
     if (!tools.length && sysText.includes('记忆整理助手')) return oneShot(this.memoryReply);
+    // 2026-10-18 起的后台学习通道：各自认一句自认标记，不消耗主脚本队列
+    if (!tools.length && sysText.includes('表达方式整理助手')) return oneShot(this.expressionReply);
+    if (!tools.length && sysText.includes('用户画像整理助手')) return oneShot(this.profileReply);
+    if (!tools.length && sysText.includes('聊天回想整理助手')) return oneShot(this.midtermReply);
+    if (!tools.length && sysText.includes('黑话候选整理助手')) return oneShot(this.jargonMineReply);
 
     // 先把这一步的结果算出来（同步逻辑），再按事件顺序推出去
     const step = this.script.shift();

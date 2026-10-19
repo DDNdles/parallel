@@ -35,8 +35,6 @@ export interface NecessityInput {
   hasAt: boolean;
   hasMention: boolean;
   isGroupChat: boolean;
-  /** 专注模式（同一时间只盯一个会话） */
-  focusActive: boolean;
   /** 最近窗口内自己发了几条 */
   recentSelfReplies: number;
   /** 最近窗口内总消息数 */
@@ -184,7 +182,6 @@ export function scoreReplyNecessity(input: NecessityInput, botName = ''): Necess
   if (input.hasAt) { relevance = 100; relevanceReason = '@'; }
   else if (input.hasMention) { relevance = 80; relevanceReason = '提及'; }
   else if (!input.isGroupChat) { relevance = 40; relevanceReason = '私聊'; }
-  else if (input.focusActive) { relevance = 40; relevanceReason = 'focus'; }
   else { relevance = 0; relevanceReason = '普通'; }
 
   const directContext = relevance > 0;

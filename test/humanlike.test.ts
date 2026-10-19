@@ -39,7 +39,7 @@ const chat: ChatRef = { platform: 'qq', type: 'group', chatId: '123' };
 function input(over: Partial<Parameters<typeof scoreReplyNecessity>[0]> = {}) {
   return {
     texts: ['普通聊天'], pendingCount: 1, triggerThreshold: 6,
-    hasAt: false, hasMention: false, isGroupChat: true, focusActive: false,
+    hasAt: false, hasMention: false, isGroupChat: true,
     recentSelfReplies: 0, recentWindowMessages: 10,
     effectiveFrequency: 1, idleSeconds: 0, idleReachedAverage: false,
     ...over,
@@ -61,11 +61,10 @@ test('必要性：@ 直接给满分，普通群聊消息给 0 分', () => {
   assert.match(scoreReplyNecessity(input({ hasAt: true })).detail, /强相关=100\(@\)/);
 });
 
-test('必要性：私聊/提及/focus 各自的相关性档位（100/80/40/40）', () => {
+test('必要性：私聊/提及各自的相关性档位（100/80/40）', () => {
   assert.equal(scoreReplyNecessity(input({ isGroupChat: false })).score, 41);
   assert.equal(scoreReplyNecessity(input({ hasMention: true })).score, 81);
   assert.ok(scoreReplyNecessity(input({ hasMention: true })).detail.includes('提及'));
-  assert.equal(scoreReplyNecessity(input({ focusActive: true })).score, 41);
 });
 
 test('必要性：内容是加分项，纯短反应是减分项', () => {
@@ -222,18 +221,38 @@ test('频率：轰炸降频 —— 10 秒内超过 5 条后门槛递增，封顶
 // ============================================================
 
 test('投递：按换行与句末标点分条；连续标点并作一个句尾；收尾引号跟着前一句', () => {
-  assert.deepEqual(splitIntoBubbles('在。有事说事。'), ['在。', '有事说事。']);
+  assert.deepEqual(splitIntoBubbles('在。有事说事。'), ['在', '有事说事']);
   assert.deepEqual(splitIntoBubbles('在\n我先睡会儿'), ['在', '我先睡会儿'], '换行是最强的分条意图');
   assert.deepEqual(splitIntoBubbles('真的吗？？'), ['真的吗？？'], '连续问号并作同一个句尾');
-  assert.deepEqual(splitIntoBubbles('他说「好。」然后走了'), ['他说「好。」', '然后走了'], '右引号跟着前一句');
+  assert.deepEqual(splitIntoBubbles('他说「好。」然后走了'), ['他说「好」', '然后走了'], '右引号跟着前一句；句号去掉');
   assert.deepEqual(splitIntoBubbles('嗯嗯'), ['嗯嗯'], '没有句末标点就是一条');
 });
 
-test('投递：最多 4 条气泡，尾巴并进最后一条（不丢字、不无限累加打字等待）', () => {
-  const out = splitIntoBubbles('一。二。三。四。五。六。');
-  assert.equal(out.length, 4);
-  assert.equal(out.join(''), '一。二。三。四。五。六。');
-  assert.equal(out[3], '四。五。六。');
+test('投递：最多 3 条气泡，超过时均衡合并（不丢字、不把尾巴全粘最后一条）', () => {
+  const text = '一。二。三。四。五。六。';
+  const out = splitIntoBubbles(text);
+  assert.equal(out.length, 3);
+  assert.equal(out.join(''), '一二三四五六', '句号去掉，内容不丢');
+  const maxLen = Math.max(...out.map((x) => [...x].length));
+  assert.ok(maxLen <= 4, `均衡后最长一组不该超过 4 字: ${JSON.stringify(out)}`);
+});
+
+test('投递：长逗号链在逗号处补切，短逗号句仍保持一条', () => {
+  const short = splitIntoBubbles('第一句，第二句，第三句。');
+  assert.equal(short.length, 1, '短逗号句不该被切开');
+  const longText = '今天早上我先去买了一杯咖啡，然后去公司开了一个很长的会，中午又和同事一起去吃了顿饭。';
+  const out = splitIntoBubbles(longText);
+  assert.ok(out.length > 1, `长逗号链应补切: ${JSON.stringify(out)}`);
+  assert.equal(out.join(''), longText.replace(/[。，,、：:；;]/g, ''), '只去标点，不丢正文');
+  assert.ok(out.every((x) => [...x].length <= 24), `补切后单条应不超过目标字数: ${JSON.stringify(out)}`);
+});
+
+test('投递：无标点超长句按 40 字硬切兜底', () => {
+  const text = '我年华虚度空有一身游荡的疲倦面对群星我无限惭愧我回首往事如烟而如今我依然在路上继续走';
+  const out = splitIntoBubbles(text);
+  assert.equal(out.join(''), text, '硬切不丢字');
+  assert.ok(out.length >= 2, `无标点长句应硬切: ${JSON.stringify(out)}`);
+  assert.ok(out.every((x) => [...x].length <= 40), `硬切后单条不该超过 40 字: ${JSON.stringify(out)}`);
 });
 
 test('投递：句边截断 —— 超长时保留到最后一个句末标点；句边靠前才按句截，否则硬切', () => {
@@ -277,7 +296,7 @@ test('投递：打字延迟按字数/速度算；抖动 0 时确定；下限 250
 test('投递：完整流水线 —— 归一化 → 句边截断 → 按句分条（截掉的尾巴不会漏出去）', () => {
   const raw = '（笑）刚睡醒。你说。<set_mood mood="x"/>';
   const t = trimAtSentence(normalizeVisibleContent(raw, DEFAULT_OUTGOING.maxMessageCharacters), DEFAULT_OUTGOING.replyMaxCharacters);
-  assert.deepEqual(splitIntoBubbles(t), ['（笑）刚睡醒。', '你说。']);
+  assert.deepEqual(splitIntoBubbles(t), ['（笑）刚睡醒', '你说']);
   const long = `${'很长的一段话'.repeat(30)}。尾巴一句。`;
   const cut = trimAtSentence(normalizeVisibleContent(long, DEFAULT_OUTGOING.maxMessageCharacters), DEFAULT_OUTGOING.replyMaxCharacters);
   assert.ok(cut.length <= DEFAULT_OUTGOING.replyMaxCharacters, `截断后不该超上限: ${cut.length}`);
@@ -504,17 +523,28 @@ test('服务：noteSpoke / noteSilent 维护存在感窗口与退避', () => {
 
 test('服务：compose 第一条不等、其余按打字延迟排停顿（按句分条）', async () => {
   const { svc } = makeService({
-    outgoing: { ...DEFAULT_OUTGOING, typingBaseDelaySeconds: 0, typingCharactersPerSecond: 1, typingMaxDelaySeconds: 30, typingJitterRatio: 0 },
+    outgoing: {
+      ...DEFAULT_OUTGOING, typingEnabled: true,
+      typingBaseDelaySeconds: 0, typingCharactersPerSecond: 1, typingMaxDelaySeconds: 30, typingJitterRatio: 0,
+    },
   });
   // 三句话 → 三个气泡；首条不等，其后每条 = ceil(字数 / 每秒字数)
   const plans = await svc.compose(chat, '在的。刚睡醒。你说。');
   assert.equal(plans.length, 3, `应按句拆成 3 条: ${plans.length}`);
   assert.equal(plans[0].pauseMs, 0, '第一条立刻发');
-  assert.deepEqual(plans.slice(1).map((p) => p.pauseMs), [4000, 3000], '后续每条 = ceil(字数 / 每秒字数)');
+  assert.deepEqual(plans.slice(1).map((p) => p.pauseMs), [3000, 2000], '后续每条按去掉句号后的字数算');
   // 逗号不断句：只有逗号的长句仍是一条
   const one = await svc.compose(chat, '第一句，第二句，第三句。');
   assert.equal(one.length, 1, '逗号不是句末标点');
   assert.equal(one[0].pauseMs, 0);
+  svc.dispose();
+});
+
+test('服务：默认不模拟打字，所有气泡立即发（pauseMs 全 0）', async () => {
+  const { svc } = makeService();
+  const plans = await svc.compose(chat, '在的。刚睡醒。你说。');
+  assert.equal(plans.length, 3);
+  assert.deepEqual(plans.map((p) => p.pauseMs), [0, 0, 0]);
   svc.dispose();
 });
 
@@ -574,8 +604,8 @@ test('配置：DEFAULT_CONFIG.humanlike 与 DEFAULT_HUMANLIKE 逐字段一致（
 test('服务：composeScene —— 发出去的就是模型写的正文；历史回灌与发出去的气泡同形', async () => {
   const { svc } = makeService();
   const { plans, historyText, spoke } = await svc.composeScene('知道了。别催。');
-  assert.deepEqual(plans.map((p) => p.segments[0].data.text), ['知道了。', '别催。']);
-  assert.equal(historyText, '知道了。\n别催。', '历史与群里看到的同形（不再有带标签剧本）');
+  assert.deepEqual(plans.map((p) => p.segments[0].data.text), ['知道了', '别催']);
+  assert.equal(historyText, '知道了\n别催', '历史与群里看到的同形（不再有带标签剧本，句号去掉）');
   assert.equal(spoke, true);
   svc.dispose();
 });
@@ -585,7 +615,7 @@ test('服务：composeScene —— 超长按句边截断；沉默标记什么都
   const cut = await svc.composeScene('第一句短。第二句也还行。第三句就开始啰嗦了要说个没完。');
   const joined = cut.plans.map((p) => p.segments[0].data.text).join('');
   assert.ok(joined.length <= 12, `截断后不该超上限: ${joined.length}`);
-  assert.ok(joined.startsWith('第一句短。'), joined);
+  assert.ok(joined.startsWith('第一句短'), joined);
   const silent = await svc.composeScene('[silent]');
   assert.equal(silent.plans.length, 0);
   assert.equal(silent.spoke, false);
@@ -844,4 +874,40 @@ test('发送服务：不可打断的发送登记不到，interrupt 打不动它'
   const r = await p;
   assert.equal(r.aborted, false);
   assert.deepEqual(sent, ['一', '二'], '命令回执这类话必须说完');
+});
+
+// ============================================================
+// 重复惩罚：跨轮口癖 / 人设名反复出现
+// ============================================================
+
+const repeatedLines = ['梁文峰说这个可以', '梁文峰又来了', '我问梁文峰了'];
+
+test('重复惩罚：最近 3 轮都提同一个词 → 462 分节；成功重写后解除', () => {
+  const { svc } = makeService({ repetition: { ...DEFAULT_HUMANLIKE.repetition } });
+  for (const line of repeatedLines) svc.noteSpoke(chat, 1, [line]);
+  const section = svc.sceneSections(chat).find((s) => s.order === 462);
+  assert.ok(section?.text.includes('梁文峰'), section?.text ?? '没有 462 分节');
+  assert.ok(section?.text.includes('人设里的名字和设定只是背景'));
+  assert.equal(svc.repetitionHit(chat, '梁文峰又来了')?.phrase, '梁文峰');
+  svc.noteRepetitionRetry(chat, '梁文峰', true);
+  assert.equal(svc.repetitionHit(chat, '梁文峰又来了'), null, '成功重写后不再触发');
+});
+
+test('重复惩罚：群里也在提同一个词 → 不注入（话题词不是口癖）', () => {
+  const { svc } = makeService({ repetition: { ...DEFAULT_HUMANLIKE.repetition } });
+  for (let i = 0; i < 3; i++) svc.ingest(ev('梁文峰最近怎么样'), { isCommand: false });
+  for (const line of repeatedLines) svc.noteSpoke(chat, 1, [line]);
+  assert.equal(svc.sceneSections(chat).some((s) => s.order === 462), false);
+  svc.dispose();
+});
+
+test('重复惩罚：提醒 5 分钟一次；连续重写失败 3 次后不再触发重写', () => {
+  const { svc, tick } = makeService({ repetition: { ...DEFAULT_HUMANLIKE.repetition } });
+  for (const line of repeatedLines) svc.noteSpoke(chat, 1, [line]);
+  assert.ok(svc.sceneSections(chat).some((s) => s.order === 462), '首次应提醒');
+  assert.equal(svc.sceneSections(chat).some((s) => s.order === 462), false, '刚提醒过不重复注入');
+  tick(5 * 60_000);
+  assert.ok(svc.sceneSections(chat).some((s) => s.order === 462), '过了提醒间隔可再提醒');
+  for (let i = 0; i < 3; i++) svc.noteRepetitionRetry(chat, '梁文峰', false);
+  assert.equal(svc.repetitionHit(chat, '梁文峰又来了'), null, '到 maxStrikes 后不再重写');
 });

@@ -100,13 +100,29 @@ export const DEFAULT_CONFIG = {
     // 圈内黑话（表达学习，humanlike/jargon.ts）：挖本群高频词，判定为圈内含意时
     // 进 prompt 的「圈内黑话」参考——帮 bot 听懂，不改说话风格、不产数值
     jargon: { enable: true },
+    // 重复惩罚（humanlike/repetition.ts）：最近若干轮 bot 发言里反复出现的词/人设名，
+    // 注入提醒；命中后可用一次重写把它去掉。窗口/判定条数/冷却可在设置页调。
+    repetition: {
+      enable: true,
+      windowMessages: 20,
+      minMessages: 3,
+      cooldownMinutes: 30,
+      maxPhrases: 3,
+      retry: true,
+      maxStrikes: 3,
+    },
+    // 表达学习（chat 插件后台，humanlike/expression 的语料只来自群聊）：
+    // 学「什么情境下大家怎么说」，作为语气参考注入；只学说法，不照抄、不改人设
+    expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
     // 跟屏复读（humanlike/repeat.ts）：>=N 位群友接连说同一句就完整跟一条；纯程序不走模型
     repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
     // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
       splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
-      replyMaxCharacters: 120,            // 回复总长上限：超了在最后一个句末标点处截断
+      replyMaxCharacters: 50,             // 回复总长上限：超了在最后一个句末标点处截断
       maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
+      bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
+      typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）
       typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
       typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久
       typingMaxDelaySeconds: 12,          // 单条后续气泡的最长打字等待（秒）
@@ -131,7 +147,7 @@ export const DEFAULT_CONFIG = {
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
     // ③ 出站打断（纯程序，见 humanlike/interrupt.ts）：她还在发气泡时对面又开口，
-    //    按概率把剩下的气泡砍掉；制止语与 @/引用 不受概率约束（那两条必打断）。
+    //    按概率把剩下的气泡砍掉；模型还在生成时则直接 abort 这一轮。命令插话必断。
     interrupt: {
       enable: true,
       probability: 0.8,                   // 插话打断概率（0~1）
@@ -260,6 +276,10 @@ export const DEFAULT_CONFIG = {
     memoryMinTurns: 6,
     memoryIdleSeconds: 180,
     memoryMaxFacts: 5,
+    // 后台画像：从长期事实生成一段短画像，随本轮发言者注入（背景，不逐条念）
+    profileAuto: true,
+    // 中期聊天摘要：把已经滑出上下文时间窗的那段聊天压成「聊天回想」，带召回线索注入
+    midtermSummary: true,
   },
   storage: {
     historyLimit: 200,                    // 每会话保留的近端历史条数

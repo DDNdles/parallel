@@ -14,6 +14,7 @@ interface Humanlike {
   /** 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限 */
   outgoing: {
     splitReplyMessages: boolean; replyMaxCharacters: number; maxReplyTokens: number;
+    bubbleSoftMaxCharacters: number; typingEnabled?: boolean;
     typingBaseDelaySeconds: number; typingCharactersPerSecond: number;
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
@@ -30,6 +31,13 @@ interface Humanlike {
   backoff: { baseSeconds: number; capSeconds: number; startCount: number; bypassPendingCount: number };
   /** 圈内黑话（表达学习）：先挖本群高频词再进 prompt 的参考节 */
   jargon?: { enable: boolean };
+  /** 表达学习：学群友「什么情境下怎么说」，作为语气参考注入 */
+  expression?: { enable: boolean };
+  /** 重复惩罚：最近多轮反复出现的词/人设名 → 提醒 + 一次重写 */
+  repetition?: {
+    enable: boolean; windowMessages: number; minMessages: number; cooldownMinutes: number;
+    maxPhrases: number; retry: boolean; maxStrikes: number;
+  };
   /** 跟屏复读：>=N 位群友接连说同一句，bot 完整跟一条（纯程序，不走模型） */
   repeat?: { enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number };
   proactive: { enable: boolean; idleSeconds: number };
@@ -61,6 +69,8 @@ interface Config {
   persona: {
     /** 自动记忆提炼：攒够几轮、静默多久才发那一发；结果只落库，不进上下文 */
     memoryAutoSave: boolean; memoryMinTurns: number; memoryIdleSeconds: number; memoryMaxFacts: number;
+    /** 后台画像与更早聊天的滚动摘要 */
+    profileAuto?: boolean; midtermSummary?: boolean;
   };
   humanlike: Humanlike;
 }
@@ -181,6 +191,10 @@ export default function SettingsPage() {
   if (!c) return <div className="mset-empty">加载中…</div>;
   const r = c.risk;
   const h = c.humanlike;
+  const rep = h.repetition ?? {
+    enable: true, windowMessages: 20, minMessages: 3, cooldownMinutes: 30,
+    maxPhrases: 3, retry: true, maxStrikes: 3,
+  };
   const patch = (p: Partial<Config>) => setC({ ...c, ...p });
   /** 即时保存：本地 state 先行；immediate=true（开关/选择类单次事件）立即发，输入框默认 600ms 防抖只发最后一拍 */
   const autoSave = (key: string, delay: number, body: Record<string, unknown>) => {
@@ -522,16 +536,27 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
                 <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
-                <Num label="打字基础延迟（秒）" value={h.outgoing.typingBaseDelaySeconds}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingBaseDelaySeconds: v } })} />
-                <Num label="打字速度（字/秒）" value={h.outgoing.typingCharactersPerSecond}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingCharactersPerSecond: v } })} />
-                <Num label="单条最大打字时长" value={h.outgoing.typingMaxDelaySeconds}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingMaxDelaySeconds: v } })} />
-                <Num label="打字抖动比例（%）" value={Math.round(h.outgoing.typingJitterRatio * 100)}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingJitterRatio: Math.min(50, Math.max(0, v)) / 100 } })} />
+                <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
+                {h.outgoing.typingEnabled === true && (<>
+                  <Num label="打字基础延迟（秒）" value={h.outgoing.typingBaseDelaySeconds}
+                    onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingBaseDelaySeconds: v } })} />
+                  <Num label="打字速度（字/秒）" value={h.outgoing.typingCharactersPerSecond}
+                    onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingCharactersPerSecond: v } })} />
+                  <Num label="单条最大打字时长" value={h.outgoing.typingMaxDelaySeconds}
+                    onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingMaxDelaySeconds: v } })} />
+                  <Num label="打字抖动比例（%）" value={Math.round(h.outgoing.typingJitterRatio * 100)}
+                    onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingJitterRatio: Math.min(50, Math.max(0, v)) / 100 } })} />
+                </>)}
                 <Num label="单条最大字符数" value={h.outgoing.maxMessageCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxMessageCharacters: v } })} />
+              </div>
+              <div className="mset-models" style={{ marginTop: 14 }}>
+                <div className="mset-mrow">
+                  <span className="plg-v">模拟打字延迟</span>
+                  <span className="mset-macts"><Switch on={h.outgoing.typingEnabled === true}
+                    onChange={() => patchH({ outgoing: { ...h.outgoing, typingEnabled: !(h.outgoing.typingEnabled === true) } }, true)} /></span>
+                </div>
               </div>
 
               <div className="mset-sec-h"><span>消息合并与主动发言</span></div>
@@ -578,6 +603,16 @@ export default function SettingsPage() {
                     onChange={() => patchH({ jargon: { enable: !(h.jargon?.enable !== false) } }, true)} /></span>
                 </div>
                 <div className="mset-mrow">
+                  <span className="plg-v">表达学习</span>
+                  <span className="mset-macts"><Switch on={h.expression?.enable !== false}
+                    onChange={() => patchH({ expression: { enable: !(h.expression?.enable !== false) } }, true)} /></span>
+                </div>
+                <div className="mset-mrow">
+                  <span className="plg-v">重复惩罚</span>
+                  <span className="mset-macts"><Switch on={rep.enable !== false}
+                    onChange={() => patchH({ repetition: { ...rep, enable: !(rep.enable !== false) } }, true)} /></span>
+                </div>
+                <div className="mset-mrow">
                   <span className="plg-v">节奏反定型<Hint text="回复结构固化时纠偏" /></span>
                   <span className="mset-macts"><Switch on={h.rhythm.enable}
                     onChange={() => patchH({ rhythm: { ...h.rhythm, enable: !h.rhythm.enable } }, true)} /></span>
@@ -604,6 +639,12 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ agency: { ...h.agency, minimumProactiveIntervalMinutes: v } })} />
                 <Num label="行动窗口有效期（分钟）" value={h.agency.maxWindowMinutes}
                   onChange={(v) => patchH({ agency: { ...h.agency, maxWindowMinutes: v } })} />
+                <Num label="重复判定窗口轮数" value={rep.windowMessages}
+                  onChange={(v) => patchH({ repetition: { ...rep, windowMessages: v } })} />
+                <Num label="重复判定条数" value={rep.minMessages}
+                  onChange={(v) => patchH({ repetition: { ...rep, minMessages: v } })} />
+                <Num label="重复冷却分钟" value={rep.cooldownMinutes}
+                  onChange={(v) => patchH({ repetition: { ...rep, cooldownMinutes: v } })} />
               </div>
               <div className="mset-field" style={{ marginTop: 14 }}>
                 <label className="mset-flabel">安静时段（格式 HH:MM-HH:MM）</label>
@@ -631,6 +672,16 @@ export default function SettingsPage() {
                     <span className="plg-v">自动保存记忆</span>
                     <span className="mset-macts"><Switch on={c.persona.memoryAutoSave !== false}
                       onChange={() => setP({ memoryAutoSave: c.persona.memoryAutoSave === false }, true)} /></span>
+                  </div>
+                  <div className="mset-mrow">
+                    <span className="plg-v">用户画像</span>
+                    <span className="mset-macts"><Switch on={c.persona.profileAuto !== false}
+                      onChange={() => setP({ profileAuto: c.persona.profileAuto === false }, true)} /></span>
+                  </div>
+                  <div className="mset-mrow">
+                    <span className="plg-v">聊天回想</span>
+                    <span className="mset-macts"><Switch on={c.persona.midtermSummary !== false}
+                      onChange={() => setP({ midtermSummary: c.persona.midtermSummary === false }, true)} /></span>
                   </div>
                 </div>
               </>

@@ -6,7 +6,7 @@
  * 模型不再为格式多写一个字；"说几条、多长"由下面三步保证：
  *   1. `normalizeVisibleContent` 剥掉媒体占位符与模型手滑输出的标签，并按单条上限硬截断；
  *   2. `trimAtSentence` 句边截断兜底：回复超长时保留到最后一个句末标点，不把半句话拍出去；
- *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 4 条，尾巴并进最后一条）；
+ *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 3 条，超出时均衡合并）；
  *      `typingDelayMs` 算第二条及后续气泡的「正在输入」等待 —— 基础延迟 + 字数/速度，
  *      乘抖动，下限 250ms。首条不等（用户已经等过模型了）。
  */
@@ -18,6 +18,10 @@ export interface OutgoingConfig {
   replyMaxCharacters: number;
   /** chat 轮单次请求的输出 token 硬顶（防止模型写小作文；<=0 = 不设） */
   maxReplyTokens: number;
+  /** 单条气泡目标字数：超过后在逗号/顿号处补切（0 = 用默认 24） */
+  bubbleSoftMaxCharacters: number;
+  /** 是否模拟「正在输入」的停顿（默认关：气泡之间立即发） */
+  typingEnabled: boolean;
   /** 发送第二条及后续分段消息前的基础打字等待秒数 */
   typingBaseDelaySeconds: number;
   /** 模拟打字速度，每秒字符数；越小长消息等得越久 */
@@ -32,8 +36,10 @@ export interface OutgoingConfig {
 
 export const DEFAULT_OUTGOING: OutgoingConfig = {
   splitReplyMessages: true,
-  replyMaxCharacters: 120,
+  replyMaxCharacters: 50,
   maxReplyTokens: 400,
+  bubbleSoftMaxCharacters: 24,
+  typingEnabled: false,
   typingBaseDelaySeconds: 1,
   typingCharactersPerSecond: 8,
   typingMaxDelaySeconds: 12,
@@ -41,14 +47,32 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   maxMessageCharacters: 2000,
 };
 
-/** 气泡数上限：再多就把尾巴并进最后一条 —— 打字等待按条累加，放任切分会把回复拖到半分钟 */
-export const MAX_BUBBLES = 4;
+/** 气泡数上限：连续发送（中间没有对方插话）最多 3 条 */
+export const MAX_BUBBLES = 3;
 
 /** 句末标点（切分与句边截断共用） */
 const ENDERS = new Set([...'。！？!?…；;']);
 
 /** 句末标点后面跟着的收尾符号（引号/括号等），跟同一句走 */
 const CLOSERS = new Set([...'」』"”’）)】]']);
+
+/** 长句补切点：逗号/顿号/冒号（只在句子超过目标字数时启用，短句仍然不切） */
+const SOFT_BREAKS = new Set([...'，,、：:']);
+
+/** 完全没有逗号可切时的硬上限：超过就按字数硬切，避免一条 50+ 字 */
+const HARD_BUBBLE_CHARS = 40;
+
+/**
+ * 气泡清洁：去掉切分标点与句尾句号。
+ * 保留问号/叹号/省略号（这些是语气，不是句末句号）；逗号/顿号/冒号/分号在切分点剥掉。
+ */
+function cleanBubble(text: string): string {
+  let t = String(text ?? '').trim();
+  // 句号/逗号等写在收尾引号或括号前时，只删标点、保留引号
+  t = t.replace(/[。，,、：:；;]+([」』"”’）)】]*)$/g, '$1').trim();
+  t = t.replace(/[。，,、：:；;]+$/g, '').trim();
+  return t;
+}
 
 /**
  * 字符串则 trim 后截断，非字符串给空串（硬截断，不重切、不丢弃整条）。
@@ -102,12 +126,90 @@ export function trimAtSentence(text: string, maxChars: number): string {
 }
 
 /**
+ * 单条句子超过目标字数时，优先在逗号/顿号/冒号处补切；没有可切点再按 40 字硬切。
+ * 切点离句首太近（<8 字）或剩余太短（<4 字）时不切，避免切出碎泡。
+ */
+function splitLongBubble(text: string, softMax: number): string[] {
+  const limit = Math.max(8, Math.floor(softMax || 24));
+  const out: string[] = [];
+  let rest = String(text ?? '').trim();
+  while ([...rest].length > limit) {
+    const chars = [...rest];
+    const scanTo = Math.min(limit, chars.length);
+    let cut = -1;
+    for (let i = scanTo - 1; i >= 8; i--) {
+      if (SOFT_BREAKS.has(chars[i])) { cut = i; break; }
+    }
+    if (cut >= 8 && chars.length - cut - 1 >= 4) {
+      out.push(chars.slice(0, cut + 1).join('').trim());
+      rest = chars.slice(cut + 1).join('').trim();
+      continue;
+    }
+    if (chars.length > HARD_BUBBLE_CHARS) {
+      let hard = HARD_BUBBLE_CHARS;
+      // 优先在靠后的空格处切；中文没有空格就按 40 字切
+      for (let i = HARD_BUBBLE_CHARS - 1; i >= Math.floor(HARD_BUBBLE_CHARS / 2); i--) {
+        if (/\s/.test(chars[i])) { hard = i; break; }
+      }
+      out.push(chars.slice(0, hard).join('').trim());
+      rest = chars.slice(hard).join('').trim();
+      continue;
+    }
+    break;
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
+/**
+ * 超过 maxBubbles 时，把相邻句贪心/DP 合并成 maxBubbles 组：
+ * 目标是最小化“最长组”的字数，保持原句顺序与标点；不再把尾巴全粘到最后一组。
+ */
+function mergeToCap(parts: string[], maxBubbles: number): string[] {
+  const n = parts.length;
+  const cap = Math.max(1, Math.floor(maxBubbles));
+  if (n <= cap) return parts;
+  const lens = parts.map((p) => [...p].length);
+  const prefix = [0];
+  for (const len of lens) prefix.push(prefix[prefix.length - 1] + len);
+
+  // dp[g][i] = 前 i 个句分成 g 组时，最长组的最小字数
+  const dp: number[][] = Array.from({ length: cap + 1 }, () => Array(n + 1).fill(Infinity));
+  const cut: number[][] = Array.from({ length: cap + 1 }, () => Array(n + 1).fill(-1));
+  for (let i = 1; i <= n; i++) dp[1][i] = prefix[i];
+  for (let g = 2; g <= cap; g++) {
+    for (let i = g; i <= n; i++) {
+      for (let j = g - 1; j < i; j++) {
+        const groupLen = prefix[i] - prefix[j];
+        const worst = Math.max(dp[g - 1][j], groupLen);
+        if (worst < dp[g][i]) {
+          dp[g][i] = worst;
+          cut[g][i] = j;
+        }
+      }
+    }
+  }
+
+  const groups: string[] = [];
+  let i = n;
+  for (let g = cap; g >= 1; g--) {
+    const j = cut[g][i];
+    if (j < 0) break;
+    groups.unshift(parts.slice(j, i).join(''));
+    i = j;
+  }
+  if (i > 0) groups.unshift(parts.slice(0, i).join(''));
+  return groups;
+}
+
+/**
  * 按换行与句末标点把一段话切成气泡（最贴近真人"一句一条"的打字节奏）。
  *  - 换行是最强的分条意图：模型自己换的行不合并；
  *  - 句末标点后切；连续标点（？！？…）并作同一个句尾；引号/右括号跟着前一句走；
- *  - 超过 `maxBubbles` 的尾巴并进最后一条：宁可最后一条长一点，也不丢字、不无限累加打字等待。
+ *  - 单句超过 softMax（默认 24 字）时，再在逗号/顿号/冒号处补切；
+ *  - 超过 maxBubbles 时做**均衡连续分组**，保持 3 条上限、不把尾巴全粘最后一条。
  */
-export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES): string[] {
+export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES, softMax = 24): string[] {
   const out: string[] = [];
   for (const line of String(text ?? '').split(/\r?\n+/)) {
     let buf = '';
@@ -123,9 +225,11 @@ export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES): string
     }
     if (buf.trim()) out.push(buf.trim());
   }
-  const cap = Math.max(1, Math.floor(maxBubbles));
-  if (out.length <= cap) return out;
-  return [...out.slice(0, cap - 1), out.slice(cap - 1).join('')];
+  const pieces = out
+    .flatMap((b) => splitLongBubble(b, softMax))
+    .map(cleanBubble)
+    .filter(Boolean);
+  return mergeToCap(pieces, maxBubbles);
 }
 
 /**

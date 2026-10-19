@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { appendFileSync, readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { appendFileSync, readFileSync, existsSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { ensureDir } from './util/fsutil.ts';
 import { newId, nowMs } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
@@ -60,6 +60,10 @@ export function localDay(ts: number): string {
 
 /** 只有真正显示在会话流里的行才算进日轨 */
 const DAY_COUNTED = new Set(['message_in', 'message_out']);
+
+/** searchMessages 单次最多往回扫的体量（字节）：群聊日志可能几十兆，全量 readFileSync
+ *  会把主线程卡住几百毫秒；检索语义是「最近的 N 条命中」，从尾部限窗倒着找，收满就停。 */
+const SEARCH_SCAN_MAX_BYTES = 5 * 1024 * 1024;
 
 /** 按扩展名猜媒体类型；猜不出来返回 undefined，由线格式按 kind 兜底。
  *  与 `pipeline.ts` 顶部是同一张表——这里**复制**一份而不是 import pipeline：
@@ -318,10 +322,15 @@ export class SessionLog {
 
   /**
    * 关键词检索本会话的历史消息（入站 message_in + 出站 message_out 原文），时间正序。
-   * 上下文窗口外的旧消息模型平时看不到，这个方法是她"翻旧账"的通道：整份 JSONL 扫一遍，
-   * 取**最近** limit 条命中（旧命中太多时不该把最早的顶上来）。工具调用是显式低频动作，全量扫可接受。
+   * 上下文窗口外的旧消息模型平时看不到，这个方法是她"翻旧账"的通道。
+   * 只取**最近** limit 条命中（旧命中太多时不该把最早的顶上来）。
    * `beforeTs`：只翻这个时刻之前的（窗口起点）——模型眼前就有的那几条再还回去一遍，
    *  它只会误以为"还有前文我没看到"，然后越查越离谱。
+   *
+   * 读取走"尾部限窗"：一次性 readFileSync 整份会话日志会把主线程卡几百毫秒（群聊日志几十兆）。
+   * 只从文件末尾回看 `SEARCH_SCAN_MAX_BYTES` 字节，按字节切行（utf-8 里 \n 永远是单字节，
+   * 按行整段解码不会劈开多字节字符）；窗口起头截在半行上的残段整行丢弃（宁少一行不错一行），
+   * 命中数够了就停。语义上仍是"最近的 N 条命中"——更老的零星命中交给 recall/长期记忆。
    */
   searchMessages(chatId: string, chatType: string, opts: { q: string; limit?: number; beforeTs?: number }): { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] {
     const q = opts.q.trim().toLowerCase();
@@ -331,7 +340,25 @@ export class SessionLog {
     if (!existsSync(file)) return [];
     const hits: { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] = [];
     try {
-      for (const line of readFileSync(file, 'utf-8').split('\n')) {
+      const size = statSync(file).size;
+      const windowLen = Math.min(size, SEARCH_SCAN_MAX_BYTES);
+      const window = Buffer.alloc(windowLen);
+      const fd = openSync(file, 'r');
+      try {
+        readSync(fd, window, 0, windowLen, size - windowLen);
+      } finally {
+        closeSync(fd);
+      }
+      // 窗口起头截在半行上（整文件比窗口长时）：丢弃首条 \n 之前的残段，从完整行的起点开始
+      let from = 0;
+      if (size > SEARCH_SCAN_MAX_BYTES) {
+        const firstNl = window.indexOf(0x0a);
+        if (firstNl === -1) return [];  // 一整窗都没有行分隔（单行比窗口还大）：可看的没有
+        from = firstNl + 1;
+      }
+      const lines = window.toString('utf8', from).split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
         if (!line.trim()) continue;
         let e: SessionLogEntry;
         try { e = JSON.parse(line); } catch { continue; }
@@ -342,12 +369,15 @@ export class SessionLog {
         const text = String(e.text ?? '');
         if (!text || !text.toLowerCase().includes(q)) continue;
         hits.push({ ts: e.ts, role: isUser ? 'user' : 'assistant', nickname: e.nickname, text });
-        if (hits.length > limit * 4) hits.splice(0, hits.length - limit);  // 极端大文件时兜底限内存
+        if (hits.length >= limit) break;
       }
     } catch {
       return [];
     }
-    return hits.slice(-limit);
+    // 倒着扫出来的命中是「新→旧」，检索的对外契约一直是时间正序（加入站早于出站按 ts 排）：
+    // 翻回来再交出去
+    hits.reverse();
+    return hits;
   }
 
   listChats(): { chatKey: string; chatId: string; chatType: string; lastTs: number; size: number; lines: number }[] {

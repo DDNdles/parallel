@@ -10,7 +10,7 @@
   "scripts": {
     "build": "npm --prefix web ci && npm --prefix web run build",
     "start": "node bin/parallel.js",
-    "test": "node --experimental-transform-types --no-warnings --test \"test/*.test.ts\"",
+    "test": "node --experimental-transform-types --no-warnings --test --test-concurrency=2 \"test/*.test.ts\"",
     "pack": "node scripts/pack-release.mjs"
   },
   "dependencies": {

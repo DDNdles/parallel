@@ -8,6 +8,7 @@ import { Db } from '../src/kernel/db.ts';
 import {
   JargonService, JARGON_LADDER,
   extractCandidates, buildJargonPrompt, parseJargonReply,
+  buildJargonMinePrompt, parseJargonMineReply, normalizeMinedTerm,
 } from '../src/kernel/humanlike/jargon.ts';
 import type { ChatEvent } from '../src/kernel/types.ts';
 
@@ -28,6 +29,7 @@ interface Harness { j: JargonService; db: Db; seen: { term: string; contexts: st
 function makeService(
   infer: (p: { term: string; contexts: string[] }) => Promise<{ jargon: boolean; meaning: string } | null> = async () => null,
   opt: { stepMs?: number } = {},
+  mine: (p: { texts: string[] }) => Promise<string[] | null> = async () => null,
 ): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'parallel-jargon-'));
   const db = new Db(dir);
@@ -37,6 +39,7 @@ function makeService(
     db,
     config: () => ({ enable: true }),
     infer: async (p) => { seen.push({ term: p.term, contexts: p.contexts }); return infer(p); },
+    mine: async (p) => mine(p),
     now: () => { t += opt.stepMs ?? 70_000; return t; },
   });
   try {
@@ -56,6 +59,39 @@ test('反事实判定两段式提示词按口径拼装、行结果能剥出来',
   assert.deepEqual(parseJargonReply('好的，结论如下 {"jargon": true, "meaning": "永远的神"} 注意'), { jargon: true, meaning: '永远的神' });
   assert.deepEqual(parseJargonReply('读不出分歧这条不是 {"jargon": false, "meaning": ""}'), { jargon: false, meaning: '' });
   assert.equal(parseJargonReply('没有结构化结论'), null);
+});
+
+test('中文候选挖掘：模型只报候选词，清洗/解析走本地口径', () => {
+  const p = buildJargonMinePrompt(['今天班味太重了', '这个梗真的绝了']);
+  assert.ok(p.includes('群聊原文（共 2 条）') && p.includes('今天班味太重了'));
+  assert.deepEqual(parseJargonMineReply('{"terms":["班味"," yyds ","","123","a b"]}'), ['班味', 'yyds']);
+  assert.deepEqual(parseJargonMineReply('["班味","绝绝子"]'), ['班味', '绝绝子']);
+  assert.equal(parseJargonMineReply('没有结构化结论'), null);
+  assert.equal(normalizeMinedTerm(' 「班味」 '), '班味');
+  assert.equal(normalizeMinedTerm('123'), '');
+  assert.equal(normalizeMinedTerm('https://x.y/z'), '');
+});
+
+test('中文黑话：攒够一批群消息让模型抽词，频次过阶梯后进参考节；注入按上下文匹配', async () => {
+  const h = makeService(
+    async (p) => p.term === '班味' ? { jargon: true, meaning: '上班上得很累的味道' } : { jargon: false, meaning: '' },
+    { stepMs: 70_000 },
+    async () => ['班味'],
+  );
+  try {
+    assert.equal(h.j.sections({ platform: 'qq', type: 'group', chatId: '910' }), null, '词没学会前不发节');
+    // 24 条触发一次挖掘；其中 4 条含「班味」，正好跨过第一档 [4]
+    for (let i = 0; i < 20; i++) h.j.observe(groupEvent('今天群里没什么事'));
+    for (let i = 0; i < 4; i++) h.j.observe(groupEvent('今天班味太重了'));
+    await waitUntil(() => h.seen.some((s) => s.term === '班味'), 500);
+    await settle();
+    const section = h.j.sections({ platform: 'qq', type: 'group', chatId: '910' }, '今天班味太重了');
+    assert.ok(section?.includes('- 班味：上班上得很累的味道'), section ?? '空');
+    assert.equal(h.j.sections({ platform: 'qq', type: 'group', chatId: '910' }, '今天天气不错'), null, '上下文没出现就不注入');
+  } finally {
+    h.j.dispose();
+    h.tryRm();
+  }
 });
 
 test('频次阶梯：第 4 次才触发一次判定，判定结果落库并进参考节', async () => {

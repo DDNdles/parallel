@@ -212,7 +212,7 @@ test('顶层图片/语音/视频：真出现在发出去的请求体里（image_
     `块序：图在前、音视频在尾：${JSON.stringify(blocks.map((b) => b?.type))}`);
 });
 
-test('人格设定不再占 user 轮：三条设定进 system，最后一条 user 是真人那句', async () => {
+test('人格设定不再占 user 轮：去重后的设定进 system，最后一条 user 是真人那句', async () => {
   const G = freshGroup();
   const since = seen.length;
   send(70010, [{ type: 'text', data: { text: '你还记得我是谁吗' } }], G);
@@ -222,7 +222,11 @@ test('人格设定不再占 user 轮：三条设定进 system，最后一条 use
   assert.match(textOf(Array.isArray(last?.content) ? last.content : []), /你还记得我是谁吗/, '最后一条 user 必须是真人那句');
   assert.ok(!allUserText(body).includes('【人格强化'), '人格强化不该以 user 轮出现（模型会当成对方念的话）');
   const sys = (body?.messages ?? []).filter((m: any) => m?.role === 'system').map((m: any) => String(m.content ?? '')).join('\n');
-  assert.match(sys, /【人格强化/, '它要落在 system 里');
+  // 2026-10-18 反重复：protagonist 与 voice.post_history 是同一整段时只注入一次，
+  // 避免「梁文峰」这类人设名一轮被强化两遍。
+  assert.match(sys, /梁文峰是你的小助手/, '人设主体要落在 system 里');
+  assert.equal((sys.match(/梁文峰是你的小助手/g) ?? []).length, 1, 'protagonist/post_history 重复段只注入一次');
+  assert.ok(!sys.includes('【人格强化'), '重复的 post_history 不再注入');
 });
 
 test('聊天记录里的图与音视频：下载预算内的全部跟着记录一起进这一发请求', async () => {

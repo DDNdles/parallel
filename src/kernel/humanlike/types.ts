@@ -7,6 +7,7 @@
 
 import { DEFAULT_OUTGOING, type OutgoingConfig } from './delivery.ts';
 import type { BackoffConfig, TalkRule } from './frequency.ts';
+import type { RepetitionConfig } from './repetition.ts';
 import { DEFAULT_RHYTHM, type RhythmConfig } from './rhythm.ts';
 import { DEFAULT_AGENCY, type AgencyConfig } from './agency.ts';
 import { DEFAULT_SCHEDULE, type ScheduleConfig } from './schedule.ts';
@@ -15,6 +16,7 @@ import type { RepeatConfig } from './repeat.ts';
 
 export type { OutgoingConfig } from './delivery.ts';
 export type { BackoffConfig, TalkRule, TalkValueConfig } from './frequency.ts';
+export type { RepetitionConfig } from './repetition.ts';
 export type { RhythmConfig } from './rhythm.ts';
 export type { AgencyConfig, AgencyWindow, ProactiveContactCandidate, AgencyCapacity } from './agency.ts';
 export type { ScheduleConfig, SchedulePlan, ScheduleRule, ScheduleException } from './schedule.ts';
@@ -50,18 +52,39 @@ export interface HumanlikeConfig {
   // 要退行为人得像退回出厂设置，那不是设置页该提供的开关。
   /** 圈内黑话（表达学习，jargon.ts）：挖本群高频词 → 反事实判定 → prompt 参考节 */
   jargon: JargonConfig;
+  /**
+   * 重复惩罚（repetition.ts）：最近若干轮 bot 发言里反复出现的词/人设名，
+   * 注入提醒；命中后可用一次重写把它去掉。与 rhythm（结构定型）互补。
+   */
+  repetition: RepetitionConfig;
+  /**
+   * 表达学习（chat 插件后台）：从群聊里学「什么情境下大家怎么说」，作为语气参考注入。
+   * 只学说法与口吻，不改人设、不产数值；与黑话（学词义）是两件事。
+   */
+  expression: {
+    enable: boolean;
+    /** 攒够多少条群消息才学一次 */
+    minMessages: number;
+    /** 群安静多久才学（秒） */
+    idleSeconds: number;
+    /** 每个会话最多保留多少条表达 */
+    maxPerChat: number;
+    /** 每次注入几条参考 */
+    injectMax: number;
+  };
   /** 跟屏复读（repeat.ts）：纯程序段，>=N 位群友说了同一句就完整跟一条 */
   repeat: RepeatConfig;
   timing: TimingConfig;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
   /**
-   * 出站打断（interrupt.ts）：她还在发气泡时对面又开口，按概率把**剩下的气泡**砍掉。
+   * 出站打断（interrupt.ts）：她还在发气泡时对面又开口，按概率把**剩下的气泡**砍掉；
+   * 模型还在生成时新消息进来，则直接 abort 这一轮（2026-10-18，pipeline.maybeInterrupt）。
    * 纯程序、不叫模型 —— 要求是"对面发完立刻生效"，走模型那一趟早就发完了。
    */
   interrupt: {
     enable: boolean;
-    /** 插话打断的概率（0~1）；制止语与 @/引用 不受它约束（那两条必打断） */
+    /** 插话打断的概率（0~1）；命令插话必断，不受它约束 */
     probability: number;
   };
   /** 消息防抖合并（群聊与私聊共用：私聊不打分，但同样攒批） */
@@ -95,6 +118,16 @@ export interface HumanlikeConfig {
 
 export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   jargon: { enable: true },
+  repetition: {
+    enable: true,
+    windowMessages: 20,
+    minMessages: 3,
+    cooldownMinutes: 30,
+    maxPhrases: 3,
+    retry: true,
+    maxStrikes: 3,
+  },
+  expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
   repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
   timing: {
     replyTriggerMode: 'likelihood',
@@ -135,4 +168,9 @@ export interface TriggerBatch {
    */
   reason: 'at' | 'mention' | 'likelihood' | 'necessity' | 'frequency' | 'idle' | 'proactive' | 'private';
   detail: string;
+  /**
+   * likelihood 门控的样本回执号：开口时创建，pipeline 在这一轮结束后用它回报
+   * 「模型最终有没有真说话」。没有它就只能拿"门开没开"当标签（自指），已在 2026-10-18 修掉。
+   */
+  gateId?: string;
 }

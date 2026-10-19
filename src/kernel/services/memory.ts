@@ -81,26 +81,28 @@ export class MemoryService {
     const q = query.trim();
     if (!q) return this.topFacts(userId, limit);
     const now = nowMs();
+    const likeRows = () => this.db.all(
+      'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY weight DESC, ts DESC LIMIT ?',
+      userId, `%${q}%`, now, limit,
+    );
     let rows: any[];
     if ([...q].length >= 3) {
-      const ftsQuery = q.replace(/["']/g, ' ');
-      rows = this.db.all(
-        `SELECT f.* FROM user_facts_fts ft JOIN user_facts f ON f.rowid = ft.rowid
-         WHERE user_facts_fts MATCH ? AND f.user_id = ? AND (f.expires_at IS NULL OR f.expires_at > ?)
-         ORDER BY f.weight DESC, f.ts DESC LIMIT ?`,
-        `"${ftsQuery}"`, userId, now, limit,
-      );
-      if (rows.length === 0) {
+      // FTS 的查询语法见到某些符号仍会直接抛解析错（这不是"没有命中"）：
+      // 降级到 LIKE 继续搜，别让一次检索报错打断会话
+      try {
+        const ftsQuery = q.replace(/["']/g, ' ');
         rows = this.db.all(
-          'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY weight DESC, ts DESC LIMIT ?',
-          userId, `%${q}%`, now, limit,
+          `SELECT f.* FROM user_facts_fts ft JOIN user_facts f ON f.rowid = ft.rowid
+           WHERE user_facts_fts MATCH ? AND f.user_id = ? AND (f.expires_at IS NULL OR f.expires_at > ?)
+           ORDER BY f.weight DESC, f.ts DESC LIMIT ?`,
+          `"${ftsQuery}"`, userId, now, limit,
         );
+      } catch {
+        rows = likeRows();
       }
+      if (rows.length === 0) rows = likeRows();
     } else {
-      rows = this.db.all(
-        'SELECT * FROM user_facts WHERE user_id=? AND content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY weight DESC, ts DESC LIMIT ?',
-        userId, `%${q}%`, now, limit,
-      );
+      rows = likeRows();
     }
     return rows.map(rowToFact);
   }

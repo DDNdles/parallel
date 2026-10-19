@@ -364,6 +364,44 @@ test('关掉自动保存后不再提炼（开关真管用）', async () => {
   }
 });
 
+test('后台用户画像：事实够了就生成，下一轮请求里能看到「对对方的印象」', async () => {
+  const U = '777890';
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  const p = kernel.config.config.persona as unknown as Record<string, unknown>;
+  const saved = { ...p };
+  p.memoryAutoSave = true; p.memoryMinTurns = 2; p.memoryIdleSeconds = 0; p.memoryMaxFacts = 5;
+  p.profileAuto = true;
+  mockProvider.memoryReply = '- 喜欢打游戏\n- 说话很直接\n- 常加班';
+  mockProvider.profileReply = '这是一个喜欢打游戏、说话直接的加班人。';
+  try {
+    wipeFacts(Number(U));
+    for (const text of ['我喜欢打游戏', '我说话比较直，最近总加班']) {
+      const mark = mock.actions.length;
+      mock.sendGroupMessage({ groupId: GROUP, userId: Number(U), text, atMe: true, nickname: 'Profile' });
+      await mock.waitForReply(GROUP, 8000, mark);
+    }
+    await until(() => !!kernel.memory.getAttr(U, 'profile'), 30000, '画像生成');
+    const profile = kernel.memory.getAttr<{ text?: string }>(U, 'profile');
+    assert.match(String(profile?.text ?? ''), /喜欢打游戏/);
+    mockProvider.script.push({ content: '嗯，今天也辛苦了。' });
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: GROUP, userId: Number(U), text: '今天又加班', atMe: true, nickname: 'Profile' });
+    await mock.waitForReply(GROUP, 8000, mark);
+    const call = (kernel.llm as any).providers.get('mock').calls.at(-1);
+    const system = String(call?.system ?? '');
+    assert.ok(system.includes('你对对方的印象'), `画像分节应进 system: ${system}`);
+    assert.ok(system.includes('喜欢打游戏'), `画像正文应进 system: ${system}`);
+  } finally {
+    for (const k of Object.keys(p)) delete p[k];
+    Object.assign(p, saved);
+    kernel.memory.forget(U);
+    mockProvider.memoryReply = 'NONE';
+    mockProvider.profileReply = 'NONE';
+    mock.actions.length = 0;
+  }
+});
+
 // ============================================================
 // 7. 沙箱边界（红线 §3.2）
 // ============================================================
@@ -788,6 +826,7 @@ test('拟人化：分条是纯程序 —— 句末标点/换行/旧分隔标记�
   mockProvider.script.push({ content: '今天去上课了<sep/>然后回来睡觉<sep/>睡醒吃了饭。' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
   await mock.waitForReply(GROUP);
+  await quiesce();   // 分条之间有 250ms 下限，等整组落地再断言
   const parts = groupSends();
   assert.ok(parts.length >= 2, `写了分隔标记就该拆成多条，实际 ${parts.length} 条`);
   for (const piece of ['今天去上课了', '回来睡觉', '睡醒吃了饭']) {
@@ -800,6 +839,7 @@ test('拟人化：分条是纯程序 —— 句末标点/换行/旧分隔标记�
   mockProvider.script.push({ content: '今天去上课了，然后回来睡觉，睡醒吃了饭。' });
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
   await mock.waitForReply(GROUP);
+  await quiesce();
   const one = groupSends();
   assert.equal(one.length, 1, `逗号不断句，实际 ${one.length} 条: ${JSON.stringify(one)}`);
 });
@@ -809,21 +849,191 @@ test('拟人化：触发消息被后来的消息刷远时，回复自动挂引�
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   mock.actions.length = 0;
   const triggerId = 88001;
-  // 让模型"想一会儿"：生成期间再进一条消息，触发消息就不是最新一条了
-  mockProvider.script.push({ content: '收到', delayMs: 500 });
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '看看这个', atMe: true, nickname: '小明', messageId: triggerId });
-  await new Promise((r) => setTimeout(r, 150));
-  mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '啊这', nickname: '阿强' });
-  await mock.waitForReply(GROUP, 8000);
+  // 这条用例要的是"生成期间来新消息 → 消息被刷远 → 挂引用"，
+  // 所以先关掉生成期打断（否则新消息会把这一轮直接 abort 掉，引用无从谈起）。
+  const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
+  const savedProbability = ic.probability;
+  ic.probability = 0;
+  try {
+    // 让模型"想一会儿"：生成期间再进一条消息，触发消息就不是最新一条了
+    mockProvider.script.push({ content: '收到', delayMs: 500 });
+    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '看看这个', atMe: true, nickname: '小明', messageId: triggerId });
+    await new Promise((r) => setTimeout(r, 150));
+    mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '啊这', nickname: '阿强' });
+    await mock.waitForReply(GROUP, 8000);
+    await quiesce();
+    const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
+    const quoted = sent.find((a) => (a.params.message ?? []).some((s: any) => s.type === 'reply'));
+    assert.ok(quoted, `回复应挂着触发消息的引用: ${JSON.stringify(sent)}`);
+    const replySeg = (quoted!.params.message ?? []).find((s: any) => s.type === 'reply');
+    assert.equal(String(replySeg.data?.id), String(triggerId), '引用的是触发那条消息');
+    // 引用块与正文必须在同一个消息里（曾把 reply 段拆成一条空消息 + 一条无引用的正文）
+    const text = (quoted!.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join('');
+    assert.match(text, /收到/);
+  } finally {
+    ic.probability = savedProbability;
+  }
+});
+
+test('拟人化：模型还在生成时插话，按概率直接打断并丢弃这一轮', async () => {
   await quiesce();
-  const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
-  const quoted = sent.find((a) => (a.params.message ?? []).some((s: any) => s.type === 'reply'));
-  assert.ok(quoted, `回复应挂着触发消息的引用: ${JSON.stringify(sent)}`);
-  const replySeg = (quoted!.params.message ?? []).find((s: any) => s.type === 'reply');
-  assert.equal(String(replySeg.data?.id), String(triggerId), '引用的是触发那条消息');
-  // 引用块与正文必须在同一个消息里（曾把 reply 段拆成一条空消息 + 一条无引用的正文）
-  const text = (quoted!.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join('');
-  assert.match(text, /收到/);
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  mock.actions.length = 0;
+  const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
+  const timing = kernel.config.config.humanlike.timing as unknown as {
+    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    pendingThreshold: number;
+  };
+  const saved = { p: ic.probability, mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
+  ic.probability = 1;
+  // 第二句普通消息不该触发一轮：频率档 + 很高的门槛，保证断言只看"第一轮有没有被 abort"
+  timing.replyTriggerMode = 'frequency';
+  timing.pendingThreshold = 100;
+  try {
+    mockProvider.script.push({ content: '这句不该发出去', delayMs: 1200 });
+    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '你先想着', atMe: true, nickname: '小明' });
+    await new Promise((r) => setTimeout(r, 200));
+    mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '插一句', nickname: '阿强' });
+    // 等到模型原本该吐字的时点之后：如果 abort 没生效，这里会看到那条回复
+    await new Promise((r) => setTimeout(r, 1800));
+    const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
+    assert.equal(sent.length, 0, `生成期被打断，不该发出回复: ${JSON.stringify(sent)}`);
+    const gates = kernel.sessionLog.tail(String(GROUP), 'group', 80)
+      .filter((e) => e.type === 'gate' && (e.data as { decision?: string } | undefined)?.decision === 'generation_interrupted');
+    assert.ok(gates.length >= 1, '应留下 generation_interrupted 的 gate 记录');
+  } finally {
+    ic.probability = saved.p;
+    timing.replyTriggerMode = saved.mode;
+    timing.pendingThreshold = saved.pending;
+  }
+});
+
+test('后台表达学习：群里攒够消息后学一条，下一轮 system 里出现「本群的说法」', async () => {
+  const G = 124;
+  await quiesce();
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  mock.actions.length = 0;
+  const ec = kernel.config.config.humanlike.expression as unknown as Record<string, unknown>;
+  const saved = { ...ec };
+  const timing = kernel.config.config.humanlike.timing as unknown as {
+    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    pendingThreshold: number;
+  };
+  const savedT = { mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
+  ec.enable = true; ec.minMessages = 4; ec.idleSeconds = 0; ec.maxPerChat = 24; ec.injectMax = 4;
+  mockProvider.expressionReply = '{"expressions":[{"situation":"有人问在吗","style":"在的在的","keys":["在吗"]}]}';
+  try {
+    // 先 @ 一次，让 chat 插件把这群标记成活跃会话
+    mockProvider.script.push({ content: '在的' });
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    await mock.waitForReply(G, 8000);
+    // 之后普通消息不触发回复（频率档 + 极高门槛），只进学习队列
+    timing.replyTriggerMode = 'frequency';
+    timing.pendingThreshold = 100;
+    for (const text of ['今天好热', '确实好热', '开空调吧', '在吗']) {
+      mock.sendGroupMessage({ groupId: G, userId: 10002, text, nickname: '阿强' });
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    await until(() => mockProvider.calls.some((c) => String(c.system ?? '').includes('表达方式整理助手')), 8000, '表达学习请求');
+    await new Promise((r) => setTimeout(r, 500));   // 等后台把学到的说法写进插件 KV
+    mockProvider.script.push({ content: '在的在的' });
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    await mock.waitForReply(G, 8000, mark);
+    const call = (kernel.llm as any).providers.get('mock').calls.at(-1);
+    const system = String(call?.system ?? '');
+    assert.ok(system.includes('本群的说法'), `表达学习分节应进 system: ${system}`);
+    assert.ok(system.includes('在的在的'), `学到的说法应进 system: ${system}`);
+  } finally {
+    for (const k of Object.keys(ec)) delete ec[k];
+    Object.assign(ec, saved);
+    timing.replyTriggerMode = savedT.mode;
+    timing.pendingThreshold = savedT.pending;
+    mockProvider.expressionReply = '{"expressions":[]}';
+    kernel.container.setGroupState('chat', String(G), false, String(MASTER));
+    mock.actions.length = 0;
+  }
+});
+
+test('后台中期回想：存着更早聊天的摘要时，下一轮 system 里有背景回想', async () => {
+  const G = 126;
+  await quiesce();
+  const key = `group_${G}`;
+  const entry = {
+    summary: '大家在聊周末开黑，约了周六晚上。',
+    cues: ['周末开黑'],
+    fromTs: 1, toTs: 2, updatedAt: Date.now(),
+  };
+  // 先卸载（让旧实例把内存态落盘），再种状态、再加载：直接 reload 会被旧实例的 onDispose 覆盖
+  const before = kernel.container.get('chat')!;
+  await kernel.container.unload('chat');
+  try {
+    kernel.db.run(
+      `INSERT INTO plugin_kv (plugin_id,key,value,updated_at) VALUES ('chat','midterm_notes',?,?)
+       ON CONFLICT(plugin_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      JSON.stringify({ [key]: entry }), Date.now(),
+    );
+    await kernel.container.load(before.dir, before.source);
+    kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+    mockProvider.script.push({ content: '周六见。' });
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '周六还开黑吗', atMe: true, nickname: '小明' });
+    await mock.waitForReply(G, 8000, mark);
+    const call = (kernel.llm as any).providers.get('mock').calls.at(-1);
+    const system = String(call?.system ?? '');
+    assert.ok(system.includes('更早的聊天（背景回想）'), `中期回想分节应进 system: ${system}`);
+    assert.ok(system.includes('周六晚上'), `回想正文应进 system: ${system}`);
+  } finally {
+    // 清掉种子并重载，别让后面共用同一内核的用例看到这份假回想
+    const loaded = kernel.container.get('chat');
+    if (loaded) await kernel.container.unload('chat');
+    kernel.db.run("DELETE FROM plugin_kv WHERE plugin_id='chat' AND key='midterm_notes'");
+    if (loaded) await kernel.container.load(loaded.dir, loaded.source);
+    kernel.container.setGroupState('chat', String(G), false, String(MASTER));
+  }
+});
+
+test('重复惩罚：连续提梁文峰后下一轮提醒并重写；人设重复段只注入一次', async () => {
+  await quiesce();
+  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
+  mock.actions.length = 0;
+  // 三轮的回复都只共享「梁文峰」这个短语（句子各不相同，避免被选成更长的固定句）
+  for (const line of ['梁文峰说这个可以', '梁文峰又来了', '我问梁文峰了']) {
+    mockProvider.script.push({ content: line });
+    const mark = mock.actions.length;
+    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    await mock.waitForReply(GROUP, 8000, mark);
+    await quiesce(150, 3000);
+  }
+
+  // 第四轮：第一版仍提梁文峰，重写版去掉
+  mockProvider.script.push({ content: '梁文峰又来了' });
+  mockProvider.script.push({ content: '这个回头再说。' });
+  const mark = mock.actions.length;
+  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+  await mock.waitForReply(GROUP, 8000, mark);
+  await quiesce();
+
+  const sent = mock.actions
+    .slice(mark)
+    .filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP))
+    .map((a) => (a.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join(''))
+    .join('\n');
+  assert.ok(!sent.includes('梁文峰'), `最终不该发出梁文峰: ${sent}`);
+  assert.ok(sent.includes('这个回头再说'), `应发出重写后的正文: ${sent}`);
+
+  const gate = kernel.sessionLog.tail(String(GROUP), 'group', 120)
+    .find((e) => e.type === 'gate' && (e.data as { decision?: string } | undefined)?.decision === 'repetition_retry');
+  assert.ok(gate, '应留一条 repetition_retry gate');
+  assert.equal((gate?.data as { phrase?: string } | undefined)?.phrase, '梁文峰');
+
+  // 第四轮那次带工具的主请求：system 里有重复提醒；且 protagonist 的整段只注入一次
+  const calls = mockProvider.calls.filter((c) => (c.tools?.length ?? 0) > 0 && String(c.system ?? '').includes('重复提醒'));
+  assert.ok(calls.length >= 1, '第四轮主请求应带重复提醒');
+  const system = String(calls[calls.length - 1].system ?? '');
+  assert.ok(system.includes('梁文峰'), '提醒里应点名梁文峰');
+  assert.equal((system.match(/梁文峰是你的小助手/g) ?? []).length, 1, 'protagonist/post_history 重复段应只注入一次');
+  mock.actions.length = 0;
 });
 
 test('拟人化：一问一答没被刷远时不挂引用（一般的消息不需要引用）', async () => {
@@ -959,6 +1169,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   const savedOut = { ...hl.outgoing };
   const savedIt = { ...hl.interrupt };
   // 每条后续气泡等 2 秒（真实默认是"基础 1s + 字数/8"）：给打断留一个确定的窗口
+  hl.outgoing.typingEnabled = true;
   hl.outgoing.typingBaseDelaySeconds = 2;
   hl.outgoing.typingMaxDelaySeconds = 2;
   hl.outgoing.typingJitterRatio = 0;
@@ -967,7 +1178,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   const chat = { platform: 'qq', type: 'group' as const, chatId: String(G) };
   try {
     mock.actions.length = 0;
-    mockProvider.script.push({ content: '第一句。第二句。第三句。第四句。' });
+    mockProvider.script.push({ content: '第一句。第二句。第三句。' });
     mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
     const sendsOf = () => mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(G));
     // 等第一条气泡落地：此刻循环正卡在"第二条之前的 2 秒打字停顿"里
@@ -980,7 +1191,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
 
     const assistants = kernel.history.snapshot(chat).filter((m) => m.role === 'assistant');
     assert.equal(assistants.length, 1, '被打断这一轮只该回灌一条 assistant');
-    assert.equal(String(assistants[0].content), '第一句。', '被砍掉的气泡一个字都不该进历史');
+    assert.equal(String(assistants[0].content), '第一句', '被砍掉的气泡一个字都不该进历史');
 
     // 会话流里留一条 gate 说明为什么话说一半（桌面端据此排障）
     const gates = kernel.sessionLog.tail(G, 'group', 60)

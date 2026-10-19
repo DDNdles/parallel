@@ -444,11 +444,41 @@ export function injectMedia(payload: any, api: string, media: PreparedMedia): an
 
 export function mapUsage(u: any): LLMUsage | undefined {
   if (!u) return undefined;
-  const cacheRead = Number(u.cacheRead ?? 0);
-  const input = Number(u.input ?? 0);
+  // pi-ai 的 Google/Anthropic/OpenAI 适配层会归一化成 cacheRead/input/output；
+  // 本地中转偶尔直接回原始形状（cache_read_input_tokens、cached_tokens、cachedContentTokenCount），
+  // 这里做一层兜底，避免缓存明明有值却被记成 0。
+  const normCache = Number(u.cacheRead);
+  const anthCache = Number(u.cache_read_input_tokens);
+  const oaiCache = Number(u.prompt_tokens_details?.cached_tokens);
+  const googleCache = Number(u.cachedContentTokenCount);
+  let cacheRead = 0;
+  let input = 0;
+  if (Number.isFinite(normCache) && normCache > 0) {
+    cacheRead = normCache;
+    input = Number(u.input ?? 0);
+  } else if (Number.isFinite(anthCache) && anthCache > 0) {
+    cacheRead = anthCache;
+    // Anthropic：input_tokens 不含缓存读，cache_creation 仍按未命中输入计
+    input = Number(u.input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0);
+  } else if (Number.isFinite(oaiCache) && oaiCache > 0) {
+    cacheRead = oaiCache;
+    // OpenAI：prompt_tokens 是总数，cached_tokens 是其中命中部分
+    input = Math.max(0, Number(u.prompt_tokens ?? 0) - cacheRead);
+  } else if (Number.isFinite(googleCache) && googleCache > 0) {
+    cacheRead = googleCache;
+    input = Math.max(0, Number(u.promptTokenCount ?? u.prompt_tokens ?? 0) - cacheRead);
+  } else {
+    input = Number(u.input ?? u.input_tokens ?? u.prompt_tokens ?? 0);
+  }
+  input = Math.max(0, Number.isFinite(input) ? input : 0);
+  cacheRead = Math.max(0, Number.isFinite(cacheRead) ? cacheRead : 0);
+  const output = Math.max(0, Number(u.output ?? u.output_tokens ?? u.completion_tokens ?? u.candidatesTokenCount ?? 0) || 0);
+  if (process.env.PARALLEL_DEBUG) {
+    console.log(`[usage] keys=${Object.keys(u).join(',')} cacheHit=${cacheRead} input=${input} output=${output}`);
+  }
   return {
     promptTokens: input + cacheRead,
-    completionTokens: Number(u.output ?? 0),
+    completionTokens: output,
     cacheHitTokens: cacheRead,
     cacheMissTokens: input,
   };

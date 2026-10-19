@@ -32,6 +32,11 @@ export interface JargonServiceOptions {
   config?: () => JargonConfig;
   /** 反事实判定回调（kernel 里用 llm.chat 装配；没接/失败返回 null） */
   infer?: (payload: { term: string; count: number; contexts: string[] }) => Promise<JargonInfer | null>;
+  /**
+   * 中文候选挖掘（2026-10-18）：ASCII 快路径靠正则，中文没有分词器，改为攒一批群消息
+   * 让模型只挑「本群特有、圈外人不好懂」的词。失败返回 null（保留这批，5 分钟后再试）。
+   */
+  mine?: (payload: { texts: string[] }) => Promise<string[] | null>;
   now?: () => number;
 }
 
@@ -41,6 +46,10 @@ const CONTEXT_MAX = 6;
 const CONTEXT_LEN = 120;
 const FLUSH_MS = 5_000;
 const INFER_GAP_MS = 60_000;
+/** 中文候选挖掘：攒够这么多条群消息问一次模型；同一群两次之间至少隔 5 分钟 */
+const MINE_BATCH = 24;
+const MINE_MAX_TEXTS = 60;
+const MINE_GAP_MS = 5 * 60_000;
 
 /** 无分词器时代的黑话候选：只收带字母的词（含数字混写）。链接、@、占位符先剥掉 */
 const STOPWORDS = new Set([
@@ -74,6 +83,10 @@ export class JargonService {
   private meta = new Map<string, { rung: number; meaning: string }>();
   /** 每个词最近见过的语境（推断时喂给反事实对比） */
   private contexts = new Map<string, string[]>();
+  /** 中文候选挖掘的待处理群消息（每群一份，够批次才问模型） */
+  private mineBuffers = new Map<string, string[]>();
+  private lastMineAt = new Map<string, number>();
+  private mineBusy = new Set<string>();
   private dirty = false;
   private inferBusy = new Set<string>();
   private lastInferAt = new Map<string, number>();
@@ -111,8 +124,9 @@ export class JargonService {
   observe(event: ChatEvent): void {
     if (!this.opts.config?.().enable) return;
     if (event.type !== 'group' || !event.text) return;
-    const terms = extractCandidates(event.text);
-    if (!terms.length) return;
+    const raw = String(event.text).trim();
+    if (!raw || raw.startsWith('/') || raw.startsWith('／')) return;
+    const terms = extractCandidates(raw);
     for (const term of terms) {
       const counts = this.countsFor(event.chatId);
       const count = (counts.get(term) ?? 0) + 1;
@@ -120,13 +134,76 @@ export class JargonService {
       const k = this.key(event.chatId, term);
       const ctx = this.contexts.get(k) ?? [];
       if (ctx.length < CONTEXT_MAX) {
-        const snippet = event.text.length > CONTEXT_LEN ? `${event.text.slice(0, CONTEXT_LEN)}…` : event.text;
+        const snippet = raw.length > CONTEXT_LEN ? `${raw.slice(0, CONTEXT_LEN)}…` : raw;
         ctx.push(snippet);
         this.contexts.set(k, ctx);
       }
       this.dirty = true;
       const rung = this.meta.get(k)?.rung ?? 0;
       if (rung < JARGON_LADDER.length && count >= JARGON_LADDER[rung]) this.fireInfer(event.chatId, term, count, rung);
+    }
+    this.queueMine(event.chatId, raw);
+  }
+
+  /** 中文候选：攒够一批群消息才让模型挑词（ASCII 仍走上面的快路径） */
+  private queueMine(chatId: string, text: string): void {
+    if (!this.opts.mine || !this.opts.config?.().enable) return;
+    if (this.mineBusy.has(chatId)) return;
+    const now = this.now();
+    if (now - (this.lastMineAt.get(chatId) ?? 0) < MINE_GAP_MS) return;
+    const buf = this.mineBuffers.get(chatId) ?? [];
+    buf.push(text.length > 200 ? `${text.slice(0, 200)}…` : text);
+    if (buf.length > MINE_MAX_TEXTS) buf.splice(0, buf.length - MINE_MAX_TEXTS);
+    this.mineBuffers.set(chatId, buf);
+    if (buf.length >= MINE_BATCH) void this.mineBatch(chatId);
+  }
+
+  /**
+   * 让模型从一批群消息里挑候选词。这里只负责"候选"，判不判成黑话仍由
+   * 频次阶梯 + 反事实对比决定（与 ASCII 路径同一把尺子）。
+   */
+  private async mineBatch(chatId: string): Promise<void> {
+    const buf = this.mineBuffers.get(chatId) ?? [];
+    if (buf.length < MINE_BATCH || !this.opts.mine) return;
+    const texts = buf.slice(-MINE_MAX_TEXTS);
+    this.mineBusy.add(chatId);
+    this.lastMineAt.set(chatId, this.now());
+    try {
+      const terms = await this.opts.mine({ texts });
+      if (!terms) return;                       // 失败：保留这批，5 分钟后再试
+      this.mineBuffers.set(chatId, []);
+      for (const rawTerm of terms) {
+        const term = normalizeMinedTerm(rawTerm);
+        if (!term) continue;
+        const lower = term.toLowerCase();
+        const occurrences = texts.reduce((n, t) => n + (String(t).toLowerCase().includes(lower) ? 1 : 0), 0);
+        if (!occurrences) continue;
+        const counts = this.countsFor(chatId);
+        const existing = counts.get(term) ?? 0;
+        // 带字母的词已经被上面的快路径数过一遍，别双算；中文/新词才补计数
+        const isCjk = /[\u4e00-\u9fff]/.test(term);
+        if (!isCjk && existing > 0) continue;
+        const count = existing + occurrences;
+        counts.set(term, count);
+        const k = this.key(chatId, term);
+        const ctx = this.contexts.get(k) ?? [];
+        if (ctx.length < CONTEXT_MAX) {
+          for (const t of texts) {
+            if (ctx.length >= CONTEXT_MAX) break;
+            if (!String(t).toLowerCase().includes(lower)) continue;
+            ctx.push(t.length > CONTEXT_LEN ? `${t.slice(0, CONTEXT_LEN)}…` : t);
+          }
+          this.contexts.set(k, ctx);
+        }
+        this.dirty = true;
+        const rung = this.meta.get(k)?.rung ?? 0;
+        if (rung < JARGON_LADDER.length && count >= JARGON_LADDER[rung]) this.fireInfer(chatId, term, count, rung);
+      }
+    } catch (e) {
+      this.opts.errors?.record('warn', 'kernel', `黑话候选挖掘出错：${(e as Error).message}`);
+    } finally {
+      this.mineBusy.delete(chatId);
+      this.flush();
     }
   }
 
@@ -183,28 +260,82 @@ export class JargonService {
 
   /**
    * 「圈内黑话」system 分节的正文：本群学到的词 + 一句话含意；没学到就 null（不发空节）。
+   * 给了 `recentText` 就只留**当前上下文里真的出现**的词——把 8 个不相干的词每轮塞进去，
+   * 既费 token 也会让模型硬找地方用；没给（测试/旧调用）仍按最近学到的排。
    * 用途限定在"听懂"，措辞里也讲清楚不许拿它当教学材料。
    */
-  sections(chat: ChatRef): string | null {
+  sections(chat: ChatRef, recentText?: string): string | null {
     if (!this.opts.config?.().enable) return null;
     let rows: { term: string; meaning: string }[] = [];
     try {
       rows = this.opts.db.all<{ term: string; meaning: string }>(
-        'SELECT term, meaning FROM jargon WHERE chat_id = ? AND meaning <> ? ORDER BY ts DESC LIMIT 12',
+        'SELECT term, meaning FROM jargon WHERE chat_id = ? AND meaning <> ? ORDER BY ts DESC LIMIT 24',
         chat.chatId, '',
       );
     } catch { return null; }
     if (!rows.length) return null;
+    const recent = String(recentText ?? '').trim().toLowerCase();
+    const picked = recent
+      ? rows.filter((r) => recent.includes(String(r.term).toLowerCase()))
+      : rows;
+    if (!picked.length) return null;
     return [
       '# 圈内黑话（以前从本群学来的）',
       '下面这些词在你们圈里有自己的含意。遇到就按写下的意思听、自然使用，别当词典来讲、也别主动教学——对方在用黑话时说不清楚意思反而是出戏。',
-      ...rows.slice(0, 8).map((r) => `- ${r.term}：${r.meaning}`),
+      ...picked.slice(0, 8).map((r) => `- ${r.term}：${r.meaning}`),
     ].join('\n');
   }
 }
 
 /** 反事实判定的两段式提示词 + 行结果解析（kernel 的 infer 闭包用） */
 export const JARGON_SYSTEM = '你在审一个 QQ 群里逐渐长出的「圈内黑话」。判定方式是反事实对比：同一个词，不看用法与看了真实用法，意思是否读得一样。读法有分歧＝圈内黑话；没分歧＝普通词。结论只给圈内含意的一句话，不要延伸故事。';
+
+/** 中文候选挖掘（kernel 的 mine 闭包用；MockEngine 认这句自认标记） */
+export const JARGON_MINE_SYSTEM = '你是黑话候选整理助手。看一段 QQ 群聊天，只挑“这个群特有、圈外人不好懂”的词、缩写或梗。不要普通词、人名、链接、语气词、纯数字。只输出一行 JSON：{"terms":["..."]}。';
+
+export function buildJargonMinePrompt(texts: string[]): string {
+  return [
+    `群聊原文（共 ${texts.length} 条）：`,
+    ...texts.map((t, i) => `${i + 1}. ${t}`),
+    '',
+    '最多 10 个候选；没有就输出 {"terms":[]}。',
+  ].join('\n');
+}
+
+/** 候选词清洗：去引号/标点、限长；URL/纯数字/空白串不要 */
+export function normalizeMinedTerm(raw: unknown): string {
+  const t = String(raw ?? '').trim()
+    .replace(/^["'“”‘’「」『』，,。.!！?？:：;；]+|["'“”‘’「」『』，,。.!！?？:：;；]+$/g, '')
+    .trim();
+  if (!t || t.length < 2 || t.length > 16) return '';
+  if (/\s/.test(t) || /^https?:\/\//i.test(t) || /^\d+$/.test(t)) return '';
+  if (!/[0-9A-Za-z\u4e00-\u9fff]/.test(t)) return '';
+  return t;
+}
+
+export function parseJargonMineReply(text: string): string[] | null {
+  const raw = String(text ?? '');
+  const m = raw.match(/\{[\s\S]*\}/) ?? raw.match(/\[[\s\S]*\]/);
+  if (!m) return null;
+  try {
+    const obj = JSON.parse(m[0]) as unknown;
+    const list = Array.isArray(obj)
+      ? obj
+      : (obj && typeof obj === 'object' && Array.isArray((obj as { terms?: unknown }).terms)
+        ? (obj as { terms: unknown[] }).terms
+        : null);
+    if (!list) return null;
+    const out: string[] = [];
+    for (const item of list) {
+      const term = normalizeMinedTerm(item);
+      if (term && !out.includes(term)) out.push(term);
+      if (out.length >= 10) break;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
 
 export function buildJargonPrompt(p: { term: string; count: number; contexts: string[] }): string {
   return [

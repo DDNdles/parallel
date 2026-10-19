@@ -58,7 +58,7 @@ test('动态阈值：连续沉默就下调且不破底；开口过头才上调�
 
 // ---------------- 服务级：likelihood 模式真的驱动 gate ----------------
 
-interface Harness { service: HumanlikeService; dirs: string[]; triggered: string[] }
+interface Harness { service: HumanlikeService; dirs: string[]; triggered: string[]; batches: import('../src/kernel/humanlike/types.ts').TriggerBatch[]; cfg: HumanlikeConfig }
 function makeService(patch: (c: HumanlikeConfig) => void, modelFile?: string): Harness {
   const cfg: HumanlikeConfig = JSON.parse(JSON.stringify(DEFAULT_HUMANLIKE)) as HumanlikeConfig;
   cfg.merge = { enable: false, windowMs: 200, maxWaitMs: 1000, bufferTtlMs: 120_000 };
@@ -66,18 +66,19 @@ function makeService(patch: (c: HumanlikeConfig) => void, modelFile?: string): H
   let t = 1_700_000_000_000;
   const dirs: string[] = [];
   const sessionDir = mkdtempSync(join(tmpdir(), 'parallel-gate-log-')); dirs.push(sessionDir);
+  const triggered: string[] = [];
+  const batches: Harness['batches'] = [];
   const service = new HumanlikeService({
     config: () => cfg,
     selfNickname: () => '大肥鱼',
-    trigger: (batch) => { triggered.push(batch.reason); },
+    trigger: (batch) => { triggered.push(batch.reason); batches.push(batch); },
     sessionLog: new SessionLog(sessionDir, new Bus()),
     bus: new Bus(),
     errors: {} as unknown as import('../src/kernel/errors.ts').ErrorCenter,
     now: () => { t += 1_000; return t; },
     modelFile,
   });
-  const triggered: string[] = [];
-  return { service, dirs, triggered };
+  return { service, dirs, triggered, batches, cfg };
 }
 
 function groupEvent(text: string): ChatEvent {
@@ -124,6 +125,81 @@ test('likelihood 模式：短反应留在门外；攒出积压与内容分就开
   }
 });
 
+test('专注模式：普通群聊不参与打分，@ 仍直通', async () => {
+  const h = makeService((cfg) => {
+    cfg.timing.replyTriggerMode = 'likelihood';
+    cfg.timing.focusMode = true;
+    cfg.timing.pendingThreshold = 1;
+    cfg.backoff = { baseSeconds: 0, capSeconds: 0, startCount: 2, bypassPendingCount: 6 };
+  });
+  try {
+    await h.service.ingest(groupEvent('今天天气不错，出去走走'), { isCommand: false });
+    await wait(80);
+    assert.equal(h.triggered.length, 0, '普通群聊不该开口');
+    const r = h.service.ingest({ ...groupEvent('你看这个'), isAtMe: true }, { isCommand: false });
+    assert.equal(r.action, 'pass', '@ 仍应直通');
+  } finally {
+    h.service.dispose();
+    for (const d of h.dirs) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('talkValue=0：普通群聊直接被频率静默（不再只是特征里的一项）', async () => {
+  const h = makeService((cfg) => {
+    cfg.timing.replyTriggerMode = 'likelihood';
+    cfg.timing.pendingThreshold = 2;
+    cfg.timing.talkValue = 0;
+    cfg.backoff = { baseSeconds: 0, capSeconds: 0, startCount: 2, bypassPendingCount: 6 };
+  });
+  try {
+    for (const text of ['地下停车位到底该怎么租啊！物业还贴条了', '能不能说说流程啊，我头一次搞这个', '这个怎么弄啊']) {
+      await h.service.ingest(groupEvent(text), { isCommand: false });
+      await wait(30);
+    }
+    await wait(60);
+    assert.equal(h.triggered.length, 0, 'talkValue=0 时不该主动开口');
+    // 把频率拨回去，同样的积压应当能触发
+    h.cfg.timing.talkValue = 1;
+    await h.service.ingest(groupEvent('这个怎么弄啊，帮我看看流程'), { isCommand: false });
+    await wait(80);
+    assert.ok(h.triggered.includes('likelihood'), `频率拨回后应能开口: ${JSON.stringify(h.triggered)}`);
+  } finally {
+    h.service.dispose();
+    for (const d of h.dirs) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('样本按回合结果记账：开口后没回执不落 y，回执 silent 落 0，drop 不落', async () => {
+  const h = makeService((cfg) => {
+    cfg.timing.replyTriggerMode = 'likelihood';
+    cfg.timing.pendingThreshold = 1;
+    cfg.backoff = { baseSeconds: 0, capSeconds: 0, startCount: 2, bypassPendingCount: 6 };
+  });
+  try {
+    await h.service.ingest(groupEvent('地下停车位到底该怎么租啊！物业还贴条了'), { isCommand: false });
+    await wait(80);
+    assert.ok(h.batches.length >= 1, '应触发一轮');
+    const gate = h.batches[0];
+    assert.ok(gate.gateId, '开口应带 gateId');
+    assert.equal(h.service.gateModelSnapshot().rows, 0, '开口当下不落样本（等模型结果）');
+    h.service.noteTurnOutcome(gate.chat, gate.gateId, false);
+    assert.equal(h.service.gateModelSnapshot().rows, 1, '回执 silent 后落一条 y=0');
+
+    // 再触发一轮，然后 drop：样本数不应变化
+    h.batches.length = 0;
+    await h.service.ingest(groupEvent('这个流程到底怎么走啊，帮我看看'), { isCommand: false });
+    await wait(80);
+    const gate2 = h.batches[0];
+    assert.ok(gate2?.gateId, '第二轮也应带 gateId');
+    const rows = h.service.gateModelSnapshot().rows;
+    h.service.dropGate(gate2!.chat, gate2!.gateId);
+    assert.equal(h.service.gateModelSnapshot().rows, rows, 'drop 不落样本');
+  } finally {
+    h.service.dispose();
+    for (const d of h.dirs) rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test('likelihood 权重与样本随行落盘；第二个实例冷启动接着学', async () => {
   const sessionDir = mkdtempSync(join(tmpdir(), 'parallel-gate-log-'));
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-gate-model-'));
@@ -135,10 +211,12 @@ test('likelihood 权重与样本随行落盘；第二个实例冷启动接着学
     cfg.timing.pendingThreshold = 3;
     cfg.backoff = { baseSeconds: 0, capSeconds: 0, startCount: 2, bypassPendingCount: 6 };
     let t = 1_700_000_000_000;
-    const service = new HumanlikeService({
+    let service!: HumanlikeService;
+    service = new HumanlikeService({
       config: () => cfg,
       selfNickname: () => '大肥鱼',
-      trigger: () => undefined,
+      // 模拟 pipeline 的回合回执：门一开就按"模型真说了"记样本，45 条都进盘
+      trigger: (b) => { if (b.gateId) service.noteTurnOutcome(b.chat, b.gateId, true); },
       sessionLog: new SessionLog(sessionDir, new Bus()),
       bus: new Bus(),
       errors: {} as unknown as import('../src/kernel/errors.ts').ErrorCenter,

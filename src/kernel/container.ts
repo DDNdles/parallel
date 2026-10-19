@@ -704,7 +704,7 @@ function makeGatedMemory(manifest: PluginManifest, deps: { memory: MemoryService
   };
   return {
     getProfile: (userId: string) => { can('memory.read'); return deps.memory.getProfile(userId); },
-    addFact: (userId: string, fact: { content: string; ttlDays?: number; weight?: number }) => {
+    addFact: (userId: string, fact: { content: string; sourceChat?: string; ttlDays?: number; weight?: number }) => {
       can('memory.write');
       return deps.memory.addFact(userId, { ...fact, sourcePlugin: manifest.id });
     },
