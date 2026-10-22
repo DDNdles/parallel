@@ -1220,6 +1220,32 @@ tr:hover td { background: var(--row-hover); }
 .mset-chip:hover { border-color: var(--border-stronger); color: var(--text); }
 .mset-chip.on { background: var(--bg-active); border-color: var(--border-stronger); color: var(--text); }
 .mset-chip.sq { padding: 6px; }
+
+/* 权限名单：用户搜索 / 群聊批量添加 */
+.perm-search { display: flex; align-items: center; gap: 8px; }
+.perm-search > .bfield, .perm-pick > .bfield { flex: 1; min-width: 0; }
+.perm-results { margin-top: 7px; }
+.perm-row { width: 100%; border: 0; background: transparent; text-align: left; font-family: var(--sans);
+  font-size: 12.5px; color: var(--dim); cursor: pointer; }
+.perm-row:hover { background: var(--bg-hover); color: var(--text); }
+.perm-row.on { background: var(--bg-active); color: var(--text); }
+.perm-row:disabled { opacity: .55; cursor: default; }
+.perm-row:disabled:hover { background: transparent; color: var(--dim); }
+.perm-row .ic { display: inline-flex; flex: none; color: var(--faint); }
+.perm-row-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+.perm-row-nm.ovf { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - var(--nm-fade, 24px)), transparent 100%); }
+.perm-row:hover .perm-row-nm.ovf .tt { animation: nm-scroll var(--nm-dur, 3s) ease-in-out .18s infinite alternate; }
+.perm-row-qq { flex: none; font-size: 11.5px; color: var(--faint); }
+.perm-chips { margin-top: 8px; }
+.perm-chip { max-width: 100%; }
+.perm-chip-nm { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-chip-qq { font-size: 11px; color: var(--faint); }
+.perm-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;
+  margin-left: 1px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--faint); cursor: pointer; }
+.perm-chip-x:hover { color: var(--err); background: var(--bg-hover); }
+.perm-members { max-height: 248px; overflow-y: auto; }
+.perm-pick { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; }
+.perm-pick-foot { margin: 10px 0 0; }
 .mset-lvl { display: inline-flex; align-items: center; gap: 2px; padding: 2px 3px 2px 8px; border: 1px solid var(--border); border-radius: 9px; }
 .mset-lvl input { width: 86px; border: 0; background: transparent; padding: 4px 0; font-size: 12.5px; }
 

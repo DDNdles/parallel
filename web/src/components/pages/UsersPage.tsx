@@ -7,11 +7,15 @@ import { get, post, fmtDT } from '@/lib/api';
 import { Icon } from '@/components/Icon';
 import { BrandInput } from '@/components/BrandInput';
 import { Modal, Field, Switch } from '@/components/Modal';
+import Hint from '@/components/Hint';
+import { PillSelect, type PillOpt } from '@/components/PillSelect';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import { useSave } from '@/lib/useSave';
 
-interface U { userId: string; nickname: string; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
+interface U { userId: string; nickname: string; remark?: string; lastSeen: number; blocked: boolean; isMaster: boolean; isAdmin: boolean }
 interface UsersApi { users: U[]; masterIds: string[]; extraAdminIds: string[] }
+interface Group { groupId: string; name: string; memberCount: number }
+interface Member { userId: string; nickname: string; card?: string; role?: string }
 interface Fact { id: string; content: string; sourcePlugin: string; weight: number; ts: number }
 interface Detail {
   profile: { userId: string; nickname: string; firstSeen: number; lastSeen: number; blocked: boolean };
@@ -20,7 +24,7 @@ interface Detail {
 interface Op { ts: number; source: string; userId: string; op: string; payload: string }
 
 const GROUPS: { v: string; t: string }[] = [
-  { v: 'master', t: '主人' }, { v: 'admin', t: '管理员' }, { v: 'user', t: '普通用户' }, { v: 'blocked', t: '已拉黑' },
+  { v: 'master', t: '主人' }, { v: 'admin', t: '用户' }, { v: 'user', t: '普通用户' }, { v: 'blocked', t: '已拉黑' },
 ];
 const groupOf = (u: U) => (u.blocked ? 'blocked' : u.isMaster ? 'master' : u.isAdmin ? 'admin' : 'user');
 
@@ -186,7 +190,7 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
 
       <div className="mset-meta">
         {u.isMaster && <span className="tag accent">主人</span>}
-        {!u.isMaster && u.isAdmin && <span className="tag">管理员</span>}
+        {!u.isMaster && u.isAdmin && <span className="tag">用户</span>}
         {u.blocked && <span className="tag err">拉黑</span>}
         <span className="tag">{detail?.facts.length ?? 0} 条记忆</span>
       </div>
@@ -196,7 +200,7 @@ function UserDetail({ u, detail, ops, q, onQ, sv, onChanged, onReload, onForget 
         <div className="mset-mrow"><span className="plg-k">首次</span><span className="plg-v">{p?.firstSeen ? fmtDT(p.firstSeen) : '—'}</span></div>
         <div className="mset-mrow"><span className="plg-k">最近</span><span className="plg-v">{fmtDT(p?.lastSeen || u.lastSeen) || '—'}</span></div>
         <div className="mset-mrow"><span className="plg-k">权限</span><span className="plg-v">
-          {u.isMaster ? '主人（最高）' : u.isAdmin ? '管理员（群管理员/群主由协议端动态识别）' : '普通用户'}</span></div>
+          {u.isMaster ? '主人（最高）' : u.isAdmin ? '用户（有work权限）' : '普通用户'}</span></div>
       </div>
 
       <div className="mset-sec-h">
@@ -270,29 +274,175 @@ const parse = (s: string) => s.split(/[,，\s]+/).map((x) => x.trim()).filter(Bo
 
 function RolesModal({ data, onClose, onChanged }: { data: UsersApi; onClose: () => void; onChanged: () => void }) {
   const [masters, setMasters] = useState(data.masterIds.join(','));
-  const [admins, setAdmins] = useState(data.extraAdminIds.join(','));
+  const [users, setUsers] = useState<string[]>(data.extraAdminIds);
+  const [q, setQ] = useState('');
+  const [picking, setPicking] = useState(false);
   const [err, setErr] = useState('');
+  const byId = new Map(data.users.map((u) => [u.userId, u]));
+  const master = new Set(data.masterIds);
+  const key = q.trim().toLowerCase();
+  const found = key
+    ? data.users.filter((u) => `${u.nickname ?? ''} ${u.remark ?? ''} ${u.userId}`.toLowerCase().includes(key)).slice(0, 8)
+    : [];
+  const rawQq = /^\d{5,12}$/.test(key) && !byId.has(key) && !users.includes(key) && !master.has(key);
+
+  const add = (...ids: string[]) => setUsers((xs) => {
+    const out = [...xs];
+    for (const id of ids) if (id && !out.includes(id) && !master.has(id)) out.push(id);
+    return out;
+  });
   const save = async () => {
     try {
-      await post('/api/users', { masterIds: parse(masters), extraAdminIds: parse(admins) });
+      await post('/api/users', { masterIds: parse(masters), extraAdminIds: users });
       setErr('');
       onClose();
       onChanged();
     } catch (e) { setErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
   return (
-    <Modal title="权限名单" onClose={onClose}>
-      <Field label="主人（masterIds）">
+    <Modal title="权限名单" wide onClose={onClose}>
+      <Field label="主人">
         <BrandInput value={masters} onChange={(e) => setMasters(e.target.value)} spellCheck={false} />
       </Field>
-      <Field label="追加管理员（extraAdminIds）">
-        <BrandInput value={admins} onChange={(e) => setAdmins(e.target.value)} spellCheck={false} />
-      </Field>
+
+      <div className="mset-field">
+        <label className="mset-flabel">用户<Hint text="有work权限" /></label>
+        <div className="perm-search">
+          <BrandInput value={q} placeholder="搜索名字或 QQ 号" spellCheck={false}
+            onChange={(e) => setQ(e.target.value)} />
+          <button className="mset-add" onClick={() => setPicking(true)}>
+            <Icon name="plus" size={13} /> 从群聊添加
+          </button>
+        </div>
+
+        {!!q.trim() && (
+          <div className="mset-models perm-results">
+            {found.map((u) => {
+              const has = users.includes(u.userId) || master.has(u.userId);
+              return (
+                <button key={u.userId} disabled={has} className="mset-mrow perm-row"
+                  title={has ? '已经在名单里' : undefined}
+                  onClick={() => { if (!has) { add(u.userId); setQ(''); } }}>
+                  <span className="ic"><Icon name="personas" size={14} /></span>
+                  <FadeName className="perm-row-nm" text={u.nickname || u.remark || u.userId} />
+                  <span className="perm-row-qq mono">{u.userId}</span>
+                  {has ? <span className="mset-badge">已有</span> : <span className="mset-macts"><Icon name="plus" size={13} /></span>}
+                </button>
+              );
+            })}
+            {rawQq && (
+              <button className="mset-mrow perm-row" onClick={() => { add(q.trim()); setQ(''); }}>
+                <span className="ic"><Icon name="plus" size={14} /></span>
+                <span className="perm-row-nm">添加 QQ {q.trim()}</span>
+              </button>
+            )}
+            {!found.length && !rawQq && <div className="mset-group-e">没有匹配的用户</div>}
+          </div>
+        )}
+
+        <div className="mset-chips wrap perm-chips">
+          {users.length ? users.map((id) => {
+            const u = byId.get(id);
+            return (
+              <span className="mset-chip perm-chip" key={id} title={u?.nickname ? `${u.nickname} ${id}` : id}>
+                <span className="perm-chip-nm">{u?.nickname || u?.remark || id}</span>
+                {!!u?.nickname && <span className="perm-chip-qq mono">{id}</span>}
+                <button className="perm-chip-x" title="移除"
+                  onClick={() => setUsers((xs) => xs.filter((x) => x !== id))}>
+                  <Icon name="close" size={11} />
+                </button>
+              </span>
+            );
+          }) : <span className="mset-group-e">还没有用户，搜索或从群聊添加</span>}
+        </div>
+      </div>
+
       <div className="mset-mfoot">
         <button className="btn primary" onClick={save}>保存</button>
         <button className="mset-link" onClick={onClose}>取消</button>
       </div>
       {err && <div className="mset-err">{err}</div>}
+
+      {picking && (
+        <GroupPicker existing={users} masters={data.masterIds}
+          onClose={() => setPicking(false)}
+          onAdd={(ids) => { add(...ids); setPicking(false); }} />
+      )}
+    </Modal>
+  );
+}
+
+/** 从群聊批量加人：群列表现拉协议端，成员按昵称/QQ 再筛一遍，已在名单里的置灰。 */
+function GroupPicker({ existing, masters, onClose, onAdd }: {
+  existing: string[]; masters: string[]; onClose: () => void; onAdd: (ids: string[]) => void;
+}) {
+  const [groups, setGroups] = useState<Group[] | null>(null);
+  const [gid, setGid] = useState('');
+  const [members, setMembers] = useState<Member[] | null>(null);
+  const [sel, setSel] = useState<string[]>([]);
+  const [q, setQ] = useState('');
+  const [err, setErr] = useState('');
+  const blocked = new Set([...existing, ...masters]);
+
+  useEffect(() => {
+    get('/api/groups').then((d: { groups: Group[] }) => {
+      setGroups(d.groups);
+      setGid(d.groups[0]?.groupId ?? '');
+      if (!d.groups.length) setErr('没有读到群聊：协议端可能还没连上');
+    }).catch((e) => { setGroups([]); setErr((e as Error)?.message ?? String(e)); });
+  }, []);
+
+  useEffect(() => {
+    if (!gid) return;
+    setMembers(null); setSel([]); setQ(''); setErr('');
+    get(`/api/groups/${encodeURIComponent(gid)}/members`)
+      .then((d: { members: Member[] }) => setMembers(d.members))
+      .catch((e) => { setMembers([]); setErr((e as Error)?.message ?? String(e)); });
+  }, [gid]);
+
+  const key = q.trim().toLowerCase();
+  const list = (members ?? []).filter((m) => !key
+    || `${m.card ?? ''} ${m.nickname} ${m.userId}`.toLowerCase().includes(key));
+  const toggle = (id: string) => setSel((xs) => xs.includes(id) ? xs.filter((x) => x !== id) : [...xs, id]);
+  const opts: PillOpt[] = (groups ?? []).map((g) => ({
+    v: g.groupId,
+    t: `${g.name || '未命名群'}${g.memberCount ? `（${g.memberCount}）` : ''}`,
+  }));
+
+  return (
+    <Modal title="从群聊添加用户" onClose={onClose}>
+      <div className="perm-pick">
+        <PillSelect align="left" value={gid} options={opts} label="群聊" onChange={setGid} />
+        <BrandInput value={q} placeholder="筛选成员" spellCheck={false} onChange={(e) => setQ(e.target.value)} />
+      </div>
+
+      <div className="mset-models perm-members">
+        {members === null ? <div className="mset-group-e">{err || '读取中…'}</div>
+          : list.length ? list.map((m) => {
+            const has = blocked.has(m.userId);
+            const on = sel.includes(m.userId);
+            return (
+              <button key={m.userId} disabled={has}
+                className={'mset-mrow perm-row' + (on ? ' on' : '')}
+                title={has ? '已经在名单里' : undefined}
+                onClick={() => { if (!has) toggle(m.userId); }}>
+                <span className="ic"><Icon name={on ? 'check' : has ? 'personas' : 'plus'} size={14} /></span>
+                <FadeName className="perm-row-nm" text={m.card || m.nickname || m.userId} />
+                <span className="perm-row-qq mono">{m.userId}</span>
+                {has && <span className="mset-badge">已有</span>}
+              </button>
+            );
+          }) : <div className="mset-group-e">{err ? '读取失败' : '这个群没有可添加的成员'}</div>}
+      </div>
+
+      <div className="perm-pick perm-pick-foot">
+        <button className="mset-link" onClick={() => setSel(list.filter((m) => !blocked.has(m.userId)).map((m) => m.userId))}>全选</button>
+        <button className="mset-link" onClick={() => setSel([])}>清空</button>
+        <span className="plg-hint">已选 {sel.length} 人</span>
+        <button className="btn primary" style={{ marginLeft: 'auto' }} disabled={!sel.length}
+          onClick={() => onAdd(sel)}>添加</button>
+      </div>
+      {err && members !== null && <div className="mset-err">{err}</div>}
     </Modal>
   );
 }

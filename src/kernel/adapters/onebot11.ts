@@ -594,6 +594,30 @@ export class OneBot11Adapter implements TransportAdapter {
     } catch { /* ignore */ }
   }
 
+  /** 桌面端权限名单：群列表与群成员。协议端没连时 call 会直接拒绝，交由 UI 就地报红。 */
+  async listGroups(): Promise<{ groupId: string; name: string; memberCount: number }[]> {
+    const list = await this.call<any[]>('get_group_list', {});
+    return (list ?? [])
+      .map((g) => ({
+        groupId: String(g.group_id ?? ''),
+        name: String(g.group_name ?? ''),
+        memberCount: Number(g.member_count ?? 0),
+      }))
+      .filter((g) => g.groupId);
+  }
+
+  async listGroupMembers(groupId: string): Promise<{ userId: string; nickname: string; card?: string; role?: string }[]> {
+    const list = await this.call<any[]>('get_group_member_list', { group_id: groupId });
+    return (list ?? [])
+      .map((m) => ({
+        userId: String(m.user_id ?? ''),
+        nickname: String(m.nickname ?? ''),
+        card: m.card ? String(m.card) : undefined,
+        role: m.role ? String(m.role) : undefined,
+      }))
+      .filter((m) => m.userId);
+  }
+
   /** 群里来消息时把群名补齐：全量列表可能还没拉到（或压根没这个群），按需问一次 get_group_info。
    *  注意这里只能缓存"群自己的名字"——曾把 msg.sender.card（群名片）当群名塞进缓存，
    *  于是任何群名片非空的群友一发消息，侧边栏和 prompt 里的群名就变成那个人的名字。 */

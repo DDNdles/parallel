@@ -794,6 +794,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     }
 
     // ================= 用户 =================
+    // 权限名单的群聊批量添加：群列表 / 群成员（都走协议端现拉，不落库）
+    if (area === 'api' && a === 'groups' && !b && req.method === 'GET') {
+      return send({ groups: await kernel.adapter.listGroups() });
+    }
+    if (area === 'api' && a === 'groups' && b && c === 'members' && req.method === 'GET') {
+      return send({ members: await kernel.adapter.listGroupMembers(String(b)) });
+    }
     if (area === 'api' && a === 'users' && !b && req.method === 'GET') {
       const users = kernel.memory.listUsers().map((u) => ({
         ...u,
