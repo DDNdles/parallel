@@ -12,7 +12,7 @@ import { fileIcon } from '@/lib/fileIcon';
 import { toolAction, splitMcp, argPath, ctxBadge, type ToolMeta } from '@/lib/entries';
 
 export interface LoopEvent {
-  kind: 'round' | 'delta' | 'thinking' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'final';
+  kind: 'round' | 'delta' | 'thinkingDelta' | 'thinking' | 'text' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'final';
   n?: number; round?: number; text?: string; name?: string; args?: string;
   meta?: ToolMeta;
   prompt?: number; completion?: number; cacheHit?: number; cacheMiss?: number;
@@ -47,10 +47,8 @@ export interface WorkRun {
 /**
  * work 子代理的事件流摊平成一行一动作（不按轮次分组），收敛回答单独拿出来。
  *
- * 思考按 ZCode 的「思考链」形态归并：一轮里模型可能先输出一段正文再调工具，
- * 每条 message_end 都会来一条 thinking——逐条铺开会把面板撑成一堵墙。这里把
- * **相邻的** thinking 合进同一条动作（正文按空行接上），行首仍是一个思考图标，
- * 收起态只显第一行摘要，点开看全文。
+ * 思考与正文分开：思考链进「思考」行（相邻的思考仍合并），模型正文进正文行、
+ * 直接显示，不再塞进思考的折叠正文里。
  */
 export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; final?: string } {
   const acts: ActRow[] = [];
@@ -60,15 +58,22 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
     const prev = acts[acts.length - 1];
     if (prev?.streaming) { prev.streaming = false; prev.running = false; }
   };
+  /** 流式增量只并进同类型的最后一行；思考/正文切换时各起一行 */
+  const appendStream = (kind: 'think' | 'text', text: string) => {
+    const prev = acts[acts.length - 1];
+    if (prev?.kind === kind && prev.streaming) prev.body += text;
+    else acts.push({ kind, subject: '', sub: '', body: text, streaming: true, running: true });
+  };
   for (const ev of events) {
     if (ev.kind === 'final') { finishStream(); final = ev.text ?? ''; }
     else if (ev.kind === 'delta') {
-      // 流式增量：先长成一条自动展开的思考行，message_end 的完整文本会把它覆盖
+      // 正文增量：先长成一条流式正文行，message_end 的完整 text 会把它覆盖
       const text = String(ev.text ?? '');
-      if (!text) continue;
-      const prev = acts[acts.length - 1];
-      if (prev?.kind === 'think' && prev.streaming) prev.body += text;
-      else acts.push({ kind: 'think', subject: '', sub: '', body: text, streaming: true, running: true });
+      if (text) appendStream('text', text);
+    } else if (ev.kind === 'thinkingDelta') {
+      // 思考链增量：长成流式思考行，message_end 的完整 thinking 会把它覆盖
+      const text = String(ev.text ?? '');
+      if (text) appendStream('think', text);
     } else if (ev.kind === 'thinking') {
       const text = String(ev.text ?? '');
       if (!text.trim()) continue;
@@ -79,6 +84,16 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
         prev.running = false;
       } else if (prev?.kind === 'think') prev.body = prev.body ? `${prev.body}\n\n${text}` : text;
       else acts.push({ kind: 'think', subject: '', sub: '', body: text });
+    } else if (ev.kind === 'text') {
+      const text = String(ev.text ?? '');
+      if (!text.trim()) continue;
+      const prev = acts[acts.length - 1];
+      if (prev?.kind === 'text' && prev.streaming) {
+        prev.body = text;
+        prev.streaming = false;
+        prev.running = false;
+      } else if (prev?.kind === 'text') prev.body = prev.body ? `${prev.body}\n\n${text}` : text;
+      else acts.push({ kind: 'text', subject: '', sub: '', body: text });
     } else if (ev.kind === 'tool') {
       finishStream();
       const args = String(ev.args ?? '');
@@ -254,6 +269,7 @@ const ACT = {
   delegate: { icon: 'delegate', label: '派生' },
   error: { icon: 'warn', label: '异常' },
   think: { icon: 'think', label: '思考' },
+  text: { icon: 'chats', label: '正文' },
   compact: { icon: 'collapse', label: '压缩' },
   note: { icon: 'bolt', label: '收尾' },
 } as const;
@@ -292,6 +308,10 @@ export function Act({ row, opened, onToggle, text, thinkSummary: isThink }: {
   // 正文首次打开后才挂载，收起时留在 0 高度里等着，才能把收起也做成滑动
   const [everOpen, setEverOpen] = useState(opened);
   useEffect(() => { if (opened) setEverOpen(true); }, [opened]);
+  // 模型正文：不挂在「思考」行里，直接按普通正文铺开，没有动作头也没有折叠
+  if (row.kind === 'text') {
+    return <div className={'wd-text' + (row.streaming ? ' live' : '')}>{row.body}</div>;
+  }
   const toggle = has ? () => { setEverOpen(true); onToggle(); } : undefined;
   return (
     <div className={'wd-act' + (opened && has ? ' open' : '') + (row.running ? ' running' : '')}>

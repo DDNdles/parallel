@@ -34,9 +34,14 @@ import { toPiMessages } from './services/pi-ai.ts';
 /** 结构化步骤事件：给桌面端侧栏画 harness 式 loop（工具调用/结果/思考/用量/压缩） */
 export type LoopEvent =
   | { kind: 'round'; n: number }
-  /** 模型正文的增量（只给 work 面的实时流；不落库，message_end 会用完整 thinking 覆盖） */
+  /** 模型正文的增量（只给 work 面的实时流；不落库，message_end 会用完整 text 覆盖） */
   | { kind: 'delta'; round: number; text: string }
+  /** 思考链的增量（同样只走实时流，message_end 用完整 thinking 覆盖） */
+  | { kind: 'thinkingDelta'; round: number; text: string }
+  /** 一条 assistant 消息的完整思考链（只含 thinking 块，正文不并进来） */
   | { kind: 'thinking'; round: number; text: string }
+  /** 一条 assistant 消息的完整正文（与思考分开，直接作为正文显示） */
+  | { kind: 'text'; round: number; text: string }
   | { kind: 'tool'; round: number; name: string; args: string }
   | { kind: 'toolResult'; round: number; name: string; text: string; meta?: ToolMeta }
   | { kind: 'usage'; round: number; prompt: number; completion: number; cacheHit: number; cacheMiss: number; ms?: number }
@@ -363,8 +368,12 @@ export class AgentLoop {
         const a = ev.assistantMessageEvent;
         if ((a?.type === 'text_delta' || a?.type === 'thinking_delta') && a.delta) {
           // work 面把增量送进活动流（桌面端实时显示），chat 面仍只走 llmDelta。
-          // thinking_delta 是模型的思考链（deepseek 等推理模型会回传），与正文一样先进流式行。
-          if (ctx.workTurn) h.event({ kind: 'delta', round: cap.rounds, text: a.delta });
+          // 正文与思考链分两条流：正文进正文行，thinking_delta 进「思考」行，互不混。
+          if (ctx.workTurn) {
+            h.event(a.type === 'thinking_delta'
+              ? { kind: 'thinkingDelta', round: cap.rounds, text: a.delta }
+              : { kind: 'delta', round: cap.rounds, text: a.delta });
+          }
           if (a.type === 'text_delta') this.bus.emit(busEvents.llmDelta, { chatKey: h.chatKey, text: a.delta });
         }
         break;
@@ -375,10 +384,9 @@ export class AgentLoop {
         if (m?.role !== 'assistant') break;
         const text = textOf(m);
         const reasoning = thinkingOf(m);
-        // 本轮模型输出：正文（工具轮里是动手前的铺垫）与思考链一起进「思考」行，
-        // 没有正文时也不会只剩一条空行（推理模型只回 thinking 块的场景）
-        const shown = [reasoning.trim(), text.trim()].filter(Boolean).join('\n\n');
-        if (shown) h.event({ kind: 'thinking', round: cap.rounds, text: shown });
+        // 思考链与正文分开落事件：正文不再塞进「思考」行。
+        if (reasoning.trim()) h.event({ kind: 'thinking', round: cap.rounds, text: reasoning });
+        if (text.trim()) h.event({ kind: 'text', round: cap.rounds, text });
         if (m.usage) {
           const u = {
             prompt: Number(m.usage.input ?? 0) + Number(m.usage.cacheRead ?? 0),

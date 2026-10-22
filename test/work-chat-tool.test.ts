@@ -186,7 +186,7 @@ test('work_dispatch：handler 立即返回，本轮 chat 收尾（agent.end）�
   }
 });
 
-test('work 输出流式下发：delta 先到；收尾记录不落 delta，message_end 的完整 thinking 仍在', async () => {
+test('work 输出流式下发：delta 先到；收尾记录不落 delta，message_end 的完整正文仍在', async () => {
   const g = await boot('9404');
   try {
     const events: any[] = [];
@@ -207,17 +207,18 @@ test('work 输出流式下发：delta 先到；收尾记录不落 delta，messag
 
     const delta = events.filter((e) => e.kind === 'delta').map((e) => e.text).join('');
     assert.equal(delta, '流式生成的正文', `delta 要实时送到前端：${JSON.stringify(events)}`);
-    assert.ok(events.some((e) => e.kind === 'thinking' && e.text.includes('流式生成的正文')), 'message_end 的完整 thinking 不能丢');
+    assert.ok(events.some((e) => e.kind === 'text' && e.text.includes('流式生成的正文')), 'message_end 的完整正文要单独落 text');
+    assert.ok(!events.some((e) => e.kind === 'thinking'), '没有思考链时不该凭空造思考行');
 
     const run = g.kernel.workRunner.list(10, g.chatKey)[0];
-    assert.ok(!run.events.some((e: any) => e.kind === 'delta'), 'delta 只走实时总线，不进运行记录');
-    assert.ok(run.events.some((e: any) => e.kind === 'thinking'), '运行记录里保留完整 thinking');
+    assert.ok(!run.events.some((e: any) => e.kind === 'delta' || e.kind === 'thinkingDelta'), '流式增量只走实时总线，不进运行记录');
+    assert.ok(run.events.some((e: any) => e.kind === 'text'), '运行记录里保留完整正文');
   } finally {
     await g.cleanup();
   }
 });
 
-test('work 思考链：推理模型的 thinking 块也进流式行与「思考」正文', async () => {
+test('work 思考链：thinking 块进思考流，正文单独进正文流', async () => {
   const g = await boot('9405');
   try {
     const events: any[] = [];
@@ -238,12 +239,16 @@ test('work 思考链：推理模型的 thinking 块也进流式行与「思考�
     off();
 
     const delta = events.filter((e) => e.kind === 'delta').map((e) => e.text).join('');
-    assert.ok(delta.includes('先确认文件在不在'), `thinking_delta 要实时进流：${delta}`);
-    assert.ok(delta.includes('我看一眼'), `正文增量也要进流：${delta}`);
+    assert.ok(delta.includes('我看一眼'), `正文增量要进流：${delta}`);
+    assert.ok(!delta.includes('先确认文件在不在'), `thinking_delta 不该混进正文流：${delta}`);
+    const thinkDelta = events.filter((e) => e.kind === 'thinkingDelta').map((e) => e.text).join('');
+    assert.ok(thinkDelta.includes('先确认文件在不在'), `thinking_delta 要进思考流：${thinkDelta}`);
     const think = events.find((e) => e.kind === 'thinking');
     assert.ok(think, 'message_end 要产出思考行');
     assert.ok(think.text.includes('先确认文件在不在'), `思考链不能丢：${think.text}`);
-    assert.ok(think.text.includes('我看一眼'), `正文也要保留：${think.text}`);
+    assert.ok(!think.text.includes('我看一眼'), `正文不能塞进思考：${think.text}`);
+    const body = events.find((e) => e.kind === 'text');
+    assert.ok(body?.text.includes('我看一眼'), `正文要单独落 text：${body?.text}`);
   } finally {
     await g.cleanup();
   }

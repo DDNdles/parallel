@@ -759,7 +759,7 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   const evs = runs[0].events ?? [];
   const kinds = evs.map((e: any) => e.kind);
   assert.ok(kinds.includes('round'), `要有轮次事件，实际 ${kinds.join(',')}`);
-  assert.ok(kinds.includes('thinking'), '要有思考事件');
+  assert.ok(kinds.includes('text'), '要有正文事件');
   assert.ok(kinds.includes('tool') && kinds.includes('toolResult'), '要有工具调用与返回事件');
   assert.ok(kinds.includes('final'), '要有收敛回答事件');
   assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'work_finish');

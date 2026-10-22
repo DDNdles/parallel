@@ -933,6 +933,10 @@ tr:hover td { background: var(--row-hover); }
 .wd-act-b { margin: 2px 0 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 12px; line-height: 1.65; color: var(--code-text-dim, var(--dim)); white-space: pre-wrap; word-break: break-word; }
 /* 思考正文与工具输出同款：12px、等宽（.wd-act-b 是 pre + mono），只有行高/文字色略作区分 */
 .wd-act-t { margin: 2px 0 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+/* 模型正文：直接铺开，不套思考折叠行 */
+.wd-text { margin: 4px 0 12px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.wk-spine .wd-text { margin-left: 22px; }
+.wd-text.live::after { content: '▍'; margin-left: 1px; color: var(--faint); animation: caret-blink 1.06s steps(1, end) infinite; }
 /* 步骤正文的展开/收起：照会话左栏分组那套开窗动效——窗口高度滑动。
    收起时正文留在 0 高度里，收起才能也是滑动而不是瞬间消失。
    注意：这里不要挂渐变蒙版（2026-10-22 用户明令），展开过程中底部要保持清晰 */

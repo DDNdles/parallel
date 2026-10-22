@@ -218,8 +218,8 @@ export class WorkRunner {
     let metaAsk: { question: string; notes?: string } | undefined;
     const track = (ev: LoopEvent) => {
       // 流式增量只走实时总线（桌面端边生成边显示），不落内存/数据库：
-      // message_end 会送完整的 thinking，收尾记录里不需要再存几百个碎片
-      if (ev.kind !== 'delta') {
+      // message_end 会送完整的 thinking / text，收尾记录里不需要再存几百个碎片
+      if (ev.kind !== 'delta' && ev.kind !== 'thinkingDelta') {
         const r = this.runs.get(id);
         if (r) {
           r.events.push(ev);
