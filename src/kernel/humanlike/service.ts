@@ -16,6 +16,7 @@ import type { ChatEvent, ChatRef, MsgSegment } from '../types.ts';
 import type { Bus } from '../bus.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { SessionLog } from '../sessionlog.ts';
+import { faceTokensToSegments } from '../util/qqface.ts';
 import {
   NECESSITY_TRIGGER_SCORE,
   idleCompensation,
@@ -831,6 +832,13 @@ export class HumanlikeService {
     return (await this.composeScene(text)).plans;
   }
 
+  /** 汇报轮正文：不进聊天气泡那套「按句切、50 字截断」，只做可见化与平台硬上限 */
+  reportText(raw: string): string {
+    const scene = String(raw ?? '');
+    if (isSilentScene(scene)) return '';
+    return normalizeVisibleContent(scene, this.config.outgoing.maxMessageCharacters).trim();
+  }
+
   /** 单条文本的打字等待（秒），插件/命令想自己排节奏时用（下限 0.25s） */
   typingSeconds(text: string): number {
     return typingDelayMs(text, this.config.outgoing) / 1000;
@@ -851,11 +859,12 @@ export class HumanlikeService {
     return splitIntoBubbles(t, MAX_BUBBLES, out.bubbleSoftMaxCharacters);
   }
 
-  /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久 */
+  /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久。
+   *  模型写的 `[表情/微笑]` 在这里切成真正的 face 段（文字与表情可以在同一条气泡里）。 */
   private plan(bubbles: string[]): SendPlan[] {
     const cfg = this.config.outgoing;
     return bubbles.map((text, i) => ({
-      segments: [{ type: 'text', data: { text } }] as MsgSegment[],
+      segments: faceTokensToSegments(text),
       pauseMs: i === 0 || !cfg.typingEnabled ? 0 : typingDelayMs(text, cfg),
     }));
   }

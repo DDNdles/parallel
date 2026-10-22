@@ -57,16 +57,20 @@ test('压缩：第二轮前触发，摘要落成会话条目，且真的进了�
   mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '（mock 交付）算完了' } }] });
 
   try {
-    const done = new Promise<any>((resolve) => {
-      const off = kernel.bus.on('work.done' as any, (d: any) => { if (d.chatKey === chatKey) { off(); resolve(d); } });
-      setTimeout(() => resolve(null), 60_000);
-      kernel.pipeline.submit({
-        id: 'compact-1', platform: 'ui', type: 'group', chatId, userId: '1', nickname: '主人', senderRole: 'owner',
-        segments: [{ type: 'text', data: { text: '/work 随便算点东西' } }],
-        text: '/work 随便算点东西', isAtMe: true, isReplyToMe: false, raw: { injected: true }, ts: Date.now(),
-      } as any);
-    });
-    const result = await done;
+    // 2026-10-21：/work 删了。这里直接走 WorkRunner（压缩发生在它的 AgentLoop 里），
+    // 不经 chat 派活那一轮——测试要钉的是"压缩在第二轮请求前触发"，不是派活语法。
+    const chat = { platform: 'ui' as const, type: 'group' as const, chatId };
+    const agent = kernel.container.workAgent();
+    const tools = kernel.container.workToolsFor(chat, 'owner', agent, 0);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([
+      kernel.workRunner.run({
+        chat, task: '随便算点东西', userId: '1', nickname: '主人', role: 'owner',
+        agent, tools, trigger: 'command', depth: 0,
+      }),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 60_000); }),
+    ]);
+    if (timer) clearTimeout(timer);
     assert.ok(result, 'work 轮要在 60s 内结束');
 
     const run = kernel.workRunner.list(5, chatKey)[0];

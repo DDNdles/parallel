@@ -9,6 +9,8 @@ import { get, post, onEvent, fmtTime, mdLite, getToken } from '@/lib/api';
 import { isWorkEntry } from '@/lib/entries';
 import { Icon } from '@/components/Icon';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
+import { QQ_FACE_NAMES } from '@/lib/qqFaceNames';
+import { WorkPulse } from '@/components/workActivity';
 import WorkDrawer from '@/components/WorkDrawer';
 import { Modal } from '@/components/Modal';
 
@@ -38,7 +40,7 @@ const RAIL_PITCH = 14;
 /** 会话左侧日轨的一格（内核按本地日期聚合整份 jsonl 算出来的） */
 interface ChatDay { day: string; count: number; firstTs: number; lastTs: number }
 
-export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, narrow, listOpen, onCloseList, cmd, onReview }: {
+export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOpen, onCloseList, cmd, onReview }: {
   /** 保留给调用方传参兼容：输入框已改为 bot 身份发言，测试用户注入不再由页面发起 */
   masterId?: string;
   /** bot 自己的登录号：会话流里 bot 那条消息右侧的头像用它取图 */
@@ -61,7 +63,6 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
   const [entries, setEntries] = useState<Entry[]>([]);
   const [input, setInput] = useState('');
   const [models, setModels] = useState<ModelsData | null>(null);
-  const [modelOpen, setModelOpen] = useState(false);
   const [ac, setAc] = useState<{ items: Cmd[]; sel: number } | null>(null);
   const [pinned, setPinned] = useState<Set<string>>(new Set());
   const [hidden, setHidden] = useState<Set<string>>(new Set());
@@ -89,9 +90,30 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
   const [folded, setFolded] = useState<Record<string, boolean>>({});
   const [animatingId, setAnimatingId] = useState<string | null>(null); // 正在开合的分组 id：淡化 mask 只作用于该分组自身
   const [listW, setListW] = useState(250);
+  /** 当前会话有顶层 work 在跑：会话流末尾亮 parallel 花押（不在左下角账号旁） */
+  const [workRunning, setWorkRunning] = useState(false);
   /** 会话页预览（群友头像 + 收来的图片缩略图）：设置页「会话」里的那个开关 */
   const [preview, setPreview] = useState(true);
   const [zoom, setZoom] = useState<{ rel: string; name: string } | null>(null);
+  // 当前会话的 work 运行态：事件触发重拉 + 15s 兜底；只在没有 final / 没在等回答时闪
+  useEffect(() => {
+    const key = current?.key;
+    if (!key) { setWorkRunning(false); return; }
+    let alive = true;
+    const refresh = () => {
+      get(`/api/work?chatKey=${encodeURIComponent(key)}&limit=10`).then((d: any) => {
+        if (!alive) return;
+        setWorkRunning((d.runs ?? []).some((r: any) =>
+          (r.depth ?? 0) === 0 && !r.historical && !r.ok && !r.error && !r.awaiting
+          && !(r.events ?? []).some((e: any) => e.kind === 'final'),
+        ));
+      }).catch(() => {});
+    };
+    refresh();
+    const offs = [onEvent('work.start', refresh), onEvent('work.done', refresh), onEvent('work.error', refresh)];
+    const timer = setInterval(refresh, 15_000);
+    return () => { alive = false; offs.forEach((off) => off()); clearInterval(timer); };
+  }, [current?.key]);
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
@@ -195,11 +217,9 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
     return () => clearTimeout(t);
   }, [pinned, hidden, listW]);
 
-  // 模型（chat + work）：进入页面拉一次，切完再拉，菜单里点开时也刷新
+  // 模型（chat + work）：进入页面拉一次；右侧抽屉的上下文占比圆环要按模型窗口当分母
   const loadModels = useCallback(() => { get('/api/providers').then(setModels).catch(() => {}); }, []);
   useEffect(loadModels, [loadModels]);
-  /** 换链首没写进去就在菜单里报一行，别让人以为已经换了 */
-  const [chainErr, setChainErr] = useState('');
 
   // 插入光标：文字由文本层显示、光标是文本层里的内联元素（自己占一格，把后面的字挤开）。
   // 这里只做两件事：把光标位（选区起点）与焦点态同步给文本层，以及把 textarea 的滚动位移带过去。
@@ -237,34 +257,6 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
     };
   }, [syncCaret]);
 
-  // 模型菜单：点外部或 Esc 关闭
-  useEffect(() => {
-    if (!modelOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest('.cmp-menu, .cmp-pill')) setModelOpen(false);
-    };
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setModelOpen(false); };
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onEsc);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onEsc);
-    };
-  }, [modelOpen]);
-
-  /** 菜单里点某一条 = 把它提到链首（当前使用的就是它） */
-  const pickChain = useCallback(async (kind: 'chat' | 'work', idx: number) => {
-    const list = models?.chains[kind] ?? [];
-    if (!list[idx]) return;
-    const entries = [list[idx], ...list.filter((_, i) => i !== idx)]
-      .map((e) => ({ provider: e.provider, model: e.model }));
-    try {
-      await post('/api/providers/chain', { kind, entries });
-      setChainErr('');
-    } catch (e) { setChainErr(`未生效：${(e as Error)?.message ?? String(e)}`); }
-    loadModels();
-  }, [models, loadModels]);
-
   const togglePin = useCallback((key: string) => {
     setPinned((p) => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }, []);
@@ -291,15 +283,6 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
   }, [chats, pinned, hidden]);
 
   const chatTitle = useCallback((c: ChatInfo) => c.title || `${c.chatType === 'group' ? '群' : '私聊'} ${c.chatId}`, []);
-  /** 输入框上的模型胶囊显示当前在服务的链首（掉线降级后会自动变成接上的那条）；
-   *  链还没配过时回落到内核的兜底供应商，至少告诉用户现在是谁在答 */
-  const servingChat = models?.chains.chat.find((e) => e.state === 'current') ?? models?.chains.chat[0]
-    ?? (models ? { provider: models.active, model: models.activeModel } as ChainEntry : null);
-  /** 链上兜底供应商也没有 = 这台机器还没配过模型，胶囊改成待办态 */
-  const noChat = !!models && !servingChat?.model;
-  const chatLabel = noChat ? '配置模型' : models
-    ? (models.providers.find((p) => p.id === servingChat?.provider)?.label ?? servingChat?.model ?? '配置模型')
-    : '模型';
   /** 模型 id -> 上下文窗口：右侧「工作」面板的占比圆环用它当分母 */
   const ctxByModel = useMemo(() => {
     const m: Record<string, number> = {};
@@ -776,6 +759,7 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
               )}
               <div className="conv-scroll" ref={streamRef} onScroll={onStreamScroll} onWheel={onStreamWheel}>
                 <div className="conv-col" ref={colRef} onAnimationEnd={onTurnRiseEnd}>{stream}</div>
+                {workRunning && <div className="conv-working"><WorkPulse /></div>}
               </div>
               {/* 消息滑到对话框上方时渐隐淡出（纯背景色渐变，比 mask 便宜，不拖累滚动） */}
               <div className="conv-fade" aria-hidden />
@@ -818,70 +802,12 @@ export default function ChatsPage({ botId, onNavigate, workOpen, onCloseWork, na
                     />
                   </div>
                   <div className="composer-bar">
-                    <div className="cmp-wrap">
-                      <button type="button" className={'cmp-pill' + (modelOpen ? ' open' : '') + (noChat ? ' blank' : '')}
-                        aria-haspopup="menu" aria-expanded={modelOpen} aria-label="选择对话模型与工作模型"
-                        onClick={() => { setModelOpen((v) => !v); loadModels(); }}>
-                        <Icon name="models" size={15} />
-                        <span className="nm">{chatLabel}</span>
-                        <Icon name="chevron" size={12} style={{ transform: 'rotate(180deg)', marginLeft: 'auto' }} />
-                      </button>
-                    </div>
                     <span className="flex" />
                     <button className="send-btn" aria-label="发送消息" onClick={send}>
                       <Icon name="send" />
                     </button>
                   </div>
                 </div>
-
-                {modelOpen && (
-                  <div className="cmp-menu" role="menu" aria-label="模型选择">
-                    {!models ? <div className="mp-head">正在读取模型列表…</div> : (
-                      <>
-                        <div className="mp-head">对话模型</div>
-                        {models.chains.chat.map((e, i) => (
-                          <button key={`${e.provider}|${e.model}`} type="button" role="menuitemradio" aria-checked={e.state === 'current'}
-                            className={'mp-item' + (e.state === 'current' ? ' sel' : '')}
-                            onClick={() => pickChain('chat', i)}>
-                            <span className="nm">{models.providers.find((p) => p.id === e.provider)?.label ?? e.provider}</span>
-                            <span className="mp-desc mono">{e.model}</span>
-                            <span className="mp-right">
-                              {e.state === 'down' && <span className="tag err">掉线</span>}
-                              {e.state !== 'current' && <span className="mp-desc">备 {i + 1}</span>}
-                              {e.state === 'current' && <Icon name="check" size={14} />}
-                            </span>
-                          </button>
-                        ))}
-                        {!models.chains.chat.length && <div className="mp-item off"><span className="nm">未配置</span></div>}
-
-                        <div className="mp-sep" />
-                        <div className="mp-head">工作模型</div>
-                        {!models.chains.work.length && <div className="mp-item off"><span className="nm">未配置</span></div>}
-                        {models.chains.work.map((e, i) => (
-                          <button key={`${e.provider}|${e.model}`} type="button" role="menuitemradio" aria-checked={e.state === 'current'}
-                            className={'mp-item' + (e.state === 'current' ? ' sel' : '')}
-                            onClick={() => pickChain('work', i)}>
-                            <span className="nm">{models.providers.find((p) => p.id === e.provider)?.label ?? e.provider}</span>
-                            <span className="mp-desc mono">{e.model}</span>
-                            <span className="mp-right">
-                              {e.state === 'down' && <span className="tag err">掉线</span>}
-                              {e.state !== 'current' && <span className="mp-desc">备 {i + 1}</span>}
-                              {e.state === 'current' && <Icon name="check" size={14} />}
-                            </span>
-                          </button>
-                        ))}
-
-                        <div className="mp-sep" />
-                        <button type="button" role="menuitem" className="mp-manage"
-                          onClick={() => { setModelOpen(false); onNavigate?.('models'); }}>
-                          <span>管理模型</span>
-                          <span className="rt"><Icon name="chevron" size={12} /></span>
-                        </button>
-                        {chainErr && <div className="mset-err">{chainErr}</div>}
-                      </>
-                    )}
-                  </div>
-                )}
               </div>
             </div>
           </>
@@ -993,6 +919,39 @@ function stripMediaMarks(t: string, has: { img?: boolean; audio?: boolean; video
   return s.replace(/^ +/, '');
 }
 
+/** QQ 经典表情：消息正文里的 `[表情:32]` 换成 `/face/32.webp`（资源由 scripts/build-qq-faces.mjs 生成） */
+function QqFace({ id }: { id: string }) {
+  const [dead, setDead] = useState(false);
+  const name = QQ_FACE_NAMES[id] ?? `表情${id}`;
+  if (dead) return <span className="qq-face-t">[{name}]</span>;
+  return (
+    <img className="qq-face" src={`/face/${id}.webp`} alt={name} title={name} loading="lazy"
+      onError={() => setDead(true)} />
+  );
+}
+
+/** 把一段正文按表情占位切开：文字保持原样，表情位置渲染成内联图 */
+function FaceText({ text }: { text: string }) {
+  const parts = String(text ?? '').split(/(\[表情[:：]\d+\])/g);
+  if (parts.length === 1) return <>{text}</>;
+  return (
+    <>
+      {parts.map((p, i) => {
+        const m = p.match(/^\[表情[:：](\d+)\]$/);
+        return m ? <QqFace key={i} id={m[1]} /> : <span key={i}>{p}</span>;
+      })}
+    </>
+  );
+}
+
+/** message_out 走 mdLite 的 HTML，这里把占位换成图片；图片缺失时回落到中文名 */
+function faceHtml(html: string): string {
+  return html.replace(/\[表情[:：](\d+)\]/g, (_, id: string) => {
+    const name = QQ_FACE_NAMES[id] ?? `表情${id}`;
+    return `<img class="qq-face" src="/face/${id}.webp" alt="${name}" title="${name}" loading="lazy" onerror="this.replaceWith(document.createTextNode('[' + this.alt + ']'))">`;
+  });
+}
+
 const mmss = (s: number) => (Number.isFinite(s) && s > 0 ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : '');
 
 /**
@@ -1076,6 +1035,8 @@ function ForwardCard({ fwd, srcOf, onZoom }:
             const m = mediaRefs(n.files);
             const live = (list: FRef[]) => list.filter((f) => !dead.includes(f.rel));
             const imgs = live(m.imgs), aud = live(m.audio), vid = live(m.video);
+            const played = new Set([...imgs, ...aud, ...vid].map((f) => f.rel));
+            const files = normRefs(n.files).filter((f) => !played.has(f.rel) && !dead.includes(f.rel));
             const text = stripMediaMarks(n.text || '', { img: imgs.length > 0, audio: aud.length > 0, video: vid.length > 0 });
             return (
               <div className={'fwd-row' + ((n.depth ?? 0) > 0 ? ' fwd-nested' : '')} key={i}>
@@ -1091,6 +1052,12 @@ function ForwardCard({ fwd, srcOf, onZoom }:
                 )}
                 {aud.map((f) => <AudioRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
                 {vid.map((f) => <VideoRow key={f.rel} f={f} srcOf={srcOf} onDead={onDead} />)}
+                {files.map((f) => (
+                  <div className="fwd-file" key={f.rel} title={f.name}>
+                    <Icon name="file" size={14} />
+                    <span className="mono">{f.name}</span>
+                  </div>
+                ))}
               </div>
             );
           })}
@@ -1111,6 +1078,15 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
   /** 取不到图的附件（被 TTL 删了/从未落盘）：这些不算"已预览"，[图片] 字样得留着 */
   const [dead, setDead] = useState<string[]>([]);
   const onDead = useCallback((rel: string) => setDead((p) => (p.includes(rel) ? p : [...p, rel])), []);
+
+  if (e.type === 'poke') {
+    const p = (e.data as any)?.poke;
+    return (
+      <div className="turn turn-poke">
+        <span className="poke-line">{e.text || `戳了戳 ${p?.nickname || p?.userId || ''}`}</span>
+      </div>
+    );
+  }
 
   if (e.type === 'message_in') {
     const media = mediaRefs(e.data?.files);
@@ -1151,7 +1127,7 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
               {quote && (
                 <div className="quote">
                   <span className="q-nm">{quote.nickname || quote.userId || ''}</span>
-                  {!!qText && <span className="q-tx">{qText}</span>}
+                  {!!qText && <span className="q-tx"><FaceText text={qText} /></span>}
                   {qImgs.length > 0 && (
                     <span className="turn-thumbs q-imgs">
                       {qImgs.map((f) => <Thumb key={f.rel} f={f} srcOf={srcOf} onZoom={onZoom} onDead={onDead} />)}
@@ -1159,7 +1135,7 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
                   )}
                 </div>
               )}
-              {!!text && <span className="q-body">{text}</span>}
+              {!!text && <span className="q-body"><FaceText text={text} /></span>}
             </div>
           )}
           {fwd && <ForwardCard fwd={fwd} srcOf={srcOf} onZoom={onZoom} />}
@@ -1176,11 +1152,14 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
     );
   }
   if (e.type === 'message_out') {
+    const fwd = forwardOf(e);
     return (
       <div className="turn turn-assistant">
         {botId ? <Avatar userId={botId} /> : null}
         <div className="turn-body">
-          <div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') + (e.data?.simulated ? '<span class="muted"> （桌面端模拟）</span>' : '') }} />
+          {fwd
+            ? <ForwardCard fwd={fwd} srcOf={srcOf} onZoom={onZoom} />
+            : <div className="text-md" dangerouslySetInnerHTML={{ __html: faceHtml(mdLite(e.text || '')) + (e.data?.simulated ? '<span class="muted"> （桌面端模拟）</span>' : '') }} />}
         </div>
       </div>
     );

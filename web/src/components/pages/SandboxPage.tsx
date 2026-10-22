@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 沙箱：左列表（按会话）+ 右详情（占用 / 全部文件按日期装进文件夹 / 清空），顶栏「限额与清理」弹窗
  *  文件点开：图片与文本都在弹窗里看；其余类型交给系统默认程序，不确定会执行的只在资源管理器里选中 */
 import { useCallback, useEffect, useState } from 'react';
@@ -111,7 +112,7 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
             {stats.map((s) => (
               <button key={s.chat} className={'mset-item' + (s.chat === sel ? ' sel' : '')} onClick={() => pick(s.chat)} title={s.chat}>
                 <span className="mset-item-ic"><Icon name="file" size={15} /></span>
-                <span className="mset-item-nm">{s.chat}</span>
+                <FadeName text={s.chat} />
                 <span className="mset-badge">{s.files}</span>
               </button>
             ))}

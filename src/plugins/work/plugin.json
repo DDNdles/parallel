@@ -1,8 +1,8 @@
 {
   "id": "work",
   "name": "工作模式",
-  "version": "4.0.0",
-  "description": "work 是 chat 子代理（双模型架构）：管理员用 /work <任务> 触发，work 模型在隔离上下文里跑 agent loop（常驻 Python 会话、浏览器、shell、文件、联网），用 work_finish 交回结构化结论，再由 chat 模型用自己的语气转述给用户。身份与工具白名单写在 agents/work.md，工具自带 promptSnippet/promptGuidelines 由内核组装成 system 的规则节。",
+  "version": "4.1.0",
+  "description": "work 是 chat 子代理（双模型架构）：chat 在聊天里用 work_dispatch 工具自然派活（管理员权限在工具内判定），work 模型在隔离上下文里跑 agent loop（常驻 Python 会话、浏览器、shell、文件、联网），用 work_finish 交回结构化结论；跑完后内核另起一轮，由 chat 带着 @发起人 用自己的人设汇报并发出产物。work_status 只查调用者自己的进度。身份与工具白名单写在 agents/work.md，工具自带 promptSnippet/promptGuidelines 由内核组装成 system 的规则节。",
   "author": {
     "name": "parallel"
   },

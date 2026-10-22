@@ -20,6 +20,10 @@ export interface ProviderModelCfg {
 /** 优先级链上的一条：某个供应商下的某个模型 */
 export interface ModelRef { provider: string; model: string }
 
+/** 思考强度（pi-ai 的 ThinkingLevel；空串 = 默认，由模型/供应商决定） */
+export const REASONING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+
 /** 单个供应商配置。custom=true 的条目由模型页创建，内核按 openai-compatible 动态注册 Provider */
 export interface ProviderCfg {
   label: string;
@@ -78,6 +82,8 @@ export const DEFAULT_CONFIG = {
     // 供应商不再分聊天/工作用途：两条有序链各自列「供应商 + 模型」，靠前的优先，掉线自动接后一个
     chatChain: [] as ModelRef[],
     workChain: [] as ModelRef[],          // 工作链独立于聊天链（不跟随）；空 = /work 没有可用模型
+    chatReasoning: '',                    // 聊天链思考强度：'' = 默认；否则 minimal/low/medium/high/xhigh/max
+    workReasoning: '',                    // 工作链思考强度（与聊天链各自独立）
     failoverThreshold: 2,                 // 同一条链上连续掉线 N 次才切到下一个模型
   },
   // work 子代理（/work 链路）。定义与压缩口径都放在这里，改配置即可调整，不必改代码。
@@ -116,6 +122,8 @@ export const DEFAULT_CONFIG = {
     expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
     // 跟屏复读（humanlike/repeat.ts）：>=N 位群友接连说同一句就完整跟一条；纯程序不走模型
     repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
+    // 戳一戳（chat 工具）：模型在有明确指向/犯贱时调用；冷却与小时上限是硬护栏
+    poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
     // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
       splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
@@ -237,8 +245,13 @@ export const DEFAULT_CONFIG = {
   sandbox: {
     runtime: 'auto',                      // 执行运行时：'docker'=容器强隔离（断网+文件隔离）| 'subprocess'=本机子进程 | 'auto'=docker 可用则用之，否则回落 subprocess
     dockerImagePython: 'python:3.12-slim',
+    // work 档的一次性 Python 换成带库镜像（numpy/pandas/matplotlib/PIL/opencv…）：
+    // 实测 slim 镜像里模型 import PIL/numpy 全部失败，便转去宿主机命令绕路——那也是隔离漏口。
+    dockerImagePythonWork: 'parallel-sandbox-python:latest',
     dockerImageNode: 'node:24-slim',
-    dockerImageBash: 'debian:12-slim',
+    dockerImageNodeWork: 'node:24-slim',
+    // work 的 bash 与一次性 Python 同镜像：debian:12-slim 里连 python3 都没有（实测）
+    dockerImageBash: 'parallel-sandbox-python:latest',
     ttlHours: 24,                         // chat 临时文件 TTL（最后一次访问起算）
     inboxTtlHours: 360,                   // 聊天收件文件 TTL（15 天：图片要能回看，设置页「沙箱」按天调）
     workTtlHours: 168,                    // work 产物 TTL（7 天：交付物值得多留）
@@ -247,7 +260,7 @@ export const DEFAULT_CONFIG = {
     maxSessionBytes: 200 * 1024 * 1024,   // 单会话总占用上限
     execTimeoutPythonMs: 20000,
     execTimeoutJsMs: 10000,
-    execTimeoutShellMs: 60000,            // work 模式 shell 执行超时（powershell/bash）
+    execTimeoutShellMs: 60000,            // work 模式 shell 执行超时（bash）
     workMaxRunsPerMin: 15,                // work 模式执行频率上限（比 chat 宽）
     workMaxSessionBytes: 1024 * 1024 * 1024, // work 模式会话沙箱容量上限（1GB）
     workExecTimeoutMs: 300000,            // work 档单次执行上限（5 分钟：长任务/构建）

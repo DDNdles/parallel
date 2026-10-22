@@ -3,12 +3,18 @@ import { busEvents } from '../bus.ts';
 import type { ChatRef, ChatSendService, MsgSegment } from '../types.ts';
 import type { SendPlan } from '../humanlike/index.ts';
 import { RateLimiter } from '../ratelimit.ts';
+import { faceTokensToSegments } from '../util/qqface.ts';
 import { existsSync, statSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { join, resolve, sep, normalize } from 'node:path';
 
 export interface TransportAdapter {
   /** 发送消息段到指定会话；返回平台消息 id（可为空） */
   send(chat: ChatRef, segments: MsgSegment[]): Promise<string | undefined>;
+  /** 发送合并转发（聊天记录）：nodes 的 content 里可以放文本与文件段 */
+  sendForward(chat: ChatRef, nodes: { userId?: string; nickname?: string; content: MsgSegment[] }[]): Promise<string | undefined>;
+  /** 戳一戳（双击头像）；群聊需要 userId，私聊传对面 userId */
+  sendPoke(chat: ChatRef, userId: string): Promise<void>;
   /** 发送本地文件（OneBot 场景传 file:// URI）；仅内核在沙箱校验后调用 */
   sendFile(chat: ChatRef, absPath: string): Promise<string | undefined>;
   connected(): boolean;
@@ -35,7 +41,10 @@ export class ChatService implements ChatSendService {
     private opts: {
       ratePerMin: number;
       sandboxRoot: (chat: ChatRef) => string;
-      sessionLog: { append(chatId: string, chatType: string, entry: any): any };
+      sessionLog: {
+        append(chatId: string, chatType: string, entry: any): any;
+        tail(chatId: string, chatType: string, limit?: number): any[];
+      };
       onUsage: (dir: 'in' | 'out') => void;
     },
   ) {
@@ -131,9 +140,10 @@ export class ChatService implements ChatSendService {
             if (!ids.length) throw new Error('协议端未连接');
             return done();   // 已经发出去几条就不再抛，免得用户看到"整条失败"
           }
+          let sentId: string | undefined;
           try {
-            const id = await this.adapter.send(chat, segments);
-            if (id) ids.push(id);
+            sentId = await this.adapter.send(chat, segments);
+            if (sentId) ids.push(sentId);
           } catch (e) {
             this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `发送失败: ${(e as Error).message}` });
             if (!ids.length) throw e;
@@ -142,7 +152,8 @@ export class ChatService implements ChatSendService {
           this.opts.onUsage('out');
           this.opts.sessionLog.append(chat.chatId, chat.type, {
             type: 'message_out', role: 'assistant', text: textOf(segments),
-            data: { segments, part: ids.length, parts: queue.length },
+            // 存协议端消息号：别人引用 bot 的这条消息时，pipeline.attachReply 才能查回原文
+            data: { segments, messageId: sentId, part: ids.length, parts: queue.length },
           });
           this.bus.emit(busEvents.chatOut, { chat, segments, text: textOf(segments), ts: Date.now() });
           sentTexts.push(textOf(segments));
@@ -176,7 +187,92 @@ export class ChatService implements ChatSendService {
   }
 
   async sendText(chat: ChatRef, text: string): Promise<void> {
-    await this.send(chat, [{ type: 'text', data: { text } }]);
+    // 桌面端手打、命令回复、系统通报都走这里：`[表情/微笑]` 同样能发成真表情
+    await this.send(chat, faceTokensToSegments(text));
+  }
+
+  /**
+   * 合并转发一条「工作交付」聊天记录：正文 + 产物文件都塞进同一个 forward。
+   * 协议端不支持 forward（或 node 里不收 file）时退回普通分开发送，正文和文件都不丢。
+   */
+  async sendForward(chat: ChatRef, opts: {
+    text: string;
+    artifacts?: string[];
+    mention?: { userId: string };
+    selfId?: string;
+    selfNickname?: string;
+  }): Promise<void> {
+    const text = String(opts.text ?? '').trim();
+    const root = normalize(this.opts.sandboxRoot(chat));
+    const files: { rel: string; name: string; abs: string; size: number }[] = [];
+    for (const rel of opts.artifacts ?? []) {
+      try {
+        const abs = normalize(resolve(root, rel));
+        if ((abs !== root && !abs.startsWith(root + sep)) || !existsSync(abs) || !statSync(abs).isFile()) continue;
+        files.push({ rel: rel.replace(/\\/g, '/'), name: rel.split(/[\\/]/).pop() || rel, abs, size: statSync(abs).size });
+      } catch { /* 单个文件解析失败不拖垮整条记录 */ }
+    }
+    if (!text && !files.length) return;
+    // 限速按条计费：一条聊天记录算一条
+    const rl = this.limiter.tryTake(`${chat.platform}:${chat.type}:${chat.chatId}`, 1);
+    if (rl.granted <= 0) {
+      this.opts.sessionLog.append(chat.chatId, chat.type, {
+        type: 'gate', role: 'system', text: `聊天记录被限速丢弃（等待 ${rl.waitMs}ms 超过上限）`,
+        data: { decision: 'rate_limited', waitMs: rl.waitMs, dropped: 1 },
+      });
+      return;
+    }
+
+    const content: MsgSegment[] = [];
+    if (opts.mention && chat.type === 'group') content.push({ type: 'at', data: { qq: opts.mention.userId } });
+    if (text) content.push({ type: 'text', data: { text } });
+    const nodes: { userId?: string; nickname?: string; content: MsgSegment[] }[] = [];
+    if (content.length) nodes.push({ userId: opts.selfId, nickname: opts.selfNickname, content });
+    for (const f of files) {
+      nodes.push({
+        userId: opts.selfId, nickname: opts.selfNickname,
+        content: [{ type: 'file', data: { file: pathToFileURL(f.abs).href, name: f.name } }],
+      });
+    }
+
+    const record = {
+      title: '工作交付',
+      dropped: 0,
+      failed: false,
+      nodes: [
+        ...(text ? [{ userId: opts.selfId ?? '', nickname: opts.selfNickname ?? '', text, ts: Date.now() }] : []),
+        ...files.map((f) => ({
+          userId: opts.selfId ?? '', nickname: opts.selfNickname ?? '',
+          text: '', ts: Date.now(),
+          files: [{ name: f.name, rel: f.rel, sandboxPath: f.abs, size: f.size }],
+        })),
+      ],
+    };
+
+    if (chat.platform === 'ui') {
+      this.opts.onUsage('out');
+      this.opts.sessionLog.append(chat.chatId, chat.type, {
+        type: 'message_out', role: 'assistant', text, data: { forward: record, simulated: true },
+      });
+      this.bus.emit(busEvents.chatOut, { chat, segments: [], text, ts: Date.now(), simulated: true });
+      return;
+    }
+    if (!this.adapter?.connected()) throw new Error('协议端未连接，消息未能发出');
+    let id: string | undefined;
+    try {
+      id = await this.adapter.sendForward(chat, nodes);
+    } catch {
+      // 老协议端/不支持 forward 的线格式：退回正文一条 + 文件逐条，至少不丢交付
+      await this.send(chat, content.length ? content : [{ type: 'text', data: { text } }]);
+      for (const f of files) await this.sendFile(chat, f.abs);
+      return;
+    }
+    this.opts.onUsage('out');
+    this.opts.sessionLog.append(chat.chatId, chat.type, {
+      type: 'message_out', role: 'assistant', text,
+      data: { forward: record, artifacts: files.map((f) => f.rel), messageId: id },
+    });
+    this.bus.emit(busEvents.chatOut, { chat, segments: [{ type: 'forward', data: { id: id ?? '' } }], text, ts: Date.now() });
   }
 
   async sendFile(chat: ChatRef, sandboxPath: string): Promise<void> {
@@ -189,6 +285,40 @@ export class ChatService implements ChatSendService {
     if (!this.adapter?.connected()) throw new Error('协议端未连接');
     await this.adapter.sendFile(chat, abs);
     this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'message_out', role: 'assistant', text: `[文件] ${abs}`, data: { file: abs } });
+  }
+
+  /** 戳一戳（双击头像）：target 可以是 QQ 号或最近说话人的昵称；私聊省略 = 对面 */
+  async poke(chat: ChatRef, target?: string): Promise<{ userId: string; nickname?: string }> {
+    const raw = String(target ?? '').trim();
+    let userId = '';
+    let nickname = '';
+    if (/^\d{4,}$/.test(raw)) {
+      userId = raw;
+    } else if (raw) {
+      // 昵称只在本会话最近 500 条里找：模型看到的就是这些名字，别去全库猜人
+      const tail = this.opts.sessionLog.tail(chat.chatId, chat.type, 500);
+      for (let i = tail.length - 1; i >= 0; i--) {
+        const e = tail[i];
+        if (e?.type === 'message_in' && (e.nickname === raw || e.userId === raw)) {
+          userId = String(e.userId ?? '');
+          nickname = String(e.nickname ?? '');
+          break;
+        }
+      }
+      if (!userId) throw new Error(`没找到最近说话的人「${raw}」`);
+    } else if (chat.type === 'private') {
+      userId = chat.chatId;
+    } else {
+      throw new Error('群里要指定戳谁');
+    }
+    if (!userId) throw new Error('没有可戳的对象');
+    if (!this.adapter?.connected()) throw new Error('协议端未连接');
+    await this.adapter.sendPoke(chat, userId);
+    const text = `戳了戳 ${nickname || userId}`;
+    this.opts.onUsage('out');
+    this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'poke', role: 'assistant', text, data: { poke: { userId, nickname } } });
+    this.bus.emit(busEvents.chatOut, { chat, segments: [], text, ts: Date.now(), poke: { userId, nickname } });
+    return { userId, nickname };
   }
 
   async reply(event: { chatId: string; type: 'group' | 'private'; platform: string }, text: string): Promise<void> {
@@ -213,7 +343,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 function textOf(segments: MsgSegment[]): string {
-  return segments.map((s) => (s.type === 'text' ? String(s.data.text ?? '') : s.type === 'image' ? '[图片]' : s.type === 'at' ? `@${s.data.qq ?? ''}` : s.type === 'reply' ? '' : `[${s.type}]`)).join('');
+  return segments.map((s) => (s.type === 'text' ? String(s.data.text ?? '')
+    : s.type === 'image' ? '[图片]'
+      : s.type === 'face' ? `[表情:${String(s.data.id ?? '')}]`
+        : s.type === 'at' ? `@${s.data.qq ?? ''}`
+          : s.type === 'reply' ? '' : `[${s.type}]`)).join('');
 }
 
 function summarize(segments: MsgSegment[]): string {
@@ -225,14 +359,14 @@ function truncateStr(s: string, n: number): string {
 }
 
 /** 把文本段按长度切成多条，其余段保持独立（平台单条上限的硬兜底）。
- *  `reply` 段例外：它是**下一条正文的引用块**，必须和正文在同一个消息里（拆开就是一条空引用 +
- *  一条无引用的正文）——挂进当前消息、跟着后面的文本走。 */
+ *  `reply` / `at` / `face` 段例外：它们必须和正文在同一个消息里（拆开就是一条只有引用/只有 @/只有表情
+ *  的空消息 + 一条无引用/没 @ 到的正文）——挂进当前消息、跟着后面的文本走。 */
 export function splitSegments(segments: MsgSegment[], maxChars: number): MsgSegment[][] {
   const out: MsgSegment[][] = [];
   let cur: MsgSegment[] = [];
   let curLen = 0;
   for (const seg of segments) {
-    if (seg.type === 'reply') { cur.push(seg); continue; }
+    if (seg.type === 'reply' || seg.type === 'at' || seg.type === 'face') { cur.push(seg); continue; }
     if (seg.type === 'text' && typeof seg.data.text === 'string') {
       let text: string = seg.data.text;
       while (text.length > maxChars) {

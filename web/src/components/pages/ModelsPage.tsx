@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 模型设置页：左栏 = 供应商列表 + 两条模型优先级链（聊天/工作，可拖动改优先级），右栏 = 供应商详情
  *  刷新与添加供应商两颗圆钮在顶栏（App.tsx），经 cmd 通道打过来。 */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
@@ -28,8 +29,15 @@ interface ChainEntry extends ChainRef { fails: number; state: 'current' | 'idle'
 interface Resp {
   active: string; activeModel: string; providers: Provider[];
   chains: { chat: ChainEntry[]; work: ChainEntry[] };
+  /** 两条链各自选定的思考强度（'' = 默认） */
+  reasoning?: { chat?: string; work?: string };
   failoverThreshold: number;
 }
+
+/** 思考强度：左栏宽度只放得下四档；后端的 pi-ai 还认 minimal/xhigh/max，手改配置也能用 */
+const REASON_LEVELS = [
+  { v: '', t: '默认' }, { v: 'low', t: '低' }, { v: 'medium', t: '中' }, { v: 'high', t: '高' },
+];
 
 /** 连接方式（内核四种线格式都已实现）；mock 是本地脚本，不发网络请求 */
 const PROTOCOLS = [
@@ -100,6 +108,19 @@ export default function ModelsPage({ onChanged, cmd }: {
     } catch (e) { fail(e); }
   }, [reload, onChanged, setErr, fail]);
 
+  /** 思考强度即时落盘（左右两条链各自独立）；失败时回滚到服务端值 */
+  const commitReasoning = useCallback(async (kind: 'chat' | 'work', level: string) => {
+    setData((d) => (d ? { ...d, reasoning: { ...(d.reasoning ?? {}), [kind]: level } } : d));
+    try {
+      const r: { reasoning?: Resp['reasoning'] } = await post('/api/providers/chain', { kind, reasoning: level });
+      setErr('');
+      if (r?.reasoning) setData((d) => (d ? { ...d, reasoning: r.reasoning } : d));
+    } catch (e) {
+      fail(e);
+      reload();
+    }
+  }, [fail, reload, setErr]);
+
   if (!data) return <div className="muted" style={{ padding: 30 }}>加载中…</div>;
   /** 只列被链引用的 + 用户自己建的；未分配的内置项不占地方（要用得先添加成自定义供应商） */
   const chainPids = new Set([...data.chains.chat, ...data.chains.work].map((e) => e.provider));
@@ -116,7 +137,7 @@ export default function ModelsPage({ onChanged, cmd }: {
             {listed.map((p) => (
               <button key={p.id} className={'mset-item' + (p.id === cur?.id ? ' sel' : '')} onClick={() => setSel(p.id)} title={p.label}>
                 <span className="mset-item-ic"><Icon name="models" size={15} /></span>
-                <span className="mset-item-nm">{p.label}</span>
+                <FadeName text={p.label} />
                 <i className={isUsable(p) ? 'dot dot-on' : 'dot mset-dot-off'} />
               </button>
             ))}
@@ -124,8 +145,10 @@ export default function ModelsPage({ onChanged, cmd }: {
           </div>
 
           <ChainGroup kind="chat" title="聊天模型" entries={data.chains.chat} providers={data.providers}
+            reasoning={data.reasoning?.chat ?? ''} onReasoning={(v) => void commitReasoning('chat', v)}
             onPick={() => setPicking('chat')} onCommit={(e) => void commitChain('chat', e)} />
           <ChainGroup kind="work" title="工作模型" entries={data.chains.work} providers={data.providers}
+            reasoning={data.reasoning?.work ?? ''} onReasoning={(v) => void commitReasoning('work', v)}
             onPick={() => setPicking('work')} onCommit={(e) => void commitChain('work', e)} />
         </aside>
 
@@ -193,9 +216,10 @@ export default function ModelsPage({ onChanged, cmd }: {
 }
 
 /** 一条模型优先级链：靠前的优先、掉线自动接后一条；行尾把手上下拖动改优先级（换位有动画） */
-function ChainGroup({ kind, title, entries, providers, note, onPick, onCommit }: {
+function ChainGroup({ kind, title, entries, providers, note, reasoning, onReasoning, onPick, onCommit }: {
   kind: 'chat' | 'work'; title: string; entries: ChainEntry[]; providers: Provider[];
-  note?: string | null; onPick: () => void; onCommit: (e: ChainRef[]) => void;
+  note?: string | null; reasoning: string; onReasoning: (v: string) => void;
+  onPick: () => void; onCommit: (e: ChainRef[]) => void;
 }) {
   const drag = useRef<number | null>(null);
   const [over, setOver] = useState<number | null>(null);
@@ -233,11 +257,20 @@ function ChainGroup({ kind, title, entries, providers, note, onPick, onCommit }:
 
   return (
     <div className="mset-group" data-chain={kind}>
-      <div className="mset-group-t">
+      <div className="mset-group-t" title={`${title}从上到下依次使用；前一条不可用时自动由下一条接替`}>
         <span>{title}</span>
         <button className="chain-add" title={`添加${title}`} aria-label={`添加${title}`} onClick={onPick}>
           <Icon name="plus" size={13} />
         </button>
+      </div>
+      <div className="chain-reason" title="交给推理模型的思考强度；默认 = 不额外指定">
+        <span>思考</span>
+        <span className="mset-chips">
+          {REASON_LEVELS.map((r) => (
+            <button key={r.v} className={'mset-chip' + (r.v === reasoning ? ' on' : '')}
+              onClick={() => { if (r.v !== reasoning) onReasoning(r.v); }}>{r.t}</button>
+          ))}
+        </span>
       </div>
       {note && <div className="mset-group-e">{note}</div>}
       {entries.map((e, i) => {
@@ -259,7 +292,8 @@ function ChainGroup({ kind, title, entries, providers, note, onPick, onCommit }:
             }}
             title={`${label(e.provider)} · ${e.model}${e.state === 'down' ? ' · 已掉线' : ''}`}
           >
-            <span className="mset-item-nm">{e.model}</span>
+            <FadeName text={e.model} />
+            {e.state === 'current' && <span className="chain-cur">当前</span>}
             {e.state === 'down' && <i className="dot plg-dot-err" />}
             <button className="chain-del" aria-label="从链上移除" title="从链上移除" onClick={() => drop(i)}><Icon name="trash" /></button>
             <span className="mset-grip" aria-hidden><Icon name="grip" size={13} /></span>

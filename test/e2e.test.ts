@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test, before, after, beforeEach } from 'node:test';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,6 +20,10 @@ let mockProvider: MockEngine;
 const GROUP = 123;
 const MEMBER = 10001;
 const MASTER = 9999;
+/** 人设主体从当前内置人格读取：只断言"重复段只注入一次"，不绑死某个版本的人设正文 */
+const PERSONA_BODY = String((JSON.parse(readFileSync(
+  join(process.cwd(), 'src/plugins/chat/personas/whale-girl/canon.json'), 'utf-8',
+)) as { canon: { protagonist: string[] } }).canon.protagonist[0]);
 
 async function until<T>(fn: () => T | undefined | null | false, timeoutMs = 15000, what = 'condition'): Promise<T> {
   const start = Date.now();
@@ -129,11 +133,15 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   kernel.container.setGroupState('sandbox', String(GROUP), true, String(MASTER));
 
-  // chat 工具面 2026-10-17 起 = 记忆读写三件套：sandbox 这类行为工具在 chat 轮严格缺席
+  // chat 工具面 = 记忆读写三件套 + work 派活/进度（2026-10-21 起）；sandbox 这类行为工具仍在 chat 轮严格缺席
   const chatTools = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
-  assert.deepEqual(chatTools, ['recall_facts', 'remember_setting', 'search_history'], `chat 面只该有记忆读写: ${chatTools}`);
+  assert.deepEqual(
+    chatTools,
+    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳与 work 派活/进度: ${chatTools}`,
+  );
 
   // 脚本：先调一次记忆查询（chat 面的工具），拿到结果后作答
   mockProvider.script.push({
@@ -192,10 +200,10 @@ test('群禁用的插件：工具缺席（命令面已整体清空）', async ()
 });
 
 // ============================================================
-// 4. 指令面（2026-10-17 用户明令）：/work 以外全删
+// 4. 指令面（2026-10-17 清空，2026-10-21 /work 也删了）
 // ============================================================
 
-test('QQ 指令面只剩 /work：旧的 /帮助 /人格 /设定 /搜索 一律未知命令', async () => {
+test('QQ 指令面为空：旧的 /帮助 /人格 /设定 /搜索 /work 一律未知命令', async () => {
   mock.actions.length = 0;
 
   // 内建命令表已清空（注册表留着给用户插件用；本仓库没有注册命令的用户插件）
@@ -216,16 +224,16 @@ test('QQ 指令面只剩 /work：旧的 /帮助 /人格 /设定 /搜索 一律�
   let reply = await mock.waitForReply(GROUP, 8000, mark);
   assert.equal(reply.trim(), '未知命令', `普通成员旧指令该得到统一未知命令：${reply}`);
 
-  // /work 仍在：管理员门槛 + 空任务给用法
+  // /work 2026-10-21 已删除（work 改为 chat 的 work_dispatch 工具）：管理员发也是未知命令
+  mark = mock.actions.length;
+  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/work 算点什么', nickname: '主人' });
+  reply = await mock.waitForReply(GROUP, 8000, mark);
+  assert.match(reply, /未知命令/, `/work 应当已经不存在：${reply}`);
+
   mark = mock.actions.length;
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/work 算点什么', nickname: '小明' });
   reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /权限不足/, `/work 仍要管理员：${reply}`);
-
-  mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/work', nickname: '主人' });
-  reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /用法：\/work/, `/work 无任务该给用法：${reply}`);
+  assert.equal(reply.trim(), '未知命令', `普通成员同样只是未知命令：${reply}`);
   mock.actions.length = 0;
 });
 
@@ -254,12 +262,16 @@ test('QQ 侧不再有清除记忆的入口：/忘记我 当未知命令处理，
   mock.actions.length = 0;
 });
 
-test('chat 工具面 = 记忆读写三件套：行为型工具（forget_me / remember_fact / plan_schedule / reply_quote）已删', () => {
+test('chat 工具面 = 记忆读写三件套 + work 派活/进度：其余行为型工具已删', () => {
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   const names = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
-  assert.deepEqual(names, ['recall_facts', 'remember_setting', 'search_history'], `chat 面只该有记忆读写: ${names}`);
+  assert.deepEqual(
+    names,
+    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳与 work 派活/进度: ${names}`,
+  );
   // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；用户事实写入由后台自动提炼承担
   for (const gone of ['forget_me', 'remember_fact', 'plan_schedule', 'reply_quote']) {
     assert.ok(!names.includes(gone), `${gone} 不该再出现在 chat 面`);
@@ -707,23 +719,40 @@ test('群名片/陌生人昵称不会顶替群名，未知名字按需补', asyn
 });
 
 // ============================================================
-// 17. work 子代理：loop 事件流 + 会话级缓存命中账（会话页右侧「工作」抽屉的数据面）
+// 17. work 子代理：chat 工具派活 / 跑完带 @ 汇报 / 停下来提问
 // ============================================================
 
-test('work 任务产出 loop 事件与缓存命中，且按 chatKey 过滤', async () => {
+test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（loop 事件与缓存账照旧）', async () => {
   const WORK_GROUP = '7001';
   const chatKey = `group_${WORK_GROUP}`;
+  kernel.container.setGroupState('work', WORK_GROUP, true, String(MASTER));
   const done = new Promise<any>((resolve) => {
-    const off = kernel.bus.on('work.done' as any, (d: any) => { if (d.chatKey === chatKey) { off(); resolve(d); } });
+    const off = kernel.bus.on('work.done' as any, (d: any) => {
+      if (d.chatKey === chatKey && d.trigger === 'chat') { off(); resolve(d); }
+    });
   });
-  // 以主人身份触发 /work（work 插件 minRole=admin）；mock 供应商会走 python_session 工具
+  // platform=ui 的发送不走协议端（ChatService 只落日志与 chat.out 事件），所以从总线上收正文与 at 段
+  const outs: any[] = [];
+  const offOut = kernel.bus.on('chat.out', (p: any) => {
+    if (p.chat?.type === 'group' && String(p.chat?.chatId) === WORK_GROUP) outs.push(p);
+  });
+  mock.actions.length = 0;
+  // work 产物落在发起人自己的沙箱作用域里；汇报轮的正文与产物会合并成一条聊天记录
+  kernel.sandbox.write({ platform: 'ui', type: 'group', chatId: WORK_GROUP, scope: `u${MASTER}` }, 'out.md', '# 结果\n1024\n');
+  // chat 第一轮调 work_dispatch；第二轮应下；work 收尾；最后一轮是人格化汇报（正文+产物进聊天记录）
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '算一下 2**10' } }] });
+  mockProvider.script.push({ content: '好，我去算一下。' });
+  mockProvider.script.push({ content: '算一下这个。', toolCalls: [{ name: 'work_finish', args: { summary: '算完了，2 的 10 次方是 1024', artifacts: ['out.md'] } }] });
+  mockProvider.script.push({ content: '算好了，是 1024。文件也给你。' });
   kernel.pipeline.submit({
     id: 'work-ev-1', platform: 'ui', type: 'group', chatId: WORK_GROUP, userId: String(MASTER),
     nickname: '主人', senderRole: 'owner',
-    segments: [{ type: 'text', data: { text: '/work 算一下 2**10' } }], text: '/work 算一下 2**10',
+    segments: [{ type: 'text', data: { text: '帮我算一下 2 的 10 次方' } }], text: '帮我算一下 2 的 10 次方',
     isAtMe: true, isReplyToMe: false, raw: { injected: true }, ts: Date.now(),
   } as any);
-  await done;
+  const ev = await done;
+  assert.equal(ev.trigger, 'chat', 'work.done 要带触发来源');
+  assert.equal(ev.nickname, '主人');
 
   const runs = kernel.workRunner.list(10, chatKey);
   assert.equal(runs.length, 1, '该会话应有 1 条 work 任务');
@@ -733,19 +762,31 @@ test('work 任务产出 loop 事件与缓存命中，且按 chatKey 过滤', asy
   assert.ok(kinds.includes('thinking'), '要有思考事件');
   assert.ok(kinds.includes('tool') && kinds.includes('toolResult'), '要有工具调用与返回事件');
   assert.ok(kinds.includes('final'), '要有收敛回答事件');
-  assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'python_session');
-  // 缓存命中账：mock 每轮报 96 命中 / 24 未命中
+  assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'work_finish');
+  assert.equal(runs[0].task, '算一下 2**10', '展示的是工具给的任务，不是用户原话');
   assert.ok(runs[0].usage, '要带本次任务的 token 账');
   assert.ok(runs[0].usage.cacheHit > 0 && runs[0].usage.cacheMiss > 0, '缓存命中/未命中要有数');
   assert.ok(runs[0].usage.prompt >= runs[0].usage.cacheHit, '提示词 token 不该少于命中数');
 
+  // 汇报轮：一条聊天记录（正文 + 文件节点），不是多条气泡/单独文件
+  const report = await until(() => kernel.sessionLog.tail(WORK_GROUP, 'group')
+    .find((e) => e.type === 'message_out' && (e.data as any)?.forward), 12000, '聊天记录汇报');
+  const fwd = (report!.data as any).forward;
+  assert.equal(fwd.title, '工作交付');
+  assert.ok(String(fwd.nodes?.[0]?.text ?? '').includes('1024'), `汇报要讲结论：${fwd.nodes?.[0]?.text}`);
+  assert.equal(String(fwd.nodes?.[1]?.files?.[0]?.name ?? ''), 'out.md', '产物要在同一个聊天记录里');
+  assert.ok(outs.some((o) => (o.text ?? '').includes('好，我去算一下')), '派活后要先由 chat 应下');
+  assert.ok(!mock.actions.some((a) => a.action === 'upload_group_file'), '平台模拟轮不应该再单独上传文件');
+
   // 别的会话取不到这条（抽屉只认当前会话）
   assert.equal(kernel.workRunner.list(10, 'group_999999').length, 0);
+  offOut();
 });
 
-test('work 停下来提问：转述按"等你回答"口径；管理员回答后接着干（不从头重来）', async () => {
+test('work 停下来提问：chat 转达问题；管理员自然回答后 work_dispatch 接着干（不从头重来）', async () => {
   const WORK_GROUP = '7002';
   const chatKey = `group_${WORK_GROUP}`;
+  kernel.container.setGroupState('work', WORK_GROUP, true, String(MASTER));
   const submit = (text: string) => kernel.pipeline.submit({
     id: `work-ask-${Math.random().toString(36).slice(2)}`, platform: 'ui', type: 'group', chatId: WORK_GROUP,
     userId: String(MASTER), nickname: '主人', senderRole: 'owner',
@@ -753,15 +794,20 @@ test('work 停下来提问：转述按"等你回答"口径；管理员回答后�
     isAtMe: true, isReplyToMe: false, raw: { injected: true }, ts: Date.now(),
   } as any);
   const waitDone = () => new Promise<any>((resolve) => {
-    const off = kernel.bus.on('work.done' as any, (d: any) => { if (d.chatKey === chatKey) { off(); resolve(d); } });
+    const off = kernel.bus.on('work.done' as any, (d: any) => {
+      if (d.chatKey === chatKey && d.trigger === 'chat') { off(); resolve(d); }
+    });
   });
 
   await quiesce();
-  // 第一轮：work 模型卡在"不知道用哪份文件"，调 work_ask 停下来
+  // 第一轮：chat 派活；work 卡在"不知道用哪份文件"，调 work_ask 停下来
   const done1 = waitDone();
   const calls1 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '整理一下那份报表' } }] });
+  mockProvider.script.push({ content: '好，我去整理。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_ask', args: { question: '用哪份文件？', notes: '已把 inbox 列出来' } }] });
-  submit('/work 整理一下那份报表');
+  mockProvider.script.push({ content: '用哪份文件呀？inbox 里我看到了几份。' });
+  submit('帮我整理一下那份报表');
   const ev1 = await done1;
   assert.equal(ev1.awaiting, true, 'work.done 要标出"停下来提问"');
   assert.equal(ev1.question, '用哪份文件？');
@@ -771,20 +817,24 @@ test('work 停下来提问：转述按"等你回答"口径；管理员回答后�
   assert.equal(run1.summary, '用哪份文件？', '结论就是那个问题，不是「## 待确认」那坨文本');
   assert.equal(run1.awaiting?.question, '用哪份文件？');
   assert.equal(run1.awaiting?.notes, '已把 inbox 列出来');
+  assert.ok(kernel.workRunner.livePending(chatKey, String(MASTER)), '要记下"等这个人回答"的现场');
 
-  // 转述轮口径：不能说成"已完成"
+  // 汇报轮口径：不能说成"已完成"，也不能再让用户发 /work
   await quiesce();
-  const relay = mockProvider.calls.slice(calls1).map((c) => c.lastUser ?? '').find((t) => t.includes('【工作子代理'));
-  assert.ok(relay, '要有一轮转述请求');
-  assert.ok(relay!.includes('停下来问你一件事'), `转述要说"停下来问"：${relay}`);
-  assert.ok(!relay!.includes('已完成任务'), '提问不能被说成已完成');
-  assert.ok(relay!.includes('/work'), '要告诉用户怎么回答');
+  const report1 = mockProvider.calls.slice(calls1).map((c) => c.lastUser ?? '')
+    .find((t) => t.includes('【你派出去的活停下来问你一件事】'));
+  assert.ok(report1, '要有一轮汇报请求');
+  assert.ok(report1!.includes('直接把答案说出来'), `要告诉用户怎么回答：${report1}`);
+  assert.ok(!report1!.includes('/work'), '汇报不该再提 /work');
 
-  // 第二轮：管理员回答 → 拼成"接着上次"的新任务交回 work
+  // 第二轮：管理员自然回答 → chat 用 work_dispatch 把回答接回 work（拼成"接着上次"）
   const done2 = waitDone();
   const calls2 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '用 inbox/a.csv 那份' } }] });
+  mockProvider.script.push({ content: '好，用那份接着弄。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '整理完了，产出 report.md', artifacts: ['report.md'] } }] });
-  submit('/work 用 inbox/a.csv 那份');
+  mockProvider.script.push({ content: '整理好了，report.md 给你。' });
+  submit('用 inbox/a.csv 那份');
   await done2;
   await quiesce();
 
@@ -797,12 +847,16 @@ test('work 停下来提问：转述按"等你回答"口径；管理员回答后�
   assert.equal(run2.awaiting, undefined, '这一轮是正常交付，不该再挂着"等回答"');
   assert.equal(run2.summary, '整理完了，产出 report.md');
   assert.equal(run2.task, '整理一下那份报表（续）', '列表里显示短标题，不是拼接文本');
+  assert.equal(kernel.workRunner.livePending(chatKey, String(MASTER)), undefined, '回答后现场要消费掉');
 
-  // 待答复已被消费：再来一次 /work 不该再粘上那段历史
+  // 待答复已被消费：再派一件新活不该再粘上那段历史
   const done3 = waitDone();
   const calls3 = mockProvider.calls.length;
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '看看沙箱里有什么' } }] });
+  mockProvider.script.push({ content: '好，我去看看。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '另一件事做完了' } }] });
-  submit('/work 换个任务：看看沙箱里有什么');
+  mockProvider.script.push({ content: '看完了，里面没什么东西。' });
+  submit('换个任务，看看沙箱里有什么');
   await done3;
   await quiesce();
   const task3 = mockProvider.calls.slice(calls3).map((c) => c.lastUser ?? '').find((t) => t.includes('看看沙箱里有什么'));
@@ -1032,7 +1086,7 @@ test('重复惩罚：连续提梁文峰后下一轮提醒并重写；人设重�
   assert.ok(calls.length >= 1, '第四轮主请求应带重复提醒');
   const system = String(calls[calls.length - 1].system ?? '');
   assert.ok(system.includes('梁文峰'), '提醒里应点名梁文峰');
-  assert.equal((system.match(/梁文峰是你的小助手/g) ?? []).length, 1, 'protagonist/post_history 重复段应只注入一次');
+  assert.equal(system.split(PERSONA_BODY).length - 1, 1, 'protagonist/post_history 重复段应只注入一次');
   mock.actions.length = 0;
 });
 

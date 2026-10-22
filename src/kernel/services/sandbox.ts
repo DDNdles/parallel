@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { join, resolve, sep, normalize, dirname } from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, rmSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, rmSync, existsSync, unlinkSync, copyFileSync } from 'node:fs';
 import type { Db } from '../db.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
@@ -14,7 +14,9 @@ function lineDiff(oldText: string, newText: string): { added: number; removed: n
   if (/\0/.test(oldText) || /\0/.test(newText)) return null;
   const tally = (t: string) => {
     const m = new Map<string, number>();
-    for (const l of t.split('\n')) m.set(l, (m.get(l) ?? 0) + 1);
+    const lines = t.split('\n');
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();   // 末尾换行不算多一行
+    for (const l of lines) m.set(l, (m.get(l) ?? 0) + 1);
     return m;
   };
   const a = oldText ? tally(oldText) : new Map<string, number>();
@@ -51,6 +53,18 @@ const SAFE_OPEN_EXT = new Set([
 ]);
 
 /**
+ * 所有一次性容器共用的硬化开关（work 与 chat 都套）：
+ *  - --init：容器里给个 PID 1 收尸，避免僵尸进程把上限吃满；
+ *  - --cap-drop ALL：丢掉全部 Linux capability（容器里不需要任何特权操作）；
+ *  - --security-opt no-new-privileges：禁止 setuid 提权；
+ *  - --pids-limit：防 fork 炸弹把宿主拖死。
+ * 不挂 docker.sock、不加 --privileged —— 那两种是"隔离看起来开了、实际全开"的典型。
+ */
+const CONTAINER_HARDEN = [
+  '--init', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '256',
+];
+
+/**
  * 轻沙箱（非隔离档，红线见 README）：
  * - 每个会话一个沙箱根目录，LLM 文件工具只能触达当前会话目录（防路径穿越）
  * - 临时性：TTL 自动清理；单文件/单会话配额
@@ -81,7 +95,40 @@ export class SandboxService {
   // ---------------- 路径与边界 ----------------
 
   chatKey(chat: ChatRef): string {
-    return `${chat.type}_${chat.chatId}`;
+    // scope = 同一聊天里按发起人再分一层（work 轮）；不带 scope 的就是聊天本身
+    return `${chat.type}_${chat.chatId}${chat.scope ? `__${chat.scope}` : ''}`;
+  }
+
+  /**
+   * 把聊天级 inbox 镜像进按人作用域的沙箱。
+   *
+   * work 轮的沙箱按发起人分开（同一个群里两位管理员各有自己的产物与常驻容器），
+   * 但群聊里收到的文件仍落在聊天级 `inbox/`。每次 work 开跑前把新文件拷进去，
+   * 模型照旧用 `inbox/xxx` 就能读到「发起者刚发的那份」。
+   * 只补缺失或更新的文件，不覆盖 work 自己产出的同名文件。
+   */
+  syncInbox(from: ChatRef, to: ChatRef): number {
+    if (!to.scope) return 0;
+    const src = join(this.rootDir, `${from.type}_${from.chatId}`, 'inbox');
+    const dest = join(this.root(to), 'inbox');
+    if (!existsSync(src)) return 0;
+    mkdirSync(dest, { recursive: true });
+    let names: string[];
+    try { names = readdirSync(src); } catch { return 0; }
+    let copied = 0;
+    for (const name of names) {
+      const s = join(src, name);
+      const d = join(dest, name);
+      try {
+        const st = statSync(s);
+        if (!st.isFile()) continue;
+        if (existsSync(d) && statSync(d).mtimeMs >= st.mtimeMs) continue;
+        copyFileSync(s, d);
+        this.touchFile(to, `inbox/${name.replace(/\\/g, '/')}`, st.size);
+        copied++;
+      } catch { /* 单个文件失败不影响整次任务 */ }
+    }
+    return copied;
   }
 
   root(chat: ChatRef): string {
@@ -286,11 +333,18 @@ export class SandboxService {
   }
 
   /**
-   * 通用执行入口：python/javascript 走容器或子进程；shell 走 powershell/bash（work 模式专用，
-   * 由调用方保证角色门槛——工具层已设 minRole，服务层不重复鉴权但记审计）。
+   * 通用执行入口：python/javascript/bash 全走容器（work 模式专用 shell 由调用方保证
+   * 角色门槛——工具层已设 minRole，服务层不重复鉴权但记审计）。
    * opts.work=true 时套用 work 档配额（更高频率/容量），并按会话沙箱上限校验。
+   *
+   * **work 档一律要求容器**（2026-10-19）：子进程回落对本机是"能跑任意命令、还能看到宿主
+   * 桌面与网络"的逃逸口——实测 work 模型在容器浏览器不可用时，自己用宿主机 PowerShell 拉起
+   * 了宿主机的 Chrome，用户看得见窗口。容器不可用时报错，让它照实说做不了，而不是悄悄降级。
+   *
+   * 不再支持 powershell（2026-10-22）：Linux 容器里的 pwsh 没有 python/git/curl，
+   * 计算与文本处理用 bash/python 就够；工具、镜像与配置项一并删掉。
    */
-  async runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'powershell' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): Promise<SandboxRunResult> {
+  async runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): Promise<SandboxRunResult> {
     const cfg = this.config.config.sandbox;
     const key = this.chatKey(chat);
     // 配额：并发 1；每分钟频率按档位（work 档更宽）
@@ -302,34 +356,94 @@ export class SandboxService {
     if (runs > rateCap) {
       throw new SandboxError(`执行频率超限（每分钟 ≤ ${rateCap} 次）`);
     }
-    const langCap = opts.language === 'python' ? cfg.execTimeoutPythonMs
-      : opts.language === 'javascript' ? cfg.execTimeoutJsMs
-      : cfg.execTimeoutShellMs;
+    const langCap = opts.work
+      // work 档有自己的整体上限（默认 5 分钟）：它经常要跑构建/大数据集，
+      // 用 chat 档的 20s 会把正常任务截断（旧代码 workExecTimeoutMs 一直没被读）
+      ? Math.max(cfg.workExecTimeoutMs ?? 300_000, opts.language === 'python' ? cfg.execTimeoutPythonMs : 0)
+      : (opts.language === 'python' ? cfg.execTimeoutPythonMs
+        : opts.language === 'javascript' ? cfg.execTimeoutJsMs
+        : cfg.execTimeoutShellMs);
     const timeoutMs = Math.min(opts.timeoutMs ?? langCap, langCap);
     const cwd = this.root(chat);
     const started = nowMs();
+    // work 执行可能顺手用 bash/python 写文件：执行前后各拍一次文本快照，
+    // 把新增/修改的文件算成整行增减，工作页才能逐条显示 +N -M
+    const before = opts.work ? this.snapshotText(chat) : null;
+    const attach = (r: SandboxRunResult): SandboxRunResult => {
+      if (!before) return r;
+      const changes = this.diffSnapshots(before, this.snapshotText(chat));
+      return changes.length ? { ...r, changes } : r;
+    };
     this.runningCount.set(key, (this.runningCount.get(key) ?? 0) + 1);
     try {
-      if (opts.language === 'powershell' || opts.language === 'bash') {
-        const runtime = this.resolveRuntime();
-        // Windows 宿主机有原生 PowerShell（-NoProfile 受控执行），不拉 350MB 的 pwsh 镜像；
-        // bash 则优先容器（宿主机 Git Bash 无 docker 那样的隔离）
-        if (opts.language === 'powershell') {
-          return await this.execSubprocessShell(chat, opts.language, opts.code, timeoutMs);
-        }
+      if (opts.language === 'bash') {
+        // shell 一律容器内跑：宿主机 shell 能看到桌面、能启动本机程序，
+        // 作为 work 工具的落地就是隔离漏口（容器不可用 → 报错，不回落）。
+        const runtime = opts.work ? this.requireDocker('shell 执行') : this.resolveRuntime();
         if (runtime === 'docker') {
-          return await this.execDockerShell(chat, opts.language, opts.code, timeoutMs);
+          return attach(await this.execDockerShell(chat, opts.code, timeoutMs));
         }
-        return await this.execSubprocessShell(chat, opts.language, opts.code, timeoutMs);
+        return attach(await this.execSubprocessShell(chat, opts.code, timeoutMs));
       }
-      const runtime = this.resolveRuntime();
+      // python/javascript：work 档同样强制容器（见方法注释）；chat 档维持 auto 回落
+      const runtime = opts.work ? this.requireDocker('脚本执行') : this.resolveRuntime();
       if (runtime === 'docker') {
-        return await this.execDocker(chat, opts.language, opts.code, timeoutMs);
+        return attach(await this.execDocker(chat, opts.language, opts.code, timeoutMs, !!opts.work));
       }
-      return await this.execSubprocess(chat, opts.language, opts.code, cwd, timeoutMs);
+      return attach(await this.execSubprocess(chat, opts.language, opts.code, cwd, timeoutMs));
     } finally {
       this.runningCount.set(key, Math.max(0, (this.runningCount.get(key) ?? 1) - 1));
     }
+  }
+
+  /** 沙箱内文本文件的快照（相对路径 → 内容）；二进制/超大文件直接跳过，别把一次执行拖成整树读盘 */
+  private snapshotText(chat: ChatRef): Map<string, string> {
+    const out = new Map<string, string>();
+    let files: SandboxEntry[] = [];
+    try { files = this.walkFiles(chat, '.', { maxFiles: 300, maxDepth: 12 }).files; } catch { return out; }
+    let bytes = 0;
+    for (const f of files) {
+      if (f.type !== 'file' || f.size > 256 * 1024) continue;
+      if (bytes + f.size > 8 * 1024 * 1024) break;
+      try {
+        const text = this.read(chat, f.relPath);
+        if (text.includes('\0')) continue;   // 二进制（图片/压缩包）不算行数
+        out.set(f.relPath, text);
+        bytes += f.size;
+      } catch { /* 读不动的跳过 */ }
+    }
+    return out;
+  }
+
+  /** 两份快照的差异 → 整行增减；删除的文件只报 -N */
+  private diffSnapshots(before: Map<string, string>, after: Map<string, string>): { path: string; added: number; removed: number }[] {
+    const changes: { path: string; added: number; removed: number }[] = [];
+    for (const [path, text] of after) {
+      const old = before.get(path);
+      if (old === undefined) {
+        const d = lineDiff('', text);
+        if (d) changes.push({ path, ...d });
+      } else if (old !== text) {
+        const d = lineDiff(old, text);
+        if (d && (d.added || d.removed)) changes.push({ path, ...d });
+      }
+    }
+    for (const [path, text] of before) {
+      if (after.has(path)) continue;
+      changes.push({ path, added: 0, removed: text ? text.split('\n').length : 0 });
+    }
+    return changes.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /** work 档的执行必须走容器：不可用就抛（隔离没生效时宁可做不了，也不悄悄降级到宿主） */
+  private requireDocker(what: string): 'docker' {
+    if (this.dockerOk === null) this.dockerOk = this.probeDocker();
+    if (!this.dockerOk) {
+      throw new SandboxError(
+        `Docker 不可用，${what}被拒绝：work 的执行只在容器沙箱里跑（宿主机子进程能看到本机桌面与网络，等于隔离失效）。请启动 Docker Desktop 后重试。`,
+      );
+    }
+    return 'docker';
   }
 
   /** 决定本次执行的运行时：docker / subprocess（配置 + 可用性探测，探测失败回落并只告警一次） */
@@ -373,16 +487,24 @@ export class SandboxService {
    * Docker 容器执行（强隔离档）：
    * --network none 物理断网；只挂载会话沙箱目录（读写）；--rm 跑完即销毁；无 GPU/无特权。
    * 代码经 stdin 传入，避免命令行长度与转义问题。
+   *
+   * work 档默认换用 `parallel-sandbox-python` 镜像（Dockerfile 里预装了 numpy/pandas/
+   * matplotlib/PIL/opencv 等）：实测 work 模型在一次性 python 里 import PIL/numpy 全失败，
+   * 只能改用宿主机命令绕路——工具面"看起来齐全、实际不可用"同样是隔离失效的一种。
    */
-  private execDocker(chat: ChatRef, language: 'python' | 'javascript', code: string, timeoutMs: number): Promise<SandboxRunResult> {
-    const cfg = this.config.config.sandbox as { dockerImagePython?: string; dockerImageNode?: string };
+  private execDocker(chat: ChatRef, language: 'python' | 'javascript', code: string, timeoutMs: number, work = false): Promise<SandboxRunResult> {
+    const cfg = this.config.config.sandbox as {
+      dockerImagePython?: string; dockerImageNode?: string;
+      dockerImagePythonWork?: string; dockerImageNodeWork?: string;
+    };
     const image = language === 'python'
-      ? (cfg.dockerImagePython || 'python:3.12-slim')
-      : (cfg.dockerImageNode || 'node:24-slim');
+      ? (work ? (cfg.dockerImagePythonWork || 'parallel-sandbox-python:latest') : (cfg.dockerImagePython || 'python:3.12-slim'))
+      : (work ? (cfg.dockerImageNodeWork || 'node:24-slim') : (cfg.dockerImageNode || 'node:24-slim'));
     // Windows 路径转 Docker 挂载格式：C:\...\dir -> //c/.../dir（Docker Desktop 接受）；先 resolve 保证带盘符
     const hostDir = resolve(this.root(chat)).replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
     const args = [
       'run', '--rm', '-i', '--network', 'none',   // -i：保持容器 stdin 开启以接收代码
+      ...CONTAINER_HARDEN,
       '-v', `${hostDir}:/ws`,
       '-w', '/ws',
       '--cpus', '1', '--memory', '512m',
@@ -434,20 +556,16 @@ export class SandboxService {
   }
 
   /**
-   * shell（powershell/bash）Docker 执行：work 模式专用。与代码沙箱同等的强隔离：
-   * --network none 断网、只挂会话目录、--rm 销毁、限额。bash 用 debian:12-slim 镜像。
+   * bash 的 Docker 执行：work 模式专用。与代码沙箱同等的强隔离：
+   * --network none 断网、只挂会话目录、--rm 销毁、限额。
+   * 用**计算镜像**而不是 debian-slim：模型会在这里 import numpy/PIL，
+   * 而 debian:12-slim 里连 python3 都没有（实测 `python3: command not found`）。
    */
-  private execDockerShell(chat: ChatRef, language: 'powershell' | 'bash', code: string, timeoutMs: number): Promise<SandboxRunResult> {
+  private execDockerShell(chat: ChatRef, code: string, timeoutMs: number): Promise<SandboxRunResult> {
     const cfg = this.config.config.sandbox as { dockerImageBash?: string };
     const hostDir = resolve(this.root(chat)).replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
-    const args = ['run', '--rm', '-i', '--network', 'none', '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
-    if (language === 'bash') {
-      args.push(cfg.dockerImageBash || 'debian:12-slim', 'bash', '-c', code);
-    } else {
-      // PowerShell 无官方 slim 镜像坚持断网场景的轻量替代：只在宿主机子进程跑（见 execSubprocessShell）；
-      // 容器内跑 pwsh 需 mcr.microsoft.com/powershell（约 350MB），按需拉取
-      args.push('mcr.microsoft.com/powershell:debian-12', 'pwsh', '-NoProfile', '-NonInteractive', '-Command', code);
-    }
+    const args = ['run', '--rm', '-i', '--network', 'none', ...CONTAINER_HARDEN, '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
+    args.push(cfg.dockerImageBash || 'parallel-sandbox-python:latest', 'bash', '-c', code);
     return new Promise((resolveP) => {
       const startTs = Date.now();
       const outCap = this.config.config.sandbox.maxOutputBytes;
@@ -486,24 +604,17 @@ export class SandboxService {
   }
 
   /**
-   * shell 子进程执行（回落 / Windows PowerShell 原生）：
-   * PowerShell 用 -NoProfile -NonInteractive（不加载用户配置、不交互）；
-   * bash 仅在宿主机存在 bash 时可用（Git Bash/WSL）。cwd=会话沙箱目录。
+   * shell 子进程执行（chat 档回落）：宿主机存在 bash 时可用（Git Bash/WSL）。cwd=会话沙箱目录。
+   * work 档不会走到这里——`runAny` 里 work 已强制容器。
    */
-  private execSubprocessShell(chat: ChatRef, language: 'powershell' | 'bash', code: string, timeoutMs: number): Promise<SandboxRunResult> {
+  private execSubprocessShell(chat: ChatRef, code: string, timeoutMs: number): Promise<SandboxRunResult> {
     const outCap = this.config.config.sandbox.maxOutputBytes;
     const cwd = this.root(chat);
     return new Promise((resolveP) => {
       const startTs = Date.now();
       let stdout = '', stderr = '', truncated = false, timedOut = false;
-      let command: string, args: string[];
-      if (language === 'powershell') {
-        command = process.env['PARALLEL_PWSH'] || 'powershell';
-        args = ['-NoProfile', '-NonInteractive', '-Command', code];
-      } else {
-        command = process.env['PARALLEL_BASH'] || 'bash';
-        args = ['-c', code];
-      }
+      const command = process.env['PARALLEL_BASH'] || 'bash';
+      const args = ['-c', code];
       const child = spawn(command, args, {
         cwd,
         windowsHide: true,
@@ -532,7 +643,7 @@ export class SandboxService {
       child.stderr!.on('data', (c: Buffer) => collect(c, false));
       child.on('error', (e) => {
         clearTimeout(timer);
-        resolveP({ ok: false, exitCode: null, stdout: '', stderr: `进程启动失败: ${e.message}（${language === 'bash' ? '宿主机可能没有 bash' : 'PowerShell 不可用'}）`, truncated: false, durationMs: Date.now() - startTs, timedOut: false });
+        resolveP({ ok: false, exitCode: null, stdout: '', stderr: `进程启动失败: ${e.message}（宿主机可能没有 bash；work 档不会走这条路，它强制容器）`, truncated: false, durationMs: Date.now() - startTs, timedOut: false });
       });
       child.on('close', (exitCode) => {
         clearTimeout(timer);
@@ -652,6 +763,17 @@ export class SandboxService {
     const key = this.chatKey(chat);
     rmSync(join(this.rootDir, key), { recursive: true, force: true });
     this.db.run('DELETE FROM sandbox_files WHERE chat_key=?', key);
+    // 清聊天级沙箱时把它名下所有按人分的 work 沙箱一起清掉（它们属于这个聊天）
+    if (!chat.scope) {
+      const prefix = `${key}__`;
+      const rows = this.db.all<{ chat_key: string }>(
+        'SELECT DISTINCT chat_key FROM sandbox_files WHERE chat_key LIKE ?', `${prefix}%`,
+      );
+      for (const r of rows) {
+        rmSync(join(this.rootDir, r.chat_key), { recursive: true, force: true });
+        this.db.run('DELETE FROM sandbox_files WHERE chat_key=?', r.chat_key);
+      }
+    }
   }
 
   /** TTL 清理：超期未访问的文件删除；inbox 更短；work 会话（有 work_runs 记录）用更长 TTL 保交付物 */

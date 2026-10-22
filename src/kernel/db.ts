@@ -181,6 +181,17 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS idx_work_runs_ts ON work_runs(ts DESC);
     `);
+    // work 产物清单（JSON 数组）：chat 的 deliver_file 在内核重启后要靠它知道"上次交付了什么"
+    // ——会话沙箱里的文件还在，不能因为重启就让 chat 说"发不了"。
+    // events / usage / nickname：桌面端「工作」抽屉在重启后还要能画 loop 与缓存/上下文指标。
+    const workCols = this.db.prepare('PRAGMA table_info(work_runs)').all() as { name: string }[];
+    const addWorkCol = (name: string, type: string) => {
+      if (workCols.length && !workCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE work_runs ADD COLUMN ${name} ${type}`);
+    };
+    addWorkCol('artifacts', 'TEXT');
+    addWorkCol('events', 'TEXT');
+    addWorkCol('usage', 'TEXT');
+    addWorkCol('nickname', 'TEXT');
     this.repairFts();
     this.migrateUsageModel();
   }

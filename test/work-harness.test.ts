@@ -575,10 +575,13 @@ test('工具面：chat 拿不到 work 面工具；work 面 = 白名单；白名�
     for (const t of workTools) {
       assert.ok(t.promptSnippet, `work 工具 ${t.name} 没写 promptSnippet，会从工具清单里消失`);
     }
-    // 关键工具确实在（漏了 run_bash 说明门控沙箱又没暴露 runAny）
-    for (const must of ['work_finish', 'work_ask', 'python_session', 'run_bash', 'run_powershell', 'sandbox_write', 'send_file']) {
+    // 关键工具确实在（漏了 run_bash 说明门控沙箱又没暴露 runAny）。
+    // run_powershell 已随 pwsh 镜像一起删掉（2026-10-22）：Linux 容器里的 pwsh 是空环境，
+    // 计算/文本处理走 bash 与 python，工具面不再暴露它。
+    for (const must of ['work_finish', 'work_ask', 'python_session', 'run_bash', 'sandbox_write', 'send_file']) {
       assert.ok(workNames.has(must), `work 面缺少 ${must}`);
     }
+    assert.ok(!workNames.has('run_powershell'), 'work 面不该再有 run_powershell（Linux 不需要 pwsh）');
   } finally {
     await kernel.shutdown();
     rmSync(dataDir, { recursive: true, force: true });

@@ -13,6 +13,13 @@ export interface ChatRef {
   platform: string;          // 'qq' | 'mock' | ...
   type: 'group' | 'private';
   chatId: string;            // 群号 或 对方 QQ 号
+  /**
+   * 作用域（可选）：同一个聊天里再按发起人分出的独立沙箱 / 常驻容器。
+   * 只有 work 轮会带它（`u<QQ号>`）——同一个群里两个管理员各自 /work 时，
+   * 文件、python_session 变量、浏览器登录态必须是两套，不能共用（2026-10-20 用户明令）。
+   * 不带 scope 的 ref = 聊天本身（收件 inbox、chat 轮沙箱）。
+   */
+  scope?: string;
 }
 
 /** 归一化的入站聊天事件（适配器产出，Pipeline 消费） */
@@ -139,6 +146,8 @@ export interface ToolContext {
   historyWindowStartTs?: number;
   /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
   work?: { depth: number; runId?: string; agent?: string };
+  /** 本轮链首模型是否收图片（模型页「输入类型」勾了 image）。工具据此决定要不要把图片塞回模型 */
+  vision?: boolean;
 }
 
 /**
@@ -147,9 +156,10 @@ export interface ToolContext {
  *    2026-10-17 起 chat 轮不给行为型工具 —— 回复本身是一次普通生成，最多一轮记忆读写；
  *    work 面照旧可见（work agent 白名单按名取用）。
  *  - `work`：只属于 work 子代理（常驻 Python 会话、浏览器、shell 这类重工具），chat 轮严格看不见；
- *  - `chat`：只给 chat 轮、work 面严格看不见（人格演化层 remember_setting 这类只在 chat 语境里成立的工具用它）；
+ *  - `chat`：只给 chat 轮、work 面严格看不见（人格演化层 remember_setting、交付物发送
+ *    deliver_file 这类只在 chat 语境里成立的工具用它）；
  *  - `both`（默认）：work 轮可用 —— 注意 **chat 轮不再有默认可见**：chat 面只收 `memory`/`chat`，
- *    其余一切（含 both）在 chat 轮严格缺席，新工具想进 chat 面必须显式标 `memory`。
+ *    其余一切（含 both）在 chat 轮严格缺席，新工具想进 chat 面必须显式标 `memory`/`chat`。
  * 由 `toolsForChat(chat, role, surface)` 在收集阶段就过滤掉，不是"注册了但调用时拒绝"。
  */
 export type ToolSurface = 'both' | 'work' | 'chat' | 'memory';
@@ -180,6 +190,11 @@ export interface ToolDef {
 
 export interface ToolResult {
   content: string;
+  /**
+   * 回给模型的图片（base64）：浏览器截图、渲染检查这类"看一眼"的结果。
+   * 只在链首模型登记了图片输入时才会送到模型；否则调用方会把它落进沙箱并只留文字说明。
+   */
+  images?: { data: string; mimeType: string }[];
   /** 需要主人注意的通知（进报错中心） */
   notify?: string;
   /** 只给桌面端「工作」面板的结构化信息，不进模型上下文 */
@@ -202,6 +217,8 @@ export interface ToolMeta {
   path?: string;
   added?: number;
   removed?: number;
+  /** shell/python 执行顺手改过的文件（执行前后快照比对）：工作页逐行显示 +N -M */
+  changes?: { path: string; added: number; removed: number }[];
   /** 本次调用产出的文件（会话沙箱内相对路径）：work 侧据此汇总产物清单 */
   artifacts?: string[];
   /** 收尾类工具：这次不是"干完了"，而是停下来等发起者回答（work_ask） */
@@ -276,18 +293,20 @@ export interface LLMRequestContext {
    * 模型于是认定还有前文没看到，越查越离谱（2026-10-16 活体报文实测）。
    */
   historyWindowStartTs?: number;
-  /** 本轮由 /work <任务> 触发（work 子代理轮）：插件可据此接管 system；仅本轮有效 */
+  /** 本轮由 work 子代理执行（workTurn）：插件可据此接管 system；仅本轮有效 */
   workTurn?: boolean;
-  /** /work 命令携带的任务原文（workTurn 时存在） */
+  /** 派活时携带的任务原文（workTurn 时存在） */
   workTask?: string;
   /** 本轮的 work 子代理定义（workTurn 时存在；内核按它筛工具面、插件按它写身份节） */
   workAgent?: WorkAgentDef;
-  /** 触发来源（workTurn 时存在；目前只有 command） */
-  workTrigger?: 'command';
+  /** 触发来源（workTurn 时存在；chat = 聊天工具派活） */
+  workTrigger?: 'chat' | 'command';
   /** 本次 work 轮的嵌套深度（入口 = 0）；达到上限时子代理工具面里不再有 delegate */
   workDepth?: number;
   /** 本次 work 运行的 id（子代理委派时作为 parentId 透传，桌面端表达嵌套） */
   workRunId?: string;
+  /** work 并发分配到的链上下标：每个任务从自己的模型起步，失败后仍走整条替代链 */
+  workSlot?: number;
 }
 
 // ---------------- work 子代理 ----------------
@@ -386,9 +405,11 @@ export interface LLMChatRequest {
   tools?: { type: 'function'; function: { name: string; description: string; parameters: unknown } }[];
   /** 输出上限（Anthropic Messages 必填；取自模型行的「最大输出」；测试连接时压到 1） */
   maxTokens?: number;
+  /** 思考强度（由链配置注入；空 = 默认，由模型/供应商决定） */
+  reasoning?: string;
   stream?: boolean;
   signal?: AbortSignal;
-  // —— 以下两项由 LlmService 解析模型配置后注入，插件/调用方不要手填 ——
+  // —— 以下字段由 LlmService 解析模型配置后注入，插件/调用方不要手填 ——
   /** 本轮附件（已按该模型 inputTypes 筛过） */
   attachments?: MessageAttachment[];
   /** 该模型自带联网搜索：线格式据此发出原生搜索开关 */
@@ -533,6 +554,8 @@ export interface ChatSendService {
   sendText(chat: ChatRef, text: string): Promise<void>;
   /** 发送文件：仅允许沙箱内路径（内核强校验） */
   sendFile(chat: ChatRef, sandboxPath: string): Promise<void>;
+  /** 戳一戳（双击头像）：target 可以是 QQ 号或最近说话的昵称；私聊省略 = 对面 */
+  poke(chat: ChatRef, target?: string): Promise<{ userId: string; nickname?: string }>;
   /** 直接回复某个事件（省去构造 ChatRef） */
   reply(event: ChatEvent, text: string): Promise<void>;
   /** 该会话有没有在途的可打断发送（还剩几条）；没有返回 undefined */
@@ -601,8 +624,8 @@ export interface GatedSandbox {
   write(chat: ChatRef, relPath: string, content: string | Buffer, opts?: { work?: boolean }): SandboxWriteResult;
   delete(chat: ChatRef, relPath: string): void;
   run(chat: ChatRef, opts: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }): SandboxRunResult;
-  /** work 模式扩展：powershell/bash + work 档配额（工具层负责 minRole 门槛） */
-  runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'powershell' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): SandboxRunResult;
+  /** work 模式扩展：bash + work 档配额（工具层负责 minRole 门槛） */
+  runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): SandboxRunResult;
   stats(): SandboxStat[];
   clear(chat: ChatRef): void;
 }
@@ -634,8 +657,8 @@ export interface WorkDelegateInput {
   role: string;
   /** 目标子代理名（缺省 = 入口 agent）；取 agents 注册表里的条目 */
   agent?: string;
-  /** 触发来源：/work 命令或上一层 work 子代理的 delegate 工具 */
-  trigger?: 'command' | 'subagent';
+  /** 触发来源：聊天工具派活、旧命令入口，或上一层 work 子代理的 delegate 工具 */
+  trigger?: 'chat' | 'command' | 'subagent';
   /** 嵌套深度（入口 0，子代理逐层 +1） */
   depth?: number;
   /** 发起这次委派的父运行 id（桌面端「工作」页表达嵌套） */
@@ -666,6 +689,50 @@ export interface GatedHistory {
   searchMessages(chat: ChatRef, q: string, limit?: number, beforeTs?: number): HistoryHit[];
 }
 
+/** chat 面工具把一件活派给 work 子代理（不等它跑完；完成/出错时由内核另起一轮汇报） */
+export interface WorkDispatchInput {
+  chat: ChatRef;
+  task: string;
+  userId: string;
+  nickname?: string;
+  role: string;
+}
+
+export interface WorkDispatchResult {
+  ok: boolean;
+  /** 实际开跑的任务名（续接上一次提问时是「原标题（续）」） */
+  label?: string;
+  reason?: string;
+}
+
+/** 正在跑的活的一条进度快照（chat 的 work_status 工具用） */
+export interface WorkLiveRun {
+  id: string;
+  task: string;
+  startedAt: number;
+  elapsedMs: number;
+  rounds: number;
+  toolCalls: number;
+  prompt: number;
+  completion: number;
+  cacheHit: number;
+  cacheMiss: number;
+  /** 最近一步：工具调用/工具结果/轮次/思考/压缩（不暴露模型原文） */
+  step?: { kind: 'tool' | 'toolResult' | 'round' | 'thinking' | 'compaction'; name?: string };
+}
+
+export interface WorkLiveStatus {
+  active: WorkLiveRun[];
+  /** 这件活停下来等发起人回答（还没接回去） */
+  pending?: { question: string; notes?: string; at: number };
+  /** 该发起人最近一次跑完的活（给「做完了吗」这类追问兜底） */
+  last?: {
+    id: string; task: string; ok: boolean; awaiting?: boolean;
+    durationMs: number; finishedAt: number; summary: string;
+    artifacts: string[]; error?: string;
+  };
+}
+
 export interface GatedWork {
   /** work 模型标识（如 'deepseek:deepseek-reasoner'），桌面端展示 chat/work 双模型 */
   modelLabel(): string;
@@ -673,8 +740,20 @@ export interface GatedWork {
   agents(): { name: string; description: string; tools?: string[]; source?: string }[];
   /** 委派一个任务给 work 模型执行（阻塞直到完成；返回结论 + 产物） */
   delegate(input: WorkDelegateInput): Promise<{ id: string; ok: boolean; summary: string; artifacts: string[]; rounds: number; toolCalls: number; durationMs: number; notes?: string; error?: string }>;
+  /**
+   * chat 面派活：把任务交给 work 子代理后台执行，**立即返回**。
+   * 上一次停下来提问的现场还没过期时，这次的话就是那个问题的回答（自动拼成续接任务）。
+   */
+  dispatch(input: WorkDispatchInput): WorkDispatchResult;
+  /** 该会话里这位发起人自己的活（只按 userId 过滤，看不到别人的） */
+  status(chatKey: string, userId: string): WorkLiveStatus;
   /** 最近任务（桌面端「工作」页） */
   list(limit?: number): unknown[];
+  /**
+   * 该会话最近一次成功交付的产物（chat 侧 deliver_file 用）。
+   * 只回最近一次成功且不在等回答的运行；没有则 undefined。
+   */
+  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string } | undefined;
 }
 
 export interface SandboxEntry {
@@ -701,6 +780,8 @@ export interface SandboxRunResult {
   truncated: boolean;
   durationMs: number;
   timedOut: boolean;
+  /** work 执行前后沙箱文本文件的整行增减（给工作页显示 +N -M；没改动就没有这个字段） */
+  changes?: { path: string; added: number; removed: number }[];
 }
 
 export interface SandboxStat {

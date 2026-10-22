@@ -6,10 +6,12 @@ import type { ChatService } from './services/chat.ts';
 import type { LlmService } from './services/llm.ts';
 import type { MemoryService } from './services/memory.ts';
 import type { SessionLog } from './sessionlog.ts';
-import type { WorkRunner } from './services/work.ts';
+import type { WorkRunner, WorkRunResult } from './services/work.ts';
+import { workScopeOf } from './services/work.ts';
 import type { ConfigStore } from './config.ts';
 import type { ErrorCenter } from './errors.ts';
 import type { Bus } from './bus.ts';
+import { busEvents } from './bus.ts';
 import type { Db } from './db.ts';
 import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
@@ -31,7 +33,6 @@ import { AGENCY_REASON_ZH } from './humanlike/agency.ts';
 import { todayKey, newId } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
 import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem, chatOutputStyleText } from './prompt-sections.ts';
-import { composeContinueTask, type PendingAsk } from './work-prompt.ts';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
 
@@ -152,20 +153,52 @@ function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachmen
  * → 插件钩子 → 命令分发 / AgentLoop → **逐条分段发送**。
  *
  * 与重构前的差别只在 chat 区：唤醒判定从「@ 或唤醒词」换成 MaiBot 那套打分，
- * 出站从「整条发」换成「按语义拆成几条短消息 + 打字停顿」。命令与 work 链路一行未动。
+ * 出站从「整条发」换成「按语义拆成几条短消息 + 打字停顿」。
  */
-/**
- * 「work 停下来提问」等回答的有效期：超过这么久，旧问题不再自动接续
- * （隔一天回来随手发一句 /work，不该把老任务又拉起来）。
- */
-const PENDING_WORK_TTL_MS = 30 * 60_000;
-
 /** 重复消息的去重窗口：上一轮刚答过同一句，这段时间内一字不差的重发不再另起一轮 */
 const DUPLICATE_WINDOW_MS = 2 * 60_000;
 
 /** 去重用的正文口径：去掉首尾空白、把连续空白折成一个空格（表情/标点原样保留，不做语义归一） */
 function dupText(text: string): string {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * work 跑完后的汇报输入（只给模型看，不进历史、也不会被当成用户发言）。
+ * 三种口径分开写：停下来提问 ≠ 干完了，不能都用"已完成"糊过去。
+ */
+function workReportNote(report: { task: string; result: WorkRunResult }): string {
+  const r = report.result;
+  if (r.awaiting) {
+    return [
+      `【你派出去的活停下来问你一件事】`,
+      `任务：${report.task}`,
+      `它要问的：${r.awaiting.question}`,
+      r.awaiting.notes ? `（它已经做到：${r.awaiting.notes}）` : '',
+      `请用你自己的语气把这个问题转达给发起人（@ 已经带上了）：说清要他定什么、为什么非他定不可，并告诉他直接把答案说出来就行，你会接着让活往下干。`,
+      `不要提"子代理""模型""系统提示"，也别把这件事说成"做完了"。`,
+    ].filter(Boolean).join('\n');
+  }
+  if (!r.ok) {
+    return [
+      `【你派出去的活没做成】`,
+      `任务：${report.task}`,
+      `失败原因：${r.error || '未知原因'}`,
+      `请用你自己的语气如实告诉发起人这次没办成（@ 已经带上了），别编造结果；能给出下一步怎么做就顺带说一句。`,
+      `不要提"子代理""模型""系统提示"这些词。`,
+    ].join('\n');
+  }
+  return [
+    `【你派出去的活做完了】`,
+    `任务：${report.task}`,
+    `结果：\n${r.summary}`,
+    r.artifacts?.length ? `产物（会话沙箱内）：${r.artifacts.join('、')}` : '',
+    r.notes ? `需要他知道的备注：${r.notes}` : '',
+    r.artifacts?.length
+      ? `产物和你的结论会由系统合并成一条「聊天记录」发出：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
+      : '',
+    `请用你自己的语气向发起人汇报（@ 已经带上了），像你自己干完活回话一样；不要提"子代理""模型""系统提示"。`,
+  ].filter(Boolean).join('\n');
 }
 
 export class Pipeline {
@@ -184,8 +217,8 @@ export class Pipeline {
   private activeTurns = new Map<string, number>();
   private adminHintAt = new Map<string, number>();
   private queueLens = new Map<string, number>();
-  /** 每个会话一条"work 问了还没答"的现场（chatKey → 现场） */
-  private pendingWork = new Map<string, PendingAsk>();
+  /** 每个会话的 work 汇报串行链：两件活同时收尾时别让两轮汇报抢同一份历史 */
+  private reportChains = new Map<string, Promise<void>>();
   /**
    * 每个会话上一轮**真正处理过**的用户输入（去重「同一句话又说了一遍」）。
    * 2026-10-18 用户反馈：同样两句隔开 2 秒以上再说时，它会像忘了一样从头重答一遍。
@@ -218,7 +251,12 @@ export class Pipeline {
     private selfId: () => string,
     private jargon?: JargonHook,
     private repeat?: RepeatHook,
-  ) {}
+  ) {
+    // work 收尾 → 另起一轮人格化汇报（只认 chat 面工具派的活；子代理的完成不回群）。
+    // 这是 /work 删除后的唯一收尾路径：chat 先应下，work 在后台跑，跑完由 chat 带着 @ 汇报。
+    this.bus.on(busEvents.workDone, (p: any) => this.scheduleWorkReport(p));
+    this.bus.on(busEvents.workError, (p: any) => this.scheduleWorkReport(p));
+  }
 
   // ---------------------------------------------------------------- 入站
 
@@ -385,12 +423,13 @@ export class Pipeline {
   }
 
   /** 引用一条消息：协议端给的 reply 段里只有原消息号，把它查回原文存成快照。
-   *  只查本会话的内存尾（引用基本都是刚刚那几条），查不到就留着 [回复:id] 占位，不编内容。 */
+   *  只查本会话的内存尾（引用基本都是刚刚那几条），查不到就留着 [回复:id] 占位，不编内容。
+   *  bot 自己的出站消息也存了 messageId：群里很常见「引用她上一句 + 这个」，不能漏。 */
   private attachReply(event: ChatEvent): void {
     const rid = String(event.segments.find((s) => s.type === 'reply')?.data?.id ?? '');
     if (!rid) return;
     const src = this.sessionLog.findByMessageId(event.chatId, event.type, rid);
-    if (!src || src.type !== 'message_in') return;
+    if (!src || (src.type !== 'message_in' && src.type !== 'message_out')) return;
     const raw = Array.isArray((src.data as { files?: unknown } | undefined)?.files)
       ? (src.data as { files: unknown[] }).files : [];
     const files = raw
@@ -398,8 +437,11 @@ export class Pipeline {
         ? { name: f, rel: 'inbox/' + f }
         : { name: String((f as { name?: unknown })?.name ?? ''), rel: String((f as { rel?: unknown })?.rel ?? '') }))
       .filter((f) => f.rel);
+    const fromBot = src.type === 'message_out';
     event.replyTo = {
-      userId: src.userId ?? '', nickname: src.nickname ?? '', text: src.text ?? '',
+      userId: fromBot ? this.selfId() : (src.userId ?? ''),
+      nickname: fromBot ? (this.selfNickname() || this.selfId()) : (src.nickname ?? ''),
+      text: src.text ?? '',
       files: files.length ? files : undefined,
     };
   }
@@ -457,7 +499,6 @@ export class Pipeline {
     const role = this.resolveRole(event);
     event.role = role;
     const text = event.text.trim();
-    const isCommand = isCommandText(text);
 
     // 「要不要理这条」只有拟人层一处判（群聊：必要性打分 / @必回；私聊与命令直通）。
     // 这里不再补第二套唤醒判定 —— 两处判同一件事时，总有一处是死的。
@@ -474,23 +515,10 @@ export class Pipeline {
     }
 
     // ---- 命令分发 ----
+    // 2026-10-21：/work 已删除（work 改成 chat 面的 work_dispatch 工具）。
+    // QQ 侧不再有任何内建命令；这里只剩用户插件注册的命令。
     const cmdText = text.startsWith('/') ? text.slice(1) : text.startsWith('／') ? text.slice(1) : null;
     if (cmdText !== null) {
-      // /work 是“任务触发器”：/work <任务描述> 交给 work 模型执行，再由 chat 模型转述给用户
-      const workMatch = cmdText.match(/^work(?:\s+([\s\S]+))?$/);
-      if (workMatch) {
-        const task = (workMatch[1] ?? '').trim();
-        if (!roleAtLeastRole(role, 'admin')) {
-          await this.chat.reply(event, '权限不足：/work 需要管理员。');
-          return;
-        }
-        if (!task) {
-          await this.chat.reply(event, '用法：/work <任务描述>\n例如：/work 分析 inbox 里的报表并生成摘要');
-          return;
-        }
-        await this.runWorkCommand(event, role, chatKey, task);
-        return;
-      }
       await this.dispatchCommand(event, role, cmdText);
       return;
     }
@@ -517,69 +545,6 @@ export class Pipeline {
 
   // ---------------- 命令 ----------------
 
-  /**
-   * /work <任务>：work 模型执行 → chat 模型转述（双模型架构，报告 11）。
-   * work 的唯一触发入口就是这里（管理员命令）；chat 模型不判断任务复杂度、不自主委派。
-   */
-  private async runWorkCommand(event: ChatEvent, role: Role, chatKey: string, task: string): Promise<void> {
-    const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
-    // 上一次停下来问的事还没答？那这次的 /work 就是他给的回答：拼成新任务交回去（沙箱里的产物还在）。
-    const pending = this.takePendingWork(chatKey);
-    const effectiveTask = pending ? composeContinueTask(pending, task) : task;
-    const label = pending ? `${pending.label}（续）` : task;
-    await this.chat.reply(event, pending
-      ? `收到，把上次那个问题的答案交回工作子代理（${this.workRunner.workModelLabel()}）了，它接着干…`
-      : `收到，已交给工作子代理（${this.workRunner.workModelLabel()}）执行…`);
-    // 工具面 = work agent 定义的白名单 ∩ （本群生效 ∩ 角色允许）；到深度上限时 delegate 自动缺席。
-    // system 由 WorkRunner 按「agent 定义 + 内核具名分节」组装，插件再经 beforeWorkLLM 追加自己的节。
-    const agent = this.plugins.workAgent();
-    const tools = this.plugins.workToolsFor(chat, role, agent, 0);
-    let result: Awaited<ReturnType<WorkRunner['run']>>;
-    try {
-      result = await this.workRunner.run({
-        chat,
-        task: effectiveTask,
-        taskLabel: label,
-        userId: event.userId,
-        nickname: event.nickname,
-        role,
-        agent,
-        tools,
-        trigger: 'command',
-        depth: 0,
-        subagents: this.plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
-        groupTitle: this.groupTitle(event.chatId),
-        runHooks: (req) => this.plugins.runWorkHooks(req),
-      });
-    } catch (e) {
-      await this.chat.reply(event, `工作子代理执行失败：${(e as Error).message}`);
-      return;
-    }
-    // 它停下来提问了：记下现场，等他回答（下一次 /work 会接着这份现场往下干）
-    if (result.awaiting) {
-      this.pendingWork.set(chatKey, {
-        task: effectiveTask, label, question: result.awaiting.question, notes: result.awaiting.notes,
-        at: Date.now(), userId: event.userId,
-      });
-    }
-    // 由 chat 模型用自己的人格把结论讲给用户
-    await this.agentTurn(event, role, chatKey, { relay: { task: label, result } });
-  }
-
-  /** 取出并消费该会话的待答复（过期视为没有）；一次 /work 只接一条 */
-  private takePendingWork(chatKey: string): PendingAsk | undefined {
-    const p = this.pendingWork.get(chatKey);
-    if (!p) return undefined;
-    this.pendingWork.delete(chatKey);
-    return Date.now() - p.at > PENDING_WORK_TTL_MS ? undefined : p;
-  }
-
-  /** 只读：还在有效期内的待答复（chat 侧提醒用，不消费） */
-  private livePendingWork(chatKey: string): PendingAsk | undefined {
-    const p = this.pendingWork.get(chatKey);
-    return p && Date.now() - p.at <= PENDING_WORK_TTL_MS ? p : undefined;
-  }
-
   private async dispatchCommand(event: ChatEvent, role: Role, cmdText: string): Promise<void> {
     const parts = cmdText.trim().split(/\s+/);
     const name = parts[0] ?? '';
@@ -589,7 +554,7 @@ export class Pipeline {
     this.sessionLog.append(event.chatId, event.type, { type: 'command', role: 'user', userId: event.userId, text: `/${cmdText}` });
 
     if (!found) {
-      // 内建指令面 2026-10-17 清空（QQ 侧只剩 /work，走上面的拦截），这里只会是用户插件注册过的命令；
+      // 内建指令面已清空（2026-10-21 起 /work 也没了），这里只会是用户插件注册过的命令；
       // 不泄露其存在性：普通成员统一「未知命令」，管理员多带一个命令名（他没在套话）
       await this.chat.reply(event, roleAtLeastRole(role, 'admin') ? `未知命令：/${name}` : '未知命令');
       return;
@@ -652,12 +617,90 @@ export class Pipeline {
 
   // ---------------- Agent 对话 ----------------
 
+  /**
+   * work 收尾 → 排队一轮人格化汇报。
+   *
+   * 只认 `trigger === 'chat'`（chat 的 work_dispatch 工具派的活）：
+   *  - 子代理的完成回给父代理，不发到群里；
+   *  - 直接调用 WorkRunner 的内部/测试路径也不打扰用户。
+   * 同一会话两件活同时收尾时串行汇报，避免两轮模型请求抢同一份历史上账。
+   */
+  private scheduleWorkReport(payload: {
+    trigger?: string;
+    chat?: { platform: string; type: 'group' | 'private'; chatId: string };
+    userId?: string;
+    nickname?: string;
+    /** 派活时的角色：群里被 QQ 认定的管理员不一定在 config.extraAdminIds 里，汇报轮要沿用，否则 deliver_file 会掉 */
+    role?: string;
+    task?: string;
+    result?: WorkRunResult;
+  }): void {
+    if (!payload || payload.trigger !== 'chat') return;
+    const chat = payload.chat;
+    const result = payload.result;
+    if (!chat || !result || !payload.userId) return;
+    const chatKey = `${chat.type}_${chat.chatId}`;
+    const prev = this.reportChains.get(chatKey) ?? Promise.resolve();
+    const next = prev
+      .then(async () => {
+        // 派活那一轮的"好，我去弄"可能还在生成/发送：等它收尾再汇报，群里顺序才自然
+        await this.waitForTurnsIdle(chatKey);
+        await this.reportWork({ chat, userId: payload.userId!, nickname: payload.nickname, role: payload.role, task: payload.task ?? '', result });
+      })
+      .catch((e) => {
+        this.errors.record('warn', 'kernel', `work 汇报失败：${(e as Error).message}`, { chatId: chat.chatId });
+      });
+    this.reportChains.set(chatKey, next);
+    void next.finally(() => {
+      if (this.reportChains.get(chatKey) === next) this.reportChains.delete(chatKey);
+    });
+  }
+
+  /** 等该会话在途的轮次结束（最多 2 分钟；卡死的轮次不能把汇报永久挂住） */
+  private async waitForTurnsIdle(chatKey: string, timeoutMs = 120_000): Promise<void> {
+    const start = Date.now();
+    while ((this.activeTurns.get(chatKey) ?? 0) > 0 && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  /** 以发起人的身份跑一轮汇报：@ 由 sendScene 程序加上，产物由 deliver_file 发出 */
+  private async reportWork(input: {
+    chat: { platform: string; type: 'group' | 'private'; chatId: string };
+    userId: string;
+    nickname?: string;
+    role?: string;
+    task: string;
+    result: WorkRunResult;
+  }): Promise<void> {
+    const event: ChatEvent = {
+      id: newId('workrep_'),
+      platform: input.chat.platform, type: input.chat.type, chatId: input.chat.chatId,
+      userId: input.userId, nickname: input.nickname ?? '', senderRole: 'member',
+      segments: [], text: '', isAtMe: false, isReplyToMe: false,
+      raw: { workReport: true }, ts: Date.now(),
+    };
+    // 会话在跑的过程中被主人隐藏了：汇报也不发（隐藏 = 这个会话对 bot 静默）
+    if (this.chatHidden(event)) return;
+    // 派活时能过权限，汇报时就该还是那个身份（群管理员不一定在 extraAdminIds 里）
+    const role = (input.role === 'owner' || input.role === 'admin' ? input.role : this.resolveRole(event)) as Role;
+    event.senderRole = role === 'owner' ? 'owner' : role === 'admin' ? 'admin' : 'member';
+    event.role = role;
+    await this.agentTurn(event, role, `${event.type}_${event.chatId}`, {
+      report: { task: input.task, result: input.result },
+      mention: event.type === 'group' ? { userId: input.userId, nickname: input.nickname } : undefined,
+    });
+  }
+
   private async agentTurn(
     event: ChatEvent,
     role: Role,
     chatKey: string,
     opts?: {
-      relay?: { task: string; result: Awaited<ReturnType<WorkRunner['run']>> };
+      /** work 跑完后的异步汇报轮：不塞历史、不套聊天风格，@ 由程序带上 */
+      report?: { task: string; result: WorkRunResult };
+      /** 汇报轮要 @ 的人（群聊才加 at 段） */
+      mention?: { userId: string; nickname?: string };
       /** 覆盖本轮的用户输入（多用户消息合并 / 主动发言） */
       userText?: string;
       /** 主动发言轮：允许模型用沉默标记保持安静，且不往历史里塞一条假用户消息 */
@@ -670,9 +713,13 @@ export class Pipeline {
   ): Promise<void> {
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
     const active = this.activeTurns.get(chatKey) ?? 0;
+    /** 汇报轮：不是闲聊，不套聊天风格，也不参与生成期打断 */
+    const isReport = !!opts?.report;
 
     // 检查本群是否有任何生效中的插件能提供工具/人格；全关时按配置提示管理员
-    const tools = this.plugins.toolsForChat(chat, role);
+    // 汇报轮的产物由系统合并成聊天记录，不再给模型 deliver_file（避免它又单独发一遍文件）
+    const tools = this.plugins.toolsForChat(chat, role)
+      .filter((t) => !(isReport && t.name === 'deliver_file'));
     // 「本群还没开启任何插件」的判据沿用重构前口径：work 面工具也算"本群有开启的插件"。
     const anyToolsInGroup = this.plugins.toolsForChat(chat, role, 'work').length > 0;
     const anyChatPersona = [...this.plugins.list()].some(
@@ -699,8 +746,8 @@ export class Pipeline {
     this.turnMeta.set(event.chatId, {
       chatKey,
       phase: 'generating',
-      // 转述轮不参与生成期打断：work 的结论必须讲完；普通聊天与主动轮都可以被新消息打断
-      interruptible: !opts?.relay,
+      // 汇报轮不参与生成期打断：work 的结论必须讲完；普通聊天与主动轮都可以被新消息打断
+      interruptible: !isReport,
     });
     this.activeTurns.set(chatKey, active + 1);
 
@@ -727,7 +774,7 @@ export class Pipeline {
       const minutes = Math.max(1, Math.round(Number(this.config.config.storage.contextMinutes) || 5));
       const sinceTs = windowAnchorTs(Date.now(), minutes);
       const windowHistory = this.history.snapshot(chat, sinceTs);
-      if (!opts?.relay) {
+      if (!isReport) {
         systemSections.push({
           order: 405, title: 'context-window',
           text: [
@@ -765,28 +812,28 @@ export class Pipeline {
       // 输出口径（order 440）：chat 轮**唯一**一段规定"输出长什么样"的指令 ——
       // 短句、镜像长度、不写动作描写，总长上限写进词里。剧本体（HDSI 的 <say> 小说格式）已删，
       // 模型说什么就发什么，分条与截断由程序侧兜底（humanlike/delivery.ts）。
-      // 转述轮不加：那轮要的是把工作结果讲清楚，不是聊天。
-      if (!opts?.relay) {
+      // 汇报轮不加：那轮要的是把工作结果讲清楚，不是聊天。
+      if (!isReport) {
         const out = this.humanlike.config.outgoing;
         systemSections.push({
           order: 440, title: 'chat-style',
           text: chatOutputStyleText({ maxChars: out.replyMaxCharacters }),
         });
       }
-      // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。转述轮同样不加。
-      if (!opts?.relay) {
+      // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。
+      if (!isReport) {
         systemSections.push(...this.humanlike.sceneSections(chat));
       }
-      // 圈内黑话（472）：本群学来的词与含意，帮 bot 听懂对方；转述轮同样不加。
+      // 圈内黑话（472）：本群学来的词与含意，帮 bot 听懂对方；汇报轮同样不加。
       // 只注入当前上下文里真的出现的词（8 个不相干的词每轮塞进去只会让模型硬用）。
-      if (!opts?.relay) {
+      if (!isReport) {
         const recentForJargon = [event.text, ...windowHistory.slice(-8).map((m) => m.content)].join('\n');
         const jargonSection = this.jargon?.sections(chat, recentForJargon);
         if (jargonSection) systemSections.push({ order: 472, title: 'jargon', text: jargonSection });
       }
-      // 有一件活停在这位管理员这里（work 停下来提问了）：让她知道，并在主人随口回答时提醒他走 /work。
+      // 有一件活停在这位管理员这里（work 停下来提问了）：让她知道，并在对方回答时用 work_dispatch 接回去。
       // 只说给管理员听：这问题只有他能定，普通成员看到也只是噪声。
-      const pendingAsk = opts?.relay ? undefined : this.livePendingWork(chatKey);
+      const pendingAsk = isReport ? undefined : this.workRunner.livePending(chatKey, event.userId);
       if (pendingAsk && roleAtLeastRole(role, 'admin')) {
         systemSections.push({
           order: 500,
@@ -795,35 +842,33 @@ export class Pipeline {
             `# 有一件活停在你这里`,
             `工作子代理 ${Math.max(1, Math.round((Date.now() - pendingAsk.at) / 60_000))} 分钟前停下来问：${pendingAsk.question}`,
             pendingAsk.notes ? `（它已经做到：${pendingAsk.notes}）` : '',
-            `这个问题只有主人能定，别替他猜；他要回答就用 /work <他的回答> 回一句，你收到后会接着干。`,
+            `这个问题只有发起人能定，别替他猜。他回答之后，用 work_dispatch 把他的回答原话交回去（task 就写他说的话），它会接着干。`,
           ].filter(Boolean).join('\n'),
         });
       }
-      // 转述轮：把 work 子代理的结果作为本轮输入交给 chat 模型（它用自己的口吻讲给用户）。
+      // 本会话最近一次 work 交付的产物（只给管理员）：用户隔了几分钟回来说"发给我看看"时，
+      // chat 模型看不到那次任务的上下文，得靠这一节知道有东西可发、叫什么名字。
+      // 产物落在**发起人自己的** work 沙箱里，所以按当前说话人取（每个人只看见自己那份）。
+      if (!isReport && roleAtLeastRole(role, 'admin')) {
+        const last = this.workRunner.latestArtifacts(chatKey, event.userId);
+        if (last?.artifacts.length) {
+          systemSections.push({
+            order: 505,
+            title: 'work-artifacts',
+            text: [
+              `# 最近一次交付的产物`,
+              `任务：${last.task}`,
+              `文件（会话沙箱内，用 deliver_file 发送）：`,
+              ...last.artifacts.map((a) => `- ${a}`),
+              `他要文件/要看效果时就用 deliver_file 发出去，不要只说路径、也不要说"发不了"。`,
+            ].join('\n'),
+          });
+        }
+      }
+      // 汇报轮：把 work 的结果作为本轮输入交给 chat 模型，由它用自己的口吻讲给发起人。
       // 三种口径分开写：停下来提问 ≠ 干完了，不能都用"已完成"糊过去。
-      const relayNote = opts?.relay
-        ? (opts.relay.result.awaiting
-            ? [
-                `【工作子代理停下来问你一件事】`,
-                `原任务：${opts.relay.task}`,
-                `它要问的：${opts.relay.result.awaiting.question}`,
-                opts.relay.result.awaiting.notes ? `（它已经做到：${opts.relay.result.awaiting.notes}）` : '',
-                `请用你自己的语气把这件事问给用户：说清要他定什么、为什么非他定不可，并告诉他回一句 /work <他的回答> 你就能接着干。`,
-                `不要提"子代理""模型""系统提示"这些词，也别把这件事说成"做完了"。`,
-              ].filter(Boolean).join('\n')
-            : [
-                `【工作子代理已完成任务】`,
-                `任务：${opts.relay.task}`,
-                opts.relay.result.ok
-                  ? `结果：\n${opts.relay.result.summary}`
-                  : `任务失败：${opts.relay.result.error ?? '未知原因'}`,
-                opts.relay.result.artifacts?.length ? `产物（会话沙箱内）：${opts.relay.result.artifacts.join('、')}` : '',
-                opts.relay.result.notes ? `需要你知道的备注：${opts.relay.result.notes}` : '',
-                `请用你自己的语气把结论讲给用户（不要提"子代理""模型""系统提示"这些词，像你自己干完活汇报一样）。`,
-              ].filter(Boolean).join('\n'))
-        : '';
-      const userText = opts?.relay
-        ? `${modelTextOf(event)}\n\n${relayNote}`
+      const userText = opts?.report
+        ? workReportNote(opts.report)
         : opts?.proactive
           ? [
               '【群里安静了一阵子】',
@@ -855,9 +900,10 @@ export class Pipeline {
         }
       }
 
-      // 主动发言轮不往历史里塞这条"假用户消息"（它不是任何人的发言）。
+      // 主动发言轮不往历史里塞这条"假用户消息"（它不是任何人的发言）；
+      // 汇报轮的输入是内核写的内部汇报单，也不该伪装成发起人的发言——模型自己的汇报正文会入历史。
       // 附件跟着入账：窗口内的历史消息要能重放"这条当时带了图/语音/视频"。
-      if (!opts?.proactive) this.history.pushUser(chat, userText, ctx.attachments);
+      if (!opts?.proactive && !opts?.report) this.history.pushUser(chat, userText, ctx.attachments);
 
       const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 
@@ -899,9 +945,9 @@ export class Pipeline {
         return;
       }
 
-      // 重复惩罚：冷却词在这条回复里又出现 → 严格重写一次（relay 不重写）。
+      // 重复惩罚：冷却词在这条回复里又出现 → 严格重写一次（汇报轮不重写）。
       // 重写走独立的一次 llm.chat，不跑第二个 agent loop；期间仍可被新消息 abort。
-      if (!opts?.relay && !isSilentScene(finalReply)) {
+      if (!isReport && !isSilentScene(finalReply)) {
         const hit = this.humanlike.repetitionHit(chat, finalReply);
         if (hit) {
           const retried = await this.rewriteRepetition(ctx, finalReply, hit.phrase, event, ac.signal);
@@ -948,7 +994,8 @@ export class Pipeline {
       // 模型最终有没有真说话：以 afterLLM 之后的可见正文为准。回 [silent] / 空输出都记 0，
       // 不再把"门开了"当成"模型开口了"（2026-10-18 修）。
       this.humanlike.noteTurnOutcome(chat, opts?.gateId, !isSilentScene(finalReply));
-      await this.sendScene(chat, finalReply, this.quoteTargetOf(event));
+      await this.sendScene(chat, finalReply, this.quoteTargetOf(event), opts?.mention,
+        opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined);
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
@@ -1060,11 +1107,40 @@ export class Pipeline {
     chat: { platform: string; type: 'group' | 'private'; chatId: string },
     raw: string,
     quoteTarget?: string,
+    /** 汇报轮 @ 发起人：程序带上 at 段（不靠模型在正文里写 @号码） */
+    mention?: { userId: string; nickname?: string },
+    /** 汇报轮：正文 + 产物合并成一条聊天记录；普通轮不传 */
+    forward?: { artifacts: string[]; userId: string; nickname?: string },
   ): Promise<void> {
+    if (forward) {
+      // 一条聊天记录：汇报正文整段进首节点（不按聊天气泡切/50 字截断），产物文件各占一个节点
+      const text = this.humanlike.reportText(raw);
+      if (!text && !forward.artifacts.length) { this.humanlike.noteSilent(chat); return; }
+      try {
+        await this.chat.sendForward({ ...chat, scope: workScopeOf(forward.userId) }, {
+          text,
+          artifacts: forward.artifacts,
+          mention: mention ? { userId: mention.userId } : undefined,
+          selfId: this.selfId(),
+          selfNickname: this.selfNickname(),
+        });
+        this.humanlike.noteSpoke(chat, 1, text ? [text] : []);
+        if (text) this.history.pushAssistant(chat, text);
+        this.markTurnSpoke(chat);
+        return;
+      } catch (e) {
+        // 协议端不支持 forward 时 sendForward 内部已经退回过分开发送；走到这里多半是没连上，
+        // 继续走普通发送，至少把文字说出去
+        this.errors.record('warn', 'work', `聊天记录发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
+      }
+    }
     const { plans } = await this.humanlike.composeScene(raw);
     if (!plans.length) {
       this.humanlike.noteSilent(chat);
       return;
+    }
+    if (mention && chat.type === 'group' && mention.userId) {
+      plans[0].segments.unshift({ type: 'at', data: { qq: mention.userId } });
     }
     if (quoteTarget) plans[0].segments.unshift({ type: 'reply', data: { id: quoteTarget } });
     const { sent, aborted, sentTexts } = await this.chat.sendPlanned(chat, plans, { interruptible: true });

@@ -1,7 +1,7 @@
 import type {
   LLMProvider, LLMChatRequest, LLMResponse, ToolCall, ChatMessage, LLMUsage,
 } from '../types.ts';
-import type { ConfigStore, ModelRef } from '../config.ts';
+import { REASONING_LEVELS, type ConfigStore, type ModelRef } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { Db } from '../db.ts';
 import { todayKey } from '../util/misc.ts';
@@ -20,6 +20,8 @@ export type ModelChainKind = 'chat' | 'work';
 export interface ChainEntry extends ModelRef {
   fails: number;
   state: 'current' | 'idle' | 'down';
+  /** 硬不可用后的冷却截止时间（毫秒时间戳）；没有冷却就没有这个字段 */
+  downUntil?: number;
 }
 
 /**
@@ -109,9 +111,25 @@ export class LlmService {
     return pid ? [{ provider: pid, model: this.modelFor(pid) }] : [];
   }
 
+  /** 某条链选定的思考强度（'' = 默认，由模型/供应商决定）。非法值按默认处理。 */
+  reasoningFor(kind: ModelChainKind): string {
+    const llm = this.config.config.llm as { chatReasoning?: string; workReasoning?: string };
+    const v = String((kind === 'work' ? llm.workReasoning : llm.chatReasoning) ?? '');
+    return (REASONING_LEVELS as readonly string[]).includes(v) ? v : '';
+  }
+
   /** 链上当前位置：连续掉线达到阈值后由 markFail 往后挪 */
   private cursor: Record<ModelChainKind, number> = { chat: 0, work: 0 };
   private streaks = new Map<string, number>();
+  /**
+   * 硬不可用后的冷却表。真不可用（连不上 / 鉴权失败 / 模型不存在）不等阈值、也不在
+   * 下一次调用里再白试一遍——否则每次派活都要先付一轮网络超时。
+   * 按供应商记一份（transport 故障整家都不可达）和按条目记一份（只是这个模型没了）。
+   */
+  private downProviders = new Map<string, number>();
+  private downEntries = new Map<string, number>();
+  /** 冷却时长：够让一次短暂抖动恢复，又不至于把已修好的供应商晾太久 */
+  private static readonly DOWN_COOLDOWN_MS = 60_000;
 
   private threshold(): number {
     const n = Number(this.config.config.llm.failoverThreshold);
@@ -123,10 +141,44 @@ export class LlmService {
     return Math.min(Math.max(this.cursor[kind] | 0, 0), len - 1);
   }
 
+  /** 这一条现在是否在冷却期 */
+  private cooling(ref: ModelRef): boolean {
+    const now = Date.now();
+    return (this.downProviders.get(ref.provider) ?? 0) > now
+      || (this.downEntries.get(`${ref.provider}|${ref.model}`) ?? 0) > now;
+  }
+
+  /** 本次调用的尝试顺序：从链上当前位置起绕一圈，冷却中的排到最后。
+   *  全都在冷却时不做过滤——宁可再试一次，也别让整条链直接没模型可用。 */
+  private order(kind: ModelChainKind, list: ModelRef[]): number[] {
+    return this.orderAt(list, this.ptr(kind, list.length));
+  }
+
+  /** 从指定下标起绕一圈（work 并发时每个任务钉自己的起始模型，仍保留整条替代链） */
+  private orderAt(list: ModelRef[], at: number): number[] {
+    const len = list.length;
+    if (!len) return [];
+    const start = ((Math.round(at) % len) + len) % len;
+    const ring: number[] = [];
+    for (let i = 0; i < len; i++) ring.push((start + i) % len);
+    const warm = ring.filter((i) => !this.cooling(list[i]));
+    return warm.length ? warm : ring;
+  }
+
+  /** 某条链第 slot 个模型的展示名（work 并发分配 / 运行记录用） */
+  modelAt(kind: ModelChainKind, slot: number): string {
+    const list = this.chainConfig(kind);
+    if (!list.length) return '—';
+    const at = ((Math.round(slot) % list.length) + list.length) % list.length;
+    const r = list[at];
+    return r ? `${r.provider}:${r.model}` : '—';
+  }
+
   /** 当前真正在服务的那条（降级后会变） */
   servingRef(kind: ModelChainKind): ModelRef | null {
     const list = this.chainConfig(kind);
-    return list[this.ptr(kind, list.length)] ?? null;
+    const idx = this.ptr(kind, list.length);
+    return list[idx] ?? null;
   }
 
   servingLabel(kind: ModelChainKind): string {
@@ -155,7 +207,12 @@ export class LlmService {
       const th = this.threshold();
       return configured.map((r, i) => {
         const fails = this.streaks.get(`${kind}|${r.provider}|${r.model}`) ?? 0;
-        return { ...r, fails, state: i === at ? 'current' as const : fails >= th ? 'down' as const : 'idle' as const };
+        const until = Math.max(
+          this.downProviders.get(r.provider) ?? 0,
+          this.downEntries.get(`${r.provider}|${r.model}`) ?? 0,
+        );
+        const state = i === at ? 'current' as const : this.cooling(r) || fails >= th ? 'down' as const : 'idle' as const;
+        return { ...r, fails, state, ...(until > Date.now() ? { downUntil: until } : {}) };
       });
     };
     return { chat: one('chat'), work: one('work') };
@@ -164,7 +221,24 @@ export class LlmService {
   /** 改链 / 改阈值后调用：位置与失败计数从头开始 */
   resetFailover(): void {
     this.streaks.clear();
+    this.downProviders.clear();
+    this.downEntries.clear();
     this.cursor = { chat: 0, work: 0 };
+  }
+
+  /** 成功一次就恢复健康：失败计数与冷却都清掉（下一次它又能按顺序当主候选） */
+  private clearHealth(kind: ModelChainKind, ref: ModelRef): void {
+    this.streaks.delete(`${kind}|${ref.provider}|${ref.model}`);
+    this.downEntries.delete(`${ref.provider}|${ref.model}`);
+    this.downProviders.delete(ref.provider);
+  }
+
+  /** 指针可能停在同一家已冷却的第二条上（第一条 transport 失败后挪过去的）；
+   *  真正服务的是这一条时把指针落回来，桌面端才显示"当前 = 实际在用的模型"。 */
+  private adopt(kind: ModelChainKind, idx: number, list: ModelRef[]): void {
+    if (this.cursor[kind] === idx) return;
+    const at = this.ptr(kind, list.length);
+    if (this.cooling(list[at])) this.cursor[kind] = idx;
   }
 
   /** 一条链上能不能用（不抛错版，供 /api/state 与登录页用） */
@@ -197,14 +271,30 @@ export class LlmService {
     return { ok: true };
   }
 
-  /** 连续失败计数：达到阈值才把链上的位置往后挪一格，并通知桌面端 */
-  private markFail(kind: ModelChainKind, idx: number, list: ModelRef[], err: Error): void {
+  /** 失败记账。
+   *
+   *  hard（连不上 / 鉴权失败 / 模型不存在 / 配置级不可用）：立刻把链上位置挪到下一条并冷却。
+   *  这类错误重试同一条毫无意义，等阈值只会让每次派活都先白等一轮超时。
+   *
+   *  soft（5xx / 429 / 过载）：仍按 failoverThreshold 计数再挪，避免一次网络抖动把整条链带偏。
+   */
+  private markFail(kind: ModelChainKind, idx: number, list: ModelRef[], err: Error, mode: 'hard' | 'config' | 'soft' = 'soft', moveCursor = true): void {
     const ref = list[idx];
     const key = `${kind}|${ref.provider}|${ref.model}`;
     const n = (this.streaks.get(key) ?? 0) + 1;
     this.streaks.set(key, n);
-    if (list.length < 2 || n < this.threshold()) return;
+
+    if (mode === 'hard') {
+      const until = Date.now() + LlmService.DOWN_COOLDOWN_MS;
+      this.downEntries.set(`${ref.provider}|${ref.model}`, until);
+      // 连不上/鉴权失败/地区不支持是整家供应商的问题，同一家的其它模型这轮也不必再试
+      if (isProviderWideFailure(err)) this.downProviders.set(ref.provider, until);
+    }
+
+    if (!moveCursor || list.length < 2) return;
+    if (mode === 'soft' && n < this.threshold()) return;
     const next = (idx + 1) % list.length;
+    if (this.cursor[kind] === next) return;
     this.cursor[kind] = next;
     this.bus.emit(busEvents.modelFailover, {
       kind,
@@ -216,8 +306,8 @@ export class LlmService {
   }
 
   /** 主入口：按「聊天模型 / 工作模型」优先级链发请求，带用量统计与报错中心。
-   *  当前这条失败后会在同一次调用里顺延到下一条（用户不至于收到一条错误），
-   *  但链上位置只在连续掉线满阈值后才挪——没到阈值就换模型会被一次网络抖动带偏。
+   *  当前这条失败后会在同一次调用里顺延到下一条（用户不至于收到一条错误）；
+   *  硬不可用会立刻挪动链上位置并冷却，软故障才按阈值挪。
    *  meta.providerId 显式指定时不走链（插件/特殊调用）。 */
   async chat(
     req: LLMChatRequest,
@@ -232,49 +322,79 @@ export class LlmService {
       : this.chainConfig(kind);
     if (!list.length) throw new ProviderError('模型链是空的：请在桌面端「模型」页的「聊天模型」里加至少一条');
 
-    const start = meta.providerId ? 0 : this.ptr(kind, list.length);
+    const order = meta.providerId ? [0] : this.order(kind, list);
+    const fails: string[] = [];
+    const skipProviders = new Set<string>();
     let streamed = false;
     const onDelta = meta.onDelta
       ? (d: { text?: string; toolCall?: Partial<ToolCall> & { index: number } }) => { if (d.text) streamed = true; meta.onDelta!(d); }
       : undefined;
     let lastErr: Error = new ProviderError('模型链全部不可用');
 
-    for (let i = 0; i < list.length; i++) {
-      const idx = (start + i) % list.length;
+    for (const idx of order) {
       const ref = list[idx];
+      if (skipProviders.has(ref.provider)) continue;
       const check = this.preflight(ref.provider);
       if (!check.ok) {
         lastErr = new ProviderError(check.reason ?? `供应商 ${ref.provider} 不可用`);
-        if (list.length > 1) this.markFail(kind, idx, list, lastErr);
+        fails.push(`${ref.provider}: ${lastErr.message}`);
+        this.markFail(kind, idx, list, lastErr, 'config');
         continue;
       }
       const pc = (this.config.config.providers as Record<string, any>)[ref.provider] ?? {};
       const model = req.model || meta.model || ref.model;
-      const shaped = this.shapeForModel(pc, model, { ...req, model });
+      const shaped = { ...this.shapeForModel(pc, model, { ...req, model }), reasoning: this.reasoningFor(kind) || undefined };
       this.activeRequests++;
       const started = Date.now();
       try {
         const resp = await this.invoke(ref.provider, pc, shaped, onDelta);
         this.recordUsage(ref.provider, model, meta.chatId ?? '-', resp.usage);
-        this.streaks.delete(`${kind}|${ref.provider}|${ref.model}`);
+        this.adopt(kind, idx, list);
+        this.clearHealth(kind, ref);
+        if (fails.length) {
+          // 已经有人接上了就不该在报错中心留下一条"失败"——记成 warn 并写明切到了谁
+          this.errors.record('warn', 'provider', `已自动切换模型：${fails.join('；')} → ${ref.provider}:${ref.model}`, {
+            chatId: meta.chatId, pluginId: meta.pluginId,
+          });
+        }
         this.bus.emit(busEvents.providerChanged, { event: 'call_ok', provider: ref.provider, model, ms: Date.now() - started });
         return resp;
       } catch (e) {
         const err = e as Error;
         lastErr = err;
-        this.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
-          chatId: meta.chatId, pluginId: meta.pluginId, stack: err.stack,
-          // 模型失败彻底沉默：只进报错中心与会话日志（这条也走 QQ 私聊通知，一并关掉）
-          notifyOwner: false,
-        });
-        // 用户主动打断、或者已经往外吐过字了：换模型只会重复输出或违背中断，直接抛
-        if (req.signal?.aborted || streamed) throw err;
-        if (list.length > 1) this.markFail(kind, idx, list, err);
+        // 用户主动打断：不是模型故障，不记报错、不降级
+        if (req.signal?.aborted) throw err;
+        fails.push(`${ref.provider}: ${err.message}`);
+        // 已经往外吐过字了：换模型只会重复输出，记下这次失败后直接抛
+        if (streamed) {
+          this.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
+            chatId: meta.chatId, pluginId: meta.pluginId, stack: err.stack, notifyOwner: false,
+          });
+          throw err;
+        }
+        const hard = isHardUnavailable(err);
+        if (list.length > 1) this.markFail(kind, idx, list, err, hard ? 'hard' : 'soft');
+        // transport/鉴权/地区问题都是整家的事：同一家的后续条目这轮直接跳过，别再白等
+        if (hard && isProviderWideFailure(err)) skipProviders.add(ref.provider);
       } finally {
         this.activeRequests--;
       }
     }
+    this.recordChainError(meta, fails, lastErr);
     throw lastErr;
+  }
+
+  private recordChainError(
+    meta: { chatId?: string; pluginId?: string },
+    fails: string[],
+    err: Error,
+  ): void {
+    const message = fails.length ? `模型链全部不可用：${fails.join('；')}` : err.message;
+    this.errors.record('error', 'provider', message, {
+      chatId: meta.chatId, pluginId: meta.pluginId, stack: err.stack,
+      // 模型失败彻底沉默：只进报错中心与会话日志（这条也走 QQ 私聊通知，一并关掉）
+      notifyOwner: false,
+    });
   }
 
   /** 按模型页上这条模型声明的配置整形本次请求（判定逻辑在 applyModelCfg，便于单测） */
@@ -307,6 +427,7 @@ export class LlmService {
           contextWindow: mcfg?.contextWindow,
           maxTokens: mcfg?.maxOutput ?? req.maxTokens,
           image: (mcfg?.inputTypes ?? []).includes('image'),
+          reasoning: !!req.reasoning,
         },
         req,
         onDelta,
@@ -332,8 +453,9 @@ export class LlmService {
    * 返回的是 pi-ai 的 AssistantMessageEventStream：立刻返回，尝试过程在背后异步跑，
    * 失败会以 error 事件终结（不会挂住调用方）。
    */
-  chainStreamFn(kind: ModelChainKind, o: { attachments?: LLMChatRequest['attachments']; chatId?: string } = {}): StreamFn {
+  chainStreamFn(kind: ModelChainKind, o: { attachments?: LLMChatRequest['attachments']; chatId?: string; start?: number } = {}): StreamFn {
     const self = this;
+    const pinned = kind === 'work' && Number.isInteger(o.start);
     return async (_model, context, options) => {
       const pie = await piAiModule();
       if (!pie) throw new Error('未安装 @earendil-works/pi-ai');
@@ -342,17 +464,20 @@ export class LlmService {
         const fail = (err: Error) => { out.push(errorEvent(err)); out.end(); };
         const list = self.chainConfig(kind);
         if (!list.length) { fail(new ProviderError('模型链是空的：请在桌面端「模型」页的「聊天模型」里加至少一条')); return; }
-        const start = self.ptr(kind, list.length);
+        const reasoning = self.reasoningFor(kind);
+        // 并发的 work 任务钉在自己的起始模型上；单个任务仍从它起绕完整条链做替代
+        const order = pinned ? self.orderAt(list, Number(o.start)) : self.order(kind, list);
+        const fails: string[] = [];
+        const skipProviders = new Set<string>();
         let lastErr: Error = new ProviderError('模型链全部不可用');
-        for (let i = 0; i < list.length; i++) {
-          const idx = (start + i) % list.length;
+        for (const idx of order) {
           const ref = list[idx];
+          if (skipProviders.has(ref.provider)) continue;
           const check = self.preflight(ref.provider);
           if (!check.ok) {
             lastErr = new ProviderError(check.reason ?? `供应商 ${ref.provider} 不可用`);
-            // 占位供应商（未接入）：链上再试也没意义，直接把原因交出去
-            if (!self.providers.get(ref.provider)?.implemented) { fail(lastErr); return; }
-            if (list.length > 1) self.markFail(kind, idx, list, lastErr);
+            fails.push(`${ref.provider}: ${lastErr.message}`);
+            self.markFail(kind, idx, list, lastErr, 'config', !pinned);
             continue;
           }
           const pc = (self.config.config.providers as Record<string, any>)[ref.provider] ?? {};
@@ -362,7 +487,8 @@ export class LlmService {
           const baseUrl = String(pc.baseUrl ?? '') || String((self.providers.get(ref.provider) as any)?.defaultBase ?? '');
           if (!isMock && !baseUrl) {
             lastErr = new ProviderError(`供应商 ${ref.provider} 缺少 Base URL 配置`);
-            self.markFail(kind, idx, list, lastErr);
+            fails.push(`${ref.provider}: ${lastErr.message}`);
+            self.markFail(kind, idx, list, lastErr, 'config', !pinned);
             continue;
           }
           const mcfg = (Array.isArray(pc.models) ? pc.models : []).find((m: any) => m?.id === ref.model);
@@ -377,6 +503,9 @@ export class LlmService {
               model: {
                 id: ref.model, contextWindow: mcfg?.contextWindow,
                 maxTokens: mcfg?.maxOutput, image: (mcfg?.inputTypes ?? []).includes('image'),
+                // 只有链上明确选了强度才把模型标成推理模型：默认档不加 reasoning 参数，
+                // 让供应商按模型自身默认走（deepseek 的推理模型默认就会思考）
+                reasoning: !!reasoning,
               },
             });
             const models = pie.createModels();
@@ -409,6 +538,7 @@ export class LlmService {
               apiKey: self.config.getProviderKey(ref.provider) || undefined,
               signal: options?.signal,
               maxTokens: options?.maxTokens ?? mcfg?.maxOutput,
+              reasoning: (reasoning || undefined) as never,
               // 媒体按"这一条候选供应商的线格式"现准备：链上不同供应商能收的块不一样
               onPayload: prepared
                 ? (payload: unknown) => injectMedia(payload, apiName, prepared)
@@ -420,7 +550,13 @@ export class LlmService {
                 // 用量要记在真实会话上：WorkRunner 靠 before/after 相减算本次任务的账，
                 // 记到 sessionId（pi-agent-core 的会话号）上就对不上了
                 self.recordUsage(ref.provider, ref.model, o.chatId ?? '-', mapUsage(ev.message?.usage));
-                self.streaks.delete(`${kind}|${ref.provider}|${ref.model}`);
+                if (!pinned) self.adopt(kind, idx, list);
+                self.clearHealth(kind, ref);
+                if (fails.length) {
+                  self.errors.record('warn', 'provider', `已自动切换模型：${fails.join('；')} → ${ref.provider}:${ref.model}`, {
+                    chatId: o.chatId,
+                  });
+                }
                 self.bus.emit(busEvents.providerChanged, { event: 'call_ok', provider: ref.provider, model: ref.model, ms: Date.now() - started });
                 out.push(ev);
                 out.end();
@@ -434,19 +570,28 @@ export class LlmService {
           } catch (e) {
             const err = e as Error;
             lastErr = err;
-            self.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
-              stack: err.stack,
-              // 模型失败彻底沉默：只进报错中心与会话日志。私聊里那条 "[parallel 报错]"
-              // 会被当成 bot 自己说的话发出去（2026-10-18 用户看到过），所以这里不通知主人。
-              notifyOwner: false,
-            });
-            // 用户打断、或已经往外吐过字：换模型只会重复输出/违背中断，直接终结
-            if (options?.signal?.aborted || streamed) { fail(err); return; }
-            if (list.length > 1) self.markFail(kind, idx, list, err);
+            // 用户打断：不是模型故障，不记报错、不降级
+            if (options?.signal?.aborted) { fail(err); return; }
+            // 已经往外吐过字：换模型只会重复输出/违背中断，记下这次失败后直接终结
+            if (streamed) {
+              self.errors.record('error', 'provider', `${ref.provider}: ${err.message}`, {
+                stack: err.stack,
+                // 模型失败彻底沉默：只进报错中心与会话日志。私聊里那条 "[parallel 报错]"
+                // 会被当成 bot 自己说的话发出去（2026-10-18 用户看到过），所以这里不通知主人。
+                notifyOwner: false,
+              });
+              fail(err);
+              return;
+            }
+            fails.push(`${ref.provider}: ${err.message}`);
+            const hard = isHardUnavailable(err);
+            if (list.length > 1) self.markFail(kind, idx, list, err, hard ? 'hard' : 'soft', !pinned);
+            if (hard && isProviderWideFailure(err)) skipProviders.add(ref.provider);
           } finally {
             self.activeRequests--;
           }
         }
+        self.recordChainError({ chatId: o.chatId }, fails, lastErr);
         fail(lastErr);
       })();
       return out;
@@ -535,6 +680,33 @@ export function usageDelta(before: UsageSnapshot, after: UsageSnapshot): UsageSn
 }
 
 export class ProviderError extends Error {}
+
+/** 网络层直接失败（连不上、断流、超时）：换下一家才有意义，同一家再试也是白等 */
+const TRANSPORT_FAILURE_RE = /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|socket hang up|network.?error|connection.?refused|connection.?lost|connection\s*error|other side closed|getaddrinfo|transport error|http2 request did not get a response|terminated|timed? ?out|timeout/i;
+
+export function isTransportFailure(err: Error): boolean {
+  return TRANSPORT_FAILURE_RE.test(String(err?.message ?? ''));
+}
+
+/** 鉴权失败与"地区不支持"是整家供应商的问题：同一家的第二个模型也不用再试 */
+const PROVIDER_WIDE_RE = /\b(401|403)\b|unauthori[sz]ed|forbidden|invalid.?api.?key|incorrect api key|user location is not supported|failed_precondition/i;
+
+export function isProviderWideFailure(err: Error): boolean {
+  const msg = String(err?.message ?? '');
+  return TRANSPORT_FAILURE_RE.test(msg) || PROVIDER_WIDE_RE.test(msg);
+}
+
+/**
+ * 这条错误是不是"再试同一条也没用"的硬不可用。
+ * 硬故障立刻挪链（并冷却），软故障（429 / 5xx / 过载）仍按 failoverThreshold 计数——
+ * 一次网络抖动不该把整条链带偏，但"连不上/没 key/没这个模型"等下一次只会更慢。
+ */
+const HARD_UNAVAILABLE_RE = /\b(401|403|404)\b|unauthori[sz]ed|forbidden|invalid.?api.?key|api.?key.*(invalid|missing|expired)|incorrect api key|model.*(not found|does not exist|not available)|no such model|user location is not supported|failed_precondition|尚未接入|未启用|缺少 api key|缺少 base url|未知的模型供应商|没有可用引擎/i;
+
+export function isHardUnavailable(err: Error): boolean {
+  const msg = String(err?.message ?? '');
+  return HARD_UNAVAILABLE_RE.test(msg) || TRANSPORT_FAILURE_RE.test(msg);
+}
 
 /** 内核实现了请求逻辑的连接方式（三种 HTTP 线格式 + 本地 mock）；其余一律拒绝，不静默降级 */
 const IMPL_PROTOCOLS = ['openai-compatible', 'openai-responses', 'anthropic', 'gemini', 'mock'];

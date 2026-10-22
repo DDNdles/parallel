@@ -299,12 +299,18 @@ export function setup(ctx: PluginContext): void {
     },
     handler: async (args, tctx) => {
       const code = String(args.code ?? '');
-      const r = await sb.run(chatRefOf(tctx), { language: 'python', code, timeoutMs: Number(args.timeout_ms) || undefined });
+      // work 轮的 run_python 也必须是容器隔离：走 runAny(work:true)，容器不可用就报错，
+      // 不能回落到宿主机子进程（那条路能读整台机器）。
+      const r = tctx.work
+        ? await sb.runAny(chatRefOf(tctx), { language: 'python', code, timeoutMs: Number(args.timeout_ms) || undefined, work: true })
+        : await sb.run(chatRefOf(tctx), { language: 'python', code, timeoutMs: Number(args.timeout_ms) || undefined });
       const parts: string[] = [`exit=${r.exitCode} (${r.durationMs}ms)`];
       if (r.stdout) parts.push(`stdout:\n${r.stdout}`);
       if (r.stderr) parts.push(`stderr:\n${r.stderr}`);
       if (r.timedOut) parts.push('（超时被终止）');
-      return parts.join('\n') || '（无输出）';
+      const text = parts.join('\n') || '（无输出）';
+      const changes = (r as { changes?: { path: string; added: number; removed: number }[] }).changes;
+      return changes?.length ? { content: text, meta: { changes } } : text;
     },
   });
 
@@ -322,12 +328,16 @@ export function setup(ctx: PluginContext): void {
     },
     handler: async (args, tctx) => {
       const code = String(args.code ?? '');
-      const r = await sb.run(chatRefOf(tctx), { language: 'javascript', code, timeoutMs: Number(args.timeout_ms) || undefined });
+      const r = tctx.work
+        ? await sb.runAny(chatRefOf(tctx), { language: 'javascript', code, timeoutMs: Number(args.timeout_ms) || undefined, work: true })
+        : await sb.run(chatRefOf(tctx), { language: 'javascript', code, timeoutMs: Number(args.timeout_ms) || undefined });
       const parts: string[] = [`exit=${r.exitCode} (${r.durationMs}ms)`];
       if (r.stdout) parts.push(`stdout:\n${r.stdout}`);
       if (r.stderr) parts.push(`stderr:\n${r.stderr}`);
       if (r.timedOut) parts.push('（超时被终止）');
-      return parts.join('\n') || '（无输出）';
+      const text = parts.join('\n') || '（无输出）';
+      const changes = (r as { changes?: { path: string; added: number; removed: number }[] }).changes;
+      return changes?.length ? { content: text, meta: { changes } } : text;
     },
   });
 

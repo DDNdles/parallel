@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, before, after, beforeEach } from 'node:test';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +28,10 @@ const GROUP = 671;
 const MEMBER = 20001;
 const MASTER = 20010;
 const RES_ID = 'res-media-1';
+/** 人设主体从当前内置人格读取：断言"设定进了 system 且只进一次"，不绑死某个人格版本 */
+const PERSONA_BODY = String((JSON.parse(readFileSync(
+  join(process.cwd(), 'src/plugins/chat/personas/whale-girl/canon.json'), 'utf-8',
+)) as { canon: { protagonist: string[] } }).canon.protagonist[0]);
 
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082', 'hex');
 /** 合法的最小 WAV：RIFF/fmt/data，data 段放几个字节的"静音" */
@@ -46,6 +50,14 @@ const MEDIA: Record<string, { buf: Buffer; type: string }> = {
   'pic.png': { buf: PNG, type: 'image/png' },
   'voice.wav': { buf: WAV, type: 'audio/wav' },
   'clip.mp4': { buf: MP4, type: 'video/mp4' },
+  // 两帧 1×1 GIF（红/蓝）：QQ 的「动画表情」落盘后就长这样，扩展名还可能是 .png
+  'anim.gif': {
+    buf: Buffer.from(
+      'R0lGODlhAQABAIAAAP8AAAAA/yH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAQABAAACAkQBACH5BAAKAAAALAAAAAABAAEAAAICTAEAOw==',
+      'base64',
+    ),
+    type: 'image/gif',
+  },
 };
 
 let kernel: Kernel;
@@ -223,9 +235,9 @@ test('人格设定不再占 user 轮：去重后的设定进 system，最后一�
   assert.ok(!allUserText(body).includes('【人格强化'), '人格强化不该以 user 轮出现（模型会当成对方念的话）');
   const sys = (body?.messages ?? []).filter((m: any) => m?.role === 'system').map((m: any) => String(m.content ?? '')).join('\n');
   // 2026-10-18 反重复：protagonist 与 voice.post_history 是同一整段时只注入一次，
-  // 避免「梁文峰」这类人设名一轮被强化两遍。
-  assert.match(sys, /梁文峰是你的小助手/, '人设主体要落在 system 里');
-  assert.equal((sys.match(/梁文峰是你的小助手/g) ?? []).length, 1, 'protagonist/post_history 重复段只注入一次');
+  // 避免人设名一轮被强化两遍。
+  assert.ok(sys.includes(PERSONA_BODY), '人设主体要落在 system 里');
+  assert.equal(sys.split(PERSONA_BODY).length - 1, 1, 'protagonist/post_history 重复段只注入一次');
   assert.ok(!sys.includes('【人格强化'), '重复的 post_history 不再注入');
 });
 
@@ -368,6 +380,34 @@ test('窗口外的历史消息不进请求体：它带的图也不出现', async
   const allBlocks = (body?.messages ?? []).filter((m: any) => m?.role === 'user')
     .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
   assert.equal(has(allBlocks, 'image_url').length, 0, '窗口外那条带的图也不许进请求体');
+});
+
+// ---------------- 动图：QQ 的「动画表情」在 chat 主链路上要被摊成分帧拼图 ----------------
+
+test('动图表情（QQ 存成 .png 但内容是两帧 GIF）：进请求体的是 JPEG 分帧拼图 + 一句排版说明', async () => {
+  // 项目自带的 ffmpeg 是抽帧的前提（测试的 dataDir 是临时目录，PATH 里通常也没有）
+  const bundled = join(process.cwd(), 'data', 'bin', 'ffmpeg.exe');
+  if (!existsSync(bundled)) return;
+  const { setFfmpegCandidate } = await import('../src/kernel/services/media.ts');
+  setFfmpegCandidate(bundled);
+
+  const G = freshGroup();
+  const since = seen.length;
+  // 段里给 .png 名字、实际字节是 GIF：识别只能按内容，不能按扩展名
+  send(71004, [
+    { type: 'text', data: { text: '这个表情好好笑' } },
+    { type: 'image', data: { file: 'sticker.png', url: URL_OF('anim.gif') } },
+  ], G);
+  const blocks = lastUserBlocks(await nextBody(since, '动图表情那一发'));
+  const imgs = has(blocks, 'image_url');
+  assert.equal(imgs.length, 1, `图片块要在：${JSON.stringify(blocks.map((b) => b?.type))}`);
+  const url = String(imgs[0].image_url?.url ?? '');
+  assert.match(url, /^data:image\/jpeg;base64,/, '动图要换成分帧拼图，而不是原始 GIF');
+  // 拼图是 JPEG：base64 解出来要以 JPEG 的 SOI 魔数（FF D8 FF）开头
+  const jpegBytes = Buffer.from(url.slice('data:image/jpeg;base64,'.length), 'base64');
+  assert.deepEqual([...jpegBytes.subarray(0, 3)], [0xff, 0xd8, 0xff], '拼图本体必须是 JPEG');
+  assert.match(textOf(blocks), /动图/, '要告诉模型这是动图的分帧，不是多张不同的图');
+  assert.match(textOf(blocks), /这个表情好好笑/, '真人正文仍要在');
 });
 
 // ---------------- 视频：没有公网 URL 时的内联兜底 ----------------

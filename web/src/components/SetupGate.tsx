@@ -26,7 +26,7 @@ interface FetchState { id: string; dest: string; bytes: number; total: number; d
 /** 只有这三项需要解释"是干什么的"（其余项名字自明）。文案一句到底，别替用户扩写。 */
 const DEP_HINTS: Record<string, string> = {
   llbot: '登录 QQ 用的协议端本体，可以点这里让它自己下载，也可以去官网拿',
-  docker: '工作模式跑脚本的强隔离沙箱靠它，没起来会退回弱隔离',
+  docker: '工作模式跑脚本与浏览器的强隔离沙箱靠它；没起来时 work 的脚本执行会被直接拒绝，不再降级到宿主机',
   ffmpeg: '语音消息要转成模型能读的格式，缺了语音不进模型',
 };
 

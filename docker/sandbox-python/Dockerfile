@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir \
       ipykernel jupyter_client \
       numpy pandas matplotlib pillow opencv-python-headless \
       scipy scikit-learn beautifulsoup4 lxml requests tabulate
+# 办公文档读写（work 交付常遇到 xlsx/docx/pdf；容器断网，只能预装）
+RUN pip install --no-cache-dir openpyxl python-docx pypdf
 
 # 中文与基础工具（文本处理/编码）
 RUN apt-get update && apt-get install -y --no-install-recommends \

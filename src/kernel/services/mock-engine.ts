@@ -12,11 +12,13 @@
 //  - usage 固定给一组带缓存命中的数，让缓存账与工作抽屉的占比有数可算。
 // ============================================================
 
-import type { AssistantMessage, AssistantMessageEvent, Model, SimpleStreamOptions, TextContent, ToolCall, TranscriptContext } from '@earendil-works/pi-ai';
+import type { AssistantMessage, AssistantMessageEvent, Model, SimpleStreamOptions, TextContent, ThinkingContent, ToolCall, TranscriptContext } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream, getCurrentTools } from '@earendil-works/pi-ai';
 
 export interface MockScriptStep {
   content?: string;
+  /** 推理模型的思考链（pi-ai 的 thinking 块）：用来钉 work 面「思考」行的来源 */
+  thinking?: string;
   toolCalls?: { name: string; args: Record<string, unknown> }[];
   /** 延迟这么久才吐字（毫秒）：给"生成期间群里又来了新消息"这类时序用例留窗口 */
   delayMs?: number;
@@ -32,7 +34,7 @@ function mockUsage(completion: number): AssistantMessage['usage'] {
 
 function assistantMessage(o: {
   model: Model<any>;
-  content: (TextContent | ToolCall)[];
+  content: (TextContent | ThinkingContent | ToolCall)[];
   stopReason: AssistantMessage['stopReason'];
   usage?: AssistantMessage['usage'];
 }): AssistantMessage {
@@ -179,7 +181,11 @@ export class MockEngine {
       const toolCalls: ToolCall[] = (step.toolCalls ?? []).map((t, i) => ({
         type: 'toolCall' as const, id: `mock_${Date.now()}_${i}`, name: t.name, arguments: t.args as any,
       }));
-      content = [...(text ? [{ type: 'text' as const, text }] : []), ...toolCalls];
+      content = [
+        ...(step.thinking ? [{ type: 'thinking' as const, thinking: step.thinking }] : []),
+        ...(text ? [{ type: 'text' as const, text }] : []),
+        ...toolCalls,
+      ];
       stopReason = toolCalls.length ? 'toolUse' : 'stop';
       usage = mockUsage(20 + text.length);
     } else {
@@ -214,6 +220,10 @@ export class MockEngine {
           // 一次性吐出整段（这里不模拟逐字；打字机效果由 UI 的 onDelta 收到一段文本渲染）
           stream.push({ type: 'text_delta', contentIndex: i, delta: block.text, partial: message } as AssistantMessageEvent);
           stream.push({ type: 'text_end', contentIndex: i, content: block.text, partial: message } as AssistantMessageEvent);
+        } else if (block.type === 'thinking') {
+          stream.push({ type: 'thinking_start', contentIndex: i, partial: message } as AssistantMessageEvent);
+          stream.push({ type: 'thinking_delta', contentIndex: i, delta: block.thinking, partial: message } as AssistantMessageEvent);
+          stream.push({ type: 'thinking_end', contentIndex: i, content: block.thinking, partial: message } as AssistantMessageEvent);
         } else {
           stream.push({ type: 'toolcall_start', contentIndex: i, partial: message } as AssistantMessageEvent);
           stream.push({ type: 'toolcall_end', contentIndex: i, toolCall: block, partial: message } as AssistantMessageEvent);

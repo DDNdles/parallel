@@ -34,10 +34,12 @@ import { toPiMessages } from './services/pi-ai.ts';
 /** 结构化步骤事件：给桌面端侧栏画 harness 式 loop（工具调用/结果/思考/用量/压缩） */
 export type LoopEvent =
   | { kind: 'round'; n: number }
+  /** 模型正文的增量（只给 work 面的实时流；不落库，message_end 会用完整 thinking 覆盖） */
+  | { kind: 'delta'; round: number; text: string }
   | { kind: 'thinking'; round: number; text: string }
   | { kind: 'tool'; round: number; name: string; args: string }
   | { kind: 'toolResult'; round: number; name: string; text: string; meta?: ToolMeta }
-  | { kind: 'usage'; round: number; prompt: number; completion: number; cacheHit: number; cacheMiss: number }
+  | { kind: 'usage'; round: number; prompt: number; completion: number; cacheHit: number; cacheMiss: number; ms?: number }
   | { kind: 'compaction'; round: number; dropped: number; tokensBefore: number; summary: string }
   | { kind: 'settle'; round: number; reason: 'terminate' | 'max_rounds' }
   | { kind: 'final'; text: string };
@@ -52,6 +54,10 @@ interface RunCapture {
   finalReply?: string;
   /** 收尾工具是否表示"活干完了"（pi-agent-core 自己也会据此早停，这里只为 LoopEvent 记一笔） */
   settled: boolean;
+  /** 本轮开始时刻：message_end 时用它算这一轮的墙钟耗时（侧栏 TPS 用） */
+  turnStartedAt?: number;
+  /** 每一轮模型上报的用量（chat 轮要写进 agent_end，抽屉的 chat 段据此画圆环） */
+  usage: { prompt: number; completion: number; cacheHit: number; cacheMiss: number; ms?: number }[];
 }
 
 /** 音频/视频进请求体的条数上限：它们没有 pi-ai 的 content 块，只能整批补在最后一条 user 上，
@@ -108,13 +114,21 @@ export class AgentLoop {
     let lastSummary: string | undefined;
     let compactions = 0;
 
-    const cap: RunCapture = { rounds: 0, toolCalls: 0, lastText: '', settled: false };
+    const cap: RunCapture = { rounds: 0, toolCalls: 0, lastText: '', settled: false, usage: [] };
 
     this.bus.emit(busEvents.agentStart, { chatKey, userId: ctx.event.userId });
-    this.sessionLog.append(chat.chatId, chat.type, { type: 'agent_start', role: 'system', text: 'agent loop 开始' });
+    this.sessionLog.append(chat.chatId, chat.type, {
+      type: 'agent_start', role: 'system', text: 'agent loop 开始', lane: ctx.workTurn ? 'work' : 'chat',
+    });
+
+    // 图片能不能进这一轮：看链首模型在模型页登记的「输入类型」——与 chainStreamFn 的筛子同一条规则
+    // （那行没登记就不筛；登记了不含 image 就不 seed）。不 seed 要如实报一条，别让 bot"装作没看见图"。
+    const headTypes = this.chainHeadInputTypes(chain);
+    const imageAllowed = headTypes ? headTypes.has('image') : true;
 
     // ---- 工具面：parallel 的 ToolDef → pi-agent-core 的 AgentTool ----
-    const tools = ctx.tools.map((def) => this.toAgentTool(ctx, def, cap, pieMod));
+    // 图片回传也看链首模型的输入类型：不收图的模型只配拿到文字结果（见 toAgentTool）
+    const tools = ctx.tools.map((def) => this.toAgentTool(ctx, def, cap, pieMod, imageAllowed, chatKey));
 
     // ---- 历史：ctx.messages 的最后一条就是本轮用户发言，交给 Agent 自己接着跑 ----
     // 中途的 system（人格插件那几条设定）在这里摘出来接到 system 末尾，不占 user 轮（见 toPiMessages 的说明）
@@ -136,10 +150,6 @@ export class AgentLoop {
       const hhmm = d ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '';
       return hhmm ? `${hhmm} 那条消息` : `窗口内第 ${i + 1} 条消息`;
     };
-    // 图片能不能进这一轮：看链首模型在模型页登记的「输入类型」——与 chainStreamFn 的筛子同一条规则
-    // （那行没登记就不筛；登记了不含 image 就不 seed）。不 seed 要如实报一条，别让 bot"装作没看见图"。
-    const headTypes = this.chainHeadInputTypes(chain);
-    const imageAllowed = headTypes ? headTypes.has('image') : true;
     const imageCount = msgs.reduce((n, _m, i) => n + attsAt(i).filter((a) => a.kind === 'image').length, 0);
     if (!imageAllowed && imageCount) {
       this.errors.record('warn', 'provider', `链上模型不收图片（模型页那行没勾「图片」），本轮 ${imageCount} 张图片没送出`, { chatId: chat.chatId });
@@ -157,6 +167,10 @@ export class AgentLoop {
     );
     if (seeded.failedImages) {
       this.errors.record('warn', 'provider', `窗口内 ${seeded.failedImages} 张图片读不动（路径/URL 取不到），这一轮没送出`, { chatId: chat.chatId });
+    }
+    // 动图没摊成分帧拼图：图照送（模型只看到首帧），但要在报错中心说清这张没被完整读到
+    for (const w of seeded.imageWarnings ?? []) {
+      this.errors.record('warn', 'provider', w, { chatId: chat.chatId });
     }
     // 音频/视频收成一个数组（当前批次 + 窗口内历史），上限 audio ≤ 8 / video ≤ 4；
     // 超出的如实报掉——静默丢媒体正是"bot 装作没听见语音"那类 bug 藏久的原因。
@@ -189,7 +203,12 @@ export class AgentLoop {
     // chat 轮的输出 token 硬顶（humanlike.outgoing.maxReplyTokens）：短回复是产品口径，
     // 抽风写小作文时由它 + 出站句边截断兜底。work 轮不设（交付多长都行，走模型页自己的 maxOutput）。
     const replyCap = ctx.workTurn ? 0 : Math.round(Number(this.config.config.humanlike.outgoing.maxReplyTokens) || 0);
-    const rawStream = this.llm.chainStreamFn(chain, { attachments: media, chatId: chat.chatId });
+    const rawStream = this.llm.chainStreamFn(chain, {
+      attachments: media,
+      chatId: chat.chatId,
+      // 并发的 work 任务各钉一个起始模型；chat 链不分槽
+      start: chain === 'work' ? ctx.workSlot : undefined,
+    });
     const streamFn = (replyCap > 0
       ? ((model: any, context: any, options: any) => rawStream(model, context, { ...(options ?? {}), maxTokens: replyCap }))
       : rawStream) as never;
@@ -260,8 +279,11 @@ export class AgentLoop {
       event({ kind: 'final', text: reply });
 
       this.sessionLog.append(chat.chatId, chat.type, {
-        type: 'agent_end', role: 'system',
+        type: 'agent_end', role: 'system', lane: ctx.workTurn ? 'work' : 'chat',
         text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
+        // chat 段没有 work.done 那种结算：把每轮用量挂在 agent_end 上，抽屉用最近一条画
+        // 上下文圆环 / 缓存命中 / TPS（否则 chat 那一栏永远是空的）
+        data: { rounds: cap.rounds, toolCalls: cap.toolCalls, usage: cap.usage, model: this.llm.servingLabel(chain) },
       });
       this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds: cap.rounds });
       return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps };
@@ -276,7 +298,7 @@ export class AgentLoop {
   }
 
   /** parallel 的工具定义 → pi-agent-core 的 AgentTool（参数用 Type.Unsafe 包一层 JSON Schema） */
-  private toAgentTool(ctx: LLMRequestContext, def: ToolDef, cap: RunCapture, pie: any): unknown {
+  private toAgentTool(ctx: LLMRequestContext, def: ToolDef, cap: RunCapture, pie: any, vision: boolean, chatKey: string): unknown {
     return {
       name: def.name,
       label: def.name,
@@ -288,6 +310,7 @@ export class AgentLoop {
           event: ctx.event, chat: ctx.chat, role: ctx.event.role ?? 'member',
           historyWindowStartTs: ctx.historyWindowStartTs,
           work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
+          vision,
         };
         try {
           const r = await def.handler(params ?? {}, tctx);
@@ -298,7 +321,15 @@ export class AgentLoop {
           // 收尾工具的交付内容优先当最终回答（模型不必再复述一遍，也就不会走样）
           if (finalReply?.trim()) { cap.finalReply = finalReply.trim(); cap.settled = true; }
           else if (terminate) cap.settled = true;
-          return { content: [{ type: 'text', text: truncate(text, 4000) }], details: meta, terminate };
+          // 图片结果（浏览器截图 / 渲染复查）：模型收图就回给模型；不收图就只留文字，
+          // 并如实告诉它"你看不到这张图"——否则它会以为自己检查过渲染效果。
+          const images = typeof r === 'string' ? undefined : r.images;
+          if (images?.length && !vision) {
+            this.errors.record('warn', 'provider', `工具 ${def.name} 返回了 ${images.length} 张图片，但链首模型不收图片，已丢弃`, { chatId: ctx.chat.chatId });
+          }
+          const content: any[] = [{ type: 'text', text: truncate(text, 4000) }];
+          if (vision) for (const img of images ?? []) content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+          return { content, details: meta, terminate };
         } catch (e) {
           const err = e as Error;
           // 权限/边界拒绝也返回给模型（诚实告知），同时留痕
@@ -319,15 +350,23 @@ export class AgentLoop {
     h: { chatKey: string; step: (s: string) => void; event: (e: LoopEvent) => void },
   ): void {
     const { chat } = ctx;
+    // 同一条会话日志里混着 chat 轮与 work 轮的条目：标出来，桌面端才能分成两段显示
+    const lane: 'chat' | 'work' = ctx.workTurn ? 'work' : 'chat';
     switch (ev?.type) {
       case 'turn_start':
         cap.rounds++;
+        cap.turnStartedAt = Date.now();
         h.event({ kind: 'round', n: cap.rounds });
         break;
 
       case 'message_update': {
         const a = ev.assistantMessageEvent;
-        if (a?.type === 'text_delta' && a.delta) this.bus.emit(busEvents.llmDelta, { chatKey: h.chatKey, text: a.delta });
+        if ((a?.type === 'text_delta' || a?.type === 'thinking_delta') && a.delta) {
+          // work 面把增量送进活动流（桌面端实时显示），chat 面仍只走 llmDelta。
+          // thinking_delta 是模型的思考链（deepseek 等推理模型会回传），与正文一样先进流式行。
+          if (ctx.workTurn) h.event({ kind: 'delta', round: cap.rounds, text: a.delta });
+          if (a.type === 'text_delta') this.bus.emit(busEvents.llmDelta, { chatKey: h.chatKey, text: a.delta });
+        }
         break;
       }
 
@@ -335,15 +374,22 @@ export class AgentLoop {
         const m = ev.message;
         if (m?.role !== 'assistant') break;
         const text = textOf(m);
-        // 本轮模型正文：有工具调用时就是"思考"，没有就是最终回答（与改造前一致）
-        if (text.trim()) h.event({ kind: 'thinking', round: cap.rounds, text: text.trim() });
+        const reasoning = thinkingOf(m);
+        // 本轮模型输出：正文（工具轮里是动手前的铺垫）与思考链一起进「思考」行，
+        // 没有正文时也不会只剩一条空行（推理模型只回 thinking 块的场景）
+        const shown = [reasoning.trim(), text.trim()].filter(Boolean).join('\n\n');
+        if (shown) h.event({ kind: 'thinking', round: cap.rounds, text: shown });
         if (m.usage) {
-          h.event({
-            kind: 'usage', round: cap.rounds,
+          const u = {
             prompt: Number(m.usage.input ?? 0) + Number(m.usage.cacheRead ?? 0),
             completion: Number(m.usage.output ?? 0),
             cacheHit: Number(m.usage.cacheRead ?? 0), cacheMiss: Number(m.usage.input ?? 0),
-          });
+            // 本轮墙钟（模型请求到出完这一条）：侧栏据此算 TPS。不含工具执行时间——
+            // 工具轮的总耗时里大头是工具，拿它除输出 token 会得到一个毫无意义的低值。
+            ms: cap.turnStartedAt ? Math.max(1, Date.now() - cap.turnStartedAt) : undefined,
+          };
+          cap.usage.push(u);
+          h.event({ kind: 'usage', round: cap.rounds, ...u });
         }
         cap.lastText = text || cap.lastText;
         break;
@@ -356,7 +402,7 @@ export class AgentLoop {
         h.event({ kind: 'tool', round: cap.rounds, name: ev.toolName, args: truncate(args, 400) });
         this.bus.emit(busEvents.toolCall, { chatKey: h.chatKey, name: ev.toolName, args: ev.args ?? {}, id: ev.toolCallId, ts: Date.now() });
         this.sessionLog.append(chat.chatId, chat.type, {
-          type: 'tool_call', role: 'tool', text: ev.toolName,
+          type: 'tool_call', role: 'tool', text: ev.toolName, lane,
           data: { args: truncate(args, 600), callId: ev.toolCallId },
         });
         break;
@@ -371,7 +417,7 @@ export class AgentLoop {
           id: ev.toolCallId, ts: Date.now(), meta: ev.result?.details,
         });
         this.sessionLog.append(chat.chatId, chat.type, {
-          type: 'tool_result', role: 'tool', text: ev.toolName,
+          type: 'tool_result', role: 'tool', text: ev.toolName, lane,
           data: { result: truncate(text, 1200), callId: ev.toolCallId, meta: ev.result?.details },
         });
         break;
@@ -474,6 +520,18 @@ function textOf(message: any): string {
   if (typeof blocks === 'string') return blocks;
   if (!Array.isArray(blocks)) return '';
   return blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text ?? '')).join('');
+}
+
+/** 从 pi-ai 的 content 块里取思考链（type=thinking，字段是 thinking） */
+function thinkingOf(message: any): string {
+  const blocks = message?.content;
+  const fromBlocks = Array.isArray(blocks)
+    ? blocks
+      .filter((b: any) => b?.type === 'thinking' || b?.type === 'reasoning')
+      .map((b: any) => String(b.thinking ?? b.text ?? b.reasoning ?? ''))
+      .join('')
+    : '';
+  return fromBlocks || (typeof message?.reasoning === 'string' ? message.reasoning : '');
 }
 
 function contentText(content: any): string {

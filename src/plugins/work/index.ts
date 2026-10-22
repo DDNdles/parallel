@@ -1,12 +1,20 @@
-import type { PluginContext, LLMRequestContext, ChatRef } from '../../kernel/types.ts';
+import type { PluginContext, LLMRequestContext, ChatRef, WorkLiveStatus } from '../../kernel/types.ts';
 import { renderAsk, renderHandoff } from '../../kernel/work-prompt.ts';
+import { workScopeOf } from '../../kernel/services/work.ts';
+import { busEvents } from '../../kernel/bus.ts';
+import { resolve as resolvePath } from 'node:path';
+import { existsSync } from 'node:fs';
 
 // ============================================================
 // work 插件 —— work 子代理的「能力面」
 //
-// 触发语义（用户定稿）：
-//  - chat 模型不判断任务复杂度、不自主委派（没有 delegate_to_work 工具）；
-//  - 唯一入口是管理员 /work <任务>（内核 pipeline 拦截，minRole admin）。
+// 触发语义（2026-10-21 用户改定，取代 /work 命令）：
+//  - chat 面注册 `work_dispatch`：模型在聊天里自然判断"这活需要实际动手"时派给 work；
+//    工具内部自己判权限（管理员），没权限就回一句拒绝理由，让 chat 用人格婉拒；
+//  - 派完先由 chat 说一句自然承接；work 跑完后内核另起一轮，由 chat 带着 @发起人 汇报
+//    （产物走 deliver_file，文字走人格化转述）；
+//  - chat 面另有 `work_status`：只查**问的人自己**的活（进度/用时/token），同样在工具内判权限。
+//  - /work 命令已删除，QQ 指令面不再有内建命令。
 //
 // 分工（对齐 pi 的 harness 分层）：
 //  - **身份与工作方式**写在 `agents/work.md`（frontmatter 声明工具白名单 + 正文写人格），
@@ -43,20 +51,212 @@ export function setup(ctx: PluginContext): void {
   }
 
   /** 把常驻内核的输出渲染成模型可读文本 */
-  function formatSession(r: { status: string; outputs: any[]; executionCount?: number }): string {
+  function formatSession(r: { status: string; outputs: any[]; executionCount?: number }): { text: string; image?: string } {
     const parts: string[] = [`[状态: ${r.status}${r.executionCount ? ` / 第 ${r.executionCount} 次执行` : ''}]`];
+    let image: string | undefined;
     for (const o of r.outputs ?? []) {
       if (o.type === 'stream') parts.push(o.text ?? '');
       else if (o.type === 'error') parts.push(`错误 ${o.name}: ${o.text ?? ''}`);
-      else if (o.image) parts.push(`[图表已生成，可 sandbox_write 保存后 send_file 发送]`);
+      // 只有 matplotlib 之类主动显示出来的图才有 image；回给模型看一眼（收图模型），否则它只能读数字
+      else if (o.image) { image = o.image; parts.push('[图表已生成（随本条结果附上）；要发给用户就 sandbox_write 落盘后 send_file]'); }
       else if (o.text) parts.push(String(o.text));
     }
-    return parts.join('\n').trim() || '（无输出）';
+    return { text: parts.join('\n').trim() || '（无输出）', image };
   }
 
-  // ---------------- ① chat 侧：无委派工具 ----------------
-  // 语义（用户定稿）：chat 模型不判断任务复杂度、不自主委派；work 只由管理员 /work 触发。
-  // 因此这里不注册 delegate_to_work——chat 轮的工具面天然干净。
+  // ---------------- ① chat 侧：派活 / 查进度 / 交付 ----------------
+  // 这三个工具是 chat 面唯一的 work 入口（`surface:'chat'`，work 轮严格看不见）：
+  //  - work_dispatch：自然派活（没有 /work 命令了）；权限在 handler 里判（不是靠 minRole 藏工具，
+  //    否则普通群友那边模型根本不知道有这回事，也就没法"被人格化地拒绝"）；
+  //  - work_status：只回**调用者自己**的活；
+  //  - deliver_file：work 做出来的文件最终由 chat 用自己的人设发出去。
+  //    work 面不需要它（那边有 send_file），所以严格只在 chat 面可见。
+  //    它只认**本会话沙箱内、且确实由某次 work 交付登记过**的文件，
+  //    不是让 chat 拿到任意文件的读取/写入口。
+  const canWork = (role: string): boolean => role === 'owner' || role === 'admin';
+  const chatKeyOf = (chat: ChatRef): string => `${chat.type}_${chat.chatId}`;
+
+  /** 工具名 → 给人看的动作（work_status 只说"在干什么"，不泄露内部工具名） */
+  const toolLabel = (name?: string): string => {
+    const n = String(name ?? '');
+    if (n.startsWith('browser_')) return '浏览器';
+    return ({
+      python_session: '常驻 Python', run_python_work: 'Python', run_bash: '命令行',
+      sandbox_read: '读文件', sandbox_write: '写文件', sandbox_edit: '改文件', sandbox_grep: '检索文件',
+      sandbox_glob: '找文件', web_search: '联网搜索', web_fetch: '读网页', todo: '任务清单',
+      send_file: '发文件', delegate: '子代理', work_finish: '收尾', work_ask: '提问',
+    } as Record<string, string>)[n] || '工具';
+  };
+
+  const fmtDur = (ms: number): string => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return `${s} 秒`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return s % 60 ? `${m} 分 ${s % 60} 秒` : `${m} 分钟`;
+    return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+  };
+  const fmtTok = (n: number): string => n >= 10_000 ? `${(n / 10_000).toFixed(1)} 万` : String(n);
+
+  /** 进度快照 → 给模型转述用的事实（时间/轮次/token 都由程序算好，别让它自己估） */
+  function renderStatus(st: WorkLiveStatus): string {
+    const lines: string[] = [];
+    if (st.active.length) {
+      lines.push(`正在跑 ${st.active.length} 件：`);
+      for (const r of st.active.slice(0, 3)) {
+        const total = r.prompt + r.completion;
+        const hit = r.prompt > 0 ? Math.round((r.cacheHit / r.prompt) * 100) : 0;
+        lines.push(`- 任务「${r.task}」：已 ${fmtDur(r.elapsedMs)}，第 ${Math.max(1, r.rounds)} 轮，${r.toolCalls} 次工具调用，共 ${fmtTok(total)} token（提示 ${fmtTok(r.prompt)} / 输出 ${fmtTok(r.completion)}，缓存命中 ${hit}%）`);
+        const step = r.step;
+        const doing = step?.kind === 'tool' ? `正在用${toolLabel(step.name)}`
+          : step?.kind === 'toolResult' ? `刚完成${toolLabel(step.name)}`
+            : step?.kind === 'thinking' ? '正在想下一步'
+              : step?.kind === 'compaction' ? '在整理上下文'
+                : '刚开始，还没出结果';
+        lines.push(`  最近：${doing}`);
+      }
+    } else {
+      lines.push('当前没有在跑的活。');
+    }
+    if (st.pending) {
+      lines.push(`有一件活停着等他回答：${st.pending.question}${st.pending.notes ? `（已经做到：${st.pending.notes}）` : ''}`);
+    }
+    if (!st.active.length && st.last) {
+      const l = st.last;
+      const state = l.awaiting ? '停下来等回答' : l.ok ? '已完成' : '失败了';
+      const agoMin = Math.max(0, Math.round((Date.now() - l.finishedAt) / 60_000));
+      lines.push(`最近一次（${agoMin ? `${agoMin} 分钟前` : '刚刚'}）：任务「${l.task}」${state}，用时 ${fmtDur(l.durationMs)}；结论：${l.summary || l.error || '（无）'}`);
+      if (l.artifacts.length) lines.push(`产物 ${l.artifacts.length} 个：${l.artifacts.slice(0, 5).join('、')}`);
+    }
+    return lines.join('\n');
+  }
+
+  ctx.llm.registerTool({
+    name: 'work_dispatch',
+    description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。',
+    // 不设 minRole：普通群友的 chat 也要"知道有这个能力、然后拒绝"，而不是工具凭空消失
+    surface: 'chat',
+    promptSnippet: '把需要实际动手的活派给工作子代理',
+    promptGuidelines: [
+      '派活的 task 要自带前因后果：做什么、输入在哪、要交回什么——工作子代理看不到你们的聊天。',
+      '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
+      '活跑完会另外给你一轮汇报：那一轮再讲结论，产物用 deliver_file 发。',
+    ],
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '要它做的事：目标、输入、要交回什么' },
+      },
+      required: ['task'],
+    },
+    handler: (args, tctx) => {
+      if (!canWork(String(tctx.role))) {
+        return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
+      }
+      const task = String(args.task ?? '').trim();
+      if (!task) return '（任务为空，没有派出去。先问清对方要做什么。）';
+      if (ctx.work.modelLabel() === '—') {
+        return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
+      }
+      const chat = tctx.chat;
+      const chatKey = chatKeyOf(chat);
+      const userId = tctx.event.userId;
+      const nickname = tctx.event.nickname;
+      // 等本轮 chat 收尾再开跑：让"好，我去弄"先由人格说出去，也避免 work 的第一发请求
+      // 和 chat 的第二轮抢同一份上下文/同一条模型链。agent 中途夭折时用 5s 兜底。
+      let started = false;
+      let off: (() => void) | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const start = () => {
+        if (started) return;
+        started = true;
+        off?.();
+        if (timer) clearTimeout(timer);
+        const r = ctx.work.dispatch({ chat, task, userId, nickname, role: String(tctx.role) });
+        if (!r.ok) ctx.log.warn(`派活没有开跑：${r.reason ?? '未知原因'}`);
+      };
+      off = ctx.bus.on(busEvents.agentEnd, (p: { chatKey?: string }) => {
+        if (p?.chatKey === chatKey) start();
+      });
+      timer = setTimeout(start, 5000);
+      timer.unref?.();
+      return `（已接下这件活，马上交给工作子代理去做。这一轮只用一句自然的话应下，不要说你已经做完了；做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
+    },
+  });
+
+  ctx.llm.registerTool({
+    name: 'work_status',
+    description: '查询当前会话里、问的人自己派的活做到哪了：在跑多久、第几轮、几次工具调用、用了多少 token，有没有停下来等他回答。用户问「做到哪了/还要多久/进度怎么样」时用。只会返回调用者自己的活，看不到别人的。',
+    surface: 'chat',
+    promptSnippet: '查自己派的活的进度（用时/轮次/token）',
+    promptGuidelines: [
+      '用户问进度时先查再答；没有在跑的活就如实说没有，不要编。',
+      '时间与 token 用工具给的事实，不要自己估；用你自己的语气说，别报任务编号。',
+    ],
+    parameters: { type: 'object', properties: {} },
+    handler: (_args, tctx) => {
+      if (!canWork(String(tctx.role))) {
+        return '（权限不足：只有管理员能查看派活进度。用你自己的语气婉拒对方，别提到权限系统或工具。）';
+      }
+      const st = ctx.work.status(chatKeyOf(tctx.chat), tctx.event.userId);
+      const body = renderStatus(st);
+      return `${body}\n（用你自己的语气转述给问的人；只说他自己这件活，不要提任务编号、工具名、系统这些词。）`;
+    },
+  });
+  ctx.llm.registerTool({
+    name: 'deliver_file',
+    description: '把工作子代理做好、登记在交付清单里的文件发给用户。用户说「发给我/发来看看/文件呢」时用它；只能发本会话沙箱里已登记的交付物。',
+    minRole: 'admin',
+    surface: 'chat',
+    promptSnippet: '把工作子代理的交付物发给用户（只能发已登记的产物）',
+    promptGuidelines: [
+      '用户要看/要文件时用 deliver_file 发出去，不要只回一个路径或说"发不了"。',
+      'deliver_file 不带 path = 发最近一次交付的全部产物；用户点名了某个文件才传 path。',
+      '它只能发已登记的产物；用户要的东西不在清单里，就如实说那次任务没有产出它。',
+    ],
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要发的文件名或沙箱相对路径（缺省 = 最近一次交付的全部产物）' },
+      },
+    },
+    handler: async (args, tctx) => {
+      const chat = chatRefOf(tctx);
+      const chatKey = `${chat.type}_${chat.chatId}`;
+      // 清单按聊天找（同一个人在群里几次交付仍是一份），但沙箱是按发起人分的：
+      // 带上调用者 userId 才能定位到他自己的 work 沙箱目录（`group_x__uQQ`）。
+      const last = ctx.work.latestArtifacts(chatKey, tctx.event.userId);
+      if (!last) return '（这个会话还没有成功交付过文件，没有可发的东西。）';
+      // 发送用带作用域的 ref：不带 scope 拿到的是聊天级沙箱，那里没有 work 产物
+      const workChat: ChatRef = { ...chat, scope: workScopeOf(last.userId || tctx.event.userId) };
+      const wanted = String(args.path ?? '').trim().replace(/\\/g, '/');
+      const pick = wanted
+        ? last.artifacts.filter((a) => a === wanted || a.endsWith('/' + wanted) || a.split('/').pop() === wanted)
+        : last.artifacts;
+      if (!pick.length) {
+        return `（那次任务（${last.task}）的产物里没有「${wanted}」。现有：${last.artifacts.join('、')}）`;
+      }
+      const sent: string[] = [];
+      const failed: string[] = [];
+      // 产物可能落在这两个地方：按发起人分的 work 沙箱（新），或聊天级沙箱（2026-10-20 之前的老交付）。
+      // 都试一遍：先按人找，找不到再退回聊天级——用户只是要文件，不该因为目录换代就说发不了。
+      const plainChat: ChatRef = { ...chat, scope: undefined };
+      for (const rel of pick) {
+        try {
+          // 只用沙箱内相对路径拼；resolve 与越界校验在 ChatService.sendFile 里（它再核一次）
+          const scoped = resolvePath(sb.root(workChat), rel);
+          const abs = existsSync(scoped) ? scoped : resolvePath(sb.root(plainChat), rel);
+          await ctx.chat.sendFile(existsSync(scoped) ? workChat : plainChat, abs);
+          sent.push(rel);
+        } catch (e) {
+          failed.push(`${rel}（${(e as Error).message}）`);
+        }
+      }
+      const parts: string[] = [];
+      if (sent.length) parts.push(`已发送：${sent.join('、')}`);
+      if (failed.length) parts.push(`发送失败：${failed.join('、')}`);
+      return parts.join('\n');
+    },
+  });
 
   // ---------------- ② work 轮工具面 ----------------
   // 每个工具自带 promptSnippet（工具清单里的一行）与 promptGuidelines（规则条目）——
@@ -255,7 +455,19 @@ export function setup(ctx: PluginContext): void {
       handler: async (args, tctx) => {
         try {
           const r = await se.runPython(chatRefOf(tctx), String(args.code ?? ''), Number(args.timeout_ms) || 60_000, false);
-          return formatSession(r);
+          const f = formatSession(r);
+          // 图表别只留在模型眼里：落进沙箱它才发得出去（send_file 只认沙箱内文件）
+          if (f.image) {
+            try {
+              const rel = `charts/chart-${Date.now()}.png`;
+              sb.write(chatRefOf(tctx), rel, Buffer.from(f.image, 'base64'), { work: true });
+              f.text += `\n[已存到 ${rel}，要发给用户就把它登记进 work_finish 的 artifacts]`;
+              return { content: f.text, images: [{ data: f.image, mimeType: 'image/png' }], meta: { path: rel, artifacts: [rel] } };
+            } catch { /* 落盘失败就只回图片 */ }
+          }
+          return f.image
+            ? { content: f.text, images: [{ data: f.image, mimeType: 'image/png' }] }
+            : f.text;
         } catch (e) {
           return `执行被拒绝：${(e as Error).message}`;
         }
@@ -307,6 +519,13 @@ export function setup(ctx: PluginContext): void {
           try {
             const r = await se.browser(chatRefOf(tctx), action, args);
             if (!r?.ok) return `浏览器操作失败：${r?.error ?? '未知错误'}`;
+            // 截图回给模型：不收图的模型那边由 agent loop 统一拦掉并留一条 warn
+            if (r.image && action === 'screenshot') {
+              return {
+                content: `${r.text || '（已截图）'}\n（截图已附在本条结果里，用于你看渲染效果；要发给用户就 sandbox_write 落盘后 send_file）`,
+                images: [{ data: String(r.image), mimeType: 'image/png' }],
+              };
+            }
             return r.text || '（无内容）';
           } catch (e) {
             return `浏览器操作失败：${(e as Error).message}`;
@@ -316,12 +535,15 @@ export function setup(ctx: PluginContext): void {
     }
   }
 
-  // 一次性执行（容器沙箱：python/js/bash 断网，powershell 宿主受控）
+  // 一次性执行（容器沙箱：python/js/bash 断网；全部在容器里跑）
+  //
+  // 没有 run_powershell：Linux 容器里的 pwsh 只是个空壳（没有 python/git/curl），
+  // 计算与文本处理用 run_bash / run_python_work 就够了。之前按"镜像在本地才暴露"
+  // 做过条件注册，2026-10-22 用户定：Linux 不需要 pwsh，工具与镜像一起删掉。
   if (has('sandbox.exec') && typeof sb.runAny === 'function') {
-    const runTools: [string, 'powershell' | 'bash' | 'python', string, string, string][] = [
-      ['run_powershell', 'powershell', '运行 PowerShell 命令（Windows 宿主受控子进程：不加载用户配置、仅会话沙箱目录可写）。', 'command', '跑 PowerShell（Windows 宿主受控子进程）'],
-      ['run_bash', 'bash', '运行 Bash 命令（Docker 容器：断网、只挂会话沙箱、跑完销毁）。适合 grep/sed/awk 文本处理。', 'command', '跑 Bash（Docker 容器，断网、跑完销毁）'],
-      ['run_python_work', 'python', '一次性运行 Python（每次全新解释器，变量不保留；需要跨调用保留请用 python_session）。', 'code', '一次性跑 Python（变量不保留）'],
+    const runTools: [string, 'bash' | 'python', string, string, string][] = [
+      ['run_bash', 'bash', '运行 Bash 命令（Docker 容器：断网、只挂会话沙箱、跑完销毁；与 python_session 同一镜像，带 python3 与常用库）。适合 grep/sed/awk 文本处理。', 'command', '跑 Bash（Docker 容器，断网、跑完销毁）'],
+      ['run_python_work', 'python', '一次性运行 Python（Docker 容器内；每次全新解释器，变量不保留；需要跨调用保留请用 python_session）。', 'code', '一次性跑 Python（变量不保留）'],
     ];
     for (const [name, language, description, argName, snippet] of runTools) {
       ctx.llm.registerTool({
@@ -330,9 +552,15 @@ export function setup(ctx: PluginContext): void {
         minRole: 'admin',
         surface: WORK,
         promptSnippet: snippet,
-        promptGuidelines: name === 'run_bash' ? ['文本处理优先用 run_bash（grep/sed/awk）；文件读写仍走 sandbox_read / sandbox_write。']
-          : name === 'run_powershell' ? ['需要 Windows 专有命令或宿主侧操作时才用 run_powershell。']
-            : ['一次性 Python 用 run_python_work；要跨调用保留状态请改用 python_session。'],
+        promptGuidelines: name === 'run_bash'
+          ? [
+              '文本处理优先用 run_bash（grep/sed/awk）；文件读写仍走 sandbox_read / sandbox_write。',
+              '不要用 heredoc/重定向在 bash 里写交付文件：新建或整篇重写用 sandbox_write，局部改用 sandbox_edit，桌面端才能显示 +N -M。',
+            ]
+          : [
+              '一次性 Python 用 run_python_work；要跨调用保留状态请改用 python_session。',
+              '不要在 Python 里写交付文件：新建或整篇重写用 sandbox_write，局部改用 sandbox_edit，桌面端才能显示 +N -M。',
+            ],
         parameters: {
           type: 'object',
           properties: {
@@ -347,7 +575,11 @@ export function setup(ctx: PluginContext): void {
               language, code: String(args[argName] ?? ''),
               timeoutMs: Number(args.timeout_ms) || undefined, work: true,
             });
-            return formatRun(r);
+            const text = formatRun(r);
+            const changes = (r as { changes?: { path: string; added: number; removed: number }[] }).changes;
+            if (!changes?.length) return text;
+            const lines = changes.map((c) => `${c.path} (+${c.added} -${c.removed})`).join('\n');
+            return { content: `${text}\n文件改动：\n${lines}`, meta: { changes } };
           } catch (e) {
             return `执行被拒绝：${(e as Error).message}`;
           }
@@ -447,12 +679,11 @@ export function setup(ctx: PluginContext): void {
     return req;
   };
 
-  ctx.log.info?.('work 已加载（/work 子代理：agent 定义 + 内核具名分节 + 工具自带规则）');
+  ctx.log.info?.('work 已加载（chat 派活 + 子代理执行：agent 定义 + 内核具名分节 + 工具自带规则）');
 }
 
 /** work 结果 → 给 chat 模型看的摘要（含产物清单） */
-export function formatWorkResult(r: any): string {
-  if (!r) return '（工作子代理未返回结果）';
+export function formatWorkResult(r: any): string {  if (!r) return '（工作子代理未返回结果）';
   if (!r.ok) return `工作子代理执行失败：${r.error ?? '未知原因'}`;
   const parts = [
     `[工作子代理完成] 用时 ${(r.durationMs / 1000).toFixed(1)}s，${r.rounds} 轮 / ${r.toolCalls} 次工具调用`,

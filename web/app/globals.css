@@ -268,6 +268,17 @@ body.resizing .wd-resize { pointer-events: auto; }
 /* 状态点用自己的 outline 描一圈底色与头像分离开——不能用 box-shadow，pulse-dot 动画会把它顶掉 */
 .sidebar-foot .dot { position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; outline: 2px solid var(--bg-side); }
 .acct-nick { min-width: 0; color: var(--text); font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 「正在工作」花押：会话流末尾、work 抽屉、工作页共用；有子代理在跑时呼吸闪烁，跑完消失 */
+.work-loader { flex: none; display: inline-flex; animation: work-blink 1.15s ease-in-out infinite; }
+.work-loader .brand-mark { width: 20px; height: 20px; border-radius: 6px; box-shadow: 0 0 10px rgba(139, 92, 246, .5); }
+.conv-working { display: flex; justify-content: center; padding: 12px 0 4px; }
+.wd-running { display: flex; padding: 12px 0 4px; }
+.wk-running { display: flex; padding: 10px 0 0 22px; }
+@keyframes work-blink {
+  0%, 100% { opacity: .28; transform: scale(.94); }
+  50% { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) { .work-loader { animation: none; opacity: 1; } }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 /* 顶栏：苹果液态玻璃（毛玻璃 + 边缘折射凹凸 + 受光边）。
@@ -499,6 +510,9 @@ tr:hover td { background: var(--row-hover); }
 /* 首条消息让开这行字。padding 在滚动容器里是跟着内容走的，所以滚起来之后消息仍会从字与玻璃底下经过 */
 .conv-wrap.reviewing .conv-scroll { padding-top: 84px; }
 .turn { margin-bottom: 24px; animation: rise-in var(--dur-moderate) var(--ease-out) both; }
+/* 戳一戳：不是消息，居中一行浅灰提示 */
+.turn-poke { display: flex; justify-content: center; margin-bottom: 14px; }
+.poke-line { font-size: 11.5px; color: var(--faint); padding: 2px 10px; }
 /* 头像直径：贴着"单行气泡"的高度那一档（一行 15px×1.6 + 上下 12px 内边距 = 48px），取 40 是不想让头像比字还抢眼 */
 .turn { --turn-av: 40px; }
 /* 入场动画播完由 JS 打上 data-rise（ChatsPage.onTurnRiseEnd），把动画从元素上摘掉：
@@ -548,6 +562,9 @@ tr:hover td { background: var(--row-hover); }
 .fwd-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fwd-time { margin-left: auto; flex: none; color: var(--faint); }
 .fwd-text { margin-top: 1px; white-space: pre-wrap; word-break: break-word; }
+/* 记录里的文件：图标 + 文件名（泛型文件在 QQ 里是文件消息，桌面端按同样一行展示） */
+.fwd-file { display: flex; align-items: center; gap: 6px; margin-top: 6px; min-width: 0; color: var(--dim); font-size: 12.5px; }
+.fwd-file .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 记录里的图比正文再小一档（引用块同档）：它是被转发进来的第二手内容，不该盖过本条消息 */
 .fwd-thumbs { margin-top: 6px; }
 .fwd-thumbs .thumb { width: 56px; height: 56px; border-radius: 8px; }
@@ -564,6 +581,10 @@ tr:hover td { background: var(--row-hover); }
 
 /* 气泡：左右同款底色（user-message-bubble-color），只靠所在一侧和上面的名字·时间区分谁说的 */
 .bubble-user, .turn-assistant .text-md { background: var(--surface-bubble); border-radius: var(--radius-bubble); padding: 12px 17px; max-width: 85%; line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-size: 15px; }
+/* QQ 经典表情：64px WebP 资源按 20px 内联，基线下压 4px 与文字对齐；引用块里再小一号 */
+.qq-face { width: 20px; height: 20px; vertical-align: -4px; margin: 0 1px; object-fit: contain; }
+.qq-face-t { color: var(--dim); }
+.quote .qq-face { width: 17px; height: 17px; vertical-align: -3px; }
 
 /* 一行 = 头像 + 内容列（名字·时间在上、气泡在下）。头像**顶边与名字顶边齐平**（align-items: flex-start），
    长消息里不跟着居中；bot 侧只把同一套结构 row-reverse 翻面，不写第二份。 */
@@ -843,7 +864,7 @@ tr:hover td { background: var(--row-hover); }
 }
 .wd-panel.open .wd-inner { opacity: 1; transition-delay: .08s; }
 /* 标题栏下边线也去掉：透明占位，保证头高和内容起点不变 */
-.wd-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid transparent; flex: none; }
+.wd-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid transparent; flex: none; }
 .wd-ic { display: inline-flex; color: var(--text); }
 .wd-title { font-size: 13px; font-weight: 600; }
 .wd-state { font-size: 11px; color: var(--faint); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; }
@@ -852,23 +873,27 @@ tr:hover td { background: var(--row-hover); }
 .wd-state.ask { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 .wd-close { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: var(--faint); cursor: pointer; }
 .wd-close:hover { background: var(--bg-hover); color: var(--text); }
-.wd-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 24px; font-size: 13px; }
+.wd-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 14px 24px; font-size: 13px; }
 
 /* 上下文占比圆环（标题栏「工作」图标右边，与标题同大、黑白反色，悬停/聚焦出详情） */
-.wd-ring { position: relative; display: inline-flex; flex: none; align-items: center; }
+.wd-ring { position: relative; display: inline-flex; flex: none; align-items: center; margin-left: 1px; color: var(--dim); }
 .wd-ring circle { fill: none; stroke-width: 2; }
-.wd-ring .t { stroke: var(--border); }
+.wd-ring .t { stroke: var(--border-stronger); }
 .wd-ring .p { stroke: var(--text); transition: stroke-dashoffset var(--dur-moderate) var(--ease-out); }
 .wd-ring-pop {
   position: absolute; top: calc(100% + 23px); left: -10px; z-index: 7; display: grid; gap: 5px;
-  min-width: 212px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px;
+  min-width: 260px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px;
   background: var(--surface); box-shadow: 0 8px 24px rgba(0, 0, 0, .3); font-size: 12px; color: var(--dim);
   opacity: 0; pointer-events: none; transition: opacity var(--dur-fast) var(--ease-out);
 }
 .wd-ring:hover .wd-ring-pop, .wd-ring:focus-visible .wd-ring-pop { opacity: 1; }
+/* 贴着详情页右上角时浮卡向右展会被 .mset-detail 的 overflow 裁掉：改成右缘对齐、往左展 */
+.mset-dright .wd-ring-pop { left: auto; right: -10px; }
 .wd-ring-pop .r { display: flex; align-items: baseline; gap: 10px; }
 .wd-ring-pop .k { color: var(--faint); flex: none; }
 .wd-ring-pop .v { margin-left: auto; color: var(--text); font-weight: 600; white-space: nowrap; }
+/* 模型名一行读完；真放不下就在浮卡里省略，完整串挂在 title 上。11px 让 30 来字的模型名也放得下 */
+.wd-ring-pop .v.wd-ring-model { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; font-size: 11px; }
 
 /* 同一会话跑过多次：一排小签子切换 */
 .wd-runs { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 12px; }
@@ -878,14 +903,16 @@ tr:hover td { background: var(--row-hover); }
 .wd-run .d { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
 .wd-run .d.run { background: var(--brand); }
 .wd-run .d.err { background: var(--danger, #e5484d); }
+/* 发起人签子上的运行条数（同一个群里每个人各自的 work 会话） */
+.wd-run .n { font-size: 10.5px; color: var(--faint); }
 
-.wd-task { margin: 14px 0 4px; }
+.wd-task { margin: 2px 0 4px; }
 .wd-task-t { font-size: 14px; line-height: 1.5; color: var(--text); }
-.wd-task-m { font-size: 11.5px; color: var(--faint); margin-top: 5px; }
 
-/* 面板分段小标题：chat 模型流水 / work 子代理的 loop */
-.wd-sec-h { font-size: 11px; color: var(--faint); letter-spacing: .08em; margin: 16px 0 2px; }
+/* 段标题（工作页的产物段等；模型/用时已经收进标题栏圆环的浮卡） */
+.wd-sec-h { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--faint); letter-spacing: .08em; margin: 16px 0 2px; }
 .wd-sec-h:first-child { margin-top: 0; }
+.wd-sec-m { display: flex; align-items: center; gap: 8px; margin-left: auto; letter-spacing: 0; font-size: 11px; color: var(--faint); }
 /* 动作行（照 ZCode 活动流）：一行一个动作，正文点开才出现，不缩进、整幅铺开 */
 .wd-act { margin-top: 1px; }
 .wd-act-h { display: flex; align-items: center; gap: 7px; padding: 8px 0; cursor: pointer; font-size: 13px; }
@@ -901,12 +928,37 @@ tr:hover td { background: var(--row-hover); }
 .wd-act-h .add { font-size: 12px; color: var(--ok); }
 .wd-act-h .del { font-size: 12px; color: var(--err); }
 .wd-act-h .wd-chev { flex: none; }
-/* 展开的正文：执行类是带边框的代码卡片，思考是灰底纯文本面板 */
+/* 展开的正文：执行类是带边框的代码卡片，思考是同一套面板（同字号、同底色、同描边），
+   只是正文按普通段落排；不要把思考做成更大更亮的另一块，观感会和工具结果打架 */
 .wd-act-b { margin: 2px 0 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 12px; line-height: 1.65; color: var(--code-text-dim, var(--dim)); white-space: pre-wrap; word-break: break-word; }
-.wd-act-t { margin: 2px 0 10px; padding: 12px 14px; border-radius: 10px; background: var(--bg-hover); font-size: 13px; line-height: 1.7; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
-/* loop 头：这一段跑了多久 */
-.wd-loop { margin-top: 10px; }
-.wd-loop-h { font-size: 12px; color: var(--faint); margin: 12px 0 2px; }
+/* 思考正文与工具输出同款：12px、等宽（.wd-act-b 是 pre + mono），只有行高/文字色略作区分 */
+.wd-act-t { margin: 2px 0 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+/* 步骤正文的展开/收起：照会话左栏分组那套开窗动效——窗口高度滑动。
+   收起时正文留在 0 高度里，收起才能也是滑动而不是瞬间消失。
+   注意：这里不要挂渐变蒙版（2026-10-22 用户明令），展开过程中底部要保持清晰 */
+.wd-fold { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .28s var(--ease-out); }
+.wd-fold.open { grid-template-rows: 1fr; transition-duration: .25s; }
+.wd-fold-inner { overflow: hidden; min-height: 0; }
+/* 运行中的转圈：一段 270° 圆弧匀速转（ZCode 的 loader 语义；reduced-motion 由全局规则兜底） */
+.wd-spin { display: inline-flex; color: var(--text); animation: wd-spin 1s linear infinite; }
+@keyframes wd-spin { to { transform: rotate(360deg); } }
+/* 思考行收起态的摘要：ZCode 的扫光字（运行中才扫，跑完就静止成普通灰字） */
+.wd-act.running .lbl,
+.wd-act.running .sb { color: var(--dim); }
+/* 运行中的动作词（「浏览器」「终端」…）：白色扫光；结果回来 running 消失，自动恢复普通灰 */
+.wd-act.running .lbl {
+  background: linear-gradient(90deg, var(--faint) 0%, var(--faint) 34%, var(--text) 50%, var(--faint) 66%, var(--faint) 100%);
+  background-size: 300% 100%; background-clip: text; -webkit-background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: wd-shimmer 2.4s linear infinite;
+}
+.wd-act .sb.wd-think-sum {
+  background: linear-gradient(90deg, var(--faint) 0%, var(--faint) 34%, var(--text) 50%, var(--faint) 66%, var(--faint) 100%);
+  background-size: 300% 100%; background-clip: text; -webkit-background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+}
+.wd-act.running .sb.wd-think-sum { animation: wd-shimmer 2.4s linear infinite; }
+@keyframes wd-shimmer { 0% { background-position: 100% 0; } 50% { background-position: 0 0; } 100% { background-position: 0 0; } }
 .wd-chev { display: inline-flex; color: var(--faint); transform: rotate(-90deg); transition: transform var(--dur-fast) var(--ease-out); }
 /* 图标本体朝下，所以静息转 -90° 读作 ">"，展开回正读作 "v" */
 .wd-act.open .wd-chev { transform: rotate(0deg); }
@@ -915,6 +967,39 @@ tr:hover td { background: var(--row-hover); }
 .wd-final .lbl { font-size: 11px; color: var(--faint); margin-bottom: 5px; }
 .wd-final.err { border-color: color-mix(in srgb, var(--danger, #e5484d) 40%, transparent); }
 .wd-answer { margin-top: 14px; font-size: 13px; line-height: 1.7; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+
+/* ---------------- 工作页（详情照 ZCode workbench：状态头 + 活动脊线 + 结论/产物卡） ---------------- */
+.wk-detail { padding-bottom: 30px; }
+.wk-meta { margin: -6px 0 14px; flex-wrap: wrap; gap: 6px; }
+.wk-state.run { color: var(--text); border-color: var(--brand); }
+.wk-state.ask { color: var(--warn); border-color: rgba(226, 185, 59, .45); }
+.wk-state.err { color: var(--err); border-color: rgba(255, 107, 97, .45); }
+.wk-state.ok { color: var(--ok); border-color: rgba(16, 163, 127, .45); }
+.wk-task { padding: 12px 14px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.wk-task-t { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.wk-task-m { margin-top: 6px; font-size: 11.5px; color: var(--faint); }
+/* 活动脊线：一条竖轨从行首图标中间穿过 */
+.wk-spine { position: relative; padding-top: 2px; margin-top: 12px; }
+.wk-spine::before { content: ''; position: absolute; left: 7px; top: 8px; bottom: 8px; width: 1px; background: var(--border-stronger); }
+.wk-spine .wd-act-h .ic { position: relative; z-index: 1; background: var(--surface-2); }
+/* 展开的正文卡片从竖轨右侧起排：否则卡片左缘正好压在竖轨上（截图里像线和框粘在一起） */
+.wk-spine .wd-act-b, .wk-spine .wd-act-t { margin-left: 22px; }
+.wk-wait { padding: 14px 0; font-size: 12.5px; color: var(--faint); }
+.wk-callout { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.wk-callout.ask { border-color: rgba(226, 185, 59, .45); }
+.wk-callout.err { border-color: rgba(255, 107, 97, .45); }
+.wk-callout-h { font-size: 11px; letter-spacing: .06em; color: var(--faint); margin-bottom: 6px; }
+.wk-callout-b { font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.wk-callout-note { margin: 8px 0 0; padding: 10px 12px; border-radius: 9px; background: var(--bg-hover);
+  font-size: 12px; line-height: 1.65; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+/* 结论/备注不做卡片：用户明确要求就是正常正文，不要底色、描边、灰色标签与粗体标题 */
+.wk-answer { margin-top: 14px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.wk-answer .md-h { font-weight: 400; color: inherit; margin: 0; }
+.wk-artifacts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.wk-artifact { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 10px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--dim); font-size: 12px; }
+.wk-artifact:hover { border-color: var(--border-stronger); color: var(--text); }
+.wk-artifact .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 顶栏「工作」按钮选中态（与主题按钮同款胶囊） */
 .icon-chip.on { background: var(--bg-active); border-color: var(--border-stronger); color: var(--text); }
@@ -959,8 +1044,14 @@ tr:hover td { background: var(--row-hover); }
    模型设置页（左供应商列表 + 右详情 + 弹窗；字号跟项目其余页面同尺度）
    ============================================================ */
 .mset-body { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--radius-card);
-  background: var(--surface-2); overflow: hidden; min-height: calc(100vh - 132px); }
-.mset-list { width: 210px; flex: none; border-right: 1px solid var(--border); padding: 10px 10px 14px; overflow-y: auto; }
+  background: var(--surface-2); overflow: hidden; height: calc(100vh - 132px); min-height: 360px; }
+/* 左栏自己滚动（不再把整页撑长）：上下留出渐变淡出带，内容滚到边缘时化开。
+   padding 正好盖住两端，静止时淡出的只是留白，第一行/最后一行不会被吃掉。 */
+.mset-list { width: 210px; flex: none; min-height: 0; border-right: 1px solid var(--border); padding: 10px 10px 14px; overflow-y: auto;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 10px, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 0, #000 10px, #000 calc(100% - 14px), transparent 100%);
+  -webkit-mask-size: 100% 100%; mask-size: 100% 100%;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat; }
 .mset-group + .mset-group { margin-top: 6px; }
 .mset-group-t { font-size: 11.5px; color: var(--faint); padding: 9px 8px 5px; }
 .mset-group-e { font-size: 11.5px; color: var(--faint); padding: 4px 8px 6px; }
@@ -971,15 +1062,29 @@ tr:hover td { background: var(--row-hover); }
 /* 选中：描边卡片（参考稿手法，不用实心填充——列表里要压住 hover 又不抢详情区的注意力） */
 .mset-item.sel { border-color: var(--border-stronger); background: var(--surface); }
 .mset-item-ic { display: inline-flex; width: 15px; height: 15px; flex: none; color: var(--text); }
-.mset-item-nm { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mset-item-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+.mset-item-nm .tt { display: inline-block; white-space: nowrap; transition: transform .34s var(--ease-out); }
+/* 与会话左栏同一套：放不下不打点，右端渐隐；悬停/选中整行来回滚 */
+.mset-item-nm.ovf { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - var(--nm-fade, 24px)), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 calc(100% - var(--nm-fade, 24px)), transparent 100%); }
+.mset-item:hover .mset-item-nm.ovf,
+.mset-item.sel .mset-item-nm.ovf,
+.mset-item.on .mset-item-nm.ovf {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 var(--nm-fade-l, 14px), #000 calc(100% - var(--nm-fade, 24px)), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 var(--nm-fade-l, 14px), #000 calc(100% - var(--nm-fade, 24px)), transparent 100%); }
+.mset-item:hover .mset-item-nm.ovf .tt,
+.mset-item.sel .mset-item-nm.ovf .tt,
+.mset-item.on .mset-item-nm.ovf .tt { animation: nm-scroll var(--nm-dur, 3s) ease-in-out .18s infinite alternate; }
 .mset-item .dot { margin-left: auto; }
 .mset-dot-off { background: var(--border-stronger); }
 
-.mset-detail { flex: 1; min-width: 0; padding: 16px 18px 22px; overflow-x: hidden; }
+.mset-detail { flex: 1; min-width: 0; min-height: 0; padding: 16px 18px 22px; overflow-x: hidden; overflow-y: auto; }
 .mset-empty { color: var(--faint); font-size: 13px; line-height: 1.7; padding: 30px 8px; }
 .mset-dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; }
 .mset-dic { display: inline-flex; width: 17px; height: 17px; flex: none; color: var(--text); }
 .mset-dtitle { font-size: 15px; font-weight: 600; }
+/* 工作页的标题是任务首行（可能很长）：让它自己截断，别把右侧状态挤出去 */
+.wk-detail > .mset-dhead > .mset-dtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mset-dright { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
 
 .mset-field { margin-bottom: 14px; }
@@ -1270,9 +1375,16 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .chain-add { margin-left: auto; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: 6px; background: transparent; color: var(--faint); cursor: pointer; padding: 0; }
 .chain-add:hover { background: transparent; color: var(--text); }
+/* 思考强度：窄左栏里用一排小胶囊，别用会溢出左栏的下拉（.mset-list 有 overflow 裁剪） */
+.chain-reason { display: flex; align-items: center; gap: 6px; padding: 1px 8px 6px; font-size: 11px; color: var(--faint); }
+.chain-reason > span:first-child { flex: none; }
+.chain-reason .mset-chips { gap: 3px; flex-wrap: wrap; }
+.chain-reason .mset-chip { padding: 3px 6px; font-size: 11px; border-radius: 7px; }
 .mset-badge-rank { background: var(--seg-active, var(--seg-bg)); color: var(--text); }
 .chain-item { cursor: grab; user-select: none; }
 .chain-item.on { background: var(--surface); border-color: var(--border-stronger); }
+.chain-cur { flex: none; padding: 0 5px; border: 1px solid var(--border-stronger); border-radius: 999px;
+  color: var(--dim); font-size: 10.5px; line-height: 16px; }
 .chain-item.dragging { opacity: .45; cursor: grabbing; }
 .chain-item.over { box-shadow: inset 0 2px 0 0 var(--text); }
 .mset-grip { display: inline-flex; flex: none; color: var(--faint); transition: color var(--dur-fast) var(--ease-out); }
@@ -1316,15 +1428,9 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .sb-image { display: block; max-width: 100%; max-height: 58vh; margin: 0 auto;
   border: 1px solid var(--border); border-radius: 10px; }
 
-/* 工作页：任务行 */
-.wk-live { border-left: 2px solid var(--text); padding-left: 10px; margin-bottom: 14px; }
-.wk-steps { margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px;
-  font-size: 11.5px; line-height: 1.55; color: var(--dim); max-height: 220px; overflow: auto; white-space: pre-wrap; }
-.wk-task { font-size: 13px; line-height: 1.6; margin-bottom: 6px; }
-
 @media (max-width: 900px) {
-  .mset-body { flex-direction: column; min-height: 0; }
-  .mset-list { width: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+  .mset-body { flex-direction: column; height: auto; min-height: 0; }
+  .mset-list { width: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--border); }
   .mset-proto { grid-template-columns: 1fr; }
   .plg-crow { align-items: flex-start; flex-direction: column; gap: 6px; }
 }

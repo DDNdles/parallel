@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 设置：左分节导航（QQ 接入 / 模型 / 搜索 / 风控 / 拟人化 / 记忆）+ 右表单；协议端选择与可用性检测都在「QQ 接入」里 */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, post, fmtTime } from '@/lib/api';
@@ -33,6 +34,8 @@ interface Humanlike {
   jargon?: { enable: boolean };
   /** 表达学习：学群友「什么情境下怎么说」，作为语气参考注入 */
   expression?: { enable: boolean };
+  /** 戳一戳（chat 工具）：开关 + 冷却 / 小时上限 */
+  poke: { enable?: boolean; minIntervalSeconds: number; maxPerHour: number };
   /** 重复惩罚：最近多轮反复出现的词/人设名 → 提醒 + 一次重写 */
   repetition?: {
     enable: boolean; windowMessages: number; minMessages: number; cooldownMinutes: number;
@@ -246,7 +249,7 @@ export default function SettingsPage() {
             {SECTIONS.map((s) => (
               <button key={s.v} className={'mset-item' + (s.v === sec ? ' sel' : '')} onClick={() => setSec(s.v)}>
                 <span className="mset-item-ic"><Icon name={s.icon} size={15} /></span>
-                <span className="mset-item-nm">{s.t}</span>
+                <FadeName text={s.t} />
               </button>
             ))}
           </div>
@@ -450,7 +453,7 @@ export default function SettingsPage() {
             </>
           )}
 
-          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
+          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-field">
@@ -622,6 +625,20 @@ export default function SettingsPage() {
                   <span className="mset-macts"><Switch on={h.agency.enable}
                     onChange={() => patchH({ agency: { ...h.agency, enable: !h.agency.enable } }, true)} /></span>
                 </div>
+              </div>
+              <div className="mset-sec-h"><span>戳一戳</span></div>
+              <div className="mset-models">
+                <div className="mset-mrow">
+                  <span className="plg-v">允许在聊天里戳人<Hint text="QQ 双击头像；只在有明确对象时由她自己判断要不要戳" /></span>
+                  <span className="mset-macts"><Switch on={h.poke.enable !== false}
+                    onChange={() => patchH({ poke: { ...h.poke, enable: !(h.poke.enable !== false) } }, true)} /></span>
+                </div>
+              </div>
+              <div className="set-grid" style={{ marginTop: 14 }}>
+                <Num label="两次戳的最小间隔（秒）" value={h.poke.minIntervalSeconds}
+                  onChange={(v) => patchH({ poke: { ...h.poke, minIntervalSeconds: v } })} />
+                <Num label="每小时最多戳几次（0=不限）" value={h.poke.maxPerHour}
+                  onChange={(v) => patchH({ poke: { ...h.poke, maxPerHour: v } })} />
               </div>
               <div className="mset-field" style={{ marginTop: 14 }}>
                 <label className="mset-flabel">节奏反定型档位</label>

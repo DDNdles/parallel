@@ -492,6 +492,8 @@ export function setup(ctx: PluginContext): void {
   const WRITE_MAX = 1;
   const overWriteQuota = (n: number) => n > WRITE_MAX
     ? '（这一轮已经写过一条演化了，别再写；把该说的话继续说完。）' : '';
+  /** 戳一戳的会话内节流（进程内存，重启清零）：只做硬护栏，正不正常由模型按语境判断 */
+  const pokeHits = new Map<string, number[]>();
 
   ctx.llm.registerTool({
     name: 'recall_facts',
@@ -552,6 +554,50 @@ export function setup(ctx: PluginContext): void {
       // 每条截 200 字：50 条 × 200 字封顶，别让一次翻旧账把上下文顶爆
       return `找到 ${hits.length} 条相关消息：\n` +
         hits.map((h) => `- [${fmt(h.ts)}] ${h.role === 'user' ? (h.nickname || '用户') : '我'}：${h.text.slice(0, 200)}`).join('\n');
+    },
+  });
+
+  // 戳一戳（QQ 双击头像）：不是所有说话都要戳，是有明确指向/犯贱时的社交动作。
+  // 指向性靠模型自己判断（它看得到「昵称：正文」与 @）；内核只做冷却与小时上限的硬护栏。
+  ctx.llm.registerTool({
+    name: 'poke',
+    description: '戳一戳对方（QQ 里双击头像那个动作）。明确对着某个人说话、想吐槽/催/撒娇/犯贱时用；只是聊到某人、没有指向性时不要用。',
+    surface: 'chat',
+    promptSnippet: '戳一戳对方（QQ 双击头像）',
+    promptGuidelines: [
+      '只在有明确对象时戳：对方正在跟你说（点名、接你的话、@你）而你恰好想吐槽/催/撒娇/犯贱；不要在闲聊里随机戳人。',
+      'target 填对方 QQ 号或最近说话人的昵称；私聊可以省略（默认对面）。一次回复最多戳一次，别连着戳同一个人。',
+      '戳完不用在正文里描述这个动作，正常把话说完；对方没惹你也别拿它当打招呼。',
+    ],
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: '对方 QQ 号或最近说话人的昵称；私聊省略 = 对面' },
+      },
+    },
+    handler: async (args, tctx) => {
+      const cfg = ((ctx.config as Record<string, any>)?.humanlike?.poke ?? {}) as {
+        enable?: boolean; minIntervalSeconds?: number; maxPerHour?: number;
+      };
+      if (cfg.enable === false) return '（戳一戳现在关着，别调用；用你自己的语气继续。）';
+      const key = `${tctx.chat.type}_${tctx.chat.chatId}`;
+      const now = Date.now();
+      const hits = (pokeHits.get(key) ?? []).filter((t) => now - t < 3600_000);
+      const minGap = Math.max(0, Number(cfg.minIntervalSeconds ?? 30)) * 1000;
+      if (minGap && hits.length && now - hits[hits.length - 1] < minGap) {
+        return '（刚戳过，最小间隔还没到；这一轮别戳，正常接话。）';
+      }
+      const max = Math.max(0, Number(cfg.maxPerHour ?? 6));
+      if (max && hits.length >= max) return '（这一小时戳得够多了；别再戳，正常接话。）';
+      try {
+        const r = await ctx.chat.poke(tctx.chat, String(args.target ?? '').trim() || undefined);
+        hits.push(now);
+        pokeHits.set(key, hits);
+        return `（已戳了戳 ${r.nickname || r.userId}。这一轮别再戳同一个人；正文里不用描述这个动作。）`;
+      } catch (e) {
+        // 错误只回给模型（别让它转述给用户）：戳不成就正常说话
+        return `（没戳成：${(e as Error).message}。不要向对方提这个错误，接着正常说话。）`;
+      }
     },
   });
 

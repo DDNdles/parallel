@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, before, after } from 'node:test';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -320,4 +320,83 @@ test('prepareMedia：Gemini 档的视频只有本机路径时如实报「不代�
   const m = await prepareMedia({ api: 'google-generative-ai', attachments: [{ kind: 'video', path: 'D:\\x\\nope.mp4' }] });
   assert.equal(m.video, undefined);
   assert.ok(m.skipped.some((s) => s.includes('Gemini')), `实际：${m.skipped.join('；')}`);
+});
+
+// ============================================================
+// 动图：图片块只认静态图，先在本机摊成分帧拼图
+// ============================================================
+
+/** 两帧 1×1 GIF（红/蓝）：够 ffmpeg 认成 2 帧动图，又不依赖本机造图 */
+const TINY_GIF = Buffer.from(
+  'R0lGODlhAQABAIAAAP8AAAAA/yH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAQABAAACAkQBACH5BAAKAAAALAAAAAABAAEAAAICTAEAOw==',
+  'base64',
+);
+
+test('动图识别：GIF 多帧/单帧、PNG、WEBP 按内容判断，不信扩展名', async () => {
+  const { isAnimatedImage } = await import('../src/kernel/services/media.ts');
+  assert.equal(isAnimatedImage(TINY_GIF), true, '两帧 GIF 是动图');
+  // 同一份 GIF 在第二个 GCE（0x21 0xF9）处截断并补结束符：只剩一帧，是静态图
+  const second = TINY_GIF.indexOf(Buffer.from([0x21, 0xf9]), 1);
+  assert.ok(second > 0, '样例 GIF 里要有第二个帧控制块');
+  const staticGif = Buffer.concat([TINY_GIF.subarray(0, second), Buffer.from([0x3b])]);
+  assert.equal(isAnimatedImage(staticGif), false, '单帧 GIF 按静态图走');
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082', 'hex');
+  assert.equal(isAnimatedImage(png), false, '普通 PNG 不是动图');
+  // APNG：PNG 头 + acTL 块
+  const apng = Buffer.concat([png.subarray(0, 8), Buffer.from('0000000848544d4c', 'hex'), Buffer.from('acTL', 'latin1'), png.subarray(8)]);
+  assert.equal(isAnimatedImage(apng), true, '带 acTL 的 PNG 是 APNG');
+  const webp = Buffer.concat([Buffer.from('RIFF', 'latin1'), Buffer.alloc(4), Buffer.from('WEBPVP8X', 'latin1'), Buffer.from('ANIM', 'latin1'), Buffer.alloc(32)]);
+  assert.equal(isAnimatedImage(webp), true, '带 ANIM 块的 WebP 是动图');
+  const stillWebp = Buffer.concat([Buffer.from('RIFF', 'latin1'), Buffer.alloc(4), Buffer.from('WEBPVP8X', 'latin1'), Buffer.alloc(32)]);
+  assert.equal(isAnimatedImage(stillWebp), false, '静态 WebP 不是动图');
+});
+
+test('动图进模型：请求里是 JPEG 分帧拼图 + 一句排版说明，不是原始 GIF', async () => {
+  const { setFfmpegCandidate } = await import('../src/kernel/services/media.ts');
+  // 测试的 dataDir 是临时目录、PATH 里也没有 ffmpeg：指向项目自带的那份（没有就跳过这条）
+  const bundled = join(process.cwd(), 'data', 'bin', 'ffmpeg.exe');
+  if (!existsSync(bundled)) return;
+  setFfmpegCandidate(bundled);
+  reset();
+  const gif = join(dataDir, 'anim.gif');
+  writeFileSync(gif, TINY_GIF);
+
+  await llm.chat({
+    model: '',
+    messages: [{ role: 'user', content: '看看这个表情' }],
+    attachments: [{ kind: 'image', path: gif, name: 'anim.gif', mime: 'image/gif' }],
+  } as any, {});
+
+  const body = bodies[bodies.length - 1];
+  const last = [...body.messages].reverse().find((m: any) => m.role === 'user');
+  const blocks = last.content as any[];
+  const img = blocks.find((c) => c.type === 'image_url');
+  assert.ok(img, `图片块要在：${JSON.stringify(blocks.map((b) => b?.type))}`);
+  assert.match(String(img.image_url?.url ?? ''), /^data:image\/jpeg;base64,/, '动图要换成分帧拼图（JPEG）');
+  assert.ok(!String(img.image_url?.url ?? '').startsWith('data:image/gif'), '原始 GIF 不该原样送出去（对端只取首帧）');
+  const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('\n');
+  assert.match(text, /动图/, '要告诉模型这是动图的分帧，不是多张不同的图');
+  assert.match(text, /不是多张不同的图/, `实际正文：${text}`);
+});
+
+test('静态图不受影响：仍是原样 base64，也不加动图说明', async () => {
+  reset();
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082', 'hex');
+  const f = join(dataDir, 'still.png');
+  writeFileSync(f, png);
+
+  await llm.chat({
+    model: '',
+    messages: [{ role: 'user', content: '看看这张' }],
+    attachments: [{ kind: 'image', path: f, name: 'still.png', mime: 'image/png' }],
+  } as any, {});
+
+  const body = bodies[bodies.length - 1];
+  const last = [...body.messages].reverse().find((m: any) => m.role === 'user');
+  const blocks = last.content as any[];
+  const img = blocks.find((c) => c.type === 'image_url');
+  assert.ok(img);
+  assert.equal(img.image_url?.url, `data:image/png;base64,${png.toString('base64')}`, '静态图一个字节都不该被改写');
+  const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('\n');
+  assert.ok(!text.includes('动图'), `静态图不该有动图说明：${text}`);
 });

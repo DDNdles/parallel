@@ -30,7 +30,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import type { ChatMessage, LLMChatRequest, LLMResponse, LLMUsage, MessageAttachment, ToolCall, ToolDef } from '../types.ts';
-import { fetchBuffer, findFfmpeg, toWavFile } from './media.ts';
+import { fetchBuffer, findFfmpeg, toWavFile, isAnimatedImage, animatedToSheetFile, animatedSheetNote } from './media.ts';
 
 export type PiProtocol = 'openai-compatible' | 'openai-responses' | 'anthropic' | 'gemini';
 
@@ -108,8 +108,8 @@ export interface PiChatOptions {
   protocol: PiProtocol;
   baseUrl: string;
   apiKey: string;
-  /** 模型元数据（连 pi-ai 的 Model 需要 contextWindow / maxTokens / 是否支持图片） */
-  model: { id: string; contextWindow?: number; maxTokens?: number; image?: boolean };
+  /** 模型元数据（连 pi-ai 的 Model 需要 contextWindow / maxTokens / 是否支持图片 / 是否推理模型） */
+  model: { id: string; contextWindow?: number; maxTokens?: number; image?: boolean; reasoning?: boolean };
   req: LLMChatRequest;
   onDelta?: (d: { text?: string; toolCall?: Partial<ToolCall> & { index: number } }) => void;
   log?: PiCheapLog;
@@ -120,7 +120,7 @@ export interface PiChatOptions {
 /** 从 parallel 的供应商配置造一份 pi-ai Model（走链的流函数与直连都复用它） */
 export async function piModelFor(o: {
   providerId: string; protocol: PiProtocol; engineApi?: string;
-  baseUrl: string; model: { id: string; contextWindow?: number; maxTokens?: number; image?: boolean };
+  baseUrl: string; model: { id: string; contextWindow?: number; maxTokens?: number; image?: boolean; reasoning?: boolean };
 }): Promise<any> {
   const pie = await loadPiAi();
   if (!pie) throw new PiNotInstalledError(NOT_INSTALLED);
@@ -149,7 +149,7 @@ function toPiModel(pie: any, o: PiChatOptions, api: string): any {
     api,
     provider: o.providerId,
     baseUrl: providerBaseUrl(o.protocol, o.baseUrl),
-    reasoning: false,
+    reasoning: !!o.model.reasoning,
     input: o.model.image ? ['text', 'image'] : ['text'],
     // 单价全 0：parallel 的模型页不维护单价，账单由 usage 自己算，不假装知道价钱
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -168,15 +168,19 @@ function toPiModel(pie: any, o: PiChatOptions, api: string): any {
  *  其中的**图片**在这里读成 pi-ai 原生的 ImageContent 块、PREPEND 到该条 content 最前——
  *  每张图长在它当时那条消息上，模型才知道"哪句话配的哪张图"。
  *  音频/视频没有 pi-ai 的 content 块可放，由调用方收起来走 onPayload（见 chainStreamFn 与 injectMedia）。
- *  时间戳取消息自带的 `ts`（上下文时间窗筛的也是同一个值），老条目没有 ts 才盖 now。 */
+ *  时间戳取消息自带的 `ts`（上下文时间窗筛的也是同一个值），老条目没有 ts 才盖 now。
+ *
+ *  动图在那一步摊成分帧拼图（见 loadImages），并把一句排版说明补在该条正文后面——
+ *  不说明的话模型会把九宫格读成"九张不同的图"，把动作理解成并列。 */
 export async function toPiMessages(
   messages: ChatMessage[],
   model: { id: string; provider: string },
   api: string,
   opt?: { attachmentsFor?: (i: number) => MessageAttachment[] | undefined },
-): Promise<{ messages: any[]; extraSystem: string; failedImages: number }> {
+): Promise<{ messages: any[]; extraSystem: string; failedImages: number; imageWarnings: string[] }> {
   const out: any[] = [];
   const lifted: string[] = [];
+  const imageWarnings: string[] = [];
   let failedImages = 0;
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
@@ -186,13 +190,17 @@ export async function toPiMessages(
     }
     if (m.role === 'user') {
       const images: any[] = [];
+      const notes: string[] = [];
       const own = opt?.attachmentsFor?.(i);
       if (own?.length) {
         const loaded = await loadImages(own);
         images.push(...loaded.images);
+        notes.push(...loaded.notes);
+        imageWarnings.push(...loaded.warnings);
         failedImages += loaded.failed;
       }
-      out.push({ role: 'user', content: [...images, { type: 'text', text: m.content }], timestamp: m.ts ?? Date.now() });
+      const text = [m.content, ...notes].filter((s) => s && String(s).trim()).join('\n');
+      out.push({ role: 'user', content: [...images, { type: 'text', text }], timestamp: m.ts ?? Date.now() });
       continue;
     }
     if (m.role === 'tool') {
@@ -230,20 +238,43 @@ export async function toPiMessages(
       timestamp: m.ts ?? Date.now(),
     });
   }
-  return { messages: out, extraSystem: lifted.join('\n\n'), failedImages };
+  return { messages: out, extraSystem: lifted.join('\n\n'), failedImages, imageWarnings };
 }
 
-/** 图片附件 → pi-ai 的 ImageContent；data URL 拆成 base64 + mimeType。读不动的记一条待报。 */
-async function loadImages(attachments: LLMChatRequest['attachments']): Promise<{ images: any[]; failed: number }> {
+/** 图片附件 → pi-ai 的 ImageContent；data URL 拆成 base64 + mimeType。读不动的记一条待报。
+ *
+ *  **动图（GIF/APNG/动态 WebP）先在本机摊成分帧拼图**：三家线格式的图片块都只认静态图
+ *  （OpenAI 只取首帧、Anthropic 拒收动图、Gemini 只读首帧），原样塞过去等于只看得到第一帧。
+ *  抽帧失败不静默丢：退回原图（至少还有首帧），原因进 `notes` 由调用方报掉。 */
+async function loadImages(
+  attachments: LLMChatRequest['attachments'],
+): Promise<{ images: any[]; failed: number; notes: string[]; warnings: string[] }> {
   const images: any[] = [];
+  const notes: string[] = [];
+  const warnings: string[] = [];
   let failed = 0;
   for (const a of attachments ?? []) {
     if (a.kind !== 'image') continue;
-    const b64 = await loadBase64(a);
-    if (b64) images.push({ type: 'image', data: b64, mimeType: a.mime ?? 'image/png' });
-    else failed++;
+    const buf = await loadBuffer(a);
+    if (!buf) { failed++; continue; }
+    if (isAnimatedImage(buf)) {
+      try {
+        const sheet = await animatedToSheetFile(buf);
+        // 只解出一帧（误判/单帧动图）：摊开没有意义，按原图送、不加说明
+        if (sheet.total > 1) {
+          images.push({ type: 'image', data: sheet.jpeg.toString('base64'), mimeType: 'image/jpeg' });
+          notes.push(animatedSheetNote(sheet));
+          continue;
+        }
+      } catch (e) {
+        const why = `一张动图没摊成分帧拼图（${(e as Error).message}），只能按第一帧看`;
+        notes.push(why);
+        warnings.push(why);
+      }
+    }
+    images.push({ type: 'image', data: buf.toString('base64'), mimeType: a.mime ?? 'image/png' });
   }
-  return { images, failed };
+  return { images, failed, notes, warnings };
 }
 
 /** 把一条附件读成 Buffer：先试本机路径，读不动再按 url 取（沙箱收件可能被保留期清掉，那份 URL 还在） */
@@ -275,17 +306,26 @@ function audioFormatOf(mime: string): 'wav' | 'mp3' | undefined {
  * 「最后一条 user」就是本轮真人那句：人格插件的设定由 toPiMessages 摘进 system，不再占 user 轮，
  * 所以图片与 injectMedia 补进去的音视频块都落在同一条真人消息上。
  * 只有插件直连（chatViaPiAi）走这条路；agent loop 主链路的图由 toPiMessages 的 attachmentsFor 按消息归位。
+ * `notes`：动图拼图的排版说明，补在该条正文后面（与 toPiMessages 同一口径）。
  */
-export function withImages(messages: any[], images: any[]): any[] {
+export function withImages(messages: any[], images: any[], notes: string[] = []): any[] {
   const i = messages.map((m: any) => m?.role).lastIndexOf('user');
   if (i < 0 || !images.length) return messages;
   const m = messages[i];
-  const content = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
+  const content = Array.isArray(m.content) ? [...m.content] : [{ type: 'text', text: String(m.content ?? '') }];
+  if (notes.length) {
+    // 正文块在最后（调用方都按"图在前、正文在后"排），说明接在正文块上
+    const last = content[content.length - 1];
+    if (last?.type === 'text') content[content.length - 1] = { ...last, text: `${last.text}\n${notes.join('\n')}` };
+    else content.push({ type: 'text', text: notes.join('\n') });
+  }
   return [...messages.slice(0, i), { ...m, content: [...images, ...content] }, ...messages.slice(i + 1)];
 }
 
 export interface PreparedMedia {
   images: any[];
+  /** 动图拼图的排版说明（模型要知道这是连续动作的分帧，不是多张不同的图） */
+  imageNotes: string[];
   /** 音频块（按各家线格式成形，见 audioBlock）——**数组**：窗口内可能带多条语音，逐条送 */
   audios: Record<string, unknown>[];
   /** 视频块（见下面的视频口径）——同上，逐条送 */
@@ -333,13 +373,13 @@ async function loadVideoInline(a: MessageAttachment): Promise<{ b64: string; mim
  * `api` 决定能补哪些：Anthropic Messages 两者都没有块，直接进 skipped。
  */
 export async function prepareMedia(o: { attachments?: MessageAttachment[]; api: string }): Promise<PreparedMedia> {
-  const { images, failed } = await loadImages(o.attachments);
-  const skipped: string[] = [];
+  const { images, failed, warnings, notes } = await loadImages(o.attachments);
+  const skipped: string[] = [...warnings];
   if (failed) skipped.push(`${failed} 张图片读不动（路径/URL 取不到）`);
 
   const audios = (o.attachments ?? []).filter((a) => a.kind === 'audio');
   const videos = (o.attachments ?? []).filter((a) => a.kind === 'video');
-  const out: PreparedMedia = { images, audios: [], videos: [], skipped };
+  const out: PreparedMedia = { images, imageNotes: notes, audios: [], videos: [], skipped };
   const done = (): PreparedMedia => {
     // 兼容别名：等于数组第一条（老调用方只认单块）。多条的场合下它只是"第一条"，别拿它当全部。
     if (out.audios[0]) out.audio = out.audios[0];
@@ -536,7 +576,7 @@ export async function chatViaPiAi(o: PiChatOptions): Promise<LLMResponse> {
         }))
       : undefined,
   };
-  if (media.images.length) context.messages = withImages(context.messages, media.images);
+  if (media.images.length) context.messages = withImages(context.messages, media.images, media.imageNotes);
 
   let text = '';
   const toolCalls: ToolCall[] = [];
@@ -546,6 +586,7 @@ export async function chatViaPiAi(o: PiChatOptions): Promise<LLMResponse> {
     apiKey: o.apiKey || undefined,
     signal: o.req.signal,
     maxTokens: o.req.maxTokens,
+    reasoning: (o.req.reasoning || undefined) as never,
     // 音频/视频：pi-ai 的 content 块里没有这两类，在它组好请求体之后补进去
     onPayload: (payload: unknown) => injectMedia(payload, meta.api, media),
   });

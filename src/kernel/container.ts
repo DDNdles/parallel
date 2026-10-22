@@ -2,8 +2,8 @@ import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import type {
-  CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext, WorkDelegateInput, GatedHumanlike,
-  LLMRequestContext, WorkAgentDef,
+  CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext,
+  WorkDelegateInput, WorkDispatchInput, GatedHumanlike, LLMRequestContext, WorkAgentDef,
 } from './types.ts';
 import type { Db } from './db.ts';
 import type { Bus } from './bus.ts';
@@ -22,6 +22,7 @@ import type { Scheduler } from './scheduler.ts';
 import type { Logger } from './types.ts';
 import { McpStdioClient } from './services/mcp.ts';
 import { resolveWorkAgent, discoverWorkAgents, resolveWorkAgentByName, ENTRY_AGENT_NAME } from './work-agent.ts';
+import { composeContinueTask } from './work-prompt.ts';
 import { atomicWriteJson, readJson } from './util/fsutil.ts';
 import { newId, nowMs } from './util/misc.ts';
 
@@ -736,10 +737,10 @@ function makeGatedSandbox(manifest: PluginManifest, deps: { sandbox: SandboxServ
       can('sandbox.exec');
       return deps.sandbox.run(chat, o);
     },
-    // work 档：powershell/bash + work 配额。此前漏了这一项，导致 work 插件的 run_bash /
-    // run_powershell / run_python_work 三个工具恒不注册（typeof sb.runAny === 'function' 永假），
+    // work 档：bash + work 配额。此前漏了这一项，导致 work 插件的 run_bash /
+    // run_python_work 两个工具恒不注册（typeof sb.runAny === 'function' 永假），
     // 而 prompt 里还在教模型用它们——工具面与 prompt 漂移的典型。
-    runAny: (chat: ChatRef, o: { language: 'python' | 'javascript' | 'powershell' | 'bash'; code: string; timeoutMs?: number; work?: boolean }) => {
+    runAny: (chat: ChatRef, o: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }) => {
       can('sandbox.exec');
       return deps.sandbox.runAny(chat, o);
     },
@@ -777,7 +778,7 @@ function makeGatedSession(manifest: PluginManifest, deps: { session: SessionCont
  */
 /**
  * work 委派门控：需 work.delegate 权限。
- * 「work 模型 → 子代理」的桥（管理员 /work 也走同一条）：
+ * 「work 模型 → 子代理」的桥（chat 工具派活也走同一条）：
  * 调用方给出目标 agent 名与任务，内核按该 agent 的定义筛工具面、组装具名分节 system，
  * 跑一个**隔离上下文**的 agent loop，返回结论供上层继续（子代理结果回给父代理，或由 chat 转述）。
  */
@@ -795,6 +796,7 @@ function makeGatedWork(
     modelLabel: () => deps.work.workModelLabel(),
     agents: () => plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
     list: (limit?: number) => deps.work.list(limit ?? 30),
+    latestArtifacts: (chatKey: string, userId?: string) => deps.work.latestArtifacts(chatKey, userId),
     delegate: async (input: WorkDelegateInput) => {
       can();
       const depth = input.depth ?? 0;
@@ -824,6 +826,43 @@ function makeGatedWork(
         abort: input.abort,
       });
     },
+
+    /**
+     * chat 面派活：**立即返回**，活由 WorkRunner 在后台跑。
+     * 上一次停下来提问的现场还没过期时，这次的话就是那个问题的回答（自动拼成续接任务）。
+     * 完成/出错由 WorkRunner 发 work.done / work.error，pipeline 再另起一轮人格化汇报。
+     */
+    dispatch: (input: WorkDispatchInput) => {
+      can();
+      // 没有 work 链就别装作派出去了：让 chat 如实说现在做不了
+      if (deps.work.workModelLabel() === '—') return { ok: false, reason: '工作模型还没配置' };
+      const agent = plugins.workAgent();
+      const chat = input.chat;
+      const role = input.role as Role;
+      const chatKey = `${chat.type}_${chat.chatId}`;
+      const pending = deps.work.takePending(chatKey, input.userId);
+      const task = pending ? composeContinueTask(pending, input.task) : input.task;
+      const label = pending ? `${pending.label}（续）` : input.task;
+      void deps.work.run({
+        chat,
+        task,
+        taskLabel: label,
+        userId: input.userId,
+        nickname: input.nickname,
+        role,
+        agent,
+        tools: plugins.workToolsFor(chat, role, agent, 0),
+        subagents: plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
+        trigger: 'chat',
+        depth: 0,
+        groupTitle: deps.groupTitle(chat.chatId),
+        runHooks: (req) => plugins.runWorkHooks(req),
+      }).catch(() => { /* run() 内部已把失败落进事件与报错中心 */ });
+      return { ok: true, label };
+    },
+
+    /** 该会话里这位发起人自己的进度（别人的活不返回） */
+    status: (chatKey: string, userId: string) => deps.work.liveStatus(chatKey, userId),
   };
 }
 

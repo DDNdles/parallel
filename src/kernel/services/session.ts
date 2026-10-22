@@ -1,5 +1,5 @@
 import { spawn, spawnSync as nodeSpawnSync } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative, isAbsolute } from 'node:path';
 import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ChatRef } from '../types.ts';
@@ -87,8 +87,13 @@ export class SessionContainers {
     return { python: probe('compute'), browser: probe('browser') };
   }
 
+  /** 容器/挂载的唯一键：work 轮按发起人再分一层（与 SandboxService.chatKey 同口径） */
+  private keyOf(chat: ChatRef): string {
+    return `${chat.type}_${chat.chatId}${chat.scope ? `__${chat.scope}` : ''}`;
+  }
+
   private hostMount(chat: ChatRef): string {
-    const dir = resolve(join(this.dataDir, 'sandbox', `${chat.type}_${chat.chatId}`));
+    const dir = resolve(join(this.dataDir, 'sandbox', this.keyOf(chat)));
     return dir.replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
   }
 
@@ -98,11 +103,14 @@ export class SessionContainers {
     const bin = this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用（会话容器需要 Docker Desktop 运行中）');
     const image = this.imageOf(kind);
-    const name = `parallel-${kind}-${chat.type}-${chat.chatId}`.slice(0, 60);
+    const name = this.containerName(kind, chat);
     // 先清理同名残留（可能是异常退出留下的）
     spawnSync(bin, ['rm', '-f', name], 20_000, this.dockerEnv());
     const args = [
       'run', '-d', '--name', name,
+      // 与一次性容器同一套硬化：丢 capability、禁提权、限进程数。
+      // Playwright 的 Chromium 在这种容器里实测可正常启动（它本来就要 --no-sandbox）。
+      '--init', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', kind === 'browser' ? '512' : '256',
       '-v', `${this.hostMount(chat)}:/ws`, '-w', '/ws',
       '--cpus', kind === 'browser' ? '2' : '1',
       '--memory', kind === 'browser' ? '1g' : '512m',
@@ -137,7 +145,9 @@ export class SessionContainers {
   }
 
   private containerName(kind: 'compute' | 'browser', chat: ChatRef): string {
-    return `parallel-${kind}-${chat.type}-${chat.chatId}`.slice(0, 60);
+    // 容器名带上作用域：同一个群里两位管理员的 work 容器必须能同时存在
+    const key = this.keyOf(chat).replace(/[^A-Za-z0-9_.-]/g, '-');
+    return `parallel-${kind}-${key}`.slice(0, 60);
   }
 
   /** 确保容器在跑（惰性拉起 + LRU 回收） */
@@ -145,7 +155,7 @@ export class SessionContainers {
     const bin = this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用（会话容器需要 Docker Desktop 运行中）');
     const reg = kind === 'compute' ? this.compute : this.browse;
-    const key = `${chat.type}_${chat.chatId}`;
+    const key = this.keyOf(chat);
     const entry = reg.get(key);
     if (entry) {
       const st = spawnSync(bin, ['inspect', '-f', '{{.State.Running}}', entry.id], 15_000, this.dockerEnv());
@@ -204,13 +214,24 @@ export class SessionContainers {
     this.browse.clear();
   }
 
-  /** 会话沙箱被清空时，连带重置其容器（避免残留状态） */
+  /** 会话沙箱被清空时，连带重置其容器（避免残留状态）；聊天级重置连按人分的 work 容器一起收 */
   async reset(chat: ChatRef): Promise<void> {
-    const key = `${chat.type}_${chat.chatId}`;
-    const c = this.compute.get(key);
-    if (c) { await this.kill('compute', c.id); this.compute.delete(key); }
-    const b = this.browse.get(key);
-    if (b) { await this.kill('browser', b.id); this.browse.delete(key); }
+    const keys = chat.scope ? [this.keyOf(chat)] : [this.keyOf(chat), ...this.scopedKeysOf(chat)];
+    for (const key of keys) {
+      const c = this.compute.get(key);
+      if (c) { await this.kill('compute', c.id); this.compute.delete(key); }
+      const b = this.browse.get(key);
+      if (b) { await this.kill('browser', b.id); this.browse.delete(key); }
+    }
+  }
+
+  /** 聊天名下所有按发起人分的容器键（`<chat>__u<QQ>`） */
+  private scopedKeysOf(chat: ChatRef): string[] {
+    const prefix = `${chat.type}_${chat.chatId}__`;
+    const keys = new Set<string>();
+    for (const k of this.compute.keys()) if (k.startsWith(prefix)) keys.add(k);
+    for (const k of this.browse.keys()) if (k.startsWith(prefix)) keys.add(k);
+    return [...keys];
   }
 
   // ---------------- 执行（docker exec 驱动容器内桥） ----------------
@@ -220,8 +241,14 @@ export class SessionContainers {
     const bin = this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用');
     const id = await this.ensure('compute', chat);
-    const payload = JSON.stringify({ code, timeout: Math.ceil(timeoutMs / 1000), restart });
-    const r = await spawnWithStdin(bin, ['exec', '-i', id, 'python', '/client.py'], payload, timeoutMs + 20_000, this.dockerEnv());
+    // 超时必须是个正数：调用方漏传时 Math.ceil(undefined/1000) 会变成 NaN，
+    // JSON.stringify 把 NaN 写成 null，桥那头 int(None) 直接炸（实测）。
+    const secs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.ceil(timeoutMs / 1000) : 60;
+    const payload = JSON.stringify({ code, timeout: secs, restart });
+    // 宿主侧看门狗的等待也要有限值：timeoutMs 是 NaN 时 setTimeout(NaN) 会当成 0 立即触发，
+    // 子进程还没回话就被 kill，报出来却是"无输出"（实测踩到，排查方向会被带偏）。
+    const waitMs = (Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : secs * 1000) + 20_000;
+    const r = await spawnWithStdin(bin, ['exec', '-i', id, 'python', '/client.py'], payload, waitMs, this.dockerEnv());
     if (!r.ok && !r.stdout.trim()) throw new Error(`会话容器执行失败：${r.stderr || '无输出'}`.slice(0, 300));
     try {
       const j = JSON.parse(r.stdout.trim());
@@ -236,14 +263,45 @@ export class SessionContainers {
     const bin = this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用');
     const id = await this.ensure('browser', chat);
-    const payload = JSON.stringify({ action, args, timeout: timeoutMs });
-    const r = await spawnWithStdin(bin, ['exec', '-i', id, 'node', '/client.mjs'], payload, timeoutMs + 25_000, this.dockerEnv());
+    // 工具面叫 browser_open，桥（/opt/bridge/client.mjs）的动作名是 goto：
+    // 直接把 open 发过去会被判成"未知动作"（2026-10-21 实测），这里收口一次。
+    const wireAction = action === 'open' ? 'goto' : action;
+    // file:// URL 指向宿主沙箱路径时，映射成容器里的 /ws/...：容器只挂了会话目录，
+    // 宿主绝对路径在容器里不存在（实测 work 模型用 file:// 打开自己写的 HTML 会失败）。
+    const fixed = { ...args };
+    if (wireAction === 'goto' && typeof fixed.url === 'string') {
+      const mapped = this.toContainerFileUrl(chat, fixed.url);
+      if (mapped) fixed.url = mapped;
+    }
+    const payload = JSON.stringify({ action: wireAction, args: fixed, timeout: timeoutMs });
+    // client.mjs 在镜像里是 /opt/bridge/client.mjs（Dockerfile 的 COPY 目标）。
+    // 之前写成 /client.mjs，browser_* 全部报 "Cannot find module '/client.mjs'"——
+    // 模型于是改去宿主机 PowerShell 拉起本机 Chrome，隔离被绕过（2026-10-19 实测抓到）。
+    const r = await spawnWithStdin(bin, ['exec', '-i', id, 'node', '/opt/bridge/client.mjs'], payload, timeoutMs + 25_000, this.dockerEnv());
     try {
       const j = JSON.parse(r.stdout.trim());
       return { ok: !!j.ok, text: j.text, image: j.image, error: j.error };
     } catch {
       throw new Error(`浏览器容器返回无法解析：${(r.stdout || r.stderr).slice(0, 200)}`);
     }
+  }
+
+  /**
+   * 宿主 `file://` 路径 → 容器内 `/ws` 路径（只映射本会话沙箱内的文件）。
+   * 不在沙箱里、不是 file:// 协议、或路径解析失败时返回 undefined（原样交给浏览器）。
+   */
+  private toContainerFileUrl(chat: ChatRef, url: string): string | undefined {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { return undefined; }
+    if (parsed.protocol !== 'file:') return undefined;
+    let hostFile: string;
+    try { hostFile = decodeURIComponent(parsed.pathname); } catch { return undefined; }
+    // Windows 上是 /C:/Users/...，去掉开头那个斜杠
+    if (/^\/[A-Za-z]:\//.test(hostFile)) hostFile = hostFile.slice(1);
+    const root = resolve(join(this.dataDir, 'sandbox', this.keyOf(chat)));
+    const rel = relative(root, resolve(hostFile));
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return undefined;
+    return `file:///ws/${rel.split(/[\\/]/).map(encodeURIComponent).join('/')}`;
   }
 
   /** 状态汇总（桌面端展示） */

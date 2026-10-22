@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 报错：左列表（按级别分组）+ 右详情（内容 / 堆栈 / 建议 / 处置） */
 import { useCallback, useEffect, useState } from 'react';
 import { get, post, fmtDT, onEvent } from '@/lib/api';
@@ -50,7 +51,7 @@ export default function ErrorsPage({ cmd }: { cmd?: PageCmd }) {
                   <button key={keyOf(e)} className={'mset-item' + (cur && keyOf(e) === keyOf(cur) ? ' sel' : '')}
                     onClick={() => setSel(ordered.indexOf(e))} title={e.message.split('\n')[0]}>
                     <span className="mset-item-ic"><Icon name={l.v === 'info' ? 'check' : 'warn'} size={15} /></span>
-                    <span className="mset-item-nm">{e.category}{e.pluginId ? ` · ${e.pluginId}` : ''}</span>
+                    <FadeName text={`${e.category}${e.pluginId ? ` · ${e.pluginId}` : ''}`} />
                     {e.count > 1 && <span className="mset-badge">×{e.count}</span>}
                   </button>
                 ))}

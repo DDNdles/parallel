@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 人格：左列表（按来源插件分组）+ 右详情（HDSI 四层结构化编辑：剧本 / 价值观 / 语气 / 世界事实，外加演化层与原始 JSON） */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, post } from '@/lib/api';
@@ -115,7 +116,7 @@ export default function PersonasPage({ cmd }: { cmd?: PageCmd }) {
               {pp.personas.map((p) => (
                 <button key={p.id} className={'mset-item' + (p.id === sel ? ' sel' : '')} onClick={() => setSel(p.id)}>
                   <span className="mset-item-ic"><Icon name="personas" size={15} /></span>
-                  <span className="mset-item-nm">{p.canon?.name || p.id}</span>
+                  <FadeName text={p.canon?.name || p.id} />
                   {p.id === data?.default && <i className="dot dot-on" />}
                 </button>
               ))}

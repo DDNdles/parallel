@@ -60,6 +60,18 @@ test('inboundModelText：群聊带昵称前缀（模型的群里身份感知来�
   );
 });
 
+test('inboundModelText：QQ 表情编号换成中文名（模型读得懂）', () => {
+  assert.equal(inboundModelText({ text: '[表情:32]' }), '[表情:疑问]');
+  assert.equal(inboundModelText({ text: '不理你[表情:14]', nickname: '小明' }), '小明：不理你[表情:微笑]');
+  // 引用里带着表情也要换（引用快照存的是落账原文）
+  assert.equal(
+    inboundModelText({ text: '[回复:1]哈哈', replyTo: { nickname: '小红', text: '笑死[表情:32]' } }),
+    '（引用「小红」：笑死[表情:疑问]）哈哈',
+  );
+  // 不认识的编号不硬猜，原样留着
+  assert.equal(inboundModelText({ text: '[表情:9999]' }), '[表情:9999]');
+});
+
 test('会话日志回读历史时走同一套净化（重启后那份记录仍在；群聊带昵称前缀、私聊不带）', () => {
   const d = dir();
   try {

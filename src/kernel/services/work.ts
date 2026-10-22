@@ -6,17 +6,17 @@ import type { AgentLoop, LoopEvent } from '../agentloop.ts';
 import type { LlmService, UsageSnapshot } from './llm.ts';
 import { usageDelta } from './llm.ts';
 import type { SandboxService } from './sandbox.ts';
-import type { ToolDef, ChatMessage, ChatRef, LLMRequestContext, WorkAgentDef } from '../types.ts';
+import type { ToolDef, ChatMessage, ChatRef, LLMRequestContext, WorkAgentDef, WorkLiveStatus } from '../types.ts';
 import { newId, nowMs, truncate } from '../util/misc.ts';
 import { busEvents } from '../bus.ts';
-import { buildWorkSections, parseWorkHandoff } from '../work-prompt.ts';
+import { buildWorkSections, parseWorkHandoff, type PendingAsk } from '../work-prompt.ts';
 import { DEFAULT_WORK_AGENT } from '../work-agent.ts';
 
 /**
  * WorkRunner：work 子代理的执行器。
  *
  * 职责边界（pi 的 subagent 语义）：
- *  - 用 **work 模型链**（llm.workChain，独立于聊天链；空 = /work 没有可用模型）跑一个隔离上下文的 agent loop；
+ *  - 用 **work 模型链**（llm.workChain，独立于聊天链；空 = 派活没有可用模型）跑一个隔离上下文的 agent loop；
  *  - system 由「work agent 定义 + 内核具名分节」组装，工具面来自 agent 定义的白名单；
  *  - 轮次无上限（用户定稿）；上下文超窗时按 pi 的口径压缩；
  *  - 插件可通过 beforeWorkLLM 追加自己的节（与 chat 的 beforeLLM 是两条独立链）；
@@ -24,7 +24,8 @@ import { DEFAULT_WORK_AGENT } from '../work-agent.ts';
  *  - 返回结构化结果（摘要 + 产物路径），交给 chat 模型做人格化转述。
  *
  * 一次 run = 一个任务。不驻留状态：上下文不跨 run 保留，产物留在会话沙箱里，
- * 而"停下来提问 → 管理员回答后接着干"靠任务描述交接（见 work-prompt 的 composeContinueTask）。
+ * 而"停下来提问 → 发起人回答后接着干"靠任务描述交接（见 work-prompt 的 composeContinueTask）。
+ * 「谁的活」按 `chatKey + userId` 记：同群每个人的进度/待回答互不可见。
  */
 
 export interface WorkRunInput {
@@ -43,8 +44,11 @@ export interface WorkRunInput {
   agent?: WorkAgentDef;
   /** 本轮的 work 工具（已按 agent.tools 白名单 + 角色 + 本群开关筛过） */
   tools: ToolDef[];
-  /** 触发来源：/work 命令（管理员）或上一层 work 子代理的 delegate 工具 */
-  trigger: 'command' | 'subagent';
+  /**
+   * 触发来源：chat 面的 work_dispatch 工具（新的唯一入口）、旧命令入口（仅测试/内部使用），
+   * 或上一层 work 子代理的 delegate 工具。
+   */
+  trigger: 'chat' | 'command' | 'subagent';
   /** 嵌套深度：入口 0，子代理逐层 +1（决定工具面里还有没有 delegate） */
   depth?: number;
   /** 发起这次委派的父运行 id（桌面端表达嵌套，不参与执行） */
@@ -85,10 +89,34 @@ export interface WorkRunResult {
 interface RunRecord extends WorkRunResult {
   task: string; chatKey: string; startedAt: number; steps: string[]; events: LoopEvent[];
   depth: number; parentId?: string; agentName: string;
+  /** 发起者：同一聊天里每个人是独立的 work 会话（沙箱/容器也按人分开） */
+  userId: string; nickname?: string;
+  /** 生命周期：只有 running 才算「正在跑」（await 是停下来等人回答） */
+  phase: 'running' | 'done' | 'await' | 'error';
+  finishedAt?: number;
+}
+
+/** 「停下来提问」等回答的有效期：超过这么久，旧问题不再自动接续 */
+const PENDING_WORK_TTL_MS = 30 * 60_000;
+
+/**
+ * work 会话的作用域键：同一个群里每位发起人各有一套 work 现场。
+ *
+ * 为什么不用「聊天 + 发起人」当 chatKey：会话流、待答复现场、桌面端抽屉都按聊天聚合，
+ * 拆开会让"这个群最近的工作"看不全。这里只把**执行面**（沙箱目录 / 常驻容器）按人分开，
+ * 列表仍按聊天取、由界面按发起人分组。
+ */
+export function workScopeOf(userId: string): string {
+  return `u${String(userId || '0').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 40)}`;
 }
 
 export class WorkRunner {
   private runs = new Map<string, RunRecord>();
+  /** 「停下来提问」现场：key = chatKey|userId（同群两个人各自的问题互不接管） */
+  private pending = new Map<string, PendingAsk>();
+  /** 并发 work 的模型槽：每个槽记正在跑的任务数，分配时挑最空的（3 个任务 → 3 个不同模型） */
+  private slotBusy = new Map<number, number>();
+  private slotCursor = 0;
 
   constructor(
     private agentLoop: AgentLoop,
@@ -105,18 +133,81 @@ export class WorkRunner {
     return this.llm.servingLabel('work');
   }
 
+  /** 领一个并发槽：优先最空的槽，平手时按游标轮转；任务结束必须 release */
+  private acquireWorkSlot(): number {
+    const len = Math.max(1, this.llm.chainConfig('work').length);
+    let best = 0;
+    let bestCount = Infinity;
+    for (let i = 0; i < len; i++) {
+      const idx = (this.slotCursor + i) % len;
+      const c = this.slotBusy.get(idx) ?? 0;
+      if (c < bestCount) { best = idx; bestCount = c; }
+    }
+    this.slotBusy.set(best, (this.slotBusy.get(best) ?? 0) + 1);
+    this.slotCursor = (best + 1) % len;
+    return best;
+  }
+
+  private releaseWorkSlot(slot: number): void {
+    const n = (this.slotBusy.get(slot) ?? 0) - 1;
+    if (n > 0) this.slotBusy.set(slot, n);
+    else this.slotBusy.delete(slot);
+  }
+
+  private pendingKey(chatKey: string, userId: string): string {
+    return `${chatKey}|${userId}`;
+  }
+
+  /** 取出并消费该会话里这个人等回答的现场；过期视为没有。一次派活只接一条。 */
+  takePending(chatKey: string, userId: string): PendingAsk | undefined {
+    const key = this.pendingKey(chatKey, userId);
+    const p = this.pending.get(key);
+    if (!p) return undefined;
+    this.pending.delete(key);
+    return Date.now() - p.at > PENDING_WORK_TTL_MS ? undefined : p;
+  }
+
+  /** 只读：还在有效期内、停下来等回答的那件事（chat 侧提醒 / work_status 用） */
+  livePending(chatKey: string, userId: string): PendingAsk | undefined {
+    const p = this.pending.get(this.pendingKey(chatKey, userId));
+    return p && Date.now() - p.at <= PENDING_WORK_TTL_MS ? p : undefined;
+  }
+
   async run(input: WorkRunInput): Promise<WorkRunResult> {
     const id = newId('work_');
     const startedAt = nowMs();
-    const model = this.workModelLabel();
+    const agent = input.agent ?? DEFAULT_WORK_AGENT;
+    const chainKind = agent.chain ?? 'work';
+    // 并发的 work 任务轮流领不同的链上下标；每个任务仍从自己的槽起绕完整条替代链
+    const slot = chainKind === 'work' ? this.acquireWorkSlot() : 0;
+    const model = chainKind === 'work' ? this.llm.modelAt('work', slot) : this.llm.servingLabel('chat');
+    try {
     const chatKey = `${input.chat.type}_${input.chat.chatId}`;
+    /**
+     * 执行面按发起人分：同一个群里每个人各自的活是独立现场。
+     * - 沙箱目录、常驻 Python/浏览器容器都挂在 scope 上（`group_123__u10001`）；
+     * - 会话日志、桌面端列表仍按聊天聚合（chatKey 不变），界面再按发起人分组。
+     * 子代理委派时父层已经把 scope 放进了 chat，这里沿用同一个（父子共享一层沙箱）。
+     */
+    const scope = input.chat.scope ?? workScopeOf(input.userId);
+    const chat: ChatRef = { ...input.chat, scope };
+    // 群聊收到的文件落在聊天级 inbox：开跑前镜像进本作用域，模型照旧用 inbox/xxx 读取
+    try { this.sandbox.syncInbox(input.chat, chat); } catch { /* 镜像失败不阻断任务 */ }
 
     const depth = input.depth ?? 0;
     const agentName = (input.agent ?? DEFAULT_WORK_AGENT).name;
     const taskLabel = input.taskLabel ?? input.task;
-    const rec = { id, task: taskLabel, chatKey, startedAt, steps: [] as string[], model, events: [] as LoopEvent[], depth, parentId: input.parentId, agentName };
-    this.runs.set(id, { ...rec, ok: false, summary: '', rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [] });
-    this.bus.emit(busEvents.workStart, { id, chatKey, task: truncate(taskLabel, 200), model, trigger: input.trigger, userId: input.userId, depth, parentId: input.parentId, agent: agentName });
+    /** 汇报轮的投递目标：**聊天级**（不带 scope），由内核在收尾后另起一轮人格化汇报 */
+    const reportChat = { platform: input.chat.platform, type: input.chat.type, chatId: input.chat.chatId };
+    const rec = {
+      id, task: taskLabel, chatKey, startedAt, steps: [] as string[], model, events: [] as LoopEvent[],
+      depth, parentId: input.parentId, agentName, userId: input.userId, nickname: input.nickname,
+    };
+    this.runs.set(id, { ...rec, ok: false, summary: '', rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [], phase: 'running' });
+    this.bus.emit(busEvents.workStart, {
+      id, chatKey, task: truncate(taskLabel, 200), model, trigger: input.trigger, chat: reportChat,
+      userId: input.userId, nickname: input.nickname, depth, parentId: input.parentId, agent: agentName,
+    });
     this.persist('start', rec, input);
 
     // 出发前记一笔会话 token 账，跑完相减 = 这次任务自己的消耗与缓存命中
@@ -126,8 +217,17 @@ export class WorkRunner {
     /** 「停下来提问」：同样从工具 meta 来（work_ask），比在文本里认标记可靠 */
     let metaAsk: { question: string; notes?: string } | undefined;
     const track = (ev: LoopEvent) => {
-      const r = this.runs.get(id);
-      if (r) r.events.push(ev);
+      // 流式增量只走实时总线（桌面端边生成边显示），不落内存/数据库：
+      // message_end 会送完整的 thinking，收尾记录里不需要再存几百个碎片
+      if (ev.kind !== 'delta') {
+        const r = this.runs.get(id);
+        if (r) {
+          r.events.push(ev);
+          // 运行中的计数：work_status 要能实时说「第几轮 / 几次工具调用」，不能等收尾才更新
+          if (ev.kind === 'round') r.rounds = ev.n;
+          if (ev.kind === 'tool') r.toolCalls++;
+        }
+      }
       if (ev.kind === 'toolResult') {
         for (const a of ev.meta?.artifacts ?? []) metaArtifacts.add(a.replace(/\\/g, '/'));
         if (ev.meta?.awaiting) {
@@ -139,28 +239,27 @@ export class WorkRunner {
     };
 
     try {
-      const agent = input.agent ?? DEFAULT_WORK_AGENT;
       // 子代理清单：只在 delegate 真在本轮工具面里时才给 prompt（否则等于教模型用一个不存在的工具）
       const subagents = input.tools.some((t) => t.name === 'delegate') ? (input.subagents ?? []) : [];
       // system = 「work agent 定义（preamble）+ 内核具名分节」；插件可在 beforeWorkLLM 里追加节
       const built = buildWorkSections({
         agent,
-        type: input.chat.type,
-        chatId: input.chat.chatId,
+        type: chat.type,
+        chatId: chat.chatId,
         groupTitle: input.groupTitle ?? '',
         nickname: input.nickname,
         userId: input.userId,
         role: input.role,
         task: input.task,
         tools: input.tools,
-        sandboxRoot: this.sandbox.root(input.chat),
+        sandboxRoot: this.sandbox.root(chat),
         trigger: input.trigger,
         depth,
         subagents,
       });
       let ctx: LLMRequestContext = {
-        chat: input.chat,
-        event: { platform: input.chat.platform, type: input.chat.type, chatId: input.chat.chatId, userId: input.userId, nickname: input.nickname, text: input.task, role: input.role } as any,
+        chat,
+        event: { platform: chat.platform, type: chat.type, chatId: chat.chatId, userId: input.userId, nickname: input.nickname, text: input.task, role: input.role } as any,
         system: built.system,
         systemSections: built.sections,
         messages: [{ role: 'user', content: input.task } as ChatMessage],
@@ -171,6 +270,7 @@ export class WorkRunner {
         workTrigger: input.trigger === 'subagent' ? undefined : input.trigger,
         workDepth: depth,
         workRunId: id,
+        workSlot: chainKind === 'work' ? slot : undefined,
       };
       if (input.runHooks) ctx = await input.runHooks(ctx);
 
@@ -207,9 +307,12 @@ export class WorkRunner {
           usage: usageDelta(usageBefore, this.llm.usageSnapshot(input.chat.chatId)),
         };
         const r = this.runs.get(id);
-        if (r) Object.assign(r, result, { steps });
+        if (r) Object.assign(r, result, { steps, phase: 'error' as const, finishedAt: nowMs() });
         this.errors.record('warn', 'sandbox', `work 任务失败: ${err}`, { chatId: input.chat.chatId });
-        this.bus.emit(busEvents.workError, { id, chatKey, error: err, model });
+        this.bus.emit(busEvents.workError, {
+          id, chatKey, error: err, model, trigger: input.trigger, chat: reportChat,
+          userId: input.userId, nickname: input.nickname, role: input.role, task: taskLabel, result,
+        });
         this.persist('error', rec, input, result);
         return result;
       }
@@ -222,8 +325,21 @@ export class WorkRunner {
         usage: usageDelta(usageBefore, this.llm.usageSnapshot(input.chat.chatId)),
       };
       const r = this.runs.get(id);
-      if (r) Object.assign(r, result, { steps });
-      this.bus.emit(busEvents.workDone, { id, chatKey, summary: truncate(result.summary, 400), rounds, toolCalls, durationMs: result.durationMs, artifacts, model, depth, parentId: input.parentId, agent: agentName, awaiting: ask ? true : false, question: ask?.question });
+      if (r) Object.assign(r, result, { steps, phase: (ask ? 'await' : 'done') as RunRecord['phase'], finishedAt: nowMs() });
+      // 停下来提问：记下现场，等**同一个人**回答后接着干（子代理的提问回给父代理，不记在聊天上）
+      if (ask && input.trigger !== 'subagent') {
+        this.pending.set(this.pendingKey(chatKey, input.userId), {
+          task: input.task, label: taskLabel, question: ask.question, notes: ask.notes,
+          at: nowMs(), userId: input.userId,
+        });
+      }
+      this.bus.emit(busEvents.workDone, {
+        id, chatKey, summary: truncate(result.summary, 400), rounds, toolCalls, durationMs: result.durationMs,
+        artifacts, model, depth, parentId: input.parentId, agent: agentName,
+        awaiting: ask ? true : false, question: ask?.question,
+        trigger: input.trigger, chat: reportChat, userId: input.userId, nickname: input.nickname,
+        role: input.role, task: taskLabel, result,
+      });
       this.persist(ask ? 'await' : 'done', rec, input, result);
       return result;
     } catch (e) {
@@ -234,47 +350,210 @@ export class WorkRunner {
         usage: usageDelta(usageBefore, this.llm.usageSnapshot(input.chat.chatId)),
       };
       const r = this.runs.get(id);
-      if (r) Object.assign(r, result);
+      if (r) Object.assign(r, result, { phase: 'error' as const, finishedAt: nowMs() });
       this.errors.record('warn', 'sandbox', `work 任务失败: ${err}`, { chatId: input.chat.chatId });
-      this.bus.emit(busEvents.workError, { id, chatKey, error: err, model });
+      this.bus.emit(busEvents.workError, {
+        id, chatKey, error: err, model, trigger: input.trigger, chat: reportChat,
+        userId: input.userId, nickname: input.nickname, role: input.role, task: taskLabel, result,
+      });
       this.persist('error', rec, input, result);
       return result;
     }
+    } finally {
+      if (chainKind === 'work') this.releaseWorkSlot(slot);
+    }
   }
 
-  /** 最近的任务记录（桌面端「工作」页）；chatKey 给了就只回该会话的（会话页右侧「工作」抽屉） */
+  /**
+   * 最近的任务记录（桌面端「工作」页）；chatKey 给了就只回该会话的（会话页右侧「工作」抽屉）。
+   *
+   * 内存只有本次内核生命周期里的运行；内核重启后回落到 work_runs 表（events/usage 一并落库），
+   * 否则抽屉一重启就变成空白——圆环与缓存/TPS 全部没有数据可画（2026-10-20 用户实测）。
+   */
   list(limit = 30, chatKey?: string): any[] {
-    return [...this.runs.values()]
+    // 内存是本次内核生命周期的真实现场（含运行中与刚收尾的 notes），必须优先；
+    // 只在库里补那些内存没有的老运行（重启前的）。
+    const live = [...this.runs.values()]
       .filter((r) => !chatKey || r.chatKey === chatKey)
+      .map((r) => this.view(r));
+    const seen = new Set(live.map((r) => r.id));
+    const fromDb = this.dbList(limit, chatKey).filter((r) => !seen.has(r.id));
+    return [...live, ...fromDb]
       .sort((a, b) => b.startedAt - a.startedAt)
-      .slice(0, limit)
+      .slice(0, limit);
+  }
+
+  /**
+   * chat 的 work_status 工具：只看**这位发起人自己**在**这个会话**里的活。
+   * 在跑 → 轮次/工具调用/token 从已收到的 loop 事件实时累加（不必等收尾）；
+   * 没在跑 → 给最近一次跑完的（内存优先，重启过就从库里补）。
+   */
+  liveStatus(chatKey: string, userId: string): WorkLiveStatus {
+    // 只看入口层（depth 0）：子代理是这件活的内部实现，不该出现在「你做的那件事」进度里
+    const mine = [...this.runs.values()].filter(
+      (r) => r.chatKey === chatKey && r.userId === userId && (r.depth ?? 0) === 0,
+    );
+    const now = nowMs();
+    const active = mine
+      .filter((r) => r.phase === 'running')
+      .sort((a, b) => a.startedAt - b.startedAt)
       .map((r) => ({
-        id: r.id, chatKey: r.chatKey, task: truncate(r.task, 200), model: r.model,
-        agent: r.agentName, depth: r.depth, parentId: r.parentId,
-        ok: r.ok, summary: truncate(r.summary, 500), error: r.error,
-        rounds: r.rounds, toolCalls: r.toolCalls, durationMs: r.durationMs,
-        artifacts: r.artifacts, startedAt: r.startedAt, steps: r.steps.slice(-30),
-        notes: r.notes, structured: r.structured, awaiting: r.awaiting,
-        usage: r.usage,
-        // 侧栏 loop 视图要按轮次分组，给全量事件（单次任务的事件量很小）
-        events: r.events,
+        id: r.id, task: truncate(r.task, 120), startedAt: r.startedAt,
+        elapsedMs: Math.max(0, now - r.startedAt), rounds: r.rounds, toolCalls: r.toolCalls,
+        ...usageOfEvents(r.events), step: lastStepOf(r.events),
       }));
+
+    const ended = mine
+      .filter((r) => r.phase !== 'running')
+      .sort((a, b) => (b.finishedAt ?? b.startedAt) - (a.finishedAt ?? a.startedAt))[0];
+    let last: WorkLiveStatus['last'];
+    if (ended) {
+      last = {
+        id: ended.id, task: truncate(ended.task, 120), ok: ended.ok, awaiting: !!ended.awaiting,
+        durationMs: ended.durationMs, finishedAt: ended.finishedAt ?? ended.startedAt + ended.durationMs,
+        summary: truncate(ended.summary, 300), artifacts: ended.artifacts, error: ended.error,
+      };
+    } else {
+      // 内核重启过：内存里没有，但那次活确实跑过 —— 从库里补最近一条（仍按 user_id 过滤）
+      try {
+        const row = this.db.get<any>(
+          `SELECT id, task, ok, phase, summary, error, duration_ms, ts, artifacts
+           FROM work_runs WHERE chat_key=? AND user_id=? AND phase IN ('done','await','error')
+           ORDER BY ts DESC LIMIT 1`,
+          chatKey, userId,
+        );
+        if (row) {
+          last = {
+            id: row.id, task: truncate(String(row.task ?? ''), 120), ok: !!row.ok,
+            awaiting: row.phase === 'await', durationMs: Number(row.duration_ms ?? 0),
+            finishedAt: Number(row.ts ?? 0), summary: truncate(String(row.summary ?? ''), 300),
+            artifacts: parseJsonArray(row.artifacts).map(String), error: row.error ?? undefined,
+          };
+        }
+      } catch { /* 表缺失等不影响状态查询 */ }
+    }
+
+    const p = this.livePending(chatKey, userId);
+    return {
+      active,
+      pending: p ? { question: p.question, notes: p.notes, at: p.at } : undefined,
+      last,
+    };
+  }
+
+  /** 内存记录 → 列表项（list 与 get 共用，字段口径只写一处） */
+  private view(r: RunRecord): any {
+    return {
+      id: r.id, chatKey: r.chatKey, task: truncate(r.task, 200), model: r.model,
+      agent: r.agentName, depth: r.depth, parentId: r.parentId,
+      ok: r.ok, summary: truncate(r.summary, 500), error: r.error,
+      rounds: r.rounds, toolCalls: r.toolCalls, durationMs: r.durationMs,
+      artifacts: r.artifacts, startedAt: r.startedAt, steps: r.steps.slice(-30),
+      notes: r.notes, structured: r.structured, awaiting: r.awaiting,
+      usage: r.usage, userId: r.userId, nickname: r.nickname,
+      // 侧栏 loop 视图要按轮次分组，给全量事件（单次任务的事件量很小）
+      events: r.events,
+    };
+  }
+
+  /** 落库的历史运行 → 列表项。events/usage 是 JSON 列，解析失败就当没有（老行） */
+  private dbList(limit: number, chatKey?: string): any[] {
+    try {
+      const rows = chatKey
+        ? this.db.all<any>(
+            `SELECT id, chat_key, task, model, trigger, phase, ok, rounds, tool_calls, duration_ms,
+                    summary, error, user_id, nickname, ts, artifacts, events, usage
+             FROM work_runs WHERE chat_key=? ORDER BY ts DESC LIMIT ?`, chatKey, limit)
+        : this.db.all<any>(
+            `SELECT id, chat_key, task, model, trigger, phase, ok, rounds, tool_calls, duration_ms,
+                    summary, error, user_id, nickname, ts, artifacts, events, usage
+             FROM work_runs ORDER BY ts DESC LIMIT ?`, limit);
+      return rows.map((r) => ({
+        id: r.id, chatKey: r.chat_key, task: truncate(String(r.task ?? ''), 200), model: r.model,
+        agent: undefined, depth: 0, parentId: undefined,
+        ok: !!r.ok, summary: truncate(String(r.summary ?? ''), 500), error: r.error ?? undefined,
+        rounds: Number(r.rounds ?? 0), toolCalls: Number(r.tool_calls ?? 0), durationMs: Number(r.duration_ms ?? 0),
+        artifacts: parseJsonArray(r.artifacts), startedAt: Number(r.ts ?? 0), steps: [],
+        notes: undefined, structured: undefined,
+        // 只有 phase=await 才是"等你回答"；其余（done/error/start）不该挂这个状态
+        awaiting: r.phase === 'await' ? { question: String(r.summary ?? '') } : undefined,
+        usage: parseJsonObj(r.usage), userId: r.user_id ?? '', nickname: r.nickname ?? undefined,
+        events: parseJsonArray(r.events),
+        /** 来自库：没有 live 的 running 语义（重启前的那次已经结束了） */
+        historical: true,
+      }));
+    } catch { return []; }
+  }
+
+  /**
+   * 该会话最近一次**成功交付**的产物（chat 的 deliver_file 工具用）。
+   *
+   * 为什么按会话记：work 只由管理员派活，产物落在会话沙箱；chat 模型在后续对话里
+   * 被要求"发给我看看"时要能找到它们——而 chat 轮的上下文里只有交付摘要，没有文件清单
+   * 的可靠记忆。只认最近一次成功、且不处于 awaiting 的运行。
+   *
+   * 产物按**聊天**找（chatKey 不带 scope），但沙箱是按发起人分的：调用方还要给出
+   * `userId`，这样才能定位到那个人自己的沙箱目录。内存里没有（内核重启过）就回落到
+   * work_runs 表——那次交付确实发生过、文件也还在沙箱里。
+   */
+  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string } | undefined {
+    const hit = [...this.runs.values()]
+      // 按发起人过滤：群里的 A 不能通过 deliver_file 拿到 B 的产物（沙箱是按人分的）
+      .filter((r) => r.chatKey === chatKey && (!userId || r.userId === userId))
+      .filter((r) => r.ok && !r.awaiting && r.artifacts.length > 0)
+      .sort((a, b) => b.startedAt - a.startedAt)[0];
+    if (hit) return { runId: hit.id, task: hit.task, artifacts: hit.artifacts, at: hit.startedAt, userId: hit.userId };
+    try {
+      const rows = userId
+        ? this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null }>(
+            "SELECT id, task, summary, artifacts, ts, user_id FROM work_runs WHERE chat_key=? AND user_id=? AND ok=1 AND phase='done' ORDER BY ts DESC LIMIT 5",
+            chatKey, userId,
+          )
+        : this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null }>(
+            "SELECT id, task, summary, artifacts, ts, user_id FROM work_runs WHERE chat_key=? AND ok=1 AND phase='done' ORDER BY ts DESC LIMIT 5",
+            chatKey,
+          );
+      for (const r of rows) {
+        let artifacts: string[] = [];
+        try {
+          const parsed = JSON.parse(r.artifacts ?? '[]');
+          if (Array.isArray(parsed)) artifacts = parsed.map(String).filter(Boolean);
+        } catch { /* 老行没有 artifacts 列值时回落到摘要解析 */ }
+        if (!artifacts.length) artifacts = parseWorkHandoff(r.summary ?? '').artifacts;
+        if (artifacts.length) {
+          return { runId: r.id, task: truncate(r.task, 200), artifacts, at: r.ts, userId: r.user_id ?? userId ?? '' };
+        }
+      }
+    } catch { /* 表缺失等不影响主流程 */ }
+    return undefined;
   }
 
   get(id: string): any | undefined {
-    return this.list(200).find((r) => r.id === id);
+    const live = this.runs.get(id);
+    if (live) return this.view(live);
+    return this.dbList(200, undefined).find((r) => r.id === id);
   }
 
   private persist(phase: string, rec: any, input: WorkRunInput, result?: WorkRunResult): void {
     try {
+      // 落库的是**整份快照**（含 events 与 usage）：重启后抽屉还要按同一份数据画 loop、
+      // 圆环、缓存与 TPS。运行中每来一条事件都写一次太重，所以 start/收尾各写一次，
+      // 中途的事件靠内存；崩掉的那次至少留下已完结前的最近一次快照。
+      const live = this.runs.get(rec.id);
       this.db.run(
-        `INSERT INTO work_runs (id, chat_key, task, model, trigger, phase, ok, rounds, tool_calls, duration_ms, summary, error, user_id, ts)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO work_runs (id, chat_key, task, model, trigger, phase, ok, rounds, tool_calls, duration_ms, summary, error, user_id, nickname, ts, artifacts, events, usage)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET phase=excluded.phase, ok=excluded.ok, rounds=excluded.rounds,
-           tool_calls=excluded.tool_calls, duration_ms=excluded.duration_ms, summary=excluded.summary, error=excluded.error, ts=excluded.ts`,
+           tool_calls=excluded.tool_calls, duration_ms=excluded.duration_ms, summary=excluded.summary,
+           error=excluded.error, ts=excluded.ts, artifacts=excluded.artifacts,
+           events=excluded.events, usage=excluded.usage, nickname=excluded.nickname`,
         rec.id, rec.chatKey, truncate(input.task, 1000), rec.model, input.trigger, phase,
-        result?.ok ? 1 : 0, result?.rounds ?? 0, result?.toolCalls ?? 0, result?.durationMs ?? 0,
-        truncate(result?.summary ?? '', 4000), result?.error ?? null, input.userId, nowMs(),
+        result?.ok ? 1 : 0, result?.rounds ?? live?.rounds ?? 0, result?.toolCalls ?? live?.toolCalls ?? 0,
+        result?.durationMs ?? live?.durationMs ?? 0,
+        truncate(result?.summary ?? '', 4000), result?.error ?? null, input.userId, input.nickname ?? null, nowMs(),
+        JSON.stringify(result?.artifacts ?? live?.artifacts ?? []),
+        JSON.stringify(live?.events ?? []),
+        JSON.stringify(result?.usage ?? null),
       );
     } catch { /* 表缺失等不影响主流程 */ }
   }
@@ -293,6 +572,31 @@ export function extractArtifacts(steps: string[]): string[] {
   return [...out].slice(0, 20);
 }
 
+/** 运行中的 token 账：loop 的 usage 事件是每轮累加的原料（收尾前的 status 也拿得到） */
+function usageOfEvents(events: LoopEvent[]): { prompt: number; completion: number; cacheHit: number; cacheMiss: number } {
+  const u = { prompt: 0, completion: 0, cacheHit: 0, cacheMiss: 0 };
+  for (const e of events) {
+    if (e.kind !== 'usage') continue;
+    u.prompt += e.prompt;
+    u.completion += e.completion;
+    u.cacheHit += e.cacheHit;
+    u.cacheMiss += e.cacheMiss;
+  }
+  return u;
+}
+
+/** 最近一步（只给种类/工具名，不给思考原文）：让 status 能说"刚在跑什么" */
+function lastStepOf(events: LoopEvent[]): WorkLiveStatus['active'][number]['step'] {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === 'tool' || e.kind === 'toolResult') return { kind: e.kind, name: e.name };
+    if (e.kind === 'round') return { kind: 'round' };
+    if (e.kind === 'thinking') return { kind: 'thinking' };
+    if (e.kind === 'compaction') return { kind: 'compaction' };
+  }
+  return undefined;
+}
+
 /** 去重（保序），并把反斜杠归一成正斜杠——沙箱相对路径统一用 / */
 function dedupe(list: string[]): string[] {
   const out: string[] = [];
@@ -304,4 +608,24 @@ function dedupe(list: string[]): string[] {
     out.push(p);
   }
   return out.slice(0, 30);
+}
+
+/** JSON 列 → 数组（老行/坏值一律当空数组，不让列表因为一条脏数据整片失败） */
+function parseJsonArray(raw: unknown): any[] {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+}
+
+/** JSON 列 → 对象（usage 这类；坏值返回 undefined） */
+function parseJsonObj(raw: unknown): Record<string, any> | undefined {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, any>;
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : undefined;
+  } catch { return undefined; }
 }

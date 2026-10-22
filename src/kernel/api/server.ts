@@ -5,7 +5,7 @@ import { join, normalize, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import type { Kernel } from '../kernel.ts';
-import type { ModelRef, ProviderModelCfg } from '../config.ts';
+import { REASONING_LEVELS, type ModelRef, type ProviderModelCfg } from '../config.ts';
 import { newId, nowMs } from '../util/misc.ts';
 import { usageReport } from '../services/usage.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
@@ -598,32 +598,60 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           usage: kernel.llm.todayUsage(),
           // 两条模型优先级链（靠前的优先，掉线自动接后一个）；两条各自独立，谁都不跟随谁
           chains: kernel.llm.chainsView(),
+          reasoning: { chat: kernel.llm.reasoningFor('chat'), work: kernel.llm.reasoningFor('work') },
           failoverThreshold: kernel.config.config.llm.failoverThreshold,
         });
       }
       if (b === 'chain' && req.method === 'POST') {
         const kind = String(body.kind ?? '');
         if (kind !== 'chat' && kind !== 'work') return send({ error: 'kind 需要是 chat 或 work' }, 400);
-        const raw = Array.isArray(body.entries) ? body.entries.slice(0, 20) : [];
-        const entries: ModelRef[] = [];
-        for (const e of raw) {
-          const pid = String((e as any)?.provider ?? '').trim().slice(0, 80);
-          const model = String((e as any)?.model ?? '').trim().slice(0, 120);
-          if (!pid || !model) return send({ error: '链上的每条都要有供应商与模型名' }, 400);
-          if (!allProviders[pid]) return send({ error: `未知供应商 ${pid}` }, 400);
-          if (!entries.some((x) => x.provider === pid && x.model === model)) entries.push({ provider: pid, model });
+        const hasEntries = Array.isArray(body.entries);
+        const hasReasoning = body.reasoning !== undefined;
+        if (!hasEntries && !hasReasoning) return send({ error: '没有要改的内容（entries / reasoning 至少给一个）' }, 400);
+
+        let entries: ModelRef[] | null = null;
+        if (hasEntries) {
+          const raw = (body.entries as unknown[]).slice(0, 20);
+          entries = [];
+          for (const e of raw) {
+            const pid = String((e as any)?.provider ?? '').trim().slice(0, 80);
+            const model = String((e as any)?.model ?? '').trim().slice(0, 120);
+            if (!pid || !model) return send({ error: '链上的每条都要有供应商与模型名' }, 400);
+            if (!allProviders[pid]) return send({ error: `未知供应商 ${pid}` }, 400);
+            if (!entries.some((x) => x.provider === pid && x.model === model)) entries.push({ provider: pid, model });
+          }
+          if (kind === 'chat' && !entries.length) return send({ error: '聊天模型至少要留一条' }, 400);
         }
-        if (kind === 'chat' && !entries.length) return send({ error: '聊天模型至少要留一条' }, 400);
+
+        let level: string | undefined;
+        if (hasReasoning) {
+          const v = String(body.reasoning ?? '').trim();
+          if (v && !(REASONING_LEVELS as readonly string[]).includes(v)) {
+            return send({ error: `思考强度需要是空或 ${REASONING_LEVELS.join(' / ')}` }, 400);
+          }
+          level = v;
+        }
+
         const llm = kernel.config.config.llm;
-        if (kind === 'chat') {
-          llm.chatChain = entries;
-          if (entries.length) llm.activeProvider = entries[0].provider;   // 人设绑定/状态展示读这个镜像
-        } else {
-          llm.workChain = entries;
+        if (entries) {
+          if (kind === 'chat') {
+            llm.chatChain = entries;
+            if (entries.length) llm.activeProvider = entries[0].provider;   // 人设绑定/状态展示读这个镜像
+          } else {
+            llm.workChain = entries;
+          }
         }
-        kernel.llm.resetFailover();
+        if (level !== undefined) {
+          if (kind === 'chat') llm.chatReasoning = level;
+          else llm.workReasoning = level;
+        }
+        if (entries) kernel.llm.resetFailover();
         kernel.config.saveConfig();
-        return send({ ok: true, chains: kernel.llm.chainsView() });
+        return send({
+          ok: true,
+          chains: kernel.llm.chainsView(),
+          reasoning: { chat: kernel.llm.reasoningFor('chat'), work: kernel.llm.reasoningFor('work') },
+        });
       }
       if (b === 'create' && req.method === 'POST') {
         const label = String(body.label ?? '').trim().slice(0, 40);
@@ -798,8 +826,11 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       if (!b) {
         // chatKey 给了就只回该会话的任务（会话页右侧「工作」抽屉按当前会话拉）
         const chatKey = url.searchParams.get('chatKey') || undefined;
+        const userId = url.searchParams.get('userId') || undefined;
+        const runs = kernel.workRunner.list(Number(url.searchParams.get('limit') ?? 40), chatKey);
         return send({
-          runs: kernel.workRunner.list(Number(url.searchParams.get('limit') ?? 40), chatKey),
+          // userId 只筛该发起人自己的运行（同一个群里每个人是独立的 work 会话）；不传 = 本群全部
+          runs: userId ? runs.filter((r: any) => String(r.userId ?? '') === userId) : runs,
           models: { chat: kernel.llm.servingLabel('chat'), work: kernel.llm.servingLabel('work') },
           containers: kernel.session.status(),
           images: kernel.session.imagesAvailable(),
@@ -1125,6 +1156,15 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     if ('minPeople' in repeat) t.minPeople = Math.min(20, Math.max(2, Math.round(Number(repeat.minPeople) || 4)));
     if ('delayMaxSec' in repeat) t.delayMaxSec = Math.min(30, Math.max(1, Math.round(Number(repeat.delayMaxSec) || 4)));
     if ('cooldownMin' in repeat) t.cooldownMin = Math.min(120, Math.max(0, Math.round(Number(repeat.cooldownMin) || 3)));
+  }
+
+  // 戳一戳（chat 工具）：开关 + 最小间隔/小时上限
+  const poke = body.poke as Record<string, unknown> | undefined;
+  if (poke && typeof poke === 'object') {
+    const t = target.poke as { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
+    applyBool(t, poke, 'enable');
+    if ('minIntervalSeconds' in poke) t.minIntervalSeconds = Math.min(3600, Math.max(0, Math.round(Number(poke.minIntervalSeconds) || 0)));
+    if ('maxPerHour' in poke) t.maxPerHour = Math.min(120, Math.max(0, Math.round(Number(poke.maxPerHour) || 0)));
   }
 
   // 节奏反定型（HDSI ChatRhythm）

@@ -6,12 +6,18 @@ export const isWorkEntry = (type: string) =>
 export interface LogEntry {
   type: string; ts?: number; text?: string; role?: string;
   chatId?: string; chatType?: string; userId?: string; nickname?: string; data?: any;
+  /** 这条属于哪条执行线：chat 会话模型 / work 子代理（老记录没有 = chat） */
+  lane?: 'chat' | 'work';
 }
 
 export const chatKeyOf = (e: LogEntry) => `${e.chatType}_${e.chatId}`;
 
 /** 工具动作的结构化说明（与内核 types.ts 的 ToolMeta 同形，随 tool_result 一起传过来） */
-export interface ToolMeta { path?: string; added?: number; removed?: number }
+export interface ToolMeta {
+  path?: string; added?: number; removed?: number;
+  /** shell/python 执行顺手改过的文件（工作页逐行显示 +N -M） */
+  changes?: { path: string; added: number; removed: number }[];
+}
 
 /** 工具能力归类（决定「工作」面板那行的图标与措辞）：执行 / 文件 / 联网 / 浏览器 / 协议动作 / 其他 */
 export type ToolKind = 'run' | 'file' | 'net' | 'browser' | 'todo' | 'ask' | 'done' | 'delegate' | 'other';

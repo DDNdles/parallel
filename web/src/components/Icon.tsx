@@ -61,6 +61,8 @@ const PATHS: Record<string, string> = {
   dots: '<circle cx="5" cy="12" r="1.7" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.7" fill="currentColor" stroke="none"/>',
   plug: '<path d="M9.5 2.5v5M14.5 2.5v5"/><path d="M6.5 7.5h11v2.6a5.5 5.5 0 0 1-11 0z"/><path d="M12 15.6v5.9"/>',
   bolt: '<path d="M13 2.5 5 14h5.2L9 21.5 19 10h-5.4z"/>',
+  /** 运行中转圈：一段 270° 的圆弧（配合 .wd-spin 旋转，见 WorkDrawer） */
+  spinner: '<path d="M12 3a9 9 0 1 0 9 9"/>',
   lock: '<rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7"/>',
   /** 文件类型徽章（行首动作图标之后那枚） */
   fText: '<path d="M6.5 3.5h7l4 4v13h-11z"/><path d="M13.5 3.5v4h4"/><path d="M9.5 12h5M9.5 15.5h5"/>',

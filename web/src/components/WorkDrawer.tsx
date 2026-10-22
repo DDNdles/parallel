@@ -4,76 +4,18 @@
  *
  * 形态照 ZCode 的子代理侧栏：从最右端滑入、关闭时弹回。在流里占一列（不压住消息），
  * 打开时把中间的会话列往左挤；左缘可拖拽调宽（320px ~ 视口 30%，宽度存 localStorage）。
- * 内容按说话人分两段，都用 ZCode 活动流的形态（一行一个动作：动作图标 + 动作词 + 主体 + 文件徽章 +
- * 行增减，正文点开才以整幅卡片/灰底面板出现）：上面是 **chat 模型**在本会话的流水——按 agent loop 成组，
- * 每段头上只报「工作 Xs」，起止本身不占行，异常作为一条动作行；下面是 **work 子代理**摊平的动作序列
- * （思考 / 工具 / 收敛回答）；标题栏那颗圆环按「当前上下文 / 模型上下文窗口」填充，悬停出占比、缓存命中与总输入。
- * 没有输入框，说话仍然在会话页做。两段都空时是空页。
+ * 内容只显示 **work 子代理** 的活动流（chat 模型的流水不在这个抽屉里展示），用 ZCode 的形态
+ * （一行一个动作：动作图标 + 动作词 + 主体 + 文件徽章 + 行增减，正文点开才以整幅卡片/灰底面板出现）；
+ * 标题栏那颗圆环按 work 的「当前上下文 / 模型上下文窗口」填充，悬停出占比、缓存命中与总输入。
+ * 没有输入框，说话仍然在会话页做。没有 work 运行时是空页。
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as RMouseEvent } from 'react';
 import { get, onEvent } from '@/lib/api';
-import { isWorkEntry, chatKeyOf, toolAction, splitMcp, argPath, ctxBadge, type LogEntry, type ToolMeta } from '@/lib/entries';
 import { Icon } from '@/components/Icon';
-import { fileIcon } from '@/lib/fileIcon';
-
-export interface LoopEvent {
-  kind: 'round' | 'thinking' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'final';
-  n?: number; round?: number; text?: string; name?: string; args?: string;
-  meta?: ToolMeta;
-  prompt?: number; completion?: number; cacheHit?: number; cacheMiss?: number;
-  // compaction / settle
-  dropped?: number; tokensBefore?: number; summary?: string; reason?: 'terminate' | 'max_rounds';
-}
-export interface WorkUsage { prompt: number; completion: number; cacheHit: number; cacheMiss: number; calls: number }
-export interface WorkRun {
-  id: string; chatKey: string; task: string; model: string;
-  ok: boolean; summary: string; error?: string;
-  rounds: number; toolCalls: number; durationMs: number;
-  artifacts: string[]; startedAt: number; usage?: WorkUsage;
-  /** 模型按交付格式写的备注 / 是否解析到了结构化交付 */
-  notes?: string; structured?: boolean;
-  /** 停下来等发起者回答（work_ask）：不是失败，也不是干完了 */
-  awaiting?: { question: string; notes?: string };
-  events?: LoopEvent[];
-}
-
-/** work 子代理的事件流摊平成一行一动作（不再按轮次分组），收敛回答单独拿出来 */
-function loopActs(events: LoopEvent[]): { acts: ActRow[]; final?: string } {
-  const acts: ActRow[] = [];
-  let final: string | undefined;
-  for (const ev of events) {
-    if (ev.kind === 'final') final = ev.text ?? '';
-    else if (ev.kind === 'thinking') acts.push({ kind: 'think', subject: '', sub: '', body: ev.text ?? '' });
-    else if (ev.kind === 'tool') {
-      const args = String(ev.args ?? '');
-      const head = actHead(ev.name ?? '', args);
-      pushAct(acts, { ...head, body: isRun(head.kind) ? `$ ${args}` : args }, true);
-    } else if (ev.kind === 'toolResult') {
-      pushAct(acts, { ...actHead(ev.name ?? ''), body: ev.text ?? '', meta: ev.meta }, false);
-    } else if (ev.kind === 'compaction') {
-      // 上下文压缩：丢掉的是模型看不到的那部分历史，正文给出摘要（点开可看）
-      acts.push({
-        kind: 'compact',
-        subject: '上下文',
-        sub: `-${ev.dropped ?? 0} 条${ev.tokensBefore ? ` / 原 ~${Math.round(ev.tokensBefore / 1000)}k tokens` : ''}`,
-        body: ev.summary ?? '',
-      });
-    } else if (ev.kind === 'settle' && ev.reason === 'max_rounds') {
-      // 正常收尾（terminate）不占行；只有被轮次上限强制收尾才提示
-      acts.push({ kind: 'note', subject: '已达工具轮次上限', sub: '强制收尾', body: '' });
-    }
-  }
-  return { acts, final };
-}
-
-/** 缓存命中率：协议端不报缓存时（两边都 0）返回 null，UI 显示"未统计"而不是 0% */
-function cacheRate(hit?: number, miss?: number): number | null {
-  const total = (hit ?? 0) + (miss ?? 0);
-  return total ? (hit ?? 0) / total : null;
-}
-
-const fmtMs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
-const fmtClock = (ts: number) => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+import {
+  Act, CtxRing, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf, thinkSummary,
+  type WorkRun,
+} from '@/components/workActivity';
 
 const W_KEY = 'parallel_work_width';
 /** 宽度下限：栏里是缓存账和工具卡片，再窄就散了（一级侧栏窄轨是 57，这里内容更重所以抬高） */
@@ -84,126 +26,6 @@ const W_MAX_RATIO = 0.3;
 const W_CONV_MIN = 280;
 /** 上面那条留不出来时的面板地板宽（再窄就散，宁可让会话列短一点） */
 const W_FLOOR = 240;
-/** chat 模型流水在面板里最多回溯这么多条原始日志（分组后再截 LOOP_MAX 个 loop） */
-const FLOW_MAX = 120;
-/** 面板里最多显示最近几个 chat loop（每个 loop = 一次 agent_start 到 agent_end） */
-const LOOP_MAX = 8;
-/** 上下文占比圆环周长（直径与标题文字同为 13px，r=5.5），用 stroke-dasharray 换算百分比 */
-const RING_C = 2 * Math.PI * 5.5;
-
-/** 动作行的图标与措辞：按能力分五类（执行/文件/联网/浏览器/其他），另加思考、异常、压缩、收尾四种行 */
-const ACT = {
-  run: { icon: 'console', label: '终端' },
-  file: { icon: 'file', label: '文件' },
-  net: { icon: 'globe', label: '联网' },
-  browser: { icon: 'browser', label: '浏览器' },
-  other: { icon: 'tool', label: '工具' },
-  // 协议类动作（toolAction 按整名判）：措辞跟着图标一起换，别再顶着「工具」二字
-  todo: { icon: 'todo', label: '清单' },
-  ask: { icon: 'ask', label: '回问' },
-  done: { icon: 'done', label: '交付' },
-  delegate: { icon: 'delegate', label: '派生' },
-  error: { icon: 'warn', label: '异常' },
-  think: { icon: 'think', label: '思考' },
-  compact: { icon: 'collapse', label: '压缩' },
-  note: { icon: 'bolt', label: '收尾' },
-} as const;
-type ActKind = keyof typeof ACT;
-
-/** 一行动作：主体 + 灰色次级 + 可展开正文（没有正文就没有 chevron，也不占第二行） */
-interface ActRow {
-  kind: ActKind; subject: string; sub: string; body: string;
-  nm?: string; call?: boolean; path?: string; meta?: ToolMeta;
-}
-
-/** 执行类（run_*、python_session、bash/powershell）的参数是命令，按 ZCode 加 $ 前缀 */
-const isRun = (k: ActKind) => k === 'run';
-
-/** ZCode 形态的动作行：动作图标 (+文件徽章) + 动作词 + 主体 + 灰色次级 + 行增减，正文点开才出现 */
-function Act({ row, opened, onToggle, text }: { row: ActRow; opened: boolean; onToggle: () => void; text?: boolean }) {
-  const m = ACT[row.kind];
-  const has = !!row.body;
-  const { added, removed } = row.meta ?? {};
-  return (
-    <div className={'wd-act' + (opened && has ? ' open' : '')}>
-      <div className={'wd-act-h' + (has ? '' : ' plain')} onClick={has ? onToggle : undefined}>
-        <span className="ic"><Icon name={m.icon} size={15} /></span>
-        <span className="lbl">{m.label}</span>
-        {row.path && <span className="bdg"><Icon name={fileIcon(row.path)} size={14} /></span>}
-        {row.subject && <span className="nm">{row.subject}</span>}
-        {row.sub && <span className="sb">{row.sub}</span>}
-        {added !== undefined && <span className="add">+{added}</span>}
-        {removed !== undefined && <span className="del">-{removed}</span>}
-        {has && <span className="wd-chev"><Icon name="chevron" size={12} /></span>}
-      </div>
-      {has && opened && (text
-        ? <div className="wd-act-t">{row.body}</div>
-        : <pre className="wd-act-b mono">{row.body}</pre>)}
-    </div>
-  );
-}
-
-/** 行首显示什么：MCP 名拆成「工具名 + 服务名次级」；文件/联网/浏览器优先用参数里的路径或 URL 当主体 */
-function actHead(name: string, args = '', meta?: ToolMeta): Pick<ActRow, 'kind' | 'subject' | 'sub' | 'nm' | 'path'> {
-  const kind = toolAction(name);
-  const mcp = name.includes('__') ? splitMcp(name) : null;
-  const sub = mcp ? mcp.server : '';
-  const base = mcp ? mcp.tool : name;
-  if (kind === 'file' || kind === 'net' || kind === 'browser') {
-    const p = meta?.path || argPath(args);
-    if (p) {
-      // 只有文件类带文件类型徽章（path 字段），联网/浏览器的主体是 URL 或查询词
-      return kind === 'file' && /[./\\]/.test(p) && !/\s/.test(p)
-        ? { kind, subject: p, sub, nm: name, path: p }
-        : { kind, subject: p, sub, nm: name };
-    }
-  }
-  return { kind, subject: base, sub, nm: name };
-}
-
-/** 一次调用 = 一行：返回折进同名的上一条（中间空一行），并把返回带来的 meta（路径 / 行增减）挂到这一行 */
-function pushAct(acts: ActRow[], row: ActRow, isCall: boolean) {
-  const prev = acts[acts.length - 1];
-  if (!isCall && prev?.call && prev.nm === row.nm) {
-    prev.body += '\n\n' + row.body;
-    if (row.meta) {
-      prev.meta = row.meta;
-      if (row.meta.path && !prev.path) { prev.path = row.meta.path; prev.subject = row.meta.path; }
-    }
-    return;
-  }
-  acts.push({ ...row, call: isCall || undefined });
-}
-
-/** 一个 chat loop：一次 agent_start 到 agent_end 之间的动作，头上一行只报这一段跑了多久 */
-interface FlowLoop { start: number; last: number; ms: number | null; acts: ActRow[] }
-
-function groupFlow(entries: LogEntry[]): FlowLoop[] {
-  const loops: FlowLoop[] = [];
-  const open = (start = 0) => { const lp: FlowLoop = { start, last: start, ms: null, acts: [] }; loops.push(lp); return lp; };
-  let cur: FlowLoop | null = null;
-  for (const e of entries) {
-    if (e.type === 'agent_start') { cur = open(e.ts ?? 0); continue; }
-    if (e.type === 'agent_end') { if (cur && cur.start && e.ts) cur.ms = e.ts - cur.start; cur = null; continue; }
-    if (!cur) cur = open();                       // tail 被裁掉起点的残段：不报耗时
-    if (e.ts) cur.last = e.ts;
-    const name = e.text || '';
-    if (e.type === 'error') pushAct(cur.acts, { kind: 'error', subject: '', sub: '', body: name }, false);
-    else if (e.type === 'tool_call') {
-      const args = String(e.data?.args ?? '');
-      const head = actHead(name, args);
-      pushAct(cur.acts, { ...head, body: isRun(head.kind) ? `$ ${args}` : args }, true);
-    } else if (e.type === 'tool_result') {
-      const meta = e.data?.meta as ToolMeta | undefined;
-      pushAct(cur.acts, { ...actHead(name, '', meta), body: String(e.data?.result ?? ''), meta }, false);
-    }
-  }
-  const tail = loops[loops.length - 1];            // 还在跑的这一段：报到最近一条日志为止
-  if (tail && !tail.ms && tail.start && tail.last > tail.start) tail.ms = tail.last - tail.start;
-  // 纯回答、没动过工具的那段没什么可看的，不占行
-  return loops.filter((l) => l.acts.length > 0).slice(-LOOP_MAX);
-}
-
 export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow }: {
   chatKey?: string;
   open: boolean;
@@ -214,8 +36,6 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
   narrow?: boolean;
 }) {
   const [runs, setRuns] = useState<WorkRun[]>([]);
-  const [flow, setFlow] = useState<LogEntry[]>([]);
-  const [selId, setSelId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [width, setWidth] = useState(420);
   const [dragging, setDragging] = useState(false);
@@ -302,17 +122,9 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
       .catch(() => {});
   }, [chatKey]);
 
-  /** chat 模型的流水：与会话页同一个 tail，只留被分流出去的那些条目 */
-  const loadFlow = useCallback(() => {
-    if (!chatKey) { setFlow([]); return; }
-    get(`/api/chats/${encodeURIComponent(chatKey)}/tail?limit=300`)
-      .then((d: { entries?: LogEntry[] }) => setFlow((d.entries ?? []).filter((e) => isWorkEntry(e.type)).slice(-FLOW_MAX)))
-      .catch(() => {});
-  }, [chatKey]);
-
-  useEffect(() => { if (open) { load(); loadFlow(); } }, [open, load, loadFlow]);
+  useEffect(() => { if (open) load(); }, [open, load]);
   // 换会话：退回"看最新一次"，并清掉展开态
-  useEffect(() => { setSelId(null); setExpanded({}); }, [chatKey]);
+  useEffect(() => { setExpanded({}); }, [chatKey]);
 
   // 实时：这个会话的 loop 事件边跑边长
   useEffect(() => {
@@ -321,15 +133,28 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
     const offs = [
       onEvent('work.start', (d: any) => {
         if (!mine(d)) return;
+        // 新任务开跑：把选中人切到它的发起者，否则事件会落进别人的视图里看不见
+        if (d.userId) setOwnerSel(String(d.userId));
         setRuns((prev) => prev.some((r) => r.id === d.id) ? prev : [{
           id: d.id, chatKey: d.chatKey, task: d.task, model: d.model, ok: false, summary: '',
           rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [], startedAt: Date.now(), events: [],
+          userId: d.userId ? String(d.userId) : '', nickname: d.nickname ? String(d.nickname) : undefined,
         }, ...prev]);
-        setSelId(d.id);
       }),
       onEvent('work.event', (d: any) => {
         if (!mine(d)) return;
-        setRuns((prev) => prev.map((r) => (r.id === d.id ? { ...r, events: [...(r.events ?? []), d.ev] } : r)));
+        setRuns((prev) => prev.map((r) => {
+          if (r.id !== d.id) return r;
+          const evs = r.events ?? [];
+          // 流式增量在本地合并成一条，别让 events 数组按 token 膨胀
+          if (d.ev?.kind === 'delta') {
+            const last = evs[evs.length - 1];
+            if (last?.kind === 'delta') {
+              return { ...r, events: [...evs.slice(0, -1), { ...last, text: `${last.text ?? ''}${d.ev.text ?? ''}` }] };
+            }
+          }
+          return { ...r, events: [...evs, d.ev] };
+        }));
       }),
       onEvent('work.done', (d: any) => {
         if (!mine(d)) return;
@@ -345,29 +170,47 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
         if (!mine(d)) return;
         setRuns((prev) => prev.map((r) => (r.id === d.id ? { ...r, ok: false, error: d.error } : r)));
       }),
-      onEvent('session.log', (e: LogEntry) => {
-        if (chatKeyOf(e) !== chatKey || !isWorkEntry(e.type)) return;
-        setFlow((prev) => [...prev, e].slice(-FLOW_MAX));
-      }),
     ];
     return () => offs.forEach((off) => off());
   }, [open, chatKey, load]);
 
-  const run = runs.find((r) => r.id === selId) ?? runs[0];
-  const { acts, final } = useMemo(() => loopActs(run?.events ?? []), [run]);
-  const rate = cacheRate(run?.usage?.cacheHit, run?.usage?.cacheMiss);
-  /** 当前上下文 = 最后一轮上报的 prompt。不能用 run.usage.prompt：那是整场任务各轮的累计和 */
-  const ctxNow = useMemo(() => {
-    const evs = run?.events ?? [];
-    for (let i = evs.length - 1; i >= 0; i--) if (evs[i].kind === 'usage') return evs[i].prompt ?? 0;
-    return 0;
-  }, [run]);
-  const ctxMax = run ? ctxByModel?.[run.model] : undefined;
-  /** 窗口没配置时画不出诚实的占比：宁可没有圆环 */
-  const ctxPct = ctxMax && ctxNow ? Math.min(ctxNow / ctxMax, 1) : null;
-  const running = !!run && !run.ok && !run.error && !final;
-  /** 流水按 loop 成组（每次 agent_start 到 agent_end 一段） */
-  const flowLoops = useMemo(() => groupFlow(flow), [flow]);
+  /**
+   * work 运行按发起人分组：同一个群里每个人 /work 是独立会话（各自的沙箱与常驻容器）。
+   * 抽屉只显示「本群 + 当前选中的那个人」那串运行，不让 A 的任务混进 B 的视图。
+   */
+  const owners = useMemo(() => {
+    const by = new Map<string, { userId: string; nickname: string; runs: WorkRun[] }>();
+    for (const r of runs) {
+      const id = r.userId || '';
+      let g = by.get(id);
+      if (!g) { g = { userId: id, nickname: r.nickname || (id ? id : '未知'), runs: [] }; by.set(id, g); }
+      if (!g.nickname && r.nickname) g.nickname = r.nickname;
+      g.runs.push(r);
+    }
+    // 最近有任务的人排前面（每个组内 runs 已按时间倒序）
+    return [...by.values()].sort((a, b) => (b.runs[0]?.startedAt ?? 0) - (a.runs[0]?.startedAt ?? 0));
+  }, [runs]);
+  const [ownerSel, setOwnerSel] = useState<string | null>(null);
+  // 换会话 / 列表变化：选中项失效就退回最近有任务的那位
+  useEffect(() => {
+    if (!owners.length) { setOwnerSel(null); return; }
+    if (!ownerSel || !owners.some((o) => o.userId === ownerSel)) setOwnerSel(owners[0].userId);
+  }, [owners, ownerSel]);
+  const owner = owners.find((o) => o.userId === ownerSel) ?? owners[0];
+  const ownerRuns = owner?.runs ?? [];
+  // 抽屉只看这位发起人最近的一次；过往运行统一去「工作」页看
+  const run = ownerRuns[0];
+  const running = !!run && !run.historical && !run.ok && !run.error && !(run.events ?? []).some((e) => e.kind === 'final');
+  const { acts, final } = useMemo(() => loopActs(run?.events ?? [], running), [run, running]);
+  /** work 段的指标：优先用结算的 usage（跑完才有），运行中就用事件流里各轮 usage 的累计 */
+  const workMetrics = useMemo(() => {
+    const m = metricsOf(run?.events ?? [], run?.model, ctxByModel);
+    if (!m) return undefined;
+    if (run?.usage && run.usage.calls > 0) {
+      return { ...m, ...run.usage, rate: cacheRate(run.usage.cacheHit, run.usage.cacheMiss) };
+    }
+    return m;
+  }, [run, ctxByModel]);
   /** 这次 work 任务的耗时：还在跑就按开始时间推（每来一个事件刷新一次），跑完用结算值 */
   const runMs = run ? (run.durationMs || (running && run.startedAt ? Date.now() - run.startedAt : 0)) : 0;
 
@@ -403,26 +246,9 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
       <div className="wd-clip">
         <div className="wd-inner">
           <header className="wd-head">
-            <span className="wd-ic"><Icon name="work" size={15} /></span>
+            <span className="wd-ic">{running ? <span className="wd-spin"><Icon name="spinner" size={15} /></span> : <Icon name="work" size={15} />}</span>
             <span className="wd-title">工作</span>
-            {ctxPct !== null && run?.usage && (
-              <span className="wd-ring" tabIndex={0}
-                aria-label={`当前上下文 ${ctxBadge(ctxNow)} / ${ctxBadge(ctxMax)}（${Math.round(ctxPct * 100)}%）`}>
-                <svg viewBox="0 0 13 13" width="13" height="13" aria-hidden>
-                  <circle className="t" cx="6.5" cy="6.5" r="5.5" />
-                  <circle className="p" cx="6.5" cy="6.5" r="5.5" transform="rotate(-90 6.5 6.5)"
-                    strokeDasharray={`${RING_C} ${RING_C}`} strokeDashoffset={RING_C * (1 - ctxPct)} />
-                </svg>
-                <span className="wd-ring-pop">
-                  <span className="r"><span className="k">上下文</span>
-                    <span className="v mono">{ctxBadge(ctxNow)} / {ctxBadge(ctxMax)} · {Math.round(ctxPct * 100)}%</span></span>
-                  <span className="r"><span className="k">缓存命中</span>
-                    <span className="v">{rate === null ? '未统计' : `${Math.round(rate * 100)}%`}</span></span>
-                  <span className="r"><span className="k">总输入</span>
-                    <span className="v mono">{ctxBadge(run.usage.prompt)} tok</span></span>
-                </span>
-              </span>
-            )}
+            {workMetrics && <CtxRing m={workMetrics} label="" model={run?.model} duration={runMs > 0 ? fmtMs(runMs) : undefined} />}
             {run && <span className={'wd-state' + (running ? ' run' : run.awaiting ? ' ask' : run.ok ? '' : ' err')}>
               {running ? '执行中' : run.awaiting ? '等你回答' : run.ok ? '已完成' : '失败'}
             </span>}
@@ -433,32 +259,17 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
           </header>
 
           <div className="wd-body" ref={bodyRef}>
-          {flowLoops.length > 0 && (
-            <>
-              <div className="wd-sec-h">chat 模型</div>
-              {flowLoops.map((lp, li) => (
-                <section className="wd-loop" key={li}>
-                  <div className="wd-loop-h">{lp.ms === null ? '工作 —' : `工作 ${fmtMs(lp.ms)}`}</div>
-                  {lp.acts.map((a, ai) => {
-                    const key = `f${li}-${ai}`;
-                    return <Act key={ai} row={a} opened={!!expanded[key]}
-                      onToggle={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))} />;
-                  })}
-                </section>
-              ))}
-            </>
-          )}
           {!run ? null : (
             <>
-              <div className="wd-sec-h">work 子代理</div>
-              {/* 同一个会话跑过多次时，上面一行小签子切换；只有一次就不占地方 */}
-              {runs.length > 1 && (
-                <div className="wd-runs">
-                  {runs.map((r) => (
-                    <button key={r.id} className={'wd-run' + (r.id === run.id ? ' sel' : '')}
-                      onClick={() => setSelId(r.id)} title={r.task}>
-                      <span className="t mono">{fmtClock(r.startedAt)}</span>
-                      <span className={'d' + (r.ok ? '' : r.error ? ' err' : ' run')} />
+              {/* 每个群友是独立的 work 会话：先选人，再看这个人的运行；只有一个人时不占地方 */}
+              {owners.length > 1 && (
+                <div className="wd-runs" role="tablist" aria-label="选择发起人">
+                  {owners.map((o) => (
+                    <button key={o.userId || 'unknown'} role="tab" aria-selected={o.userId === owner?.userId}
+                      className={'wd-run' + (o.userId === owner?.userId ? ' sel' : '')}
+                      onClick={() => setOwnerSel(o.userId)} title={o.userId ? `QQ ${o.userId}` : o.nickname}>
+                      <span>{o.nickname}</span>
+                      <span className="n mono">{o.runs.length}</span>
                     </button>
                   ))}
                 </div>
@@ -466,21 +277,23 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
 
               <div className="wd-task">
                 <div className="wd-task-t">{run.task}</div>
-                <div className="wd-task-m mono">
-                  {run.model} · {run.rounds} 轮 · {run.toolCalls} 次工具
-                </div>
               </div>
-
-              {runMs > 0 && <div className="wd-loop-h">工作 {fmtMs(runMs)}</div>}
 
               {acts.map((a, i) => {
                 const key = `w${i}`;
-                return <Act key={i} row={a} text={a.kind === 'think'} opened={!!expanded[key]}
-                  onToggle={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))} />;
+                // 思考行收起时把首行当摘要挂在行首（ZCode 的思考链：一行摘要，点开看全文）
+                const row = a.kind === 'think'
+                  ? { ...a, subject: '', sub: thinkSummary(a.body) }
+                  : a;
+                // 摘要那格单独挂类名：只有思考行有扫光，其他行的次级文字保持静态
+                const isThink = a.kind === 'think';
+                return <Act key={i} row={row} text={isThink} opened={!!expanded[key] || !!a.streaming}
+                  onToggle={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))} thinkSummary={isThink} />;
               })}
 
               {run.error && <div className="wd-final err"><div className="lbl">执行失败</div><div>{run.error}</div></div>}
               {final && <div className="wd-answer">{final}</div>}
+              {running && <div className="wd-running"><WorkPulse /></div>}
             </>
           )}
           </div>

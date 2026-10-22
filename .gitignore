@@ -19,3 +19,6 @@ plugins-off/
 
 # 发布产物
 dist/
+
+# 本地记忆镜像（个人浏览用，不入库）
+.memory/

@@ -100,7 +100,10 @@ export function mdLite(text: string): string {
   out = out
     .replace(/`([^`\n]+)`/g, '<code class="mono" style="background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:.92em">$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    // 标题：work 的交付摘要常用 `## 完成` / `## 产物` 这类行。只去掉井号，按普通正文行排；
+    // 用内联 span 而不是 div，避免 pre-wrap 下多出一整行空白。
+    .replace(/^#{1,6}\s+(.+)$/gm, '<span class="md-h">$1</span>');
   out = out.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[Number(i)]);
   return out;
 }

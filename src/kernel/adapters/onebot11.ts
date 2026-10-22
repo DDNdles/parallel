@@ -451,6 +451,41 @@ export class OneBot11Adapter implements TransportAdapter {
     return r?.message_id ? String(r.message_id) : undefined;
   }
 
+  /** 合并转发：LLBot 与 NapCat 都吃 `messages: [{type:'node', data:{...content}}]`；
+   *  node 里的 file 段由协议端展开成文件消息（LLBot transformOutgoingSegments 支持 File）。 */
+  async sendForward(chat: ChatRef, nodes: { userId?: string; nickname?: string; content: MsgSegment[] }[]): Promise<string | undefined> {
+    const messages = nodes.map((n) => ({
+      type: 'node',
+      data: {
+        user_id: n.userId ?? this.selfId,
+        nickname: n.nickname ?? this.selfNickname,
+        content: n.content.map(localizeSegment),
+      },
+    }));
+    const payload: Record<string, unknown> = { message_type: chat.type, messages };
+    if (chat.type === 'group') payload.group_id = chat.chatId;
+    else payload.user_id = chat.chatId;
+    const r = await this.call('send_forward_msg', payload);
+    return r?.message_id ? String(r.message_id) : undefined;
+  }
+
+  /** 戳一戳：优先 go-cqhttp 的 send_poke；老协议端退回 group_poke / friend_poke */
+  async sendPoke(chat: ChatRef, userId: string): Promise<void> {
+    if (chat.type === 'group') {
+      try {
+        await this.call('send_poke', { group_id: chat.chatId, user_id: userId });
+      } catch {
+        await this.call('group_poke', { group_id: chat.chatId, user_id: userId });
+      }
+      return;
+    }
+    try {
+      await this.call('send_poke', { user_id: chat.chatId });
+    } catch {
+      await this.call('friend_poke', { user_id: chat.chatId });
+    }
+  }
+
   async sendFile(chat: ChatRef, absPath: string): Promise<string | undefined> {
     if (!existsSync(absPath) || !statSync(absPath).isFile()) throw new Error('文件不存在');
     const uri = pathToFileURL(absPath).href;

@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 用户：左列表（按角色分组）+ 右详情（档案 / 记忆事实 / 操作审计 / 拉黑 / 忘记我）
  *  顶栏四颗圆钮：重新读取、导出记忆、导入记忆、权限名单 */
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -99,7 +100,7 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
                 <button key={u.userId} className={'mset-item' + (u.userId === sel ? ' sel' : '')}
                   onClick={() => { setQ(''); setSel(u.userId); }} title={`${u.nickname || ''} ${u.userId}`}>
                   <span className="mset-item-ic"><Icon name={g.v === 'blocked' ? 'block' : 'personas'} size={15} /></span>
-                  <span className="mset-item-nm">{u.nickname || u.userId}</span>
+                  <FadeName text={u.nickname || u.userId} />
                   {g.v === 'blocked' && <i className="dot plg-dot-err" />}
                 </button>
               ))}

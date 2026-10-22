@@ -1,18 +1,24 @@
 'use client';
-/** 工作：左列表（环境 / 正在执行 / 历史）+ 右详情（模型链与容器，或单次任务的结论与步骤） */
-import { useCallback, useEffect, useState } from 'react';
-import { get, post, onEvent, fmtDT } from '@/lib/api';
+import { FadeName } from '@/components/FadeName';
+/**
+ * 工作：左列表（环境 / 正在执行 / 历史）+ 右详情。
+ *
+ * 详情形态照 ZCode 的 workbench（`packages/ui/src/v4/ConversationRowView.tsx` 与
+ * `ToolCallBlocks`）：顶部是状态头与本次运行的几个数，下面按轮次铺一条活动脊线——
+ * 一行一个动作（图标 + 能力词 + 主体 + 灰色次级 + 行增减），正文点开才展开；
+ * 结论、待回答的问题、失败原因与产物各占一张卡。没有 events 的老记录退回原来的步骤文本。
+ */
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { get, post, onEvent, fmtDT, mdLite } from '@/lib/api';
 import { Icon } from '@/components/Icon';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
+import { fileIcon } from '@/lib/fileIcon';
+import { ctxBadge } from '@/lib/entries';
+import {
+  Act, CtxRing, SecHead, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf, thinkSummary,
+  type ActRow, type LoopEvent, type Metrics, type WorkRun,
+} from '@/components/workActivity';
 
-interface WorkRun {
-  id: string; chatKey: string; task: string; model: string; ok: boolean; summary: string;
-  error?: string; rounds: number; toolCalls: number; durationMs: number; artifacts: string[];
-  startedAt: number; steps: string[];
-  /** 停下来等发起者回答（work_ask）：不是失败，也不是干完了 */
-  awaiting?: { question: string; notes?: string };
-  notes?: string;
-}
 interface WorkApi {
   runs: WorkRun[];
   models: { chat: string; work: string };
@@ -20,38 +26,196 @@ interface WorkApi {
   images: { python: boolean; browser: boolean };
   docker: boolean;
 }
-interface LiveRun { id: string; chatKey: string; task: string; model: string; trigger: string; steps: string[] }
 
 const ENV = '__env__';
 
+/** 还在跑：没结束、没失败、没停下来提问，也还没收到收敛回答 */
+const isRunning = (r: WorkRun): boolean => {
+  if (r.historical || r.ok || r.error || r.awaiting) return false;
+  return !(r.events ?? []).some((e) => e.kind === 'final');
+};
+
+interface RoundActs { n: number; acts: ActRow[] }
+
+/** 把事件流按 round 切开，每段再交给共享的 loopActs 摊平（思考归并、工具结果折回同一行） */
+function roundTimeline(events: LoopEvent[], live: boolean): { rounds: RoundActs[]; final?: string; total: number } {
+  const rounds: RoundActs[] = [];
+  let current: RoundActs | null = null;
+  let buffer: LoopEvent[] = [];
+  let final: string | undefined;
+  let n = 0;
+  const flush = () => {
+    if (!buffer.length) return;
+    const { acts } = loopActs(buffer, live);
+    buffer = [];
+    if (!acts.length) return;
+    if (!current) {
+      current = { n: 0, acts: [] };
+      rounds.push(current);
+    }
+    current.acts.push(...acts);
+  };
+  for (const ev of events) {
+    if (ev.kind === 'round') {
+      flush();
+      n += 1;
+      current = { n: ev.round ?? ev.n ?? n, acts: [] };
+      rounds.push(current);
+    } else if (ev.kind === 'final') {
+      final = ev.text ?? '';
+    } else {
+      buffer.push(ev);
+    }
+  }
+  flush();
+  const used = rounds.filter((r) => r.acts.length);
+  return { rounds: used, final, total: used.reduce((s, r) => s + r.acts.length, 0) };
+}
+
 export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
   const [data, setData] = useState<WorkApi | null>(null);
-  const [live, setLive] = useState<LiveRun[]>([]);
+  const [live, setLive] = useState<Record<string, WorkRun>>({});
   const [sel, setSel] = useState(ENV);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [ctxByModel, setCtxByModel] = useState<Record<string, number>>({});
+  const [now, setNow] = useState(() => Date.now());
+  /** 已经点开看过的失败运行：红点只提示一次，点掉后不再回来（存 localStorage） */
+  const [acked, setAcked] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('parallel_work_ack_fail');
+      if (!raw) return;
+      const ids = JSON.parse(raw);
+      if (Array.isArray(ids)) setAcked(new Set(ids.map(String)));
+    } catch { /* 坏数据当没看过 */ }
+  }, []);
+
+  const ackFail = useCallback((id: string) => {
+    setAcked((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      try { localStorage.setItem('parallel_work_ack_fail', JSON.stringify([...next])); } catch { /* 存不下就只在本页生效 */ }
+      return next;
+    });
+  }, []);
 
   const reload = useCallback(() => {
-    get('/api/work').then((d: WorkApi) => setData(d)).catch(() => {});
+    get('/api/work?limit=200').then((d: WorkApi) => setData(d)).catch(() => {});
+  }, []);
+
+  const loadModels = useCallback(() => {
+    get('/api/providers').then((d: any) => {
+      const m: Record<string, number> = {};
+      for (const p of d?.providers ?? []) for (const mm of p.config?.models ?? []) if (mm.contextWindow) m[mm.id] = mm.contextWindow;
+      setCtxByModel(m);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
     reload();
-    const offStart = onEvent('work.start', (d: any) => {
-      setLive((prev) => [{ id: d.id, chatKey: d.chatKey, task: d.task, model: d.model, trigger: d.trigger, steps: [] }, ...prev.filter((r) => r.id !== d.id)]);
-    });
-    const offStep = onEvent('work.step', (d: any) => {
-      setLive((prev) => prev.map((r) => (r.id === d.id ? { ...r, steps: [...r.steps, d.step] } : r)));
-    });
-    const offDone = onEvent('work.done', (d: any) => { setLive((prev) => prev.filter((r) => r.id !== d.id)); reload(); });
-    const offErr = onEvent('work.error', (d: any) => { setLive((prev) => prev.filter((r) => r.id !== d.id)); reload(); });
+    loadModels();
     const t = setInterval(reload, 8000);
-    return () => { offStart(); offStep(); offDone(); offErr(); clearInterval(t); };
+    return () => clearInterval(t);
+  }, [reload, loadModels]);
+
+  // 实时运行：work.start 先落一条空记录，work.event 往里长，收尾后 300ms 重拉完整记录（usage 是跑完才结算的）
+  useEffect(() => {
+    const offStart = onEvent('work.start', (d: any) => {
+      setLive((prev) => ({
+        ...prev,
+        [d.id]: {
+          id: d.id, chatKey: d.chatKey, task: d.task, model: d.model, ok: false, summary: '',
+          rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [], startedAt: Date.now(),
+          events: [], userId: d.userId, nickname: d.nickname, trigger: d.trigger,
+        },
+      }));
+    });
+    const offEvent = onEvent('work.event', (d: any) => {
+      setLive((prev) => {
+        const r = prev[d.id];
+        if (!r) return prev;
+        const evs = r.events ?? [];
+        // 流式增量在本地合并成一条，别让 events 数组按 token 膨胀
+        if (d.ev?.kind === 'delta') {
+          const last = evs[evs.length - 1];
+          if (last?.kind === 'delta') {
+            return {
+              ...prev,
+              [d.id]: { ...r, events: [...evs.slice(0, -1), { ...last, text: `${last.text ?? ''}${d.ev.text ?? ''}` }] },
+            };
+          }
+        }
+        return { ...prev, [d.id]: { ...r, events: [...evs, d.ev] } };
+      });
+    });
+    const offDone = onEvent('work.done', (d: any) => {
+      setLive((prev) => {
+        const r = prev[d.id];
+        if (!r) return prev;
+        return {
+          ...prev,
+          [d.id]: {
+            ...r, ok: true, summary: d.summary ?? '', rounds: d.rounds ?? r.rounds,
+            toolCalls: d.toolCalls ?? r.toolCalls, durationMs: d.durationMs ?? 0,
+            artifacts: d.artifacts ?? [],
+            awaiting: d.awaiting ? { question: String(d.question ?? d.summary ?? '') } : undefined,
+          },
+        };
+      });
+      setTimeout(reload, 300);
+    });
+    const offErr = onEvent('work.error', (d: any) => {
+      setLive((prev) => {
+        const r = prev[d.id];
+        if (!r) return prev;
+        return { ...prev, [d.id]: { ...r, ok: false, error: d.error } };
+      });
+      setTimeout(reload, 300);
+    });
+    return () => { offStart(); offEvent(); offDone(); offErr(); };
   }, [reload]);
 
   usePageCmd('work', cmd, () => reload());
 
-  const runs = data?.runs ?? [];
-  const lr = live.find((r) => r.id === sel);
-  const hr = !lr && sel !== ENV ? runs.find((r) => r.id === sel) : undefined;
+  /** 实时记录优先于轮询快照（event 流比 8s 轮询新）；快照里才有的 usage/历史标记补回来 */
+  const runs = useMemo(() => {
+    const by = new Map<string, WorkRun>((data?.runs ?? []).map((r) => [r.id, r]));
+    for (const l of Object.values(live)) {
+      const a = by.get(l.id);
+      by.set(l.id, a ? { ...a, ...l, usage: l.usage ?? a.usage, historical: a.historical } : l);
+    }
+    return [...by.values()].sort((a, b) => b.startedAt - a.startedAt);
+  }, [data, live]);
+
+  const runningRuns = runs.filter(isRunning);
+  const historyRuns = runs.filter((r) => !isRunning(r));
+
+  // 正在跑的任务让列表上的用时自己走（WorkPage 只在这一段时间里有秒针）
+  useEffect(() => {
+    if (!runningRuns.length) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [runningRuns.length]);
+
+  // 选中的运行被清理 / 还没加载出来：退回环境页
+  useEffect(() => {
+    if (sel !== ENV && !runs.some((r) => r.id === sel)) setSel(ENV);
+  }, [runs, sel]);
+
+  const run = sel !== ENV ? runs.find((r) => r.id === sel) : undefined;
+  const running = !!run && isRunning(run);
+  const metrics = useMemo(() => {
+    if (!run) return undefined;
+    const m = metricsOf(run.events ?? [], run.model, ctxByModel);
+    if (!m) return undefined;
+    if (run.usage && run.usage.calls > 0) {
+      return { ...m, ...run.usage, rate: cacheRate(run.usage.cacheHit, run.usage.cacheMiss) };
+    }
+    return m;
+  }, [run, ctxByModel]);
+  const duration = run ? (run.durationMs || (running ? Math.max(0, now - run.startedAt) : 0)) : 0;
 
   return (
     <div>
@@ -61,98 +225,147 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
             <div className="mset-group-t">环境</div>
             <button className={'mset-item' + (sel === ENV ? ' sel' : '')} onClick={() => setSel(ENV)}>
               <span className="mset-item-ic"><Icon name="models" size={15} /></span>
-              <span className="mset-item-nm">运行环境</span>
+              <FadeName text="运行环境" />
               {data && !data.docker && <i className="dot plg-dot-err" />}
             </button>
           </div>
 
-          {live.length > 0 && (
+          {runningRuns.length > 0 && (
             <div className="mset-group">
-              <div className="mset-group-t">正在执行（{live.length}）</div>
-              {live.map((r) => (
+              <div className="mset-group-t">正在执行（{runningRuns.length}）</div>
+              {runningRuns.map((r) => (
                 <button key={r.id} className={'mset-item' + (r.id === sel ? ' sel' : '')} onClick={() => setSel(r.id)} title={r.task}>
-                  <span className="mset-item-ic"><Icon name="work" size={15} /></span>
-                  <span className="mset-item-nm">{r.chatKey}</span>
-                  <i className="dot dot-on" />
+                  <span className="mset-item-ic"><span className="wd-spin"><Icon name="spinner" size={15} /></span></span>
+                  <FadeName text={r.task} />
+                  <span className="mset-badge mono">{fmtMs(Math.max(0, now - r.startedAt))}</span>
                 </button>
               ))}
             </div>
           )}
 
           <div className="mset-group">
-            <div className="mset-group-t">历史（{runs.length}）</div>
-            {runs.map((r) => (
-              <button key={r.id} className={'mset-item' + (r.id === sel ? ' sel' : '')} onClick={() => setSel(r.id)} title={r.task}>
+            <div className="mset-group-t">历史（{historyRuns.length}）</div>
+            {historyRuns.map((r) => (
+              <button key={r.id} className={'mset-item' + (r.id === sel ? ' sel' : '')}
+                onClick={() => { setSel(r.id); if (!r.ok && !r.awaiting) ackFail(r.id); }} title={r.task}>
                 <span className="mset-item-ic"><Icon name="work" size={15} /></span>
-                <span className="mset-item-nm">{r.task}</span>
-                {r.awaiting ? <i className="dot plg-dot-ask" /> : !r.ok && <i className="dot plg-dot-err" />}
+                <FadeName text={r.task} />
+                {!r.ok && !r.awaiting && !acked.has(r.id) && <i className="dot plg-dot-err" />}
               </button>
             ))}
-            {!runs.length && <div className="mset-group-e">还没有工作任务</div>}
+            {!historyRuns.length && <div className="mset-group-e">还没有历史任务</div>}
           </div>
         </aside>
 
-        {lr ? <RunDetail r={{ ...lr, live: true }} />
-          : hr ? <RunDetail r={{ ...hr, live: false }} />
-          : <EnvDetail data={data} onReload={reload} />}
+        {run ? (
+          <RunDetail
+            run={run} running={running} metrics={metrics} duration={duration}
+            expanded={expanded} onToggle={(k) => setExpanded((p) => ({ ...p, [k]: !p[k] }))}
+          />
+        ) : (
+          <EnvDetail data={data} onReload={reload} />
+        )}
       </div>
     </div>
   );
 }
 
-type View = (LiveRun & { live: true }) | (WorkRun & { live: false });
+function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
+  run: WorkRun; running: boolean; metrics?: Metrics; duration: number;
+  expanded: Record<string, boolean>; onToggle: (k: string) => void;
+}) {
+  const timeline = useMemo(() => roundTimeline(run.events ?? [], running), [run.events, running]);
+  // awaiting 时 summary 就是那个问题，已经单独成卡，不再重复一遍
+  const answer = timeline.final || (!run.awaiting ? run.summary : '');
+  const state: [string, string] = running ? ['执行中', 'run'] : run.awaiting ? ['等你回答', 'ask'] : run.error ? ['失败', 'err'] : run.ok ? ['已完成', 'ok'] : ['已结束', 'idle'];
+  // 顶栏已经写着「工作」了，详情头不再重复：用任务首行当标题（完整任务在下面那张卡里）
+  const headTitle = run.task.split('\n')[0].replace(/^任务：/, '').trim().slice(0, 48) || '工作';
 
-function RunDetail({ r }: { r: View }) {
   return (
-    <section className="mset-detail">
+    <section className="mset-detail wk-detail">
       <div className="mset-dhead">
-        <span className="mset-dic"><Icon name="work" size={17} /></span>
-        <h2 className="mset-dtitle">{r.live ? '正在执行' : r.awaiting ? '等你回答' : r.ok ? '已完成' : '失败'}</h2>
-        <span className="plg-ver mono">{r.chatKey}</span>
+        <span className="mset-dic">{running ? <span className="wd-spin"><Icon name="spinner" size={17} /></span> : <Icon name="work" size={17} />}</span>
+        <h2 className="mset-dtitle" title={run.task}>{headTitle}</h2>
+        <div className="mset-dright">
+          {metrics && <CtxRing m={metrics} label="" />}
+          <span className={`tag wk-state ${state[1]}`}>{state[0]}</span>
+        </div>
       </div>
 
-      <div className="wk-task">{r.task}</div>
-
-      <div className="mset-meta">
-        <span className="tag mono">{r.model}</span>
-        {!r.live && <span className="tag accent">{r.rounds} 轮 · {r.toolCalls} 工具</span>}
-        {!r.live && <span className="tag">{(r.durationMs / 1000).toFixed(1)}s</span>}
-        {!r.live && <span className="tag mono">{fmtDT(r.startedAt)}</span>}
-        {r.live && <span className="tag mono">{r.trigger === 'command' ? '/work' : r.trigger}</span>}
+      <div className="mset-meta wk-meta">
+        <span className="tag mono">{run.model}</span>
+        <span className="tag mono">{run.chatKey}</span>
+        {run.nickname && <span className="tag">{run.nickname}</span>}
+        <span className="tag mono">{fmtDT(run.startedAt)}</span>
+        {duration > 0 && <span className="tag mono">{fmtMs(duration)}</span>}
+        {metrics && <span className="tag mono">{ctxBadge(metrics.prompt + metrics.completion)} tok</span>}
       </div>
 
-      {!r.live && !r.ok && r.error && (
-        <>
-          <div className="mset-sec-h"><span>错误</span></div>
-          <pre className="plg-msg">{String(r.error)}</pre>
-        </>
+      <div className="wk-task">
+        <div className="wk-task-t">{run.task}</div>
+        {run.trigger && <div className="wk-task-m mono">{run.trigger === 'chat' ? '由 chat 派活' : run.trigger}</div>}
+      </div>
+
+      {run.awaiting && (
+        <div className="wk-callout ask">
+          <div className="wk-callout-h">它在等你回答</div>
+          <div className="wk-callout-b">{run.awaiting.question}</div>
+          {run.awaiting.notes && <pre className="wk-callout-note mono">{run.awaiting.notes}</pre>}
+        </div>
       )}
-      {!r.live && r.summary && (
-        <>
-          <div className="mset-sec-h"><span>{r.awaiting ? '它要你定的事' : '结论'}</span></div>
-          <pre className="plg-msg">{String(r.summary)}</pre>
-        </>
+
+      {run.error && (
+        <div className="wk-callout err">
+          <div className="wk-callout-h">执行失败</div>
+          <div className="wk-callout-b">{run.error}</div>
+        </div>
       )}
-      {!r.live && r.awaiting?.notes && (
-        <>
-          <div className="mset-sec-h"><span>它已经做到</span></div>
-          <pre className="plg-msg">{String(r.awaiting.notes)}</pre>
-        </>
+
+      {timeline.total === 0 ? (
+        running
+          ? <div className="wk-wait">等待模型响应…</div>
+          : (run.steps?.length
+            ? <pre className="plg-stack mono">{run.steps.slice(-60).join('\n')}</pre>
+            : <div className="wk-wait">（无执行记录）</div>)
+      ) : (
+        <div className="wk-spine">
+          {timeline.rounds.map((rd, ri) => (
+            <Fragment key={ri}>
+              {rd.acts.map((a, ai) => {
+                const key = `${ri}-${ai}`;
+                const row = a.kind === 'think' ? { ...a, subject: '', sub: thinkSummary(a.body) } : a;
+                const isThink = a.kind === 'think';
+                return (
+                  <Act key={key} row={row} text={isThink} opened={!!expanded[key] || !!a.streaming}
+                    onToggle={() => onToggle(key)} thinkSummary={isThink} />
+                );
+              })}
+            </Fragment>
+          ))}
+        </div>
       )}
-      {!r.live && r.artifacts?.length > 0 && (
+
+      {running && <div className="wk-running"><WorkPulse /></div>}
+
+      {answer && <div className="wk-answer" dangerouslySetInnerHTML={{ __html: mdLite(answer) }} />}
+
+      {run.notes && run.notes !== answer && (
+        <div className="wk-answer" dangerouslySetInnerHTML={{ __html: mdLite(run.notes) }} />
+      )}
+
+      {!!run.artifacts?.length && (
         <>
-          <div className="mset-sec-h"><span>产物</span></div>
-          <div className="mset-models">
-            {r.artifacts.map((a) => <div key={a} className="mset-mrow"><span className="plg-v mono">{a}</span></div>)}
+          <SecHead title="产物" />
+          <div className="wk-artifacts">
+            {run.artifacts.map((a) => (
+              <div key={a} className="wk-artifact" title={a}>
+                <Icon name={fileIcon(a)} size={14} />
+                <span className="mono">{a.split(/[\\/]/).pop() || a}</span>
+              </div>
+            ))}
           </div>
         </>
       )}
-
-      <div className="mset-sec-h">
-        <span>执行步骤</span>
-        <span className="plg-sec-r plg-hint">{r.steps.length} 步</span>
-      </div>
-      <pre className="plg-stack mono">{r.steps.slice(-60).join('\n') || (r.live ? '等待模型响应…' : '（无）')}</pre>
     </section>
   );
 }
@@ -168,9 +381,9 @@ function EnvDetail({ data, onReload }: { data: WorkApi | null; onReload: () => v
       </div>
 
       <div className="mset-meta">
-        <span className={'tag' + (data && !data.docker ? ' warn' : '')}>Docker {data?.docker ? '就绪' : '不可用'}</span>
-        <span className={'tag' + (data && !data.images?.python ? ' warn' : '')}>Python{data?.images?.python ? '可用' : '不可用'}</span>
-        <span className={'tag' + (data && !data.images?.browser ? ' warn' : '')}>浏览器{data?.images?.browser ? '可用' : '不可用'}</span>
+        <span className={'tag' + (data && !data.docker ? ' err' : '')}>Docker {data?.docker ? '就绪' : '不可用'}</span>
+        <span className={'tag' + (data && !data.images?.python ? ' err' : '')}>Python{data?.images?.python ? '可用' : '不可用'}</span>
+        <span className={'tag' + (data && !data.images?.browser ? ' err' : '')}>浏览器{data?.images?.browser ? '可用' : '不可用'}</span>
       </div>
 
       <div className="mset-sec-h"><span>模型链</span></div>

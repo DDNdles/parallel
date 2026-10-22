@@ -11,6 +11,8 @@ export type SessionLogType =
   | 'message_in' | 'message_out' | 'command' | 'command_result'
   | 'agent_start' | 'agent_end' | 'llm_call' | 'llm_delta' | 'tool_call' | 'tool_result'
   | 'error' | 'system'
+  /** 戳一戳（双击头像）：不是消息，但会话流里要留下这一下 */
+  | 'poke'
   /** 上下文压缩：这条之前的消息在后续请求里由 summary 代替（对齐 pi 的 compaction 条目） */
   | 'compaction'
   /** 拟人层决策：这一轮为什么开口 / 为什么沉默（含必要性打分与空窗补偿明细） */
@@ -30,6 +32,12 @@ export interface SessionLogEntry {
   chatType: string;
   type: SessionLogType;
   role?: 'user' | 'assistant' | 'system' | 'tool';
+  /**
+   * 这条属于哪条执行线：`chat` = 会话模型自己的 loop，`work` = work 子代理的 loop。
+   * 两边都会往同一份会话日志里写 tool_call / agent_start…，桌面端「工作」抽屉靠它分开显示。
+   * 老记录没有这个字段 = chat（那时还没有 work 侧栏）。
+   */
+  lane?: 'chat' | 'work';
   userId?: string;
   nickname?: string;
   text?: string;

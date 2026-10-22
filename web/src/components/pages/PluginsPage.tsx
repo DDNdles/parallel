@@ -1,4 +1,5 @@
 'use client';
+import { FadeName } from '@/components/FadeName';
 /** 插件管理：左列表（按归属分组，行内只放图标 + 名字 + 状态点）+ 右详情页
  *  （简介 / 归属与权限 / 能力 / 分群开关 / 可配置项）。外壳与「模型」页共用 mset-* 一套类。 */
 import { useCallback, useEffect, useState } from 'react';
@@ -67,7 +68,7 @@ export default function PluginsPage({ cmd }: { cmd?: PageCmd }) {
                 <button key={p.id} className={'mset-item' + (p.id === cur?.id ? ' sel' : '')}
                   onClick={() => setSel(p.id)} title={p.name}>
                   <span className="mset-item-ic"><Icon name="plugins" size={15} /></span>
-                  <span className="mset-item-nm">{p.name}</span>
+                  <FadeName text={p.name} />
                   <i className={p.state === 'loaded' ? 'dot dot-on' : p.state === 'error' ? 'dot plg-dot-err' : 'dot mset-dot-off'} />
                 </button>
               ))}

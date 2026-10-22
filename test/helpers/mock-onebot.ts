@@ -84,6 +84,8 @@ export class MockOneBot {
     if (action === 'get_group_info') return { group_id: Number(params?.group_id ?? 0), group_name: '按需群名' };
     if (action === 'get_friend_list') return [];
     if (action === 'send_group_msg' || action === 'send_private_msg') return { message_id: Math.floor(Math.random() * 100000) };
+    // 发文件（deliver_file / send_file）：协议端回一个文件 id；测试靠 actions 里的记录断言
+    if (action === 'upload_group_file' || action === 'upload_private_file') return { file_id: 'mock-file' };
     return {};
   }
 

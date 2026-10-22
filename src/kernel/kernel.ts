@@ -421,6 +421,9 @@ export class Kernel {
     await this.adapter.stop();
     await this.llbot.stop().catch(() => {});
     await this.napcat.stop().catch(() => {});
+    // 会话容器不随内核退出自己消失：不在这里收掉，Docker 里会一直留着 compute/browser
+    // 两个容器（下次启动还会同名 rm -f 重建，等于白占内存）
+    await this.session.stopAll().catch(() => {});
     this.db.close();
   }
 }

@@ -83,7 +83,7 @@ export interface WorkPromptInput {
   tools: ToolDef[];
   /** 会话沙箱根目录的展示路径（内核保证写只发生在这里） */
   sandboxRoot: string;
-  trigger?: 'command' | 'subagent';
+  trigger?: 'chat' | 'command' | 'subagent';
   /** 嵌套深度（入口 0）：子代理在自己的 prompt 里知道"我是被谁叫来的" */
   depth?: number;
   /** 可委派的子代理清单（仅在工具面里有 delegate 时给） */
@@ -131,7 +131,9 @@ export function buildWorkSections(input: WorkPromptInput): { system: string; sec
         `# 本次任务`,
         input.task,
         '',
-        `（触发方式：${input.trigger === 'subagent' ? `上一层 work 子代理委派（第 ${(input.depth ?? 0)} 层）` : '管理员 /work 命令'}。只做这一件事；范围外的改动不要顺手做。）`,
+        `（触发方式：${input.trigger === 'subagent'
+          ? `上一层 work 子代理委派（第 ${(input.depth ?? 0)} 层）`
+          : input.trigger === 'chat' ? '聊天里由助手派发（管理员授权）' : '管理员命令'}。只做这一件事；范围外的改动不要顺手做。）`,
       ].join('\n'),
     },
     {
@@ -148,6 +150,14 @@ export function buildWorkSections(input: WorkPromptInput): { system: string; sec
         `# 环境`,
         `- 会话沙箱：${input.sandboxRoot}（可读写；这是唯一可写的地方，路径越界会被内核拒绝）。`,
         `- 计算沙箱**没有外网**：联网一律走工具，不要在脚本里直接请求网络。`,
+        `- 脚本 / shell / 浏览器都在 **Linux 容器**里跑：容器内会话目录是 \`/ws\`（= 上面那个沙箱根），`,
+        `  python_session、run_python_work、run_bash 里的相对路径都相对 \`/ws\`。`,
+        `- **不要在脚本里写宿主机的 Windows 路径**（C:\\...）：容器里不存在它，按它写文件会造出一个名字很怪的空文件。`,
+        `  要打开自己写的网页用 browser_open + \`file:///ws/文件名\`，不要用宿主路径的 file:// URL。`,
+        `- 宿主机桌面与它上面装的程序（本机 Chrome/Edge 等）在沙箱里看不到、也不该去调用；`,
+        `  需要渲染网页就用 browser_*，不要试图启动本机浏览器。`,
+        `- 这个沙箱是本会话里**发起人自己的**一份（同一群其他人看不到它的内容）；`,
+        `  群聊里收到的文件已放在 \`inbox/\`，用相对路径读即可。`,
         `- 产物留在会话沙箱内，按下面的格式登记；需要直接发给用户时用 send_file。`,
       ].join('\n'),
     },
