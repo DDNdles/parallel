@@ -310,7 +310,12 @@ export function Act({ row, opened, onToggle, text, thinkSummary: isThink }: {
   useEffect(() => { if (opened) setEverOpen(true); }, [opened]);
   // 模型正文：不挂在「思考」行里，直接按普通正文铺开，没有动作头也没有折叠
   if (row.kind === 'text') {
-    return <div className={'wd-text' + (row.streaming ? ' live' : '')}>{row.body}</div>;
+    return (
+      <div className="wd-text">
+        {row.body}
+        {row.streaming && <span className="caret-slot wd-caret"><Icon name="brand" size={13} /></span>}
+      </div>
+    );
   }
   const toggle = has ? () => { setEverOpen(true); onToggle(); } : undefined;
   return (

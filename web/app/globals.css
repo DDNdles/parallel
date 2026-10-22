@@ -936,7 +936,9 @@ tr:hover td { background: var(--row-hover); }
 /* 模型正文：直接铺开，不套思考折叠行 */
 .wd-text { margin: 4px 0 12px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
 .wk-spine .wd-text { margin-left: 22px; }
-.wd-text.live::after { content: '▍'; margin-left: 1px; color: var(--faint); animation: caret-blink 1.06s steps(1, end) infinite; }
+/* 正文流式光标与会话页 composer 同款：parallel 花押，宽度=字号、按行高对齐 */
+.wd-text .wd-caret { width: 13px; height: 1.75em; vertical-align: top; }
+.wd-text .wd-caret svg { width: 13px; height: 13px; }
 /* 步骤正文的展开/收起：照会话左栏分组那套开窗动效——窗口高度滑动。
    收起时正文留在 0 高度里，收起才能也是滑动而不是瞬间消失。
    注意：这里不要挂渐变蒙版（2026-10-22 用户明令），展开过程中底部要保持清晰 */
