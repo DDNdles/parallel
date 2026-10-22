@@ -947,18 +947,22 @@ tr:hover td { background: var(--row-hover); }
 .wd-act.running .sb { color: var(--dim); }
 /* 运行中的动作词（「浏览器」「终端」…）：白色扫光；结果回来 running 消失，自动恢复普通灰 */
 .wd-act.running .lbl {
-  background: linear-gradient(90deg, var(--faint) 0%, var(--faint) 34%, var(--text) 50%, var(--faint) 66%, var(--faint) 100%);
-  background-size: 300% 100%; background-clip: text; -webkit-background-clip: text;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--text) 45%, transparent) 0%, color-mix(in srgb, var(--text) 45%, transparent) 30%, var(--text) 50%, color-mix(in srgb, var(--text) 45%, transparent) 70%, color-mix(in srgb, var(--text) 45%, transparent) 100%);
+  background-size: 200% 100%; background-clip: text; -webkit-background-clip: text;
   color: transparent; -webkit-text-fill-color: transparent;
-  animation: wd-shimmer 2.4s linear infinite;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--text) 55%, transparent));
+  animation: wd-shimmer 1.6s linear infinite;
 }
 .wd-act .sb.wd-think-sum {
-  background: linear-gradient(90deg, var(--faint) 0%, var(--faint) 34%, var(--text) 50%, var(--faint) 66%, var(--faint) 100%);
-  background-size: 300% 100%; background-clip: text; -webkit-background-clip: text;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--text) 45%, transparent) 0%, color-mix(in srgb, var(--text) 45%, transparent) 30%, var(--text) 50%, color-mix(in srgb, var(--text) 45%, transparent) 70%, color-mix(in srgb, var(--text) 45%, transparent) 100%);
+  background-size: 200% 100%; background-clip: text; -webkit-background-clip: text;
   color: transparent; -webkit-text-fill-color: transparent;
 }
-.wd-act.running .sb.wd-think-sum { animation: wd-shimmer 2.4s linear infinite; }
-@keyframes wd-shimmer { 0% { background-position: 100% 0; } 50% { background-position: 0 0; } 100% { background-position: 0 0; } }
+.wd-act.running .sb.wd-think-sum {
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--text) 55%, transparent));
+  animation: wd-shimmer 1.6s linear infinite;
+}
+@keyframes wd-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0% 0; } }
 .wd-chev { display: inline-flex; color: var(--faint); transform: rotate(-90deg); transition: transform var(--dur-fast) var(--ease-out); }
 /* 图标本体朝下，所以静息转 -90° 读作 ">"，展开回正读作 "v" */
 .wd-act.open .wd-chev { transform: rotate(0deg); }
