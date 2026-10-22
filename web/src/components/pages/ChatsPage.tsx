@@ -10,7 +10,6 @@ import { isWorkEntry } from '@/lib/entries';
 import { Icon } from '@/components/Icon';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import { QQ_FACE_NAMES } from '@/lib/qqFaceNames';
-import { WorkPulse } from '@/components/workActivity';
 import WorkDrawer from '@/components/WorkDrawer';
 import { Modal } from '@/components/Modal';
 
@@ -90,30 +89,9 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   const [folded, setFolded] = useState<Record<string, boolean>>({});
   const [animatingId, setAnimatingId] = useState<string | null>(null); // 正在开合的分组 id：淡化 mask 只作用于该分组自身
   const [listW, setListW] = useState(250);
-  /** 当前会话有顶层 work 在跑：会话流末尾亮 parallel 花押（不在左下角账号旁） */
-  const [workRunning, setWorkRunning] = useState(false);
   /** 会话页预览（群友头像 + 收来的图片缩略图）：设置页「会话」里的那个开关 */
   const [preview, setPreview] = useState(true);
   const [zoom, setZoom] = useState<{ rel: string; name: string } | null>(null);
-  // 当前会话的 work 运行态：事件触发重拉 + 15s 兜底；只在没有 final / 没在等回答时闪
-  useEffect(() => {
-    const key = current?.key;
-    if (!key) { setWorkRunning(false); return; }
-    let alive = true;
-    const refresh = () => {
-      get(`/api/work?chatKey=${encodeURIComponent(key)}&limit=10`).then((d: any) => {
-        if (!alive) return;
-        setWorkRunning((d.runs ?? []).some((r: any) =>
-          (r.depth ?? 0) === 0 && !r.historical && !r.ok && !r.error && !r.awaiting
-          && !(r.events ?? []).some((e: any) => e.kind === 'final'),
-        ));
-      }).catch(() => {});
-    };
-    refresh();
-    const offs = [onEvent('work.start', refresh), onEvent('work.done', refresh), onEvent('work.error', refresh)];
-    const timer = setInterval(refresh, 15_000);
-    return () => { alive = false; offs.forEach((off) => off()); clearInterval(timer); };
-  }, [current?.key]);
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
@@ -759,7 +737,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
               )}
               <div className="conv-scroll" ref={streamRef} onScroll={onStreamScroll} onWheel={onStreamWheel}>
                 <div className="conv-col" ref={colRef} onAnimationEnd={onTurnRiseEnd}>{stream}</div>
-                {workRunning && <div className="conv-working"><WorkPulse /></div>}
               </div>
               {/* 消息滑到对话框上方时渐隐淡出（纯背景色渐变，比 mask 便宜，不拖累滚动） */}
               <div className="conv-fade" aria-hidden />
