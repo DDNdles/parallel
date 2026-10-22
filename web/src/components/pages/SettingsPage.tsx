@@ -198,6 +198,7 @@ export default function SettingsPage() {
     enable: true, windowMessages: 20, minMessages: 3, cooldownMinutes: 30,
     maxPhrases: 3, retry: true, maxStrikes: 3,
   };
+  const intr = h.interrupt;
   const patch = (p: Partial<Config>) => setC({ ...c, ...p });
   /** 即时保存：本地 state 先行；immediate=true（开关/选择类单次事件）立即发，输入框默认 600ms 防抖只发最后一拍 */
   const autoSave = (key: string, delay: number, body: Record<string, unknown>) => {
@@ -310,16 +311,13 @@ export default function SettingsPage() {
           {sec === 'chat' && (() => {
             // 旧内核没有这些键就不渲染：重启内核后出现
             const rp = h?.repeat;
-            const it = h?.interrupt;
             const st = c.storage;
             const cm = st?.contextMinutes;
             const setRp = (p: Partial<NonNullable<Humanlike['repeat']>>, immediate = false) =>
               rp && patchH({ repeat: { ...rp, ...p } }, immediate);
-            const setIt = (p: Partial<NonNullable<Humanlike['interrupt']>>, immediate = false) =>
-              it && patchH({ interrupt: { ...it, ...p } }, immediate);
             return (
               <>
-                {(cm !== undefined || rp || it) && (
+                {(cm !== undefined || rp) && (
                   <div className="set-grid">
                     {cm !== undefined && st && (
                       <Num label="传入上下文时限分钟" value={cm}
@@ -330,10 +328,6 @@ export default function SettingsPage() {
                       <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
                       <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
                     </>)}
-                    {it && (
-                      <Num label="插话打断概率（%）" value={Math.round(it.probability * 100)}
-                        onChange={(v) => setIt({ probability: Math.min(100, Math.max(0, v)) / 100 })} />
-                    )}
                   </div>
                 )}
 
@@ -349,13 +343,6 @@ export default function SettingsPage() {
                       <span className="plg-v">跟屏复读</span>
                       <span className="mset-macts"><Switch on={rp.enable !== false}
                         onChange={() => setRp({ enable: !(rp.enable !== false) }, true)} /></span>
-                    </div>
-                  )}
-                  {it && (
-                    <div className="mset-mrow">
-                      <span className="plg-v">说话时被插话就停下</span>
-                      <span className="mset-macts"><Switch on={it.enable !== false}
-                        onChange={() => setIt({ enable: !(it.enable !== false) }, true)} /></span>
                     </div>
                   )}
                 </div>
@@ -453,7 +440,7 @@ export default function SettingsPage() {
             </>
           )}
 
-          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
+          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-field">
@@ -596,6 +583,19 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ backoff: { ...h.backoff, capSeconds: v } })} />
                 <Num label="绕过退避的积压条数" value={h.backoff.bypassPendingCount}
                   onChange={(v) => patchH({ backoff: { ...h.backoff, bypassPendingCount: v } })} />
+              </div>
+
+              <div className="mset-sec-h"><span>插话打断</span></div>
+              <div className="mset-models">
+                <div className="mset-mrow">
+                  <span className="plg-v">说话时被插话就停下<Hint text="她还在生成回复或逐条发气泡时，群里有人插话：生成中的整轮会作废，剩余没发出的气泡按概率砍掉。" /></span>
+                  <span className="mset-macts"><Switch on={intr.enable !== false}
+                    onChange={() => patchH({ interrupt: { ...intr, enable: !(intr.enable !== false) } }, true)} /></span>
+                </div>
+              </div>
+              <div className="set-grid" style={{ marginTop: 14 }}>
+                <Num label="插话打断概率（%）" hint="0 = 从不打断，100 = 每句插话都打断。@ 触发的回复目前也受这个概率影响。" value={Math.round(intr.probability * 100)}
+                  onChange={(v) => patchH({ interrupt: { ...intr, probability: Math.min(100, Math.max(0, v)) / 100 } })} />
               </div>
 
               <div className="mset-sec-h"><span>群聊行为</span></div>
