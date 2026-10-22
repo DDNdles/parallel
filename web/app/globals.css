@@ -1405,11 +1405,13 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .chain-add { margin-left: auto; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: 6px; background: transparent; color: var(--faint); cursor: pointer; padding: 0; }
 .chain-add:hover { background: transparent; color: var(--text); }
-/* 思考强度：窄左栏里用一排小胶囊，别用会溢出左栏的下拉（.mset-list 有 overflow 裁剪） */
-.chain-reason { display: flex; align-items: center; gap: 6px; padding: 1px 8px 6px; font-size: 11px; color: var(--faint); }
-.chain-reason > span:first-child { flex: none; }
-.chain-reason .mset-chips { gap: 3px; flex-wrap: wrap; }
-.chain-reason .mset-chip { padding: 3px 6px; font-size: 11px; border-radius: 7px; }
+/* 思考强度：每个模型一行自己的小胶囊；菜单 portal 到 body，避开左栏 overflow 裁剪 */
+.chain-r-pill { flex: none; display: inline-flex; }
+.chain-r-pill .pf-btn { padding: 2px 6px; gap: 3px; border-radius: 7px; font-size: 10.5px; color: var(--faint); }
+.chain-r-pill .pf-btn:hover, .chain-r-pill .pf-btn.open { color: var(--text); }
+.chain-r-pill .pf-chev svg { width: 10px; height: 10px; }
+.pf-menu.pf-compact { padding: 4px; border-radius: 11px; }
+.pf-menu.pf-compact .pf-item { padding: 5px 8px; font-size: 11.5px; border-radius: 7px; }
 .mset-badge-rank { background: var(--seg-active, var(--seg-bg)); color: var(--text); }
 .chain-item { cursor: grab; user-select: none; }
 .chain-item.on { background: var(--surface); border-color: var(--border-stronger); }

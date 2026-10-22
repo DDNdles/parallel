@@ -82,8 +82,8 @@ export const DEFAULT_CONFIG = {
     // 供应商不再分聊天/工作用途：两条有序链各自列「供应商 + 模型」，靠前的优先，掉线自动接后一个
     chatChain: [] as ModelRef[],
     workChain: [] as ModelRef[],          // 工作链独立于聊天链（不跟随）；空 = /work 没有可用模型
-    chatReasoning: '',                    // 聊天链思考强度：'' = 默认；否则 minimal/low/medium/high/xhigh/max
-    workReasoning: '',                    // 工作链思考强度（与聊天链各自独立）
+    /** 每个模型单独的思考强度：键 = `${provider}|${model}`，值 = 该模型声明过的档位；空/缺省 = 默认 */
+    modelReasoning: {} as Record<string, string>,
     failoverThreshold: 2,                 // 同一条链上连续掉线 N 次才切到下一个模型
   },
   // work 子代理（/work 链路）。定义与压缩口径都放在这里，改配置即可调整，不必改代码。
@@ -365,6 +365,7 @@ export class ConfigStore {
       }
     }
     this.migrateModelChains();
+    this.migrateModelReasoning();
     // 迁移：风控里的「随机抖动」与「唤醒方式/唤醒词」已并入拟人化（回复前的等待归打字节奏，
     // 要不要理人归必要性打分），配置里残留的旧键在这里清掉，别让它们一直躺在文件里当死配置。
     for (const k of ['jitterMinMs', 'jitterMaxMs', 'groupWake', 'wakeWords'] as const) {
@@ -432,6 +433,36 @@ export class ConfigStore {
       llm.chatChain = llm.chatChain.filter((x: ModelRef) => x.provider !== 'gemini-3.8-flash');
       llm.workChain = llm.workChain.filter((x: ModelRef) => x.provider !== 'gemini-3.8-flash');
       if (llm.activeProvider === 'gemini-3.8-flash') llm.activeProvider = llm.chatChain[0]?.provider ?? '';
+    }
+  }
+
+  /**
+   * 迁移：链级思考强度（chatReasoning / workReasoning）→ 每个模型单独的 modelReasoning。
+   * 旧值只迁给实际声明过该档位的链上模型；迁完删掉旧键，避免死配置继续躺在文件里。
+   */
+  private migrateModelReasoning(): void {
+    const llm = this.config.llm as any;
+    const providers = this.config.providers as Record<string, any>;
+    if (!llm.modelReasoning || typeof llm.modelReasoning !== 'object' || Array.isArray(llm.modelReasoning)) {
+      llm.modelReasoning = {};
+    }
+    const levelsOf = (pid: string, model: string): string[] => {
+      const p = providers[pid];
+      const m = (Array.isArray(p?.models) ? p.models : []).find((x: any) => x?.id === model);
+      return (Array.isArray(m?.reasoningLevels) ? m.reasoningLevels : [])
+        .map(String)
+        .filter((v: string) => (REASONING_LEVELS as readonly string[]).includes(v));
+    };
+    for (const [kind, field] of [['chat', 'chatReasoning'], ['work', 'workReasoning']] as const) {
+      const v = String(llm[field] ?? '');
+      if ((REASONING_LEVELS as readonly string[]).includes(v)) {
+        for (const ref of (kind === 'chat' ? llm.chatChain : llm.workChain) ?? []) {
+          if (ref?.provider && ref?.model && levelsOf(ref.provider, ref.model).includes(v)) {
+            llm.modelReasoning[`${ref.provider}|${ref.model}`] = v;
+          }
+        }
+      }
+      delete llm[field];
     }
   }
 

@@ -1,7 +1,7 @@
 import type {
   LLMProvider, LLMChatRequest, LLMResponse, ToolCall, ChatMessage, LLMUsage,
 } from '../types.ts';
-import { REASONING_LEVELS, type ConfigStore, type ModelRef } from '../config.ts';
+import { REASONING_LEVELS, type ConfigStore, type ModelRef, type ProviderModelCfg } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { Db } from '../db.ts';
 import { todayKey } from '../util/misc.ts';
@@ -20,6 +20,8 @@ export type ModelChainKind = 'chat' | 'work';
 export interface ChainEntry extends ModelRef {
   fails: number;
   state: 'current' | 'idle' | 'down';
+  /** 该模型单独选定的思考强度（'' = 默认） */
+  reasoning: string;
   /** 硬不可用后的冷却截止时间（毫秒时间戳）；没有冷却就没有这个字段 */
   downUntil?: number;
 }
@@ -111,11 +113,35 @@ export class LlmService {
     return pid ? [{ provider: pid, model: this.modelFor(pid) }] : [];
   }
 
-  /** 某条链选定的思考强度（'' = 默认，由模型/供应商决定）。非法值按默认处理。 */
-  reasoningFor(kind: ModelChainKind): string {
-    const llm = this.config.config.llm as { chatReasoning?: string; workReasoning?: string };
-    const v = String((kind === 'work' ? llm.workReasoning : llm.chatReasoning) ?? '');
-    return (REASONING_LEVELS as readonly string[]).includes(v) ? v : '';
+  /** 供应商为某个模型声明的思考等级；只保留 pi-ai 真能识别的档位 */
+  reasoningLevelsFor(provider: string, model: string): string[] {
+    const pc = (this.config.config.providers as Record<string, any>)[provider] ?? {};
+    const m = (Array.isArray(pc.models) ? pc.models : []).find((x: ProviderModelCfg) => x?.id === model);
+    return (Array.isArray(m?.reasoningLevels) ? m.reasoningLevels : [])
+      .map(String)
+      .filter((v: string) => (REASONING_LEVELS as readonly string[]).includes(v));
+  }
+
+  /** 某个模型单独选定的思考强度（'' = 默认）。没声明等级、或存的值已不在声明里，都按默认。 */
+  reasoningFor(provider: string, model: string): string {
+    const levels = this.reasoningLevelsFor(provider, model);
+    if (!levels.length) return '';
+    const v = String((this.config.config.llm as any).modelReasoning?.[`${provider}|${model}`] ?? '');
+    return levels.includes(v) ? v : '';
+  }
+
+  /** 写某个模型的思考强度；'' = 清掉（回到默认）。非法档位直接拒绝。 */
+  setModelReasoning(provider: string, model: string, level: string): { ok: boolean; error?: string } {
+    const levels = this.reasoningLevelsFor(provider, model);
+    if (level && !levels.includes(level)) {
+      return { ok: false, error: `模型 ${model} 声明的思考等级是 ${levels.join(' / ') || '（无）'}` };
+    }
+    const llm = this.config.config.llm as any;
+    if (!llm.modelReasoning || typeof llm.modelReasoning !== 'object') llm.modelReasoning = {};
+    const key = `${provider}|${model}`;
+    if (level) llm.modelReasoning[key] = level;
+    else delete llm.modelReasoning[key];
+    return { ok: true };
   }
 
   /** 链上当前位置：连续掉线达到阈值后由 markFail 往后挪 */
@@ -212,7 +238,7 @@ export class LlmService {
           this.downEntries.get(`${r.provider}|${r.model}`) ?? 0,
         );
         const state = i === at ? 'current' as const : this.cooling(r) || fails >= th ? 'down' as const : 'idle' as const;
-        return { ...r, fails, state, ...(until > Date.now() ? { downUntil: until } : {}) };
+        return { ...r, fails, state, reasoning: this.reasoningFor(r.provider, r.model), ...(until > Date.now() ? { downUntil: until } : {}) };
       });
     };
     return { chat: one('chat'), work: one('work') };
@@ -343,7 +369,12 @@ export class LlmService {
       }
       const pc = (this.config.config.providers as Record<string, any>)[ref.provider] ?? {};
       const model = req.model || meta.model || ref.model;
-      const shaped = { ...this.shapeForModel(pc, model, { ...req, model }), reasoning: this.reasoningFor(kind) || undefined };
+      // 显式传进来的档位优先（目前只有测试/内部调用会用）；否则读这个模型自己的设置
+      const own = String(req.reasoning ?? '');
+      const reasoning = (REASONING_LEVELS as readonly string[]).includes(own)
+        ? own
+        : this.reasoningFor(ref.provider, model);
+      const shaped = { ...this.shapeForModel(pc, model, { ...req, model }), reasoning: reasoning || undefined };
       this.activeRequests++;
       const started = Date.now();
       try {
@@ -464,7 +495,6 @@ export class LlmService {
         const fail = (err: Error) => { out.push(errorEvent(err)); out.end(); };
         const list = self.chainConfig(kind);
         if (!list.length) { fail(new ProviderError('模型链是空的：请在桌面端「模型」页的「聊天模型」里加至少一条')); return; }
-        const reasoning = self.reasoningFor(kind);
         // 并发的 work 任务钉在自己的起始模型上；单个任务仍从它起绕完整条链做替代
         const order = pinned ? self.orderAt(list, Number(o.start)) : self.order(kind, list);
         const fails: string[] = [];
@@ -492,6 +522,7 @@ export class LlmService {
             continue;
           }
           const mcfg = (Array.isArray(pc.models) ? pc.models : []).find((m: any) => m?.id === ref.model);
+          const reasoning = self.reasoningFor(ref.provider, ref.model);
           const engine = isMock ? { apiName: 'mock', api: mockStreams() } : undefined;
           const apiName = engine ? engine.apiName : piApiName(piProto);
           let streamed = false;

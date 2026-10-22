@@ -95,6 +95,8 @@ before(async () => {
   }
   // 同一家供应商下的第二个模型：用来验"整家连不上时，同家的后续条目这轮直接跳过"
   providers.dead.models.push({ id: 'dead-2', enabled: true });
+  // 思考等级由每个模型自己声明；good 只开 low/high 两档
+  providers.good.models[0].reasoningLevels = ['low', 'high'];
   llm.syncCustomProviders();
   config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
   config.config.llm.failoverThreshold = 1;
@@ -308,20 +310,21 @@ test('链为空时按 activeProvider 兜底（手改 config.json 仍然生效）
   config.config.llm.chatChain = saved;
 });
 
-test('思考强度：两条链各自读自己的设置，请求体带上 reasoning_effort', async () => {
+test('思考强度：每个模型单独设置，只认该模型声明的档位', async () => {
   reset();
   config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
-  config.config.llm.chatReasoning = 'high';
-  config.config.llm.workReasoning = 'low';
-  assert.equal(llm.reasoningFor('chat'), 'high');
-  assert.equal(llm.reasoningFor('work'), 'low');
+  config.config.llm.modelReasoning = { 'good|good-1': 'high' };
+  assert.deepEqual(llm.reasoningLevelsFor('good', 'good-1'), ['low', 'high']);
+  assert.equal(llm.reasoningFor('good', 'good-1'), 'high');
 
   await llm.chat(req(), { chain: 'chat' });
   assert.equal(String(bodies[bodies.length - 1]?.reasoning_effort ?? ''), 'high',
-    `聊天链的思考强度要进请求体：${JSON.stringify(bodies[bodies.length - 1])}`);
+    `模型的思考强度要进请求体：${JSON.stringify(bodies[bodies.length - 1])}`);
 
-  config.config.llm.chatReasoning = 'not-a-level';
-  assert.equal(llm.reasoningFor('chat'), '', '非法值按默认处理');
-  config.config.llm.chatReasoning = '';
-  config.config.llm.workReasoning = '';
+  config.config.llm.modelReasoning['good|good-1'] = 'not-a-level';
+  assert.equal(llm.reasoningFor('good', 'good-1'), '', '非法值按默认处理');
+
+  config.config.llm.modelReasoning['bad|bad-1'] = 'high';
+  assert.equal(llm.reasoningFor('bad', 'bad-1'), '', '没声明等级模型不生效');
+  config.config.llm.modelReasoning = {};
 });

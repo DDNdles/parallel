@@ -82,7 +82,7 @@ function uniqueProviderId(label: string, existing: Record<string, unknown>): str
 }
 
 const PROVIDER_PROTOCOLS = ['openai-compatible', 'openai-responses', 'anthropic', 'gemini', 'mock'];
-const RESERVED_IDS = ['chain', 'create', 'probe'];
+const RESERVED_IDS = ['chain', 'create', 'probe', 'reasoning'];
 /** 模型行可选值：内核会按这些语义去整形请求，收不认识的键没有意义 */
 const MODEL_INPUT_TYPES = ['text', 'image', 'video', 'audio'];
 const MODEL_CAPABILITIES = ['webSearch'];
@@ -100,13 +100,14 @@ function sanitizeModels(list: unknown[]): ProviderModelCfg[] {
     const m = raw as Record<string, unknown>;
     const id = String(m?.id ?? '').trim().slice(0, 120);
     if (!id || out.some((o) => o.id === id)) continue;
+    const levels = only(m.reasoningLevels, [...REASONING_LEVELS]);
     out.push({
       id,
       contextWindow: num(m.contextWindow),
       maxOutput: num(m.maxOutput),
       inputTypes: only(m.inputTypes, MODEL_INPUT_TYPES),
       capabilities: only(m.capabilities, MODEL_CAPABILITIES),
-      reasoningLevels: strs(m.reasoningLevels),
+      reasoningLevels: levels ? [...new Set(levels)] : undefined,
       enabled: m.enabled === false ? false : true,
     });
   }
@@ -598,60 +599,46 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           usage: kernel.llm.todayUsage(),
           // 两条模型优先级链（靠前的优先，掉线自动接后一个）；两条各自独立，谁都不跟随谁
           chains: kernel.llm.chainsView(),
-          reasoning: { chat: kernel.llm.reasoningFor('chat'), work: kernel.llm.reasoningFor('work') },
+          modelReasoning: kernel.config.config.llm.modelReasoning,
           failoverThreshold: kernel.config.config.llm.failoverThreshold,
         });
       }
       if (b === 'chain' && req.method === 'POST') {
         const kind = String(body.kind ?? '');
         if (kind !== 'chat' && kind !== 'work') return send({ error: 'kind 需要是 chat 或 work' }, 400);
-        const hasEntries = Array.isArray(body.entries);
-        const hasReasoning = body.reasoning !== undefined;
-        if (!hasEntries && !hasReasoning) return send({ error: '没有要改的内容（entries / reasoning 至少给一个）' }, 400);
+        if (!Array.isArray(body.entries)) return send({ error: '没有要改的内容（entries）' }, 400);
 
-        let entries: ModelRef[] | null = null;
-        if (hasEntries) {
-          const raw = (body.entries as unknown[]).slice(0, 20);
-          entries = [];
-          for (const e of raw) {
-            const pid = String((e as any)?.provider ?? '').trim().slice(0, 80);
-            const model = String((e as any)?.model ?? '').trim().slice(0, 120);
-            if (!pid || !model) return send({ error: '链上的每条都要有供应商与模型名' }, 400);
-            if (!allProviders[pid]) return send({ error: `未知供应商 ${pid}` }, 400);
-            if (!entries.some((x) => x.provider === pid && x.model === model)) entries.push({ provider: pid, model });
-          }
-          if (kind === 'chat' && !entries.length) return send({ error: '聊天模型至少要留一条' }, 400);
+        const raw = (body.entries as unknown[]).slice(0, 20);
+        const entries: ModelRef[] = [];
+        for (const e of raw) {
+          const pid = String((e as any)?.provider ?? '').trim().slice(0, 80);
+          const model = String((e as any)?.model ?? '').trim().slice(0, 120);
+          if (!pid || !model) return send({ error: '链上的每条都要有供应商与模型名' }, 400);
+          if (!allProviders[pid]) return send({ error: `未知供应商 ${pid}` }, 400);
+          if (!entries.some((x) => x.provider === pid && x.model === model)) entries.push({ provider: pid, model });
         }
-
-        let level: string | undefined;
-        if (hasReasoning) {
-          const v = String(body.reasoning ?? '').trim();
-          if (v && !(REASONING_LEVELS as readonly string[]).includes(v)) {
-            return send({ error: `思考强度需要是空或 ${REASONING_LEVELS.join(' / ')}` }, 400);
-          }
-          level = v;
-        }
+        if (kind === 'chat' && !entries.length) return send({ error: '聊天模型至少要留一条' }, 400);
 
         const llm = kernel.config.config.llm;
-        if (entries) {
-          if (kind === 'chat') {
-            llm.chatChain = entries;
-            if (entries.length) llm.activeProvider = entries[0].provider;   // 人设绑定/状态展示读这个镜像
-          } else {
-            llm.workChain = entries;
-          }
+        if (kind === 'chat') {
+          llm.chatChain = entries;
+          if (entries.length) llm.activeProvider = entries[0].provider;   // 人设绑定/状态展示读这个镜像
+        } else {
+          llm.workChain = entries;
         }
-        if (level !== undefined) {
-          if (kind === 'chat') llm.chatReasoning = level;
-          else llm.workReasoning = level;
-        }
-        if (entries) kernel.llm.resetFailover();
+        kernel.llm.resetFailover();
         kernel.config.saveConfig();
-        return send({
-          ok: true,
-          chains: kernel.llm.chainsView(),
-          reasoning: { chat: kernel.llm.reasoningFor('chat'), work: kernel.llm.reasoningFor('work') },
-        });
+        return send({ ok: true, chains: kernel.llm.chainsView(), modelReasoning: llm.modelReasoning });
+      }
+      if (b === 'reasoning' && req.method === 'POST') {
+        const pid = String(body.provider ?? '').trim().slice(0, 80);
+        const model = String(body.model ?? '').trim().slice(0, 120);
+        if (!pid || !model) return send({ error: '需要 provider 与 model' }, 400);
+        if (!allProviders[pid]) return send({ error: `未知供应商 ${pid}` }, 400);
+        const r = kernel.llm.setModelReasoning(pid, model, String(body.reasoning ?? '').trim());
+        if (!r.ok) return send({ error: r.error }, 400);
+        kernel.config.saveConfig();
+        return send({ ok: true, chains: kernel.llm.chainsView(), modelReasoning: kernel.config.config.llm.modelReasoning });
       }
       if (b === 'create' && req.method === 'POST') {
         const label = String(body.label ?? '').trim().slice(0, 40);

@@ -8,6 +8,7 @@ import { ctxBadge } from '@/lib/entries';
 import { Icon } from '@/components/Icon';
 import { BrandInput } from '@/components/BrandInput';
 import { Modal, Field } from '@/components/Modal';
+import { PillSelect } from '@/components/PillSelect';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import { useSave } from '@/lib/useSave';
 
@@ -25,19 +26,30 @@ interface Provider {
 }
 /** 链上一条：内核按顺序取，掉线自动接后一条 */
 interface ChainRef { provider: string; model: string }
-interface ChainEntry extends ChainRef { fails: number; state: 'current' | 'idle' | 'down' }
+interface ChainEntry extends ChainRef { fails: number; state: 'current' | 'idle' | 'down'; reasoning: string }
 interface Resp {
   active: string; activeModel: string; providers: Provider[];
   chains: { chat: ChainEntry[]; work: ChainEntry[] };
-  /** 两条链各自选定的思考强度（'' = 默认） */
-  reasoning?: { chat?: string; work?: string };
+  /** 每个模型单独选定的思考强度，键 = `provider|model` */
+  modelReasoning?: Record<string, string>;
   failoverThreshold: number;
 }
 
-/** 思考强度：左栏宽度只放得下四档；后端的 pi-ai 还认 minimal/xhigh/max，手改配置也能用 */
-const REASON_LEVELS = [
-  { v: '', t: '默认' }, { v: 'low', t: '低' }, { v: 'medium', t: '中' }, { v: 'high', t: '高' },
+/** pi-ai 支持的思考档位；供应商在模型行里声明该模型实际支持哪几档 */
+const REASON_ALL = [
+  { v: 'minimal', t: '最低' }, { v: 'low', t: '低' }, { v: 'medium', t: '中' },
+  { v: 'high', t: '高' }, { v: 'xhigh', t: '很高' }, { v: 'max', t: '最高' },
 ];
+const REASON_LABEL = new Map(REASON_ALL.map((r) => [r.v, r.t]));
+
+/** 某个模型声明过的档位（供应商没登记模型行 = 不支持思考配置） */
+function reasoningLevelsOf(providers: Provider[], pid: string, model: string): string[] {
+  const p = providers.find((x) => x.id === pid);
+  if (!p) return [];
+  const m = modelsOf(p).find((x) => x.id === model);
+  const declared = m?.reasoningLevels ?? [];
+  return REASON_ALL.filter((r) => declared.includes(r.v)).map((r) => r.v);
+}
 
 /** 连接方式（内核四种线格式都已实现）；mock 是本地脚本，不发网络请求 */
 const PROTOCOLS = [
@@ -108,13 +120,20 @@ export default function ModelsPage({ onChanged, cmd }: {
     } catch (e) { fail(e); }
   }, [reload, onChanged, setErr, fail]);
 
-  /** 思考强度即时落盘（左右两条链各自独立）；失败时回滚到服务端值 */
-  const commitReasoning = useCallback(async (kind: 'chat' | 'work', level: string) => {
-    setData((d) => (d ? { ...d, reasoning: { ...(d.reasoning ?? {}), [kind]: level } } : d));
+  /** 某个模型的思考强度即时落盘（同款模型在两条链上共用一份设置）；失败时回滚到服务端值 */
+  const commitModelReasoning = useCallback(async (provider: string, model: string, level: string) => {
+    const apply = (d: Resp): Resp => ({
+      ...d,
+      chains: {
+        chat: d.chains.chat.map((e) => e.provider === provider && e.model === model ? { ...e, reasoning: level } : e),
+        work: d.chains.work.map((e) => e.provider === provider && e.model === model ? { ...e, reasoning: level } : e),
+      },
+    });
+    setData((d) => (d ? apply(d) : d));
     try {
-      const r: { reasoning?: Resp['reasoning'] } = await post('/api/providers/chain', { kind, reasoning: level });
+      const r: { chains?: Resp['chains'] } = await post('/api/providers/reasoning', { provider, model, reasoning: level });
       setErr('');
-      if (r?.reasoning) setData((d) => (d ? { ...d, reasoning: r.reasoning } : d));
+      if (r?.chains) setData((d) => (d ? { ...d, chains: r.chains! } : d));
     } catch (e) {
       fail(e);
       reload();
@@ -145,10 +164,10 @@ export default function ModelsPage({ onChanged, cmd }: {
           </div>
 
           <ChainGroup kind="chat" title="聊天模型" entries={data.chains.chat} providers={data.providers}
-            reasoning={data.reasoning?.chat ?? ''} onReasoning={(v) => void commitReasoning('chat', v)}
+            onReasoning={commitModelReasoning}
             onPick={() => setPicking('chat')} onCommit={(e) => void commitChain('chat', e)} />
           <ChainGroup kind="work" title="工作模型" entries={data.chains.work} providers={data.providers}
-            reasoning={data.reasoning?.work ?? ''} onReasoning={(v) => void commitReasoning('work', v)}
+            onReasoning={commitModelReasoning}
             onPick={() => setPicking('work')} onCommit={(e) => void commitChain('work', e)} />
         </aside>
 
@@ -216,9 +235,9 @@ export default function ModelsPage({ onChanged, cmd }: {
 }
 
 /** 一条模型优先级链：靠前的优先、掉线自动接后一条；行尾把手上下拖动改优先级（换位有动画） */
-function ChainGroup({ kind, title, entries, providers, note, reasoning, onReasoning, onPick, onCommit }: {
+function ChainGroup({ kind, title, entries, providers, note, onReasoning, onPick, onCommit }: {
   kind: 'chat' | 'work'; title: string; entries: ChainEntry[]; providers: Provider[];
-  note?: string | null; reasoning: string; onReasoning: (v: string) => void;
+  note?: string | null; onReasoning: (provider: string, model: string, level: string) => void;
   onPick: () => void; onCommit: (e: ChainRef[]) => void;
 }) {
   const drag = useRef<number | null>(null);
@@ -263,18 +282,11 @@ function ChainGroup({ kind, title, entries, providers, note, reasoning, onReason
           <Icon name="plus" size={13} />
         </button>
       </div>
-      <div className="chain-reason" title="交给推理模型的思考强度；默认 = 不额外指定">
-        <span>思考</span>
-        <span className="mset-chips">
-          {REASON_LEVELS.map((r) => (
-            <button key={r.v} className={'mset-chip' + (r.v === reasoning ? ' on' : '')}
-              onClick={() => { if (r.v !== reasoning) onReasoning(r.v); }}>{r.t}</button>
-          ))}
-        </span>
-      </div>
       {note && <div className="mset-group-e">{note}</div>}
       {entries.map((e, i) => {
         const key = `${e.provider}|${e.model}`;
+        const levels = reasoningLevelsOf(providers, e.provider, e.model);
+        const opts = [{ v: '', t: '默认' }, ...levels.map((v) => ({ v, t: REASON_LABEL.get(v) ?? v }))];
         return (
           <div
             key={key}
@@ -295,6 +307,12 @@ function ChainGroup({ kind, title, entries, providers, note, reasoning, onReason
             <FadeName text={e.model} />
             {e.state === 'current' && <span className="chain-cur">当前</span>}
             {e.state === 'down' && <i className="dot plg-dot-err" />}
+            {levels.length > 0 && (
+              <span className="chain-r-pill" title="该模型声明过的思考强度">
+                <PillSelect value={e.reasoning || ''} options={opts} label="思考强度" portal compact
+                  onChange={(v) => onReasoning(e.provider, e.model, v)} />
+              </span>
+            )}
             <button className="chain-del" aria-label="从链上移除" title="从链上移除" onClick={() => drop(i)}><Icon name="trash" /></button>
             <span className="mset-grip" aria-hidden><Icon name="grip" size={13} /></span>
           </div>
@@ -680,25 +698,19 @@ function ModelFields({ m, on, remote, protocol, advDefault = false, autoFocus }:
               ))}
             </div>
           </Field>
-          <Field label="推理等级（从低到高）">
+          <Field label="推理等级">
             <div className="mset-chips wrap">
-              {(m.reasoningLevels ?? []).map((lv, i) => (
-                <span key={i} className="mset-lvl">
-                  <BrandInput value={lv} onChange={(e) => {
-                    const next = [...(m.reasoningLevels ?? [])];
-                    next[i] = e.target.value;
-                    on({ reasoningLevels: next });
-                  }} />
-                  <button className="mset-ibtn in" aria-label="删除该等级"
-                    onClick={() => on({ reasoningLevels: (m.reasoningLevels ?? []).filter((_, j) => j !== i) })}>
-                    <Icon name="close" size={12} />
-                  </button>
-                </span>
-              ))}
-              <button className="mset-chip sq" aria-label="添加等级"
-                onClick={() => on({ reasoningLevels: [...(m.reasoningLevels ?? []), ''] })}>
-                <Icon name="plus" size={13} />
-              </button>
+              {REASON_ALL.map((r) => {
+                const active = (m.reasoningLevels ?? []).includes(r.v);
+                return (
+                  <button key={r.v} className={'mset-chip' + (active ? ' on' : '')}
+                    onClick={() => {
+                      const cur = (m.reasoningLevels ?? []).filter((v) => REASON_ALL.some((x) => x.v === v));
+                      const next = active ? cur.filter((v) => v !== r.v) : [...cur, r.v];
+                      on({ reasoningLevels: REASON_ALL.filter((x) => next.includes(x.v)).map((x) => x.v) });
+                    }}>{r.t}</button>
+                );
+              })}
             </div>
           </Field>
           <Field label="调用参数">
@@ -841,7 +853,7 @@ function ModelCard({ title, value, remote, protocol, dupIds = [], smart, advDefa
     if (remote && !remote.includes(id)) { setErr('该模型 ID 不在供应商返回的列表里（可关闭智能配置强制添加）'); return; }
     setErr('');
     onSave({
-      ...m, id, reasoningLevels: (m.reasoningLevels ?? []).map((s) => s.trim()).filter(Boolean),
+      ...m, id, reasoningLevels: REASON_ALL.filter((r) => (m.reasoningLevels ?? []).includes(r.v)).map((r) => r.v),
     });
   };
   return (
