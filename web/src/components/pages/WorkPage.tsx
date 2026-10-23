@@ -14,6 +14,7 @@ import { Icon } from '@/components/Icon';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 import { fileIcon } from '@/lib/fileIcon';
 import { ctxBadge } from '@/lib/entries';
+import { Switch } from '@/components/Modal';
 import {
   Act, CtxRing, SecHead, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf, thinkSummary,
   type ActRow, type LoopEvent, type Metrics, type WorkRun,
@@ -28,6 +29,14 @@ interface WorkApi {
 }
 
 const ENV = '__env__';
+const SKILLS = '__skills__';
+
+interface SkillInfo {
+  id: string; name: string; description: string; version?: string;
+  attachments: { rel: string; size: number }[];
+  hasScripts: boolean; source: string; mtimeMs: number; enabled: boolean;
+}
+interface SkillsApi { dir: string; dirLabel: string; skills: SkillInfo[] }
 
 /** 还在跑：没结束、没失败、没停下来提问，也还没收到收敛回答 */
 const isRunning = (r: WorkRun): boolean => {
@@ -81,6 +90,8 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
   const [now, setNow] = useState(() => Date.now());
   /** 已经点开看过的失败运行：红点只提示一次，点掉后不再回来（存 localStorage） */
   const [acked, setAcked] = useState<Set<string>>(() => new Set());
+  const [skills, setSkills] = useState<SkillsApi | null>(null);
+  const [skillErr, setSkillErr] = useState('');
 
   useEffect(() => {
     try {
@@ -104,6 +115,28 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
   const reload = useCallback(() => {
     get('/api/work?limit=200').then((d: WorkApi) => setData(d)).catch(() => {});
   }, []);
+
+  const loadSkills = useCallback(() => {
+    get('/api/skills')
+      .then((d: SkillsApi) => { setSkills(d); setSkillErr(''); })
+      .catch((e) => setSkillErr((e as Error).message || '读取技能库失败'));
+  }, []);
+
+  // 挂载就读一次（左栏要显示数量）；进「技能库」时再刷新一遍，文件是现放现认的
+  useEffect(() => { loadSkills(); }, [loadSkills]);
+
+  /** 开关即时落盘：先翻 UI，失败再回滚并就地红字（全站不弹 toast） */
+  const toggleSkill = useCallback((s: SkillInfo) => {
+    const enabled = !s.enabled;
+    setSkillErr('');
+    setSkills((prev) => prev
+      ? { ...prev, skills: prev.skills.map((x) => (x.id === s.id ? { ...x, enabled } : x)) }
+      : prev);
+    post('/api/skills/toggle', { name: s.id, enabled }).catch((e) => {
+      setSkillErr((e as Error).message || '保存失败');
+      loadSkills();
+    });
+  }, [loadSkills]);
 
   const loadModels = useCallback(() => {
     get('/api/providers').then((d: any) => {
@@ -199,12 +232,12 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
     return () => clearInterval(t);
   }, [runningRuns.length]);
 
-  // 选中的运行被清理 / 还没加载出来：退回环境页
+  // 选中的运行被清理 / 还没加载出来：退回环境页（技能库不是运行，别被误判）
   useEffect(() => {
-    if (sel !== ENV && !runs.some((r) => r.id === sel)) setSel(ENV);
+    if (sel !== ENV && sel !== SKILLS && !runs.some((r) => r.id === sel)) setSel(ENV);
   }, [runs, sel]);
 
-  const run = sel !== ENV ? runs.find((r) => r.id === sel) : undefined;
+  const run = sel !== ENV && sel !== SKILLS ? runs.find((r) => r.id === sel) : undefined;
   const running = !!run && isRunning(run);
   const metrics = useMemo(() => {
     if (!run) return undefined;
@@ -227,6 +260,16 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
               <span className="mset-item-ic"><Icon name="models" size={15} /></span>
               <FadeName text="运行环境" />
               {data && !data.docker && <i className="dot plg-dot-err" />}
+            </button>
+          </div>
+
+          <div className="mset-group">
+            <div className="mset-group-t">技能</div>
+            <button className={'mset-item' + (sel === SKILLS ? ' sel' : '')}
+              onClick={() => { setSel(SKILLS); loadSkills(); }}>
+              <span className="mset-item-ic"><Icon name="plugins" size={15} /></span>
+              <FadeName text="技能库" />
+              {skills && <span className="mset-badge mono">{skills.skills.length}</span>}
             </button>
           </div>
 
@@ -257,7 +300,9 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
           </div>
         </aside>
 
-        {run ? (
+        {sel === SKILLS ? (
+          <SkillsDetail data={skills} err={skillErr} onToggle={toggleSkill} onReload={loadSkills} />
+        ) : run ? (
           <RunDetail
             run={run} running={running} metrics={metrics} duration={duration}
             expanded={expanded} onToggle={(k) => setExpanded((p) => ({ ...p, [k]: !p[k] }))}
@@ -408,6 +453,48 @@ function EnvDetail({ data, onReload }: { data: WorkApi | null; onReload: () => v
           </div>
         )) : <div className="mset-group-e">当前没有常驻容器</div>}
       </div>
+    </section>
+  );
+}
+
+/**
+ * 技能库：技能是宿主上的一组 md（目录式可带脚本/模板）。
+ * 这里只做「看一眼 + 逐条开关」——文件由用户自己放进 data/plugin-data/skills，
+ * 放进来默认就是开的，关掉的不会进 work 的 system 目录。
+ */
+function SkillsDetail({ data, err, onToggle, onReload }: {
+  data: SkillsApi | null; err: string; onToggle: (s: SkillInfo) => void; onReload: () => void;
+}) {
+  const on = data?.skills.filter((s) => s.enabled).length ?? 0;
+  return (
+    <section className="mset-detail">
+      <div className="mset-dhead">
+        <span className="mset-dic"><Icon name="plugins" size={17} /></span>
+        <h2 className="mset-dtitle">技能库</h2>
+        <div className="mset-dright">
+          {data && <span className="tag mono">{on}/{data.skills.length}</span>}
+          <button className="mset-ibtn" title="重新扫描" onClick={onReload}><Icon name="refresh" size={14} /></button>
+        </div>
+      </div>
+
+      <div className="mset-meta">
+        <span className="tag mono" title={data?.dir}>{data?.dirLabel ?? 'data/plugin-data/skills'}</span>
+      </div>
+
+      <div className="mset-models" style={{ marginTop: 14 }}>
+        {data?.skills.length ? data.skills.map((s) => (
+          <div className={'mset-mrow' + (s.enabled ? '' : ' off')} key={s.id}>
+            <span className="sk-name" title={s.name}>{s.name}</span>
+            {s.name !== s.id && <span className="mset-badge mono">{s.id}</span>}
+            {!!s.attachments.length && <span className="mset-badge">{s.attachments.length} 文件</span>}
+            {s.hasScripts && <span className="mset-badge">脚本</span>}
+            <span className="sk-desc" title={s.description}>{s.description || '（未写 description）'}</span>
+            <span className="mset-macts"><Switch on={s.enabled} onChange={() => onToggle(s)} /></span>
+          </div>
+        )) : <div className="mset-group-e">{data ? '还没有技能' : '正在读取…'}</div>}
+      </div>
+
+      {err && <div className="sk-err">{err}</div>}
     </section>
   );
 }

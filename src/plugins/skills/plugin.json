@@ -1,0 +1,18 @@
+{
+  "id": "skills",
+  "name": "技能库",
+  "version": "1.0.0",
+  "description": "目录式技能：work 子代理按需读取技能手册（SKILL.md），可把技能自带的脚本/模板装配进会话沙箱；开关与目录入口在桌面端「工作」页。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": [
+    "fs.sandbox"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {},
+  "hidden": true
+}

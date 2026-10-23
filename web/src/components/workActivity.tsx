@@ -267,6 +267,7 @@ const ACT = {
   ask: { icon: 'ask', label: '回问' },
   done: { icon: 'done', label: '交付' },
   delegate: { icon: 'delegate', label: '派生' },
+  skill: { icon: 'plugins', label: '技能' },
   error: { icon: 'warn', label: '异常' },
   think: { icon: 'think', label: '思考' },
   text: { icon: 'chats', label: '正文' },

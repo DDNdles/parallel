@@ -85,6 +85,7 @@ export function setup(ctx: PluginContext): void {
       sandbox_read: '读文件', sandbox_write: '写文件', sandbox_edit: '改文件', sandbox_grep: '检索文件',
       sandbox_glob: '找文件', web_search: '联网搜索', web_fetch: '读网页', todo: '任务清单',
       send_file: '发文件', delegate: '子代理', work_finish: '收尾', work_ask: '提问',
+      skill: '技能', skill_file: '读技能文件', skill_install: '装配技能',
     } as Record<string, string>)[n] || '工具';
   };
 
