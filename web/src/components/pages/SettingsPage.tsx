@@ -314,6 +314,12 @@ export default function SettingsPage() {
               rp && patchH({ repeat: { ...rp, ...p } }, immediate);
             return (
               <>
+                {c.storage?.contextMinutes !== undefined && (
+                  <div className="set-grid">
+                    <Num label="传入上下文时限分钟" value={c.storage.contextMinutes}
+                      onChange={(v) => { patch({ storage: { ...c.storage!, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />
+                  </div>
+                )}
                 {rp && (
                   <div className="set-grid">
                     <Num label="复读触发人数" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
@@ -368,8 +374,6 @@ export default function SettingsPage() {
               </div>
 
               <div className="set-grid" style={{ marginTop: 14 }}>
-                {c.storage?.contextMinutes !== undefined && <Num label="传入上下文时限分钟" value={c.storage.contextMinutes}
-                  onChange={(v) => { patch({ storage: { ...c.storage!, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />}
                 {c.storage && <Num label="每会话历史条数" hint="模型每次读取的最近消息条数" value={c.storage.historyLimit}
                   onChange={(v) => { patch({ storage: { ...c.storage!, historyLimit: v } }); autoSave('storage', 600, { storage: { historyLimit: v } }); }} />}
               </div>
