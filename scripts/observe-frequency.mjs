@@ -169,8 +169,18 @@ function gateKind(e) {
 function analyzeChat(chatKey, entries) {
   const sorted = [...entries].sort((a, b) => a.ts - b.ts);
   const inbound = sorted.filter((e) => e.type === 'message_in');
-  const outbound = sorted.filter((e) => e.type === 'message_out' && !e?.data?.simulated);
-  const turns = sorted.filter((e) => e.type === 'agent_end' && isChatLane(e));
+  const rawOutbound = sorted.filter((e) => e.type === 'message_out' && !e?.data?.simulated);
+  // 工作交付（forward 标题「工作交付」）不是聊天回复：单独计数，不进气泡/轮数/bot 占比
+  const workReports = rawOutbound.filter((e) => e?.data?.forward?.title === '工作交付');
+  const outbound = rawOutbound.filter((e) => e?.data?.forward?.title !== '工作交付');
+  const rawTurns = sorted.filter((e) => e.type === 'agent_end' && isChatLane(e));
+  const reportTurnIds = new Set();
+  for (const t of rawTurns) {
+    if (rawOutbound.some((e) => e.ts >= t.ts && e.ts <= t.ts + 60_000 && e?.data?.forward?.title === '工作交付')) {
+      reportTurnIds.add(t.id);
+    }
+  }
+  const turns = rawTurns.filter((t) => !reportTurnIds.has(t.id));
   const starts = sorted.filter((e) => e.type === 'agent_start' && isChatLane(e));
   const gates = sorted.filter((e) => e.type === 'gate');
 
@@ -271,6 +281,7 @@ function analyzeChat(chatKey, entries) {
     inboundChars,
     inboundPerMinute: +(inbound.length / Math.max(1, (to - from) / 60_000)).toFixed(2),
     outbound: outbound.length,
+    workReports: workReports.length,
     outboundChars,
     turns: turns.length,
     bubbles: {
@@ -324,6 +335,7 @@ const totals = {
   })(),
   atMe: sum((c) => c.atMe),
   outbound: sum((c) => c.outbound),
+  workReports: sum((c) => c.workReports),
   turns: sum((c) => c.turns),
   opens: sum((c) => c.opens.total),
   waits: sum((c) => c.waits.total),
@@ -393,7 +405,8 @@ if (has('--markdown')) {
   lines.push('');
   lines.push(`总量：入站 ${totals.inbound}（${totals.uniqueSenders} 人，@我 ${totals.atMe}）/ 出站 ${totals.outbound} 条、${totals.turns} 轮 / ` +
     `每百条入站回 ${fmt(totals.replyTurnsPer100Inbound)} 轮 / frequency 开口 ${totals.openReasons.frequency ?? 0} 次（${fmt(totals.frequencyTurnsPer100NonAt)}/百条非@）/ ` +
-    `bot 消息占比 ${fmt(totals.botShare)} / 平均每轮 ${fmt(totals.avgBubblesPerTurn)} 条`);
+    `bot 消息占比 ${fmt(totals.botShare)} / 平均每轮 ${fmt(totals.avgBubblesPerTurn)} 条` +
+    (totals.workReports ? ` / 工作交付 ${totals.workReports} 条（不计入聊天）` : ''));
   const reasons = Object.entries(totals.openReasons).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
   const decs = Object.entries(totals.decisions).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
   lines.push(`开口 ${totals.opens}（${reasons}）/ 沉默评估 ${totals.waits} / 其它决策 ${decs} / 错误 ${totals.errors}（会话落账）+ ${health.errorsInWindow ?? 0}（错误中心 error 级）`);
