@@ -6,3 +6,5 @@
 
 ### 2.每次对话完成后，必须提交`git`和`github`，必须push
 
+### 3.可用travily mcp进行搜索
+
