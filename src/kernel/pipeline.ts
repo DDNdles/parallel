@@ -196,6 +196,26 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
   ].filter(Boolean).join('\n');
 }
 
+/**
+ * 出站引用只在「这一轮就是回这一条」时挂：
+ *  - 多消息合批（frequency 模式最常见）里，回复是对整批说的，挑哪条都可能是错的 → 不挂；
+ *  - 汇报轮/主动发言轮挂的是很早的触发消息 → 不挂；
+ *  - 纯 @ / 纯占位没有实质内容 → 不挂；
+ *  - 图片/表情/语音/视频/文件/聊天记录算实质内容，可以引用。
+ */
+export function canQuoteTurn(
+  event: ChatEvent,
+  opts?: { report?: unknown; proactive?: boolean; batch?: ChatEvent[] },
+): boolean {
+  if (opts?.report || opts?.proactive) return false;
+  if ((opts?.batch?.length ?? 1) !== 1) return false;
+  return event.segments.some((s) =>
+    (s.type === 'text' && String(s.data?.text ?? '').trim() !== '') ||
+    s.type === 'image' || s.type === 'face' || s.type === 'record' ||
+    s.type === 'video' || s.type === 'file' || s.type === 'forward',
+  );
+}
+
 export class Pipeline {
   private queues = new Map<string, Promise<void>>();
   private aborts = new Map<string, AbortController>();
@@ -990,7 +1010,8 @@ export class Pipeline {
       // 模型最终有没有真说话：以 afterLLM 之后的可见正文为准。回 [silent] / 空输出都记 0，
       // 不再把"门开了"当成"模型开口了"（2026-10-18 修）。
       this.humanlike.noteTurnOutcome(chat, opts?.gateId, !isSilentScene(finalReply));
-      await this.sendScene(chat, finalReply, this.quoteTargetOf(event), opts?.mention,
+      const quoteTarget = canQuoteTurn(event, opts) ? this.quoteTargetOf(event) : undefined;
+      await this.sendScene(chat, finalReply, quoteTarget, opts?.mention,
         opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined,
         !forcedAt);
       if (opts?.proactive) this.humanlike.noteProactive(chat);

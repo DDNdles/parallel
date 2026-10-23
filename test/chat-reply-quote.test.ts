@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { MockOneBot } from './helpers/mock-onebot.ts';
+import { canQuoteTurn } from '../src/kernel/pipeline.ts';
 
 // ============================================================
 // 引用回查：bot 自己的出站消息也要存协议端 message_id。
@@ -77,4 +78,20 @@ test('引用 bot 的出站消息：出站落账带 messageId，入站回查成 r
     await kernel.shutdown();
     rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+// 出站引用「引错消息」的根因：frequency/necessity 一轮通常合并 6～10 条，回复是对整批说的，
+// 程序却把最后一条当锚点。多消息合批、汇报轮/主动轮、纯 @ 都不该挂引用。
+test('出站引用只在单条实质消息的轮次挂', () => {
+  const ev = (segments: any[]) => ({
+    id: 'e', platform: 'qq', type: 'group', chatId: '1', userId: '2', nickname: 'n',
+    senderRole: 'member', segments, text: '', isAtMe: false, isReplyToMe: false, raw: null, ts: 1,
+  }) as any;
+  const text = ev([{ type: 'text', data: { text: '你好' } }]);
+  assert.equal(canQuoteTurn(text), true, '单条有正文的消息可以引用');
+  assert.equal(canQuoteTurn(text, { batch: [text, ev([{ type: 'text', data: { text: '再来' } }])] }), false, '多消息合批不引用');
+  assert.equal(canQuoteTurn(text, { report: {} }), false, '汇报轮不引用');
+  assert.equal(canQuoteTurn(text, { proactive: true }), false, '主动发言轮不引用');
+  assert.equal(canQuoteTurn(ev([{ type: 'at', data: { qq: '1' } }])), false, '裸 @ 不引用');
+  assert.equal(canQuoteTurn(ev([{ type: 'image', data: { file: 'a.png' } }])), true, '图片消息可以引用');
 });
