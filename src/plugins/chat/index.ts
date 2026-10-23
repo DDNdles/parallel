@@ -128,14 +128,19 @@ export function setup(ctx: PluginContext): void {
   }
 
   /** 把当前人格的叫醒词推给内核拟人层：换人格/改 canon 后立即生效，不用重启 */
-  function publishAliases(): void {
+  let lastAliasKey = '';
+  function publishAliases(force = false): void {
     const id = activePersonaId();
     const raw = personas.get(id)?.canon?.aliases;
     const aliases = Array.isArray(raw) ? raw.map((x) => String(x)) : [];
+    // 设置页是即时保存，config.changed 会很频繁：没换人格也没改词就不重复推送/刷日志
+    const key = `${id}\u0000${aliases.join('\u0001')}`;
+    if (!force && key === lastAliasKey) return;
+    lastAliasKey = key;
     ctx.bus.emit(busEvents.personaAliases, { personaId: id, aliases });
     ctx.log.info(`人格 ${id} 叫醒词：${aliases.length ? aliases.join('/') : '无'}`);
   }
-  publishAliases();
+  publishAliases(true);
   // 通过配置页换默认人格时也跟着换（active_persona 状态目前没有设置入口）
   ctx.on(busEvents.configChanged, () => publishAliases());
   // 插件卸载/热重载时清掉，别让旧人格的叫醒词在没载入人格时还生效
