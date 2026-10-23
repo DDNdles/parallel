@@ -147,16 +147,20 @@ function isChatLane(e) { return e?.lane !== 'work'; }
 function gateKind(e) {
   const d = e?.data ?? {};
   const text = String(e?.text ?? '');
-  // 先认文本：wait 条目也带 data.decision='wait'，只看 decision 会把沉默评估算进"其它决策"
+  const decision = d.decision ? String(d.decision) : '';
+  // 打断/重写/限速这些条目也带 data.reason（如「插话（掷中 0.05）」），
+  // 必须在 reason 之前认 decision，否则会被误算成一次开口
+  if (decision && decision !== 'wait') return { kind: 'decision', decision };
+  // wait 条目也带 data.decision='wait'，先按文本细分成退避/分数/专注
   if (text.startsWith('退避中')) return { kind: 'wait', wait: 'backoff' };
   if (text.startsWith('不说：')) return { kind: 'wait', wait: 'score' };
   if (text.startsWith('专注模式')) return { kind: 'wait', wait: 'focus' };
+  if (decision === 'wait') return { kind: 'wait', wait: 'other' };
   if (d.reason) return { kind: 'open', reason: String(d.reason) };
   if (text.startsWith('开口（')) {
     const m = text.match(/^开口（([^）]+)）/);
     return { kind: 'open', reason: m?.[1] ?? 'unknown' };
   }
-  if (d.decision === 'wait') return { kind: 'wait', wait: 'other' };
   if (text.startsWith('主动开口被行动容量挡下')) return { kind: 'decision', decision: 'agency_blocked' };
   if (d.decision) return { kind: 'decision', decision: String(d.decision) };
   return { kind: 'other' };
@@ -400,8 +404,9 @@ if (has('--markdown')) {
   lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
   for (const c of chats) {
     const d = c.decisions;
+    const interrupted = Math.max(d.generation_interrupted ?? 0, d.generation_aborted ?? 0);
     const lat = c.latencyMs.agentStartToFirstBubble;
-    lines.push(`| ${c.chatKey} | ${c.inbound} | ${c.atMe} | ${c.outbound} | ${c.turns} | ${fmt(c.replyTurnsPer100Inbound)} | ${fmt(c.frequencyTurnsPer100NonAt)} | ${fmt(c.botShare)} | ${c.opens.total} | ${c.waits.total} | ${(d.generation_interrupted ?? 0) + (d.generation_aborted ?? 0)} | ${d.empty_reply ?? 0} | ${d.repetition_retry ?? 0} | ${(d.rate_limited ?? 0) + (d.rate_truncated ?? 0)} | ${fmt(c.bubbles.perTurn.avg)}/${fmt(c.bubbles.perTurn.max)} | ${fmt(lat.p50)}/${fmt(lat.p90)}ms |`);
+    lines.push(`| ${c.chatKey} | ${c.inbound} | ${c.atMe} | ${c.outbound} | ${c.turns} | ${fmt(c.replyTurnsPer100Inbound)} | ${fmt(c.frequencyTurnsPer100NonAt)} | ${fmt(c.botShare)} | ${c.opens.total} | ${c.waits.total} | ${interrupted} | ${d.empty_reply ?? 0} | ${d.repetition_retry ?? 0} | ${(d.rate_limited ?? 0) + (d.rate_truncated ?? 0)} | ${fmt(c.bubbles.perTurn.avg)}/${fmt(c.bubbles.perTurn.max)} | ${fmt(lat.p50)}/${fmt(lat.p90)}ms |`);
   }
   console.log(lines.join('\n'));
 } else {
