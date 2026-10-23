@@ -226,7 +226,7 @@ export function setup(ctx: PluginContext): void {
       // 清单按聊天找（同一个人在群里几次交付仍是一份），但沙箱是按发起人分的：
       // 带上调用者 userId 才能定位到他自己的 work 沙箱目录（`group_x__uQQ`）。
       const last = ctx.work.latestArtifacts(chatKey, tctx.event.userId);
-      if (!last) return '（这个会话还没有成功交付过文件，没有可发的东西。）';
+      if (!last) return '（这个会话还没有产出过文件，没有可发的东西。）';
       // 发送用带作用域的 ref：不带 scope 拿到的是聊天级沙箱，那里没有 work 产物
       const workChat: ChatRef = { ...chat, scope: workScopeOf(last.userId || tctx.event.userId) };
       const wanted = String(args.path ?? '').trim().replace(/\\/g, '/');
@@ -253,6 +253,7 @@ export function setup(ctx: PluginContext): void {
         }
       }
       const parts: string[] = [];
+      if (!last.ok) parts.push('上次任务没有跑完，以下是已经产出的部分：');
       if (sent.length) parts.push(`已发送：${sent.join('、')}`);
       if (failed.length) parts.push(`发送失败：${failed.join('、')}`);
       return parts.join('\n');

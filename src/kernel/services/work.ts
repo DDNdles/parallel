@@ -11,6 +11,8 @@ import { newId, nowMs, truncate } from '../util/misc.ts';
 import { busEvents } from '../bus.ts';
 import { buildWorkSections, parseWorkHandoff, type PendingAsk } from '../work-prompt.ts';
 import { DEFAULT_WORK_AGENT } from '../work-agent.ts';
+import { readdirSync, statSync } from 'node:fs';
+import { join, relative } from 'node:path';
 
 /**
  * WorkRunner：work 子代理的执行器。
@@ -108,6 +110,60 @@ const PENDING_WORK_TTL_MS = 30 * 60_000;
  */
 export function workScopeOf(userId: string): string {
   return `u${String(userId || '0').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 40)}`;
+}
+
+/** 补扫产物时跳过的目录：收件箱、技能装配、缓存都不是用户要的交付物 */
+const ARTIFACT_SKIP_DIRS = new Set(['inbox', '.skills', '.git', 'node_modules', '__pycache__', '.cache', '.venv', 'venv']);
+/** 补扫产物时跳过的文件：字节码/日志/临时件，以及 `_contact.html` 这类内部预览页 */
+const ARTIFACT_SKIP_FILE = /\.(pyc|pyo|log|tmp|bak|swp)$/i;
+const ARTIFACT_MAX_FILES = 80;
+const ARTIFACT_MAX_FILE_BYTES = 50 * 1024 * 1024;
+const ARTIFACT_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
+
+/**
+ * work 产物补扫：模型常用 run_bash/Python 直接写文件，这条路径不会经过 `sandbox_write`
+ * 的 ToolMeta.artifacts，导致 `work_finish` 没登记时交付清单是空的（2026-10-23 论文任务就是
+ * 这样：paper.tex/图/CSV 都在沙箱里，报告只带了两个技能文件）。
+ *
+ * 只收本次 run 期间新增/修改的文件（留 5 分钟余量），排除收件箱、技能、缓存与内部预览页；
+ * 按路径排序、限 80 个/单文件 50MB/总计 200MB，避免把整个工作目录打包进转发。
+ */
+export function collectRecentArtifacts(root: string, startedAt: number): string[] {
+  const found: { rel: string; size: number }[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8) return;
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      if (name.startsWith('.')) continue; // .skills / .git / 隐藏文件
+      const abs = join(dir, name);
+      let st;
+      try { st = statSync(abs); } catch { continue; }
+      if (st.isDirectory()) {
+        if (ARTIFACT_SKIP_DIRS.has(name)) continue;
+        walk(abs, depth + 1);
+        continue;
+      }
+      if (!st.isFile() || st.size <= 0) continue;
+      if (ARTIFACT_SKIP_FILE.test(name) || name.startsWith('_')) continue;
+      if (st.mtimeMs < startedAt - 5 * 60_000) continue;
+      if (st.size > ARTIFACT_MAX_FILE_BYTES) continue;
+      const rel = relative(root, abs).replace(/\\/g, '/');
+      if (!rel || rel.startsWith('..')) continue;
+      found.push({ rel, size: st.size });
+    }
+  };
+  walk(root, 0);
+  found.sort((a, b) => a.rel.localeCompare(b.rel));
+  const out: string[] = [];
+  let total = 0;
+  for (const f of found) {
+    if (out.length >= ARTIFACT_MAX_FILES) break;
+    if (total + f.size > ARTIFACT_MAX_TOTAL_BYTES) continue;
+    total += f.size;
+    out.push(f.rel);
+  }
+  return out;
 }
 
 export class WorkRunner {
@@ -290,11 +346,13 @@ export class WorkRunner {
         onEvent: track,
       });
 
-      // 结论与产物：优先用交付格式里的结构化字段，解析不到就回落到全文 + 正则兜底
+      // 结论与产物：优先用交付格式里的结构化字段，解析不到就回落到全文 + 正则兜底；
+      // 最后再补扫沙箱——模型常用 run_bash/Python 直接写文件，不会经过 sandbox_write 的 artifact 回执。
       const handoff = parseWorkHandoff(reply);
+      const scanned = collectRecentArtifacts(this.sandbox.root(chat), startedAt);
       const artifacts = handoff.structured && handoff.artifacts.length
-        ? dedupe([...handoff.artifacts, ...metaArtifacts])
-        : dedupe([...metaArtifacts, ...extractArtifacts(steps)]);
+        ? dedupe([...handoff.artifacts, ...metaArtifacts, ...scanned])
+        : dedupe([...metaArtifacts, ...extractArtifacts(steps), ...scanned]);
       // 停下来提问：结论就是那个问题（交付文本里的「## 待确认/## 已做到」只是留给人读的）
       const ask = metaAsk as { question: string; notes?: string } | undefined;
       // 模型链一整轮什么都没吐（没接模型/额度耗尽/链全挂被吞成空流）：判成失败，
@@ -344,12 +402,16 @@ export class WorkRunner {
       return result;
     } catch (e) {
       const err = (e as Error).message;
+      const r = this.runs.get(id);
+      // 跑挂了也要把已经写出来的文件带出去：失败报告至少能附上部分产物，
+      // 不能因为最后一步模型链断了就把整场工作的文件全丢在沙箱里。
+      const scanned = collectRecentArtifacts(this.sandbox.root(chat), startedAt);
+      const artifacts = dedupe([...metaArtifacts, ...extractArtifacts(r?.steps ?? rec.steps), ...scanned]);
       const result: WorkRunResult = {
-        id, ok: false, summary: '', rounds: 0, toolCalls: 0,
-        durationMs: nowMs() - startedAt, artifacts: [], error: err, model,
+        id, ok: false, summary: '', rounds: r?.rounds ?? 0, toolCalls: r?.toolCalls ?? 0,
+        durationMs: nowMs() - startedAt, artifacts, error: err, model,
         usage: usageDelta(usageBefore, this.llm.usageSnapshot(input.chat.chatId)),
       };
-      const r = this.runs.get(id);
       if (r) Object.assign(r, result, { phase: 'error' as const, finishedAt: nowMs() });
       this.errors.record('warn', 'sandbox', `work 任务失败: ${err}`, { chatId: input.chat.chatId });
       this.bus.emit(busEvents.workError, {
@@ -496,21 +558,22 @@ export class WorkRunner {
    * `userId`，这样才能定位到那个人自己的沙箱目录。内存里没有（内核重启过）就回落到
    * work_runs 表——那次交付确实发生过、文件也还在沙箱里。
    */
-  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string } | undefined {
+  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string; ok: boolean } | undefined {
     const hit = [...this.runs.values()]
       // 按发起人过滤：群里的 A 不能通过 deliver_file 拿到 B 的产物（沙箱是按人分的）
       .filter((r) => r.chatKey === chatKey && (!userId || r.userId === userId))
-      .filter((r) => r.ok && !r.awaiting && r.artifacts.length > 0)
+      // 失败/中断的活也可能已经产出文件（2026-10-23 论文任务）：有产物就能发，不再要求 ok
+      .filter((r) => !r.awaiting && r.artifacts.length > 0)
       .sort((a, b) => b.startedAt - a.startedAt)[0];
-    if (hit) return { runId: hit.id, task: hit.task, artifacts: hit.artifacts, at: hit.startedAt, userId: hit.userId };
+    if (hit) return { runId: hit.id, task: hit.task, artifacts: hit.artifacts, at: hit.startedAt, userId: hit.userId, ok: hit.ok };
     try {
       const rows = userId
-        ? this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null }>(
-            "SELECT id, task, summary, artifacts, ts, user_id FROM work_runs WHERE chat_key=? AND user_id=? AND ok=1 AND phase='done' ORDER BY ts DESC LIMIT 5",
+        ? this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null; ok: number }>(
+            "SELECT id, task, summary, artifacts, ts, user_id, ok FROM work_runs WHERE chat_key=? AND user_id=? AND artifacts IS NOT NULL AND artifacts <> '[]' ORDER BY ts DESC LIMIT 5",
             chatKey, userId,
           )
-        : this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null }>(
-            "SELECT id, task, summary, artifacts, ts, user_id FROM work_runs WHERE chat_key=? AND ok=1 AND phase='done' ORDER BY ts DESC LIMIT 5",
+        : this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null; ok: number }>(
+            "SELECT id, task, summary, artifacts, ts, user_id, ok FROM work_runs WHERE chat_key=? AND artifacts IS NOT NULL AND artifacts <> '[]' ORDER BY ts DESC LIMIT 5",
             chatKey,
           );
       for (const r of rows) {
@@ -521,7 +584,7 @@ export class WorkRunner {
         } catch { /* 老行没有 artifacts 列值时回落到摘要解析 */ }
         if (!artifacts.length) artifacts = parseWorkHandoff(r.summary ?? '').artifacts;
         if (artifacts.length) {
-          return { runId: r.id, task: truncate(r.task, 200), artifacts, at: r.ts, userId: r.user_id ?? userId ?? '' };
+          return { runId: r.id, task: truncate(r.task, 200), artifacts, at: r.ts, userId: r.user_id ?? userId ?? '', ok: !!r.ok };
         }
       }
     } catch { /* 表缺失等不影响主流程 */ }

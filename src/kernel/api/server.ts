@@ -6,8 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import type { Kernel } from '../kernel.ts';
 import { REASONING_LEVELS, type ModelRef, type ProviderModelCfg } from '../config.ts';
-import { newId, nowMs } from '../util/misc.ts';
+import { newId, nowMs, truncate } from '../util/misc.ts';
 import { usageReport } from '../services/usage.ts';
+import { collectRecentArtifacts, workScopeOf } from '../services/work.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
 import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
 import { geminiApiBase } from '../services/pi-ai.ts';
@@ -907,6 +908,45 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         const m = String(body.chatKey ?? '').match(/^(group|private)_(.+)$/);
         if (m) await kernel.session.reset({ platform: 'qq', type: m[1] as 'group', chatId: m[2] });
         return send({ ok: true });
+      }
+      if (b === 'deliver' && req.method === 'POST') {
+        // 补发一次 work 的产物（运行失败/中断也能发）：不重跑模型，直接从发起人沙箱把已写出的文件
+        // 重新打包成一条「工作交付」。run_bash/Python 写的文件不进 artifacts，这里再扫一遍。
+        const runId = String(body.runId ?? '').trim();
+        if (!runId) return send({ error: 'runId 不能为空' }, 400);
+        const row = kernel.db.get<{
+          id: string; chat_key: string; task: string; user_id: string; nickname?: string;
+          ts: number; duration_ms: number; artifacts: string | null; ok: number; error: string | null;
+        }>('SELECT id, chat_key, task, user_id, nickname, ts, duration_ms, artifacts, ok, error FROM work_runs WHERE id=?', runId);
+        if (!row) return send({ error: `没有运行 ${runId}` }, 404);
+        const m = String(row.chat_key ?? '').match(/^(group|private)_(.+)$/);
+        if (!m) return send({ error: '这次运行没有可投递的会话' }, 400);
+        const userId = String(row.user_id ?? '').trim();
+        if (!userId) return send({ error: '这次运行没有发起人，无法定位沙箱' }, 400);
+        const chat: ChatRef = {
+          platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2], scope: workScopeOf(userId),
+        };
+        let known: string[] = [];
+        try {
+          const parsed = JSON.parse(row.artifacts ?? '[]');
+          if (Array.isArray(parsed)) known = parsed.map(String).filter(Boolean);
+        } catch { /* 老行没有 artifacts */ }
+        known = known.filter((a) => !a.startsWith('.skills/') && !a.startsWith('inbox/'));
+        const started = Number(row.ts) || nowMs();
+        const scanFrom = Math.min(started, started - (Number(row.duration_ms) || 0)) - 5 * 60_000;
+        const scanned = collectRecentArtifacts(kernel.sandbox.root(chat), scanFrom);
+        const artifacts = [...new Set([...known, ...scanned])].slice(0, 60);
+        if (!artifacts.length) return send({ error: '这次运行在沙箱里没有找到可发送的文件' }, 400);
+        const st = kernel.adapter?.status() as { selfId?: string; selfNickname?: string; connected?: boolean } | undefined;
+        if (!st?.connected) return send({ error: '协议端未连接，稍后再补发' }, 503);
+        await kernel.chat.sendForward(chat, {
+          text: `补发上次未跑完任务的产物（${artifacts.length} 个）：${truncate(row.task, 80)}`,
+          artifacts,
+          mention: chat.type === 'group' ? { userId } : undefined,
+          selfId: st.selfId,
+          selfNickname: st.selfNickname,
+        });
+        return send({ ok: true, sent: artifacts.length, artifacts });
       }
       return send({ error: 'not found' }, 404);
     }
