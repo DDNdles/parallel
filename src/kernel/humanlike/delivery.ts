@@ -6,7 +6,7 @@
  * 模型不再为格式多写一个字；"说几条、多长"由下面三步保证：
  *   1. `normalizeVisibleContent` 剥掉媒体占位符与模型手滑输出的标签，并按单条上限硬截断；
  *   2. `trimAtSentence` 句边截断兜底：回复超长时保留到最后一个句末标点，不把半句话拍出去；
- *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 10 条，超出时均衡合并）；
+ *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 6 条，超出时均衡合并）；
  *      `typingDelayMs` 算第二条及后续气泡的「正在输入」等待 —— 基础延迟 + 字数/速度，
  *      乘抖动，下限 250ms。首条不等（用户已经等过模型了）。
  */
@@ -47,8 +47,8 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   maxMessageCharacters: 2000,
 };
 
-/** 气泡数硬上限：连续发送（中间没有对方插话）最多 10 条 */
-export const MAX_BUBBLES = 10;
+/** 气泡数硬上限：连续发送（中间没有对方插话）最多 6 条 */
+export const MAX_BUBBLES = 6;
 /** 提示里的推荐总长（字）：硬上限由设置页 replyMaxCharacters 决定，必要情况可以突破推荐值 */
 export const RECOMMENDED_REPLY_CHARS = 50;
 /** 提示里的推荐气泡数（2～3 条）：硬上限是 MAX_BUBBLES，必要情况可以超过 3 条 */
@@ -241,7 +241,7 @@ function mergeToCap(parts: string[], maxBubbles: number): string[] {
  *  - 换行是最强的分条意图：模型自己换的行不合并；
  *  - 句末标点后切；连续标点（？！？…）并作同一个句尾；引号/右括号跟着前一句走；
  *  - 单句超过 softMax（默认 24 字）时，再在逗号/顿号/冒号处补切；
- *  - 超过 maxBubbles 时做**均衡连续分组**，保持 10 条上限、不把尾巴全粘最后一条。
+ *  - 超过 maxBubbles 时做**均衡连续分组**，保持 MAX_BUBBLES 上限、不把尾巴全粘最后一条。
  */
 export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES, softMax = 24): string[] {
   const out: string[] = [];
