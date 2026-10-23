@@ -277,7 +277,7 @@ export class WorkRunner {
       const { reply, rounds, toolCalls, steps } = await this.agentLoop.run(ctx, {
         chatKey,
         abort: input.abort,
-        // 轮次：由 work agent 定义的 max_rounds 决定（0/缺省 = 无上限，用户定稿的 work 语义）；
+        // 轮次：work 轮不设上限（2026-10-23 用户定）；agent 定义里的 max_rounds 不再参与截断
         // 模型链：由 agent 定义决定（缺省 work；子代理可声明 chain: chat）
         chain: agent.chain ?? 'work',
         // 每一步（工具调用）推给桌面端

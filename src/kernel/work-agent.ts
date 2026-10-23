@@ -14,7 +14,7 @@
 //   description: 查资料并给出来源
 //   tools: web_search, web_fetch, sandbox_write, work_finish
 //   chain: work                 # 跑哪条模型链（缺省 work）
-//   max_rounds: 0               # 0 / 缺省 = 无上限
+//   max_rounds: 0               # 兼容保留：work 轮已不设轮次上限（2026-10-23），写多少都不截断
 //   ---
 //   正文：身份 / 工作方式 / 交付要求
 //

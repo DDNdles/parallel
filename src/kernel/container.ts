@@ -382,6 +382,43 @@ export class PluginContainer {
   }
 
   /**
+   * 继续一次被打断的 work：按原任务重开一轮（同一发起人的沙箱还在，产物不用重做）。
+   * 汇报仍由 WorkRunner 的 work.done 触发 pipeline 的 chat 汇报轮（trigger='chat'）；
+   * 正常派活仍走 work_dispatch，这条只给桌面端/内核自用（例如内核重启后接着跑）。
+   */
+  async resumeWork(input: {
+    chatKey: string;
+    task: string;
+    userId: string;
+    nickname?: string;
+    role: Role;
+    trigger?: 'chat' | 'subagent';
+  }): Promise<{ ok: boolean; reason?: string }> {
+    const m = String(input.chatKey ?? '').match(/^(group|private)_(.+)$/);
+    if (!m) return { ok: false, reason: 'chatKey 不合法' };
+    if (this.deps.work.workModelLabel() === '—') return { ok: false, reason: '工作模型还没配置' };
+    const chat: ChatRef = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };
+    const agent = this.workAgent();
+    const all = this.listWorkAgents();
+    const role = input.role;
+    void this.deps.work.run({
+      chat,
+      task: input.task,
+      userId: input.userId,
+      nickname: input.nickname,
+      role,
+      agent,
+      tools: this.workToolsFor(chat, role, agent, 0),
+      subagents: all.map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
+      trigger: input.trigger ?? 'chat',
+      depth: 0,
+      groupTitle: this.deps.groupTitle(chat.chatId),
+      runHooks: (req) => this.runWorkHooks(req),
+    }).catch(() => { /* run() 内部已把失败落进事件与报错中心 */ });
+    return { ok: true };
+  }
+
+  /**
    * work 轮的插件钩子链（beforeWorkLLM）。与 chat 的 beforeLLM 是两条独立链：
    * chat 轮的人格/世界书注入不会漏进 work，work 的子代理身份也不会污染 chat。
    */

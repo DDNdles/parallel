@@ -13,7 +13,7 @@ import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts
 import { geminiApiBase } from '../services/pi-ai.ts';
 import { LLBotManager } from '../services/llbot.ts';
 import { busEvents } from '../bus.ts';
-import type { ChatEvent, ChatRef } from '../types.ts';
+import type { ChatEvent, ChatRef, Role } from '../types.ts';
 import { findSkill, scanSkills, skillStateKey, SKILL_PLUGIN_ID } from '../skills.ts';
 
 const MIME: Record<string, string> = {
@@ -875,6 +875,32 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           images: kernel.session.imagesAvailable(),
           docker: kernel.session.available(),
         });
+      }
+      if (b === 'resume' && req.method === 'POST') {
+        // 继续一次中断的 work：按 runId 取原任务（可被 body.task 覆盖），在同一发起人沙箱里重开一轮。
+        // 汇报仍走 work.done → pipeline 的 chat 汇报轮（trigger='chat'）。
+        const runId = String(body.runId ?? '').trim();
+        const row = runId
+          ? kernel.db.get<{ id: string; chat_key: string; task: string; user_id: string; nickname?: string }>(
+              'SELECT id, chat_key, task, user_id, nickname FROM work_runs WHERE id=?', runId)
+          : undefined;
+        if (runId && !row) return send({ error: `没有运行 ${runId}` }, 404);
+        const chatKey = String(body.chatKey ?? row?.chat_key ?? '').trim();
+        const userId = String(body.userId ?? row?.user_id ?? '').trim();
+        const task = String(body.task ?? row?.task ?? '').trim();
+        if (!chatKey || !userId || !task) return send({ error: 'chatKey / userId / task 不能为空' }, 400);
+        const cfg = kernel.config.config as any;
+        const role = (cfg.masterIds ?? []).includes(userId)
+          ? 'owner'
+          : (cfg.extraAdminIds ?? []).includes(userId) ? 'admin' : 'member';
+        if (role === 'member') return send({ error: '只有管理员能继续工作' }, 403);
+        const r = await kernel.container.resumeWork({
+          chatKey, task, userId,
+          nickname: body.nickname ?? row?.nickname ?? undefined,
+          role: role as Role,
+          trigger: 'chat',
+        });
+        return send(r, r.ok ? 200 : 400);
       }
       if (b === 'reset' && req.method === 'POST') {
         // 重置某会话的常驻容器（状态化 Python / 浏览器）

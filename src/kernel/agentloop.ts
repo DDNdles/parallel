@@ -107,13 +107,12 @@ export class AgentLoop {
       throw new Error('未安装 @earendil-works/pi-ai：agent loop 跑在它的引擎上，请先 `npm i`');
     }
 
-    // 轮次上限：opts.maxRounds 显式给出则生效；否则 work agent 定义里的 max_rounds（0/缺省 = 无上限）。
-    // **chat 轮是两轮硬上限（2026-10-17 用户裁定）**：第一轮允许走一次记忆查询（recall_facts /
+    // 轮次上限：work 轮**不设上限**（2026-10-23 用户定：工具轮次不设上限）；
+    // agent 定义里的 max_rounds 只为兼容旧定义保留，不再参与截断。
+    // **chat 轮仍是两轮硬上限（2026-10-17 用户裁定）**：第一轮允许走一次记忆查询（recall_facts /
     // search_history，见 prepareNextTurn 第二轮摘工具），没查就一轮答完——旧的 llm.maxToolRounds
     // 配置键已删：这是产品决定，不是旋钮。
-    const agentRounds = ctx.workTurn ? ctx.workAgent?.maxRounds : undefined;
-    const maxRounds = opts.maxRounds
-      ?? (ctx.workTurn ? (agentRounds && agentRounds > 0 ? agentRounds : Infinity) : 2);
+    const maxRounds = opts.maxRounds ?? (ctx.workTurn ? Infinity : 2);
     const compaction = ctx.workTurn ? this.compactionSettings() : null;
     const contextWindow = ctx.workTurn ? this.llm.contextWindow(chain) : undefined;
     let lastSummary: string | undefined;
