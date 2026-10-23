@@ -4,13 +4,12 @@
  *
  * 两块职责分开：
  *  1. **概率**：8 个会话结构特征 → 逻辑回归 → 这批消息会让 chat 轮开口的概率。
- *     特征与先验权重逐项对齐 MaiBot；权重是离线拟合的结果，这里作为先验。
+ *     特征与权重逐项对齐 MaiBot；权重固定，不在线重训。
  *  2. **门控**：1 小时窗口里按 talk_value 折算目标回复量，用窗口内概率的分位点当阈值。
  *     概率只负责排序，真正决定"放几个"的是预算。
  *
- * 与 MaiBot 的唯一有意差异：MaiBot 用无门控时期 Planner 首轮的 `no_reply` 当拟合标签；
- * 这里用**模型最终有没有真说话**（`noteTurnOutcome` 的回执）当标签。先验仍是 MaiBot 的权重，
- * 样本攒够后只在先验邻域内重训，避免少量新样本把行为带跑。
+ * "模型最终有没有真说话"只用于动态预算的 actual reply 记账（MaiBot 的 `record_reply`），
+ * 不再拿它重训权重。
  */
 
 /** 一次评估的输入特征（口径与 MaiBot ReplyLikelihoodInput 一致） */
@@ -40,18 +39,12 @@ export interface GateWeights {
   w: number[];
 }
 
-/** 训练样本：特征向量（已缩放）+ 这一次的实际结果（1=模型真说话 0=模型没说话） */
-export interface GateSample {
-  f: number[];
-  y: 0 | 1;
-}
-
 /**
  * MaiBot `reply_likelihood.py` 的原始权重。
  * 保留一份原文，方便以后重新拟合时对照；真正参与计算的是下面缩放后的先验。
  *
  * 原始特征口径：recent_message_count 是原条数、seconds_since_bot 取 log1p、pending 封顶 20。
- * 为了让在线重训的梯度量级稳定，特征向量把这三项分别除以 50 / 5 / 20，
+ * 为了让特征量级稳定，特征向量把这三项分别除以 50 / 5 / 20，
  * 权重同比放大，先验概率与 MaiBot 逐位等价。
  */
 export const MAIBOT_RAW_WEIGHTS = {
@@ -113,51 +106,6 @@ export function replyLikelihood(f: GateFeatures, w: GateWeights): number {
   let z = w.bias;
   for (let i = 0; i < v.length; i++) z += (w.w[i] ?? 0) * v[i];
   return sigmoid(z);
-}
-
-export function gateSampleOf(f: GateFeatures, y: 0 | 1): GateSample {
-  return { f: likelihoodFeatureVector(f), y };
-}
-
-/**
- * 逻辑回归 SGD（无依赖、无随机）。
- * 小样本下防过拟合的两道闸：`L2` 轻微收缩 + 权重离先验太远直接夹回
- * （每维最多偏 |w0| 2.5，最多偏掉 bias 3）——重训是在**校准**先验，不是把话柄交给几千条日志。
- */
-export function fitWeights(
-  rows: GateSample[],
-  prior: GateWeights,
-  opts: { iterations?: number; lr?: number; l2?: number } = {},
-): GateWeights {
-  const dim = prior.w.length;
-  const w = prior.w.slice();
-  let bias = prior.bias;
-  const lr = opts.lr ?? 0.25;
-  const l2 = opts.l2 ?? 1e-4;
-  const iters = opts.iterations ?? 240;
-  if (!rows.length) return { bias, w: w.slice() };
-  for (let it = 0; it < iters; it++) {
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      let z = bias;
-      for (let k = 0; k < dim; k++) z += (w[k] ?? 0) * (r.f[k] ?? 0);
-      const err = sigmoid(z) - r.y;
-      for (let k = 0; k < dim; k++) {
-        const x = r.f[k] ?? 0;
-        // L2 把权重往 0 收一点点；先验窗口在下一段统一夹
-        w[k] = (w[k] ?? 0) - lr * (err * x + l2 * (w[k] ?? 0));
-      }
-      bias -= lr * (err + l2 * bias);
-    }
-  }
-  for (let k = 0; k < dim; k++) w[k] = clampTo((prior.w[k] ?? 0), w[k] ?? 0, 2.5);
-  bias = clampTo(prior.bias, bias, 3);
-  return { bias, w };
-}
-
-function clampTo(base: number, v: number, span: number): number {
-  const lo = base - span, hi = base + span;
-  return Math.min(hi, Math.max(lo, Number.isFinite(v) ? v : base));
 }
 
 function clamp01(n: number): number {

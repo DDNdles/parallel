@@ -142,8 +142,6 @@ export class Kernel {
       sessionLog: this.sessionLog,
       bus: this.bus,
       errors: this.errors,
-      // likelihood 模型的权重与样本池（开口拟合回归），跟 data/ 一起走
-      modelFile: join(this.dataDir, 'gate-model.json'),
     });
     // 人格叫醒词：chat 插件在载入/切换人格/保存 canon 时推送，拟人层用它判"在叫我"
     this.bus.on(busEvents.personaAliases, (d: { aliases?: unknown }) => {

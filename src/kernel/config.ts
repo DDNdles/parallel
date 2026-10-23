@@ -141,8 +141,7 @@ export const DEFAULT_CONFIG = {
     timing: {
       // MaiBot 源码默认是 frequency；dynamic（这里叫 likelihood）要显式切
       replyTriggerMode: 'frequency' as 'likelihood' | 'frequency',
-      pendingThreshold: 12,               // frequency 门槛；likelihood 下是最小批次（parallel 没有 Planner wait）
-      talkValue: 1,                       // 群聊频率 0–1：frequency 下 0=静默；likelihood 下是 1 小时目标回复率
+      talkValue: 1,                       // 群聊频率 0–1：frequency 下门槛=ceil(1/值)；likelihood 下是 1 小时目标回复率
       privateTalkValue: 1,
       enableRules: false,                 // 按群/时段单独调频率
       rules: [
@@ -387,6 +386,7 @@ export class ConfigStore {
       // 必要性模式已删（2026-10-23）：老配置里的 necessity 一律切到 likelihood
       if (hlTiming.replyTriggerMode === 'necessity') hlTiming.replyTriggerMode = 'likelihood';
       delete hlTiming.necessityThreshold;
+      delete hlTiming.pendingThreshold;
       delete hlTiming.replyStyle;
     }
     // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费

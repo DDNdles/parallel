@@ -20,12 +20,9 @@ import { faceTokensToSegments } from '../util/qqface.ts';
 import {
   DEFAULT_GATE_WEIGHTS,
   DynamicReplyGate,
-  fitWeights,
   replyLikelihood,
-  gateSampleOf,
   type DynamicGateDecision,
   type GateFeatures,
-  type GateSample,
   type GateWeights,
 } from './likelihood.ts';
 import { backoffBypassed, idleBackoffSeconds, idleCompensation, talkValueFor } from './frequency.ts';
@@ -50,7 +47,6 @@ import {
   type HumanlikeConfig,
   type TriggerBatch,
 } from './types.ts';
-import { readJson, atomicWriteJson } from '../util/fsutil.ts';
 
 interface ChatState {
   buffer: ChatEvent[];
@@ -89,10 +85,10 @@ interface ChatState {
   /** 最近一次动态门控判定（状态页/日志用） */
   lastGate?: DynamicGateDecision;
   /**
-   * likelihood 的待回执样本（gateId → 特征）。开口那一刻只登记、不落样本；
-   * 等 pipeline 把「模型最终有没有真说话」回报回来才记 y。避免把 [silent]/失败也记成开口。
+   * 待回执号（gateId → 开口时刻）。pipeline 回报模型最终有没有真说话；
+   * 只落 gate 日志供调参/排障，不参与权重重训。
    */
-  pendingGates: Map<string, { feats: GateFeatures; at: number; frequency: number }>;
+  pendingGates: Map<string, { at: number }>;
 }
 
 /** 相邻入站间隔的统计窗口（MaiBot 30 分钟）与连发抖动阈值（<5s 不计入平均） */
@@ -100,12 +96,6 @@ const INTERVAL_WINDOW_MS = 30 * 60_000;
 const INTERVAL_BURST_MS = 5_000;
 /** 空窗补偿的平均间隔下限：低活跃群里别把沉默折算得太快（MaiBot 30s） */
 const IDLE_COMPENSATION_MIN_AVERAGE_INTERVAL_SECONDS = 30;
-/** 拟合闭环：每满 80 条新样本重训一次 */
-const GATE_FIT_BATCH = 80;
-/** 样本池上限（连同权重的 JSON 约 130KB） */
-const GATE_ROW_CAP = 1200;
-/** 重训至少要有这么多条"真开口"样本，避免退化成一堆 0 */
-const GATE_FIT_MIN_POSITIVES = 20;
 
 export interface HumanlikeServiceOptions {
   config: () => HumanlikeConfig;
@@ -120,37 +110,19 @@ export interface HumanlikeServiceOptions {
   now?: () => number;
   /** 合批起跳随机延时的随机源（测试注入用；缺省 Math.random） */
   random?: () => number;
-  /**
-   * likelihood 模型的落盘位置（`data/gate-model.json`）。不传就只跑内存，
-   * 冷启动从先验开始 —— 测试与 dump 场景用这个口。
-   */
-  modelFile?: string;
 }
 
 export class HumanlikeService {
   private states = new Map<string, ChatState>();
   private disposed = false;
   private readonly now: () => number;
-  /** likelihood 权重（冷启动先验，随样本重训后更新） */
+  /** likelihood 权重：MaiBot 固定权重，不在线重训 */
   private gateWeights: GateWeights = { ...DEFAULT_GATE_WEIGHTS, w: [...DEFAULT_GATE_WEIGHTS.w] };
-  /** 训练样本池（环形，只入不出；随权重一起落盘，冷启动不从头学） */
-  private gateRows: GateSample[] = [];
-  private lastFitRows = 0;
   /** 当前人格的叫醒词（canon.json 的 aliases，由 chat 插件推送）：与 QQ 昵称同一条提及通道 */
   private mentionAliases: string[] = [];
 
   constructor(private opts: HumanlikeServiceOptions) {
     this.now = opts.now ?? Date.now;
-    if (opts.modelFile) {
-      const m = readJson<{ v?: number; feature?: string; weights?: GateWeights; rows?: GateSample[] }>(opts.modelFile, {});
-      // 特征口径换过（necessity 特征 → MaiBot 8 特征）：旧权重/旧样本直接作废，从新先验起步
-      const fresh = m.v === 2 && m.feature === 'maibot-v1';
-      if (fresh && m.weights && Number.isFinite(m.weights.bias) && Array.isArray(m.weights.w) && m.weights.w.length === DEFAULT_GATE_WEIGHTS.w.length) {
-        this.gateWeights = m.weights;
-        this.gateRows = Array.isArray(m.rows) ? m.rows.slice(-GATE_ROW_CAP) : [];
-        this.lastFitRows = this.gateRows.length;
-      }
-    }
   }
 
   get config(): HumanlikeConfig {
@@ -355,7 +327,7 @@ export class HumanlikeService {
 
   /**
    * 核心决策：现在该不该开口。
-   *  - frequency：积压 >= pendingThreshold 直接放行；不够时用空窗补偿补一次
+   *  - frequency：积压 >= ceil(1/talk_value) 直接放行；不够时用空窗补偿补一次
    *    （MaiBot `FrequencyThresholdTurnGate`）。
    *  - likelihood：最小批次 + MaiBot 8 特征概率 + 1 小时动态预算门控。
    *    概率只负责排序，放不放由 talk_value 折算的目标回复量决定（MaiBot `dynamic`）。
@@ -385,22 +357,6 @@ export class HumanlikeService {
     const pending = st.buffer.length;
     const idleSeconds = st.lastInboundAt ? Math.max(0, (now - st.lastInboundAt) / 1000) : 0;
     const avgInterval = this.averageInterval(st);
-    const comp = idleCompensation({
-      pendingCount: pending,
-      triggerThreshold: cfg.timing.pendingThreshold,
-      idleSeconds,
-      averageIntervalSeconds: avgInterval,
-    });
-
-    // 空闲退避：连续不理人就指数放慢；群里重新热闹（积压够多）直接绕过
-    const backoff = idleBackoffSeconds(cfg.backoff, st.consecutiveNoAction);
-    const bypass = backoffBypassed(cfg.backoff, pending);
-    if (backoff > 0 && !bypass && now < st.backoffUntil) {
-      this.armRecheck(carrier, st, Math.max(200, st.backoffUntil - now));
-      this.logWait(carrier, st, `退避中（还差 ${Math.round((st.backoffUntil - now) / 1000)}s，连续不说=${st.consecutiveNoAction}）`);
-      return;
-    }
-
     const frequency = talkValueFor(
       {
         talkValue: cfg.timing.talkValue,
@@ -414,10 +370,26 @@ export class HumanlikeService {
     const freq = Math.min(1, Math.max(0, Number(frequency) || 0));
     // talkValue=0 = 这个会话现在不说话（@/提及仍由上面的硬规则直通）
     const silentByFrequency = freq <= 0;
-    const mode = cfg.timing.replyTriggerMode;
-    const minPending = Math.max(1, Math.round(Number(cfg.timing.pendingThreshold) || 1));
+    // MaiBot frequency：攒够 ceil(1/talk_value) 条才进一轮
+    const freqThreshold = silentByFrequency ? 1 : Math.max(1, Math.ceil(1 / freq));
+    const comp = idleCompensation({
+      pendingCount: pending,
+      triggerThreshold: freqThreshold,
+      idleSeconds,
+      averageIntervalSeconds: avgInterval,
+    });
 
-    let likelihood: { feats: GateFeatures; p: number; decision: DynamicGateDecision } | null = null;
+    // 空闲退避：连续不理人就指数放慢；群里重新热闹（积压够多）直接绕过
+    const backoff = idleBackoffSeconds(cfg.backoff, st.consecutiveNoAction);
+    const bypass = backoffBypassed(cfg.backoff, pending);
+    if (backoff > 0 && !bypass && now < st.backoffUntil) {
+      this.armRecheck(carrier, st, Math.max(200, st.backoffUntil - now));
+      this.logWait(carrier, st, `退避中（还差 ${Math.round((st.backoffUntil - now) / 1000)}s，连续不说=${st.consecutiveNoAction}）`);
+      return;
+    }
+
+    const mode = cfg.timing.replyTriggerMode;
+    let likelihood: { p: number; decision: DynamicGateDecision } | null = null;
     let reason: TriggerBatch['reason'] | null = null;
     let detail = '';
 
@@ -429,22 +401,17 @@ export class HumanlikeService {
       if (newIds.length) st.dynamic.recordProactiveDemand(p, now);
       const decision = st.dynamic.evaluate(p, freq, now);
       st.lastGate = decision;
-      const enough = pending >= minPending;
-      if (!silentByFrequency && enough && decision.shouldTrigger) {
+      if (!silentByFrequency && decision.shouldTrigger) {
         reason = 'likelihood';
-        detail = `pending=${pending} ≥ ${minPending}｜${decision.detail}`;
-      } else if (silentByFrequency) {
-        detail = 'talkValue=0，静默';
-      } else if (!enough) {
-        detail = `pending=${pending} < ${minPending}（最小批次）｜${decision.detail}`;
-      } else {
         detail = decision.detail;
+      } else {
+        detail = silentByFrequency ? 'talkValue=0，静默' : decision.detail;
       }
-      likelihood = { feats, p, decision };
+      likelihood = { p, decision };
     } else {
-      if (!silentByFrequency && pending >= minPending) {
+      if (!silentByFrequency && pending >= freqThreshold) {
         reason = 'frequency';
-        detail = `pending=${pending} ≥ ${minPending}`;
+        detail = `pending=${pending} ≥ ${freqThreshold}（ceil(1/${freq.toFixed(3)})）`;
       } else if (!silentByFrequency && comp.reached) {
         reason = 'idle';
         detail = comp.detail;
@@ -458,12 +425,10 @@ export class HumanlikeService {
       st.consecutiveNoAction = 0;
       st.backoffUntil = 0;
       st.dynamic.closeRound();
-      // likelihood 的样本先挂起：等 pipeline 回报"模型最终有没有真说话"再记 y。
-      const gateId = likelihood ? this.newGateId() : undefined;
-      if (likelihood && gateId) {
-        st.pendingGates.set(gateId, { feats: likelihood.feats, at: now, frequency: freq });
-        while (st.pendingGates.size > 8) st.pendingGates.delete(st.pendingGates.keys().next().value as string);
-      }
+      // 回执号两种模式都发：pipeline 用它回报"模型最终有没有真说话"，只记日志不重训
+      const gateId = this.newGateId();
+      st.pendingGates.set(gateId, { at: now });
+      while (st.pendingGates.size > 8) st.pendingGates.delete(st.pendingGates.keys().next().value as string);
       this.opts.sessionLog.append(carrier.chatId, carrier.type, {
         type: 'gate', role: 'system',
         text: `开口（${reason}）：${detail}`,
@@ -477,7 +442,7 @@ export class HumanlikeService {
             targetReplies: Number(likelihood.decision.targetReplies.toFixed(2)),
             actualReplies: likelihood.decision.actualReplies,
           } : {}),
-          ...(gateId ? { gateId } : {}),
+          gateId,
         },
       });
       this.opts.trigger({ chat, events, reason, detail, gateId });
@@ -542,18 +507,7 @@ export class HumanlikeService {
   }
 
   /**
-   * 一次真实回合结果的记账：只记「模型最终有没有真说话」的样本。
-   * 门控 wait 不落样本——那不是模型行为，是门控自己的决定；用它当标签会学成自指。
-   */
-  private recordOutcome(st: ChatState, spoke: boolean, feats: GateFeatures): void {
-    this.gateRows.push(gateSampleOf(feats, spoke ? 1 : 0));
-    if (this.gateRows.length > GATE_ROW_CAP) this.gateRows.splice(0, this.gateRows.length - GATE_ROW_CAP);
-    this.maybeFit();
-  }
-
-  /**
    * 被 @/提及强制触发的一次回复：按 MaiBot 的 0.91 期望值占用 1 小时预算。
-   * 不进训练样本——强制轮不是概率门控放行的。
    */
   noteForcedTurn(chat: ChatRef): void {
     if (this.config.timing.replyTriggerMode !== 'likelihood') return;
@@ -565,8 +519,8 @@ export class HumanlikeService {
   }
 
   /**
-   * 回合结束回执：模型最终有没有真说话。只有拿到这个回执才落 y，
-   * 模型回 [silent]、空输出、失败都不再被记成"开口"。
+   * 回合结束回执：模型最终有没有真说话。只记一条 gate 日志供调参/排障；
+   * 权重是 MaiBot 固定值，不拿它在线重训。
    */
   noteTurnOutcome(chat: ChatRef, gateId: string | undefined, spoke: boolean): void {
     if (!gateId) return;
@@ -574,52 +528,17 @@ export class HumanlikeService {
     const p = st.pendingGates.get(gateId);
     if (!p) return;
     st.pendingGates.delete(gateId);
-    if (this.config.timing.replyTriggerMode !== 'likelihood') return;
-    this.recordOutcome(st, spoke, p.feats);
+    this.opts.sessionLog.append(chat.chatId, chat.type, {
+      type: 'gate', role: 'system',
+      text: `回执：模型${spoke ? '开口' : '沉默'}`,
+      data: { decision: 'turn_outcome', gateId, spoke, waitedMs: Math.max(0, this.now() - p.at) },
+    });
   }
 
-  /** 这一轮被打断/异常结束：样本直接丢掉，不把"没来得及回"当成模型不想回 */
+  /** 这一轮被打断/异常结束：清掉待回执，不把"没来得及回"记成沉默 */
   dropGate(chat: ChatRef, gateId: string | undefined): void {
     if (!gateId) return;
     this.state(chat).pendingGates.delete(gateId);
-  }
-
-  /** 攒够了整批新样本就重训一次，权重落盘（下一轮评估用新权重） */
-  private maybeFit(): void {
-    if (this.gateRows.length - this.lastFitRows >= GATE_FIT_BATCH) {
-      const positives = this.gateRows.reduce((n, r) => n + r.y, 0);
-      const negatives = this.gateRows.length - positives;
-      if (positives >= GATE_FIT_MIN_POSITIVES && negatives >= GATE_FIT_MIN_POSITIVES) {
-        this.gateWeights = fitWeights(this.gateRows, DEFAULT_GATE_WEIGHTS);
-        this.lastFitRows = this.gateRows.length;
-        this.saveGateModel();
-        return;
-      }
-      // 样本类别不平衡时不重训，只把样本留下；否则会把先验拉成"一律不说话"。
-      // 不推进 lastFitRows：等沉默样本攒够后仍然从这一批里触发重训。
-    }
-    // 没到重训量级也要定期存样本池：冷启动接得上上一轮的学头
-    if (this.gateRows.length - this.lastSavedRows >= 40) this.saveGateModel();
-  }
-
-  private lastSavedRows = 0;
-
-  private saveGateModel(): void {
-    if (!this.opts.modelFile) return;
-    this.lastSavedRows = this.gateRows.length;
-    try {
-      atomicWriteJson(this.opts.modelFile, {
-        v: 2,
-        feature: 'maibot-v1',
-        weights: this.gateWeights,
-        rows: this.gateRows,
-      }, { rotate: false });
-    } catch { /* 落盘失败只影响下次冷启动的起点，不值得打断说话 */ }
-  }
-
-  /** likelihood 模型快照（调试/测试/未来状态页用；不给运行路径） */
-  gateModelSnapshot(): { bias: number; w: number[]; rows: number } {
-    return { bias: this.gateWeights.bias, w: [...this.gateWeights.w], rows: this.gateRows.length };
   }
 
   // ------------------------------------------------------------ 主动发言（没人说话也开口）

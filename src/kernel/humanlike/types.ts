@@ -26,15 +26,9 @@ export type { RepeatConfig } from './repeat.ts';
 export interface TimingConfig {
   /**
    * likelihood = 开口概率 + 1 小时动态预算门控（对齐 MaiBot `dynamic` 模式）；
-   * frequency = 只看攒了多少条（对齐 MaiBot `frequency` 模式）。
+   * frequency = 攒够 ceil(1/talk_value) 条进一轮（对齐 MaiBot `frequency` 模式）。
    */
   replyTriggerMode: 'likelihood' | 'frequency';
-  /**
-   * frequency 模式的触发门槛；likelihood 模式下作为**最小批次**：
-   * 不够这么多条就不进入概率判定（parallel 没有 Planner 的 wait 步骤，
-   * 没有这道闸门时 talk_value=1 会变成每条消息都开一轮 chat）。
-   */
-  pendingThreshold: number;
   talkValue: number;
   privateTalkValue: number;
   enableRules: boolean;
@@ -135,7 +129,6 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   timing: {
     replyTriggerMode: 'frequency',
-    pendingThreshold: 12,
     talkValue: 1,
     privateTalkValue: 1,
     enableRules: false,

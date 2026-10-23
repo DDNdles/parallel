@@ -317,11 +317,14 @@ export class Pipeline {
 
   /** 拟人层攒够消息后的回调（也用于主动发言轮：events 为空） */
   enqueueBatch(batch: TriggerBatch): void {
+    // 频率/拟合概率/空窗补偿放行的轮次，模型可以像 Planner 一样选择 wait；
+    // @/提及/私聊/命令是硬触发，不能靠沉默逃掉。
+    const waitable = batch.reason === 'likelihood' || batch.reason === 'frequency' || batch.reason === 'idle';
     if (!batch.events.length) {
-      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail, gateId: batch.gateId });
+      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail, gateId: batch.gateId, waitable });
       return;
     }
-    this.enqueue(batch.events, { gateId: batch.gateId });
+    this.enqueue(batch.events, { gateId: batch.gateId, waitable });
   }
 
   /** 主动发言轮没有真实消息，构造一个只用来承载"哪个会话"的空事件 */
@@ -335,7 +338,7 @@ export class Pipeline {
     };
   }
 
-  private enqueue(events: ChatEvent[], opts: { proactive?: string; gateId?: string } = {}): void {
+  private enqueue(events: ChatEvent[], opts: { proactive?: string; gateId?: string; waitable?: boolean } = {}): void {
     const carrier = events[events.length - 1];
     if (!carrier) return;
     const key = `${carrier.type}_${carrier.chatId}`;
@@ -468,7 +471,7 @@ export class Pipeline {
 
   // ---------------------------------------------------------------- 处理
 
-  private async process(events: ChatEvent[], opts: { proactive?: string; gateId?: string } = {}): Promise<void> {
+  private async process(events: ChatEvent[], opts: { proactive?: string; gateId?: string; waitable?: boolean } = {}): Promise<void> {
     if (!events.length) return;
     const event = events[events.length - 1];
     const chatKey = `${event.type}_${event.chatId}`;
@@ -556,7 +559,7 @@ export class Pipeline {
       return;
     }
     this.lastTurn.set(chatKey, { text: dupText(userText), at: Date.now(), spoke: false });
-    await this.agentTurn(event, role, chatKey, { userText, batch: allowed, gateId: opts.gateId });
+    await this.agentTurn(event, role, chatKey, { userText, batch: allowed, gateId: opts.gateId, waitable: opts.waitable });
   }
 
   // ---------------- 命令 ----------------
@@ -725,6 +728,8 @@ export class Pipeline {
       batch?: ChatEvent[];
       /** 拟人层开口时发的样本回执号（pipeline 用它回报模型最终有没有真说话） */
       gateId?: string;
+      /** 频率/拟合概率放行的轮次：允许模型输出 [silent] 当 wait（MaiBot Planner 语义） */
+      waitable?: boolean;
     },
   ): Promise<void> {
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
@@ -834,6 +839,19 @@ export class Pipeline {
         systemSections.push({
           order: 440, title: 'chat-style',
           text: chatOutputStyleText({ maxChars: out.replyMaxCharacters }),
+        });
+      }
+      // 频率/拟合概率放行的轮次：给模型一个 Planner 式 wait 出口。
+      // 只在这些轮次出现；@/提及/私聊/命令是硬触发，不能靠 [silent] 逃掉。
+      if (!isReport && opts?.waitable) {
+        systemSections.push({
+          order: 442, title: 'wait-option',
+          text: [
+            '# 可以先不接',
+            '- 这一轮不是别人叫你，是你自己判断要不要插话。',
+            '- 如果现在不适合接，只输出 [silent]（不要写别的字，不要解释）。',
+            '- 想接就正常说；别为了回应而回应。',
+          ].join('\n'),
         });
       }
       // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。

@@ -21,7 +21,6 @@ interface Humanlike {
   };
   timing: {
     replyTriggerMode: 'likelihood' | 'frequency';
-    pendingThreshold: number;
     talkValue: number; privateTalkValue: number;
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
     mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
@@ -440,16 +439,9 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'frequency' } }, true)} />
               </div>
               <div className="set-grid">
-                <Num
-                  label={triggerMode === 'frequency' ? '触发所需积压条数' : '最小批次条数'}
-                  hint={triggerMode === 'frequency'
-                    ? '频率模式的开口门槛：攒够这么多条才进模型'
-                    : '攒够这么多条才进入概率判定；不够就不打扰'}
-                  value={h.timing.pendingThreshold}
-                  onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
                 <Num label="群聊频率（0-1）"
                   hint={triggerMode === 'frequency'
-                    ? '0 = 静默；频率模式的实际门槛由上面的积压条数决定'
+                    ? '触发门槛 = ceil(1/频率)：1 = 每条都判断，0.2 ≈ 每 5 条，0 = 静默'
                     : '1 小时目标回复率：1 = 不设限，越小越安静，0 = 静默'}
                   value={h.timing.talkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, talkValue: v } })} />

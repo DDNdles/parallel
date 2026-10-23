@@ -1293,8 +1293,7 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     applyBool(t, timing, 'inevitableAtReply');
     applyBool(t, timing, 'focusMode');
     applyBool(t, timing, 'enableRules');
-    let e = applyNum(t, timing, 'pendingThreshold', 1, 100, '条数阈值'); if (e) return e;
-    e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
+    let e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
     e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;
     if (Array.isArray(timing.rules)) {
       const rules: Record<string, unknown>[] = [];

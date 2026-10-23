@@ -338,10 +338,10 @@ test('拟人化没有总开关：配置形状里就不该有 enabled（她不是
   assert.equal('enabled' in (DEFAULT_CONFIG.humanlike as Record<string, unknown>), false);
 });
 
-test('服务：攒够条数（frequency 模式）后由定时器触发，而不是逐条触发', async () => {
+test('服务：攒够 ceil(1/talkValue) 条（frequency 模式）后由定时器触发，而不是逐条触发', async () => {
   const { svc, triggers, cfg } = makeService({
     merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 3 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 0.34 },
   });
   svc.ingest(ev('一'), { isCommand: false });
   svc.ingest(ev('二'), { isCommand: false });
@@ -359,7 +359,7 @@ test('服务：攒够条数（frequency 模式）后由定时器触发，而不�
 test('服务：合批关窗后按随机延时起跳，不是关窗就秒回', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 10, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 40, fireDelayMaxMs: 40 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 1 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 1 },
   });
   svc.ingest(ev('在吗'), { isCommand: false });
   await wait(25);
@@ -372,7 +372,7 @@ test('服务：合批关窗后按随机延时起跳，不是关窗就秒回', as
 test('服务：@ 直通不受合批与起跳延时影响（同步放行）', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 10_000, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 5_000, fireDelayMaxMs: 5_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 1 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 1 },
   });
   const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
   assert.equal(at.action, 'pass', '@ 立即交回调用方，不走合批与延时');
@@ -383,7 +383,7 @@ test('服务：@ 直通不受合批与起跳延时影响（同步放行）', asy
 test('服务：frequency 模式攒不够就沉默，且门控 wait 不累加退避', async () => {
   const { svc, triggers, logs } = makeService({
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 5 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 0.2 },
   });
   svc.ingest(ev('随便说说'), { isCommand: false });
   await wait(30);
@@ -396,7 +396,7 @@ test('服务：frequency 模式攒不够就沉默，且门控 wait 不累加退�
 test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自我唤醒）', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 2 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 0.5 },
     backoff: { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 },
   }, { realClock: true });
 
@@ -417,7 +417,7 @@ test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自�
 test('服务：pending=0 时不会纯靠沉默自我唤醒（主动发言默认关）', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, talkValue: 0.5 },
   }, { realClock: true });
   svc.ingest(ev('a', { isAtMe: true }), { isCommand: false });
   await wait(60);
@@ -483,7 +483,7 @@ test('服务：关掉分条就整段一条发出去（分条是纯程序开关�
 test('服务：缓冲里的老消息会被 TTL 清掉（不复述几分钟前的话）', async () => {
   const { svc, triggers, tick, now } = makeService({
     merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 1000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 2 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', talkValue: 0.5 },
     backoff: { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 },
   });
   const at = (text: string) => ev(text, { ts: now() });
