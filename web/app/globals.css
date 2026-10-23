@@ -268,14 +268,12 @@ body.resizing .wd-resize { pointer-events: auto; }
 /* 状态点用自己的 outline 描一圈底色与头像分离开——不能用 box-shadow，pulse-dot 动画会把它顶掉 */
 .sidebar-foot .dot { position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; outline: 2px solid var(--bg-side); }
 .acct-nick { min-width: 0; color: var(--text); font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* 「正在工作」花押：work 抽屉、工作页共用；蓝底 + 与会话页光标同款闪烁，跑完消失 */
-.work-loader { flex: none; display: inline-flex; }
-.work-loader .brand-mark { width: 20px; height: 20px; border-radius: 6px; background: #3b82f6; color: #fff;
-  box-shadow: 0 0 12px rgba(59, 130, 246, .55); }
-.work-loader .brand-mark svg { animation: caret-blink 1.06s steps(1, end) infinite; }
+/* 「正在工作」花押：work 抽屉、工作页共用；直接复用会话页光标的 parallel 花押与闪烁，无底色 */
+.work-loader { flex: none; display: inline-flex; align-items: center; color: var(--text); }
+.work-loader svg { width: 15px; height: 15px; animation: caret-blink 1.06s steps(1, end) infinite; }
 .wd-running { display: flex; padding: 12px 0 4px; }
 .wk-running { display: flex; padding: 10px 0 0 22px; }
-@media (prefers-reduced-motion: reduce) { .work-loader .brand-mark svg { animation: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .work-loader svg { animation: none; opacity: 1; } }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 /* 顶栏：苹果液态玻璃（毛玻璃 + 边缘折射凹凸 + 受光边）。

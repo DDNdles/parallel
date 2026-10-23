@@ -288,11 +288,11 @@ export interface ActRow {
 /** 执行类（run_*、python_session、bash）的参数是命令，按 ZCode 加 $ 前缀 */
 export const isRun = (k: ActKind) => k === 'run';
 
-/** 正在工作的花押：工作页、会话页 work 抽屉、会话流末尾共用（呼吸闪烁，跑完消失） */
+/** 正在工作的花押：工作页、会话页 work 抽屉共用；与会话页光标同款的 parallel 图标闪烁，跑完消失 */
 export function WorkPulse() {
   return (
     <span className="work-loader" title="工作子代理正在执行" aria-label="工作子代理正在执行">
-      <span className="brand-mark"><Icon name="brand" size={13} /></span>
+      <Icon name="brand" size={15} />
     </span>
   );
 }
