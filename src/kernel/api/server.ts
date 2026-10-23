@@ -188,7 +188,14 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     return;
   }
 
-  const body = await readBody(req).catch(() => ({}));
+  // 插件端点（/api/plugin/...）要能收原始字节（表情包上传这类二进制）；
+  // JSON 请求照旧解析，其余内核接口保持「空 body / 坏 body = {}」的原口径。
+  const rawBody = await readBody(req).catch(() => Buffer.alloc(0));
+  const body = path.startsWith('/api/plugin/')
+    && rawBody.length > 0
+    && !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))
+    ? rawBody
+    : parseJsonBody(rawBody);
   const segments = path.split('/').filter(Boolean); // ['api', ...]
   const send = (data: unknown, status = 200) => {
     // API 一律 no-store：清掉的 key / 改完的配置不许被浏览器缓存端回来（静态资源在 serveStatic 另有缓存头）
@@ -1208,6 +1215,20 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       return send({ groups: Object.fromEntries([...(kernel.adapter as any).groupNames?.entries?.() ?? []]) });
     }
 
+    // ================= 插件自定义端点 =================
+    // 兜底放在所有内核端点之后：只有上面没人认领的 /api/plugin/<pluginId>/... 才交给插件容器。
+    // 鉴权已走前面的统一分支（与其它 /api/* 同一把 uiToken）；未载入/已停用/没有该路由一律 404。
+    if (area === 'api' && a === 'plugin' && b) {
+      const subPath = '/' + segments.slice(3).join('/');
+      const r = await kernel.container.dispatchHttp(
+        b, req.method ?? 'GET', subPath, Object.fromEntries(url.searchParams), body,
+      );
+      if (!r) return send({ error: 'not found' }, 404);
+      res.writeHead(r.status, r.headers);
+      res.end(r.body);
+      return;
+    }
+
     return send({ error: `未找到接口 ${path}` }, 404);
   } catch (e) {
     kernel.errors.record('error', 'kernel', `API ${path} 失败: ${(e as Error).message}`, { stack: (e as Error).stack });
@@ -1415,17 +1436,19 @@ function sendHtml(res: ServerResponse, file: string): void {
   res.end(html.includes('__UI_BUILD__') ? html : tag + html);
 }
 
-function readBody(req: IncomingMessage): Promise<any> {
+function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolveP, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c));
-    req.on('end', () => {
-      const s = Buffer.concat(chunks).toString('utf-8');
-      if (!s) return resolveP({});
-      try { resolveP(JSON.parse(s)); } catch { resolveP({}); }
-    });
+    req.on('end', () => resolveP(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** JSON body 的旧口径：空 body / 解析失败都当 {} */
+function parseJsonBody(raw: Buffer): any {
+  if (!raw.length) return {};
+  try { return JSON.parse(raw.toString('utf-8')); } catch { return {}; }
 }
 
 /** QQ 公开头像（40 尺寸：登录卡片展示足够） */

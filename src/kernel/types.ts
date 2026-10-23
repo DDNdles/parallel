@@ -489,6 +489,45 @@ export interface UserFact {
   expiresAt?: number;
 }
 
+// ---------------- 插件 HTTP 端点 ----------------
+
+/** 一次插件端点调用的请求视图（内核已解析好 query 与 JSON body） */
+export interface PluginHttpRequest {
+  /** 大写方法名（GET / POST / PUT / DELETE ...） */
+  method: string;
+  /** 本插件命名空间下的子路径（即注册时给的 path，含前导斜杠） */
+  path: string;
+  /** URL query（同名键取最后一个） */
+  query: Record<string, string>;
+  /** 请求体：JSON 解析后的对象（空 body 或解析失败时为 {}）；
+   *  content-type 非 JSON 时是原始字节 Buffer（插件收图片上传这类二进制用）。 */
+  body: unknown;
+}
+
+/** 插件端点的回复：status/headers 可省，body 缺省为空 */
+export interface PluginHttpResponse {
+  status?: number;
+  headers?: Record<string, string>;
+  /** string/Buffer 原样发送；对象/数组按 JSON 发送（content-type 可被 headers 覆盖） */
+  body?: unknown;
+}
+
+/** 直接返回 string/Buffer 等价于 `{ body }`（少写一层也避免"返回了字符串却是空响应"） */
+export type PluginHttpHandler = (
+  req: PluginHttpRequest,
+) => PluginHttpResponse | string | Buffer | void
+  | Promise<PluginHttpResponse | string | Buffer | void>;
+
+export interface PluginHttp {
+  /**
+   * 注册端点：对外完整路径固定为 `/api/plugin/<pluginId><path>`，鉴权与其它 /api/* 一致（uiToken）。
+   * path 需以 / 开头，按「方法 + 路径」精确匹配（查询串不参与）。
+   * 同 method + path 重复注册直接抛错（与工具/命令重名同口径：插件启动时暴露，而不是后者静默覆盖）。
+   * 注册随插件卸载自动摘除；插件处于 disabled 运行态时整组端点 404。
+   */
+  on(method: string, path: string, handler: PluginHttpHandler): void;
+}
+
 // ---------------- 插件上下文（容器注入） ----------------
 
 export interface PluginContext {
@@ -523,6 +562,8 @@ export interface PluginContext {
   humanlike: GatedHumanlike;
   /** 会话历史检索（需 history.search 权限）：只能搜当前会话，不是全库 */
   history: GatedHistory;
+  /** 插件自带 HTTP 端点（挂在 /api/plugin/<pluginId>/...，复用桌面端 uiToken 鉴权） */
+  http: PluginHttp;
   /** LLM：注册工具 + 直连补全（需在 manifest 声明 llm 能力即默认可用） */
   llm: {
     registerTool(def: ToolDef): void;

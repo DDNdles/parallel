@@ -1,10 +1,47 @@
 {
   "id": "sticker",
   "name": "表情包",
-  "version": "0.1.0",
-  "description": "群级表情包库：按名搜索、随机发。LLM 可调用 send_sticker 发送（QQ 侧指令已随指令面清空删除，暂无收图入口）。",
+  "version": "0.2.0",
+  "description": "bot 的表情包库：模型看情况发表情，也能把群里/消息里的图收进库里；桌面端「表情包」页可上传、改描述与标签。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "keywords": [
+    "sticker",
+    "表情包"
+  ],
   "category": "fun",
   "trust": "builtin",
-  "permissions": [],
-  "defaultGroupState": "off"
+  "permissions": [
+    "fs.sandbox"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {
+    "autoSteal": {
+      "type": "boolean",
+      "default": false,
+      "description": "自动把群里发的图片收进表情包库（关着也能用 steal_sticker 手动收）"
+    },
+    "stealDailyCap": {
+      "type": "number",
+      "default": 50,
+      "description": "每个群每天自动收图的上限（0 = 不自动收）"
+    },
+    "sendCooldownSec": {
+      "type": "number",
+      "default": 60,
+      "description": "send_sticker 的冷却秒数（同一个群两次发图的最小间隔，0 = 不冷却）"
+    },
+    "promptListMax": {
+      "type": "number",
+      "default": 40,
+      "description": "注入提示词的表情清单条数上限（按使用次数取前 N）"
+    },
+    "maxLibrary": {
+      "type": "number",
+      "default": 500,
+      "description": "表情包库容量上限，满了以后拒收新图"
+    }
+  }
 }

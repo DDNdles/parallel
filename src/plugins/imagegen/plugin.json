@@ -1,0 +1,45 @@
+{
+  "id": "imagegen",
+  "name": "生图",
+  "version": "1.0.0",
+  "description": "用你自己的 Gemini API Key 画图：文生图与参考图生图，PNG 产物落进会话沙箱 imagegen/。普通成员每个自然周（周一起算）3 张，主人与管理员不限；桌面端「生图」页可看画廊与本周用量。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "keywords": [
+    "image",
+    "gemini",
+    "tool"
+  ],
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": [
+    "network",
+    "fs.sandbox"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {
+    "apiKey": {
+      "type": "string",
+      "default": "",
+      "description": "Gemini API Key（在 aistudio.google.com 申请）",
+      "secret": true
+    },
+    "model": {
+      "type": "string",
+      "default": "gemini-3-pro-image",
+      "description": "生图模型名（默认 gemini-3-pro-image，可改成别的 Gemini 生图模型）"
+    },
+    "weeklyQuota": {
+      "type": "number",
+      "default": 3,
+      "description": "普通成员每个自然周（周一起算）可生成的张数"
+    },
+    "ownerUnlimited": {
+      "type": "boolean",
+      "default": true,
+      "description": "主人与管理员不受每周张数限制"
+    }
+  }
+}

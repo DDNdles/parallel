@@ -1,7 +1,7 @@
 ---
 name: research
 description: 查资料员：联网检索 + 读网页正文，把结论整理成带来源的要点
-tools: web_search, web_fetch, run_python, sandbox_write, sandbox_read, work_finish, work_ask
+tools: web_search, web_fetch, run_python, sandbox_write, sandbox_read, work_finish, work_ask, bili_search, bili_video, bili_comments
 chain: work
 max_rounds: 0
 ---

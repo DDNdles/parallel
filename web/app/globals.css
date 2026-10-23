@@ -1479,6 +1479,71 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .sb-image { display: block; max-width: 100%; max-height: 58vh; margin: 0 auto;
   border: 1px solid var(--border); border-radius: 10px; }
 
+/* ============================================================
+   三个插件页（表情包 / b站搜索 / 生图）：外壳整套复用 mset-*，
+   hover 都并进全站那一档；固定形状的行/卡不真加边框——inset 描边。
+   ============================================================ */
+/* BlobImg 的占位块与图片同槽位（尺寸全由 className 给） */
+.blob-ph { display: block; background: var(--bg-hover); }
+.blob-zoom { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.blob-zoom img { display: block; width: 100%; }
+
+/* ---------------- 表情包页 ---------------- */
+/* 拖拽悬停时一条虚线说「松手就在这」 */
+.mset-body.stk-drag { outline: 2px dashed var(--border-stronger); outline-offset: -4px; }
+.stk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(172px, 1fr)); gap: 12px; }
+.stk-card { border: 1px solid var(--border); border-radius: 11px; background: var(--surface-2); overflow: hidden; }
+.stk-card:hover { box-shadow: inset 0 0 0 1px var(--border-stronger); }
+.stk-thumb { position: relative; display: block; aspect-ratio: 1; background: var(--bg-hover); }
+.stk-img { width: 100%; height: 100%; object-fit: contain; }
+/* 删除钮与 .chain-del 同款：平时藏进轮廓里，卡片悬停才浮出来 */
+.stk-del { position: absolute; right: 6px; top: 6px; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 7px; background: var(--surface); color: var(--faint); cursor: pointer; padding: 0;
+  opacity: 0; transition: opacity var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out); }
+.stk-card:hover .stk-del { opacity: 1; }
+.stk-del:hover { background: var(--bg-active); color: var(--text); }
+.stk-body { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px 10px; }
+.stk-body .bfield-field { height: 26px; padding: 3px 8px; border-radius: 8px; font-size: 12.5px; }
+.stk-meta { font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------------- b站搜索页 ---------------- */
+/* 结果行带 16:9 缩略图，左栏加宽一档 */
+.bili-list { width: 300px; }
+.bili-search { padding: 2px 2px 8px; }
+.bili-search .bfield-field { height: 26px; padding: 3px 10px; border-radius: 9px; font-size: 12.5px; }
+.bili-row { display: flex; align-items: flex-start; gap: 8px; width: 100%; margin-bottom: 2px; padding: 7px 8px;
+  border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text);
+  font-family: var(--sans); text-align: left; cursor: pointer; }
+.bili-row:hover { background: var(--bg-hover); }
+.bili-row.sel { border-color: var(--border-stronger); background: var(--surface); }
+.bili-thumb { width: 84px; aspect-ratio: 16/9; flex: none; object-fit: cover; border-radius: 7px; background: var(--bg-hover); }
+.bili-t { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+/* 标题封顶两行（与 .ig-prompt 同一手法） */
+.bili-title { font-size: 12.5px; line-height: 1.45; color: var(--text); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.bili-sub { font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bili-dtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bili-desc { margin-top: 10px; }
+.bili-cmt { padding: 9px 2px; border-top: 1px solid var(--row-line); }
+.bili-cmt-h { display: flex; align-items: baseline; gap: 9px; margin-bottom: 3px; font-size: 11px; color: var(--faint); }
+.bili-cmt-u { font-size: 12px; font-weight: 600; color: var(--dim); }
+.bili-cmt-c { font-size: 12.5px; line-height: 1.6; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.bili-pager { display: flex; align-items: center; gap: 9px; margin: 10px 0 4px; }
+
+/* ---------------- 生图页 ---------------- */
+/* 用量名单是只读的：不进 hover 档 */
+.mset-item.ig-static { cursor: default; }
+.mset-item.ig-static:hover { background: transparent; }
+.ig-form { margin-bottom: 16px; }
+.ig-form-row { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+.ig-gen { margin-left: auto; }
+.ig-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(184px, 1fr)); gap: 12px; }
+.ig-card { border: 1px solid var(--border); border-radius: 11px; background: var(--surface-2); overflow: hidden; }
+.ig-card:hover { box-shadow: inset 0 0 0 1px var(--border-stronger); }
+.ig-img { width: 100%; aspect-ratio: 1; object-fit: cover; }
+.ig-body { padding: 8px 10px 10px; }
+.ig-prompt { font-size: 12px; line-height: 1.5; color: var(--text); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.ig-meta { margin-top: 5px; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 @media (max-width: 900px) {
   .mset-body { flex-direction: column; height: auto; min-height: 0; }
   .mset-list { width: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--border); }

@@ -105,6 +105,9 @@ const SECTIONS: { v: string; t: string; icon: string }[] = [
   { v: 'risk', t: '风控', icon: 'lock' },
   { v: 'humanlike', t: '拟人化', icon: 'think' },
   { v: 'persona', t: '记忆', icon: 'memory' },
+  { v: 'sticker', t: '表情包', icon: 'sticker' },
+  { v: 'bilibili', t: 'b站搜索', icon: 'bilibili' },
+  { v: 'imagegen', t: '生图', icon: 'image' },
 ];
 
 export default function SettingsPage() {
@@ -118,22 +121,40 @@ export default function SettingsPage() {
   const [tavily, setTavily] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [maxRes, setMaxRes] = useState(3);
-  /** 已从插件页挪走的能力：联网搜索（web-search）——含其全局默认 */
-  const [plug, setPlug] = useState<{ web: PlugCfg } | null>(null);
+  /** 已从插件页挪走的能力：联网搜索（web-search）+ 三个插件页的配置分节；读不到的插件为 null（分节给「未启用」空态） */
+  const [plug, setPlug] = useState<{ web: PlugCfg; sticker: PlugCfg | null; bilibili: PlugCfg | null; imagegen: PlugCfg | null } | null>(null);
+  /** 插件配置的可编辑镜像：本地先行，写入走 autoSavePlug 防抖（密钥不进这份、不随普通字段回写） */
+  const [pv, setPv] = useState<{ sticker: Record<string, unknown>; bilibili: Record<string, unknown>; imagegen: Record<string, unknown> } | null>(null);
+  const [showBili, setShowBili] = useState(false);
+  const [showGen, setShowGen] = useState(false);
+  /** sessdata / apiKey 这类密钥的本地输入：null = 没动过，跟着服务端回显 */
+  const [biliKey, setBiliKey] = useState<string | null>(null);
+  const [genKey, setGenKey] = useState<string | null>(null);
   /** 本页所有写入失败都在这里就地报红 */
   const { err, setErr, save, run, fail } = useSave();
   /** 即时保存的防抖句柄：同一节的连续修改只发最后一拍 */
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  /** 防抖窗口内同一插件改过的字段要累加：只留最后一拍的值会把前一个字段的修改吞掉 */
+  const pendingPlug = useRef<Record<string, Record<string, unknown>>>({});
 
   /** 插件配置读取的序号：慢的旧响应不许覆盖新状态，否则删掉的 key 会被端回来 */
   const plugSeq = useRef(0);
   const loadPlug = useCallback((): Promise<void> => {
     const seq = ++plugSeq.current;
-    return get('/api/plugins/web-search/config').then((b: PlugCfg) => {
+    return Promise.all([
+      get('/api/plugins/web-search/config').catch(() => null),
+      get('/api/plugins/sticker/config').catch(() => null),
+      get('/api/plugins/bilibili/config').catch(() => null),
+      get('/api/plugins/imagegen/config').catch(() => null),
+    ] as const).then(([web, sticker, bilibili, imagegen]: (PlugCfg | null)[]) => {
       if (seq !== plugSeq.current) return;
-      setPlug({ web: b });
-      setMaxRes(Number(b.values.maxResults ?? 3));
-    }).catch(() => {});
+      // 四个全读不通多半是内核没起来，维持「读取中」而不是满屏「未启用」
+      if (!web && !sticker && !bilibili && !imagegen) return;
+      setPlug({ web: web ?? { values: {}, globalDefault: true }, sticker, bilibili, imagegen });
+      setMaxRes(Number(web?.values.maxResults ?? 3));
+      const rec = (p: PlugCfg | null) => { const { apiKey: _a, sessdata: _s, ...rest } = p?.values ?? {}; return rest; };
+      setPv({ sticker: rec(sticker), bilibili: rec(bilibili), imagegen: rec(imagegen) });
+    });
   }, []);
   const savePlug = (id: string, values: Record<string, unknown>) =>
     run(() => post(`/api/plugins/${id}/config`, { values }), loadPlug);
@@ -199,10 +220,13 @@ export default function SettingsPage() {
   };
   const autoSavePlug = (id: string, delay: number, values: Record<string, unknown>) => {
     const key = `plug:${id}`;
+    pendingPlug.current[key] = { ...(pendingPlug.current[key] ?? {}), ...values };
     if (saveTimers.current[key]) clearTimeout(saveTimers.current[key]);
     saveTimers.current[key] = setTimeout(() => {
       delete saveTimers.current[key];
-      savePlug(id, values);
+      const merged = pendingPlug.current[key] ?? values;
+      delete pendingPlug.current[key];
+      savePlug(id, merged);
     }, delay);
   };
   const patchH = (p: Partial<Humanlike>, immediate = false) => {
@@ -229,6 +253,21 @@ export default function SettingsPage() {
     run(() => post('/api/plugins/web-search/config', { values: { apiKey: key, ...extra } }), () => {
       setPlug((p) => (p ? { ...p, web: { ...p.web, values: { ...p.web.values, apiKey: key } } } : p));
       setTavily(null);
+      void loadPlug();
+    });
+  };
+
+  /** 插件页配置分节的字段写入：本地镜像先行，开关 0ms 即发、数字/文本 600ms 防抖（镜像不含密钥，整包回写也带不走密钥） */
+  const setPlugVal = (id: 'sticker' | 'bilibili' | 'imagegen', part: Record<string, unknown>, delay = 600) => {
+    if (!pv) return;
+    setPv({ ...pv, [id]: { ...pv[id], ...part } });
+    autoSavePlug(id, delay, part);
+  };
+  /** 密钥落库（空串 = 真删）：与 Tavily key 同一口径——先本地认账再刷新，删掉的不许当场"复活" */
+  const savePlugKey = (id: 'bilibili' | 'imagegen', key: string, val: string, cleared: () => void) => {
+    run(() => post(`/api/plugins/${id}/config`, { values: { [key]: val } }), () => {
+      setPlug((p) => (p && p[id] ? { ...p, [id]: { ...p[id]!, values: { ...p[id]!.values, [key]: val } } } : p));
+      cleared();
       void loadPlug();
     });
   };
@@ -663,6 +702,110 @@ export default function SettingsPage() {
               </>
             );
           })()}
+
+          {sec === 'sticker' && (!plug || !pv ? <div className="mset-empty">读取中…</div> : !plug.sticker ? <div className="mset-empty">插件未启用，可在插件页开启。</div> : (() => {
+            const sc = pv.sticker;
+            const on = sc.autoSteal !== false;
+            return (
+              <>
+                <div className="mset-models">
+                  <div className="mset-mrow">
+                    <span className="plg-v">自动收图<Hint text="群聊图片自动存进表情库" /></span>
+                    <span className="mset-macts"><Switch on={on}
+                      onChange={() => setPlugVal('sticker', { autoSteal: !on }, 0)} /></span>
+                  </div>
+                </div>
+                <div className="set-grid" style={{ marginTop: 14 }}>
+                  <Num label="每日收图上限" hint="0 = 不自动收" value={Number(sc.stealDailyCap ?? 0)}
+                    onChange={(v) => setPlugVal('sticker', { stealDailyCap: v })} />
+                  <Num label="发表情冷却（秒）" value={Number(sc.sendCooldownSec ?? 0)}
+                    onChange={(v) => setPlugVal('sticker', { sendCooldownSec: v })} />
+                  <Num label="列表最多列几张" value={Number(sc.promptListMax ?? 0)}
+                    onChange={(v) => setPlugVal('sticker', { promptListMax: v })} />
+                  <Num label="表情库上限" hint="满了拒收新图" value={Number(sc.maxLibrary ?? 0)}
+                    onChange={(v) => setPlugVal('sticker', { maxLibrary: v })} />
+                </div>
+              </>
+            );
+          })())}
+
+          {sec === 'bilibili' && (!plug || !pv ? <div className="mset-empty">读取中…</div> : !plug.bilibili ? <div className="mset-empty">插件未启用，可在插件页开启。</div> : (() => {
+            const bc = pv.bilibili;
+            const stored = String(plug.bilibili.values.sessdata ?? '').trim();
+            const val = biliKey ?? stored;
+            return (
+              <>
+                <div className="mset-field">
+                  <label className="mset-flabel">SESSDATA<Hint text="b 站网页 cookie 里复制，登录态" /></label>
+                  <div className="mset-keywrap">
+                    <BrandInput type={showBili ? 'text' : 'password'} value={val} spellCheck={false}
+                      autoComplete="new-password"
+                      onChange={(e) => setBiliKey(e.target.value)}
+                      onBlur={() => {
+                        const k = val.trim();
+                        if (k === stored) { setBiliKey(null); return; }
+                        // 写成功才放弃本地输入；失败留着用户填的内容 + 就地报红
+                        savePlugKey('bilibili', 'sessdata', k, () => setBiliKey(null));
+                      }} />
+                    <button className="mset-ibtn in" title={showBili ? '隐藏密钥' : '显示密钥'} onClick={() => setShowBili((v) => !v)}>
+                      <Icon name={showBili ? 'eyeOff' : 'eye'} size={15} />
+                    </button>
+                  </div>
+                </div>
+                <div className="set-grid">
+                  <Num label="搜索返回条数" value={Number(bc.searchLimit ?? 0)}
+                    onChange={(v) => setPlugVal('bilibili', { searchLimit: v })} />
+                  <Num label="评论每页条数" value={Number(bc.commentLimit ?? 0)}
+                    onChange={(v) => setPlugVal('bilibili', { commentLimit: v })} />
+                  <Num label="请求间隔（毫秒）" hint="压一压别被 b 站风控" value={Number(bc.requestDelayMs ?? 0)}
+                    onChange={(v) => setPlugVal('bilibili', { requestDelayMs: v })} />
+                </div>
+              </>
+            );
+          })())}
+
+          {sec === 'imagegen' && (!plug || !pv ? <div className="mset-empty">读取中…</div> : !plug.imagegen ? <div className="mset-empty">插件未启用，可在插件页开启。</div> : (() => {
+            const gc = pv.imagegen;
+            const stored = String(plug.imagegen.values.apiKey ?? '').trim();
+            const val = genKey ?? stored;
+            const unlimited = gc.ownerUnlimited !== false;
+            return (
+              <>
+                <div className="mset-field">
+                  <label className="mset-flabel">API Key</label>
+                  <div className="mset-keywrap">
+                    <BrandInput type={showGen ? 'text' : 'password'} value={val} spellCheck={false}
+                      autoComplete="new-password"
+                      onChange={(e) => setGenKey(e.target.value)}
+                      onBlur={() => {
+                        const k = val.trim();
+                        if (k === stored) { setGenKey(null); return; }
+                        savePlugKey('imagegen', 'apiKey', k, () => setGenKey(null));
+                      }} />
+                    <button className="mset-ibtn in" title={showGen ? '隐藏密钥' : '显示密钥'} onClick={() => setShowGen((v) => !v)}>
+                      <Icon name={showGen ? 'eyeOff' : 'eye'} size={15} />
+                    </button>
+                  </div>
+                </div>
+                <div className="mset-field">
+                  <label className="mset-flabel">模型</label>
+                  <BrandInput value={String(gc.model ?? '')} spellCheck={false}
+                    onChange={(e) => setPlugVal('imagegen', { model: e.target.value })} />
+                </div>
+                <div className="set-grid">
+                  <Num label="每人每周张数" value={Number(gc.weeklyQuota ?? 0)}
+                    onChange={(v) => setPlugVal('imagegen', { weeklyQuota: v })} />
+                </div>
+                <div className="mset-models" style={{ marginTop: 14 }}>
+                  <div className="mset-mrow">
+                    <span className="plg-v">主人不限张数</span>
+                    <span className="mset-macts"><Switch on={unlimited}
+                      onChange={() => setPlugVal('imagegen', { ownerUnlimited: !unlimited }, 0)} /></span>
+                  </div>
+                </div>
+              </>
+            );
+          })())}
         </section>
       </div>
     </div>

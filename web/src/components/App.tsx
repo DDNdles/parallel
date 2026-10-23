@@ -21,6 +21,9 @@ import WorkPage from '@/components/pages/WorkPage';
 import SandboxPage from '@/components/pages/SandboxPage';
 import UsagePage from '@/components/pages/UsagePage';
 import SettingsPage from '@/components/pages/SettingsPage';
+import StickersPage from '@/components/pages/StickersPage';
+import BilibiliPage from '@/components/pages/BilibiliPage';
+import ImagegenPage from '@/components/pages/ImagegenPage';
 
 export interface AppState {
   adapter: { connected: boolean; selfId?: string; selfNickname?: string; endpoint?: string; mode?: string };
@@ -44,6 +47,9 @@ export const PAGES: { id: string; name: string; nav: string; icon: string }[] = 
   { id: 'work', name: '工作', nav: '工作', icon: 'work' },
   { id: 'sandbox', name: '沙箱', nav: '沙箱', icon: 'file' },
   { id: 'settings', name: '设置', nav: '设置', icon: 'settings' },
+  { id: 'stickers', name: '表情包', nav: '表情包', icon: 'sticker' },
+  { id: 'bilibili', name: 'b站搜索', nav: 'b站搜索', icon: 'bilibili' },
+  { id: 'imagegen', name: '生图', nav: '生图', icon: 'image' },
 ];
 const ALL_PAGES = PAGES;
 
@@ -77,6 +83,9 @@ const PAGE_TOOLS: Record<string, { id: string; icon: string; title: string; kind
   sandbox: [
     { id: 'btn-sandbox-reload', icon: 'refresh', title: '重新读取沙箱', kind: 'reload' },
     { id: 'btn-sandbox-limits', icon: 'settings', title: '限额与清理', kind: 'limits' },
+  ],
+  stickers: [
+    { id: 'btn-stickers-upload', icon: 'upload', title: '上传表情包', kind: 'upload' },
   ],
 };
 /** 一级侧栏「只留图标」的窄轨宽度（同时是默认宽度）= 右边框 1 + nav 内边距 10×2 + 按钮内边距 10×2 + 图标 16 */
@@ -240,6 +249,9 @@ export default function App() {
       case 'sandbox': return <SandboxPage cmd={pageCmd} />;
       case 'usage': return <UsagePage cmd={pageCmd} />;
       case 'settings': return <SettingsPage />;
+      case 'stickers': return <StickersPage cmd={pageCmd} />;
+      case 'bilibili': return <BilibiliPage />;
+      case 'imagegen': return <ImagegenPage />;
       default: return null;
     }
   })();

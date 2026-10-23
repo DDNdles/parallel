@@ -25,6 +25,26 @@ export const get = (p: string) => api('GET', p);
 export const post = (p: string, b?: unknown) => api('POST', p, b ?? {});
 export const del = (p: string) => api('DELETE', p);
 
+/** 取二进制（图片等）：与 api() 同款带 token 头，回 Blob 给 objectURL 用 */
+export async function getBlob(p: string): Promise<Blob> {
+  const resp = await fetch(p, { headers: { 'x-auth-token': TOKEN } });
+  if (resp.status === 401) throw new Error('unauthorized');
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${resp.status}`);
+  }
+  return await resp.blob();
+}
+
+/** 原始字节上传（表情包上传那种）：body 不经 JSON 序列化，只带 token 头 */
+export async function postRaw(p: string, body: BodyInit): Promise<any> {
+  const resp = await fetch(p, { method: 'POST', headers: { 'x-auth-token': TOKEN }, body });
+  if (resp.status === 401) throw new Error('unauthorized');
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.ok === false) throw new Error(data.error || `HTTP ${resp.status}`);
+  return data;
+}
+
 // ---------------- 实时事件流 ----------------
 type Listener = (data?: any, ev?: string) => void;
 const listeners = new Map<string, Set<Listener>>();

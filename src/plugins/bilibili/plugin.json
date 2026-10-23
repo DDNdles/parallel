@@ -1,0 +1,39 @@
+{
+  "id": "bilibili",
+  "name": "B站搜索",
+  "version": "1.0.0",
+  "description": "B 站视频取数：关键词搜索、视频详情与 AI 字幕、评论区。work 子代理用 bili_search / bili_video / bili_comments 总结视频与评论；桌面端「b站搜索」页经 /api/plugin/bilibili/{search,video,comments} 取同一份数据。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "category": "tool",
+  "trust": "builtin",
+  "permissions": [
+    "network"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {
+    "sessdata": {
+      "type": "string",
+      "default": "",
+      "description": "B 站 Cookie 里的 SESSDATA（选填；AI 字幕等接口需要登录态时填）",
+      "secret": true
+    },
+    "searchLimit": {
+      "type": "number",
+      "default": 20,
+      "description": "搜索单次返回条数上限（1~50）"
+    },
+    "commentLimit": {
+      "type": "number",
+      "default": 20,
+      "description": "评论单次返回条数上限（1~20）"
+    },
+    "requestDelayMs": {
+      "type": "number",
+      "default": 500,
+      "description": "相邻 B 站请求的最小间隔（毫秒，防 -412 风控）"
+    }
+  }
+}

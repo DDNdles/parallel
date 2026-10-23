@@ -133,14 +133,15 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   kernel.container.setGroupState('sandbox', String(GROUP), true, String(MASTER));
 
-  // chat 工具面 = 记忆读写三件套 + work 派活/进度（2026-10-21 起）；sandbox 这类行为工具仍在 chat 轮严格缺席
+  // chat 工具面 = 记忆读写三件套 + 戳一戳 + work 派活/进度 + 表情包（2026-10-24 起）；
+  // sandbox 这类行为工具仍在 chat 轮严格缺席
   const chatTools = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
   assert.deepEqual(
     chatTools,
-    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'work_dispatch', 'work_status'],
-    `chat 面只该有记忆读写、戳一戳与 work 派活/进度: ${chatTools}`,
+    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'steal_sticker', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳、work 派活/进度与表情包: ${chatTools}`,
   );
 
   // 脚本：先调一次记忆查询（chat 面的工具），拿到结果后作答
@@ -262,15 +263,15 @@ test('QQ 侧不再有清除记忆的入口：/忘记我 当未知命令处理，
   mock.actions.length = 0;
 });
 
-test('chat 工具面 = 记忆读写三件套 + work 派活/进度：其余行为型工具已删', () => {
+test('chat 工具面 = 记忆读写三件套 + work 派活/进度 + 表情包：其余行为型工具已删', () => {
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   const names = kernel.container
     .toolsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'member')
     .map((t) => t.name).sort();
   assert.deepEqual(
     names,
-    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'work_dispatch', 'work_status'],
-    `chat 面只该有记忆读写、戳一戳与 work 派活/进度: ${names}`,
+    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'steal_sticker', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳、work 派活/进度与表情包: ${names}`,
   );
   // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；用户事实写入由后台自动提炼承担
   for (const gone of ['forget_me', 'remember_fact', 'plan_schedule', 'reply_quote']) {

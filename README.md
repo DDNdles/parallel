@@ -2,7 +2,7 @@
 
 内核是一个可接入 LLM 的 **agent loop**，通过它掌控一个 QQ 账号，在群聊和私信里充当机器人。QQ 接入只是它的一种通道——协议适配本身也是插件形态，将来可以同一内核换接其他通道。
 
-**一切皆插件**：角色化聊天（人格+好感度）、沙箱、搜索、每日推送……全部是热插拔插件；内核只保留 agent loop、Pipeline、服务容器与插件运行时（dsh 式组织，zcode 式四贡献面清单）。
+**一切皆插件**：角色化聊天（人格+好感度）、沙箱、搜索……全部是热插拔插件；内核只保留 agent loop、Pipeline、服务容器与插件运行时（dsh 式组织，zcode 式四贡献面清单）。
 
 ```
 ┌─────────────────────── 桌面端 UI（zcode/codex 风格，内核自托管 http://127.0.0.1:3080）───────────────────────┐
@@ -69,9 +69,7 @@ npm start           # = node bin/parallel.js
 | 插件系统 | ✅ 完整 | 热插拔（不重启进程）、三类来源、四贡献面（tools/commands/userConfig/mcpServers）、声明式权限门控 |
 | 分群开关 | ✅ 完整 | 默认全部关闭；禁用的插件在该群工具列表缺席、命令不可用、普通成员完全不可见；开关权限=群管理员/群主/主人 |
 | 用户记忆 | ✅ 完整 | 按 QQ 号：昵称/事实(FTS 检索)/状态(好感度)；插件按权限读写；"忘记我"；UI 管理+导入导出+审计 |
-| 表情包 | ✅ 可用 | 群级库：搜索/随机/LLM 调用发图（QQ 侧指令已随指令面清空删除，暂无收图入口） |
 | 网络搜索 | ✅ 可用 | Tavily REST 封装（MCP 等价封装），未配 key 自检提示 |
-| 每日一题 / MC 推荐 / 每日音乐 / 每日诗 / 链接解析 | 🚧 骨架 | 能装、能开关、命令可触发、留清晰 TODO |
 | 桌面端 UI | ✅ 完整 | Next.js 15 静态导出（`web/` 源码 → `ui/` 产物，内核自托管）：黑白双主题、40rem 居中会话列、工具调用折叠行、毛玻璃顶栏+模型选择器、大圆角 composer、全站品牌光标；全部操控面 |
 | 可测试 | ✅ 完整 | 模拟协议端 E2E + 单测（`npm test`） |
 
@@ -107,8 +105,8 @@ src/kernel/humanlike/ 拟人化层（chat 区行为本身，不在插件体系�
                      types.ts     humanlike 配置形状（字段名与 MaiBot 对齐）+ TriggerBatch
 src/kernel/adapters/  OneBot 11 反向 WS 适配器
 src/kernel/api/       REST API + 事件 WS + 静态 UI 服务
-src/plugins/          内置插件 10 个（chat / sandbox / web-search / work 是底座，不在插件页列表显示；
-                      daily-question / link-parser / mc-daily / music-daily / poem-daily / sticker 可玩）
+src/plugins/          内置插件 8 个（chat / sandbox / web-search / work / skills 是底座，不在插件页列表显示；
+                      sticker / bilibili / imagegen 供表情包、B 站取数、生图，可在插件页配置）
 src/plugins/work/agents/  子代理定义（work.md 入口 / research.md / data.md：工具白名单 + 身份正文；
                       用户可在 <data>/agents/ 自加，同名覆盖内置）
 examples/             示例插件（自建模板，含 MCP server 示例）

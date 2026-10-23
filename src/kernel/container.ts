@@ -3,7 +3,8 @@ import { pathToFileURL } from 'node:url';
 import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import type {
   CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext,
-  WorkDelegateInput, WorkDispatchInput, GatedHumanlike, LLMRequestContext, WorkAgentDef,
+  WorkDelegateInput, WorkDispatchInput, GatedHumanlike, LLMRequestContext, WorkAgentDef, PluginHttpHandler,
+  PluginHttpResponse,
 } from './types.ts';
 import type { Db } from './db.ts';
 import type { Bus } from './bus.ts';
@@ -29,6 +30,13 @@ import { newId, nowMs } from './util/misc.ts';
 export type PluginSource = 'builtin' | 'example' | 'user';
 export type PluginRuntimeState = 'loaded' | 'disabled' | 'error';
 
+/** 插件端点交给 API 层的最终响应（body 已是可直接写出的文本/字节） */
+export interface PluginHttpResult {
+  status: number;
+  headers: Record<string, string>;
+  body: string | Buffer;
+}
+
 export interface LoadedPlugin {
   manifest: PluginManifest;
   dir: string;
@@ -37,6 +45,8 @@ export interface LoadedPlugin {
   loadedAt: number;
   tools: Map<string, ToolDef>;
   commands: Map<string, CommandDef>;
+  /** 插件自定义 HTTP 端点：键 = "METHOD 规范化路径"（见 httpRouteKey） */
+  httpRoutes: Map<string, PluginHttpHandler>;
   disposers: (() => void)[];
   mcpClients: McpStdioClient[];
   /** 连续同错计数（自动停用阈值） */
@@ -138,6 +148,7 @@ export class PluginContainer {
       manifest, dir, source,
       state: 'loaded', loadedAt: nowMs(),
       tools: new Map(), commands: new Map(),
+      httpRoutes: new Map(),
       disposers: [], mcpClients: [],
       errStreak: new Map(),
       hooks: {},
@@ -472,6 +483,53 @@ export class PluginContainer {
     return true;
   }
 
+  // =============== 插件 HTTP 端点 ===============
+
+  /**
+   * 把 `/api/plugin/<id><path>` 交给插件处理。
+   * 返回 undefined = 这个请求不该由插件应答（插件未载入 / 已停用 / 没有这条路由），
+   * 由 API 层统一回 404（插件未加载与"没有这条路由"对外不可区分，不暴露插件清单）。
+   *
+   * 停用态也归入 404：端点与工具/命令同属插件的贡献面，插件事务性停用后应当整体消失，
+   * 而不是留一个 403 让外部脚本以为"端点还在、只是这次没权限"。
+   */
+  async dispatchHttp(
+    pluginId: string,
+    method: string,
+    path: string,
+    query: Record<string, string>,
+    body: unknown,
+  ): Promise<PluginHttpResult | undefined> {
+    const lp = this.plugins.get(pluginId);
+    if (!lp || lp.state !== 'loaded') return undefined;
+    const m = method.toUpperCase();
+    const handler = lp.httpRoutes.get(httpRouteKey(m, path));
+    if (!handler) return undefined;
+
+    // handler 抛错不在这里吞：交给 API 层统一记进报错中心并回 500（与其它内核端点同一条兜底）
+    const raw = await handler({ method: m, path, query, body });
+    // 裸 string/Buffer 直接当 body
+    const out: PluginHttpResponse = typeof raw === 'string' || Buffer.isBuffer(raw) ? { body: raw } : (raw ?? {});
+    const headers: Record<string, string> = { 'cache-control': 'no-store' };
+    for (const [k, v] of Object.entries(out.headers ?? {})) headers[k.toLowerCase()] = String(v);
+
+    let payload: string | Buffer = '';
+    let kind: 'json' | 'text' | 'bytes' = 'text';
+    if (out.body !== undefined) {
+      if (Buffer.isBuffer(out.body)) { payload = out.body; kind = 'bytes'; }
+      else if (typeof out.body === 'string') { payload = out.body; kind = 'text'; }
+      else { payload = JSON.stringify(out.body) ?? ''; kind = 'json'; }
+    }
+    if (!headers['content-type']) {
+      headers['content-type'] = kind === 'json' ? 'application/json; charset=utf-8'
+        : kind === 'bytes' ? 'application/octet-stream'
+        : 'text/plain; charset=utf-8';
+    }
+    const status = typeof out.status === 'number' && out.status >= 100 && out.status <= 599
+      ? Math.trunc(out.status) : 200;
+    return { status, headers, body: payload };
+  }
+
   // =============== 错误隔离（红线 §3.4） ===============
 
   /** 包装任意插件回调：崩溃不外泄；连续同错 3 次自动停用并通知主人 */
@@ -556,6 +614,21 @@ export class PluginContainer {
       work: makeGatedWork(manifest, { work: this.deps.work, plugins: this, groupTitle: this.deps.groupTitle }),
       humanlike: makeGatedHumanlike(this.deps.humanlike),
       history: makeGatedHistory(manifest, this.deps.sessionLog),
+      http: {
+        on: (method, path, handler) => {
+          const m = String(method ?? '').toUpperCase();
+          if (!/^[A-Z]+$/.test(m)) throw new Error(`HTTP 端点方法非法：${method}`);
+          if (!path.startsWith('/') || path.includes('?') || path.includes('#')) {
+            throw new Error(`HTTP 端点路径需以 / 开头且不带查询串：${path}`);
+          }
+          const key = httpRouteKey(m, path);
+          // 重复注册直接抛错（与 llm.registerTool 重名同口径）：写错路径应当启动即失败，不静默覆盖
+          if (lp.httpRoutes.has(key)) throw new Error(`HTTP 端点 ${m} ${path} 重复注册`);
+          lp.httpRoutes.set(key, handler);
+          // 卸载即摘除：reload 时旧路由先清掉，新实例重新注册（不会残留指向旧闭包）
+          lp.disposers.push(() => { lp.httpRoutes.delete(key); });
+        },
+      },
       llm: {
         registerTool: (def) => {
           if (lp.tools.has(def.name)) throw new Error(`工具 ${def.name} 重复注册`);
@@ -906,4 +979,11 @@ function makeGatedWork(
 
 function mcpToolName(pluginId: string, serverId: string, tool: string): string {
   return `${pluginId}__${serverId}__${tool}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);
+}
+
+/** 端点路由键：方法大写 + 路径去尾斜杠（查询串不参与精确匹配；注册与查找共用同一口径） */
+function httpRouteKey(method: string, path: string): string {
+  const m = method.toUpperCase();
+  const p = path.length > 1 ? path.replace(/\/+$/, '') : path;
+  return `${m} ${p}`;
 }

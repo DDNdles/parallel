@@ -95,19 +95,6 @@ export class Db {
         PRIMARY KEY (plugin_id, key)
       );
 
-      CREATE TABLE IF NOT EXISTS stickers (
-        id TEXT PRIMARY KEY,
-        chat_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        tags TEXT DEFAULT '',
-        file TEXT NOT NULL,
-        count INTEGER DEFAULT 0,
-        last_used INTEGER,
-        added_by TEXT,
-        added_at INTEGER,
-        UNIQUE (chat_id, name)
-      );
-
       CREATE TABLE IF NOT EXISTS sandbox_files (
         chat_key TEXT NOT NULL,
         rel_path TEXT NOT NULL,
@@ -138,13 +125,6 @@ export class Db {
         last_ts INTEGER,
         last_message TEXT,
         PRIMARY KEY (plugin_id, error_key)
-      );
-
-      CREATE TABLE IF NOT EXISTS daily_items (
-        plugin_id TEXT NOT NULL,
-        day TEXT NOT NULL,
-        item TEXT,
-        PRIMARY KEY (plugin_id, day)
       );
 
       CREATE TABLE IF NOT EXISTS settings_kv (
