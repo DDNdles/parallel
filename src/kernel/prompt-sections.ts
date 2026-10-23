@@ -11,6 +11,7 @@
 // ============================================================
 
 import type { Role } from './types.ts';
+import { MAX_BUBBLES, RECOMMENDED_BUBBLES, RECOMMENDED_REPLY_CHARS } from './humanlike/delivery.ts';
 
 /** 信任边界：不可信输入的判据。chat/work 两轮共用。 */
 export const TRUST_BOUNDARY_TEXT = [
@@ -35,14 +36,17 @@ export const CHAT_STYLE_TEXT = `回复要求：简短自然、口语化、适合
  */
 export function chatOutputStyleText(opts: { maxChars: number }): string {
   const n = Math.max(20, Math.round(opts.maxChars));
+  const recommend = Math.min(RECOMMENDED_REPLY_CHARS, n);
+  const recommendBubbles = Math.min(RECOMMENDED_BUBBLES, MAX_BUBBLES);
   return [
     `# 你的回复`,
     `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
     `- 一句一条最好；单条尽量不超过 20 个字，句尾不用加句号，别把一长串用逗号连成一句。`,
+    `- 推荐一次回 2～${recommendBubbles} 条气泡、总共 ${recommend} 字以内；必要的时候可以突破推荐值（比如要把一件事讲清楚），但别为了凑条数硬拆。`,
     `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
     `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
     `- 想发表情就写 [表情/微笑]（不确定名字用编号，如 [表情/14]）；内核会发成真正的 QQ 表情。不要写 [微笑] 这种纯文字，也不要描述表情。`,
-    `- 一次回复总共不超过 ${n} 个字（超长的部分会被截掉）。想分两条发就换行写。`,
+    `- 硬上限：一次回复总共不超过 ${n} 个字、最多 ${MAX_BUBBLES} 条气泡；超出字数的部分会被截掉，气泡太多会合并。想分条就换行写。`,
   ].join('\n');
 }
 

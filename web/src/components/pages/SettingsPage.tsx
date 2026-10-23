@@ -528,7 +528,7 @@ export default function SettingsPage() {
 
               <div className="mset-sec-h"><span>发送方式</span></div>
               <div className="set-grid" style={{ marginTop: 14 }}>
-                <Num label="回复最长字符数" value={h.outgoing.replyMaxCharacters}
+                <Num label="回复最长字符数" hint="硬上限；提示里推荐 50 字、2～3 条气泡，必要时可突破推荐值" value={h.outgoing.replyMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
                 <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />

@@ -127,7 +127,7 @@ export const DEFAULT_CONFIG = {
     // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
       splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
-      replyMaxCharacters: 50,             // 回复总长上限：超了在最后一个句末标点处截断
+      replyMaxCharacters: 100,            // 回复总长硬上限（提示里推荐 50）：超了在最后一个句末标点处截断
       maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
       bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
       typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）

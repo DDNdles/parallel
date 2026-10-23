@@ -237,13 +237,13 @@ test('投递：按换行与句末标点分条；连续标点并作一个句尾�
   assert.deepEqual(splitIntoBubbles('嗯嗯'), ['嗯嗯'], '没有句末标点就是一条');
 });
 
-test('投递：最多 3 条气泡，超过时均衡合并（不丢字、不把尾巴全粘最后一条）', () => {
-  const text = '一。二。三。四。五。六。';
+test('投递：最多 10 条气泡，超过时均衡合并（不丢字、不把尾巴全粘最后一条）', () => {
+  const text = '一。二。三。四。五。六。七。八。九。十。十一。十二。';
   const out = splitIntoBubbles(text);
-  assert.equal(out.length, 3);
-  assert.equal(out.join(''), '一二三四五六', '句号去掉，内容不丢');
+  assert.equal(out.length, 10);
+  assert.equal(out.join(''), '一二三四五六七八九十十一十二', '句号去掉，内容不丢');
   const maxLen = Math.max(...out.map((x) => [...x].length));
-  assert.ok(maxLen <= 4, `均衡后最长一组不该超过 4 字: ${JSON.stringify(out)}`);
+  assert.ok(maxLen <= 2, `均衡后最长一组不该超过 2 字: ${JSON.stringify(out)}`);
 });
 
 test('投递：长逗号链在逗号处补切，短逗号句仍保持一条', () => {
