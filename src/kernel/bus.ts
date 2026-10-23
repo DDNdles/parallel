@@ -43,6 +43,8 @@ export const busEvents = {
   configChanged: 'config.changed',
   adapterStatus: 'adapter.status',
   memoryChanged: 'memory.changed',
+  /** chat 插件推送当前人格的叫醒词（canon.json 的 aliases），拟人层拿来认"在叫我" */
+  personaAliases: 'persona.aliases',
   scheduleFire: 'schedule.fire',
   // work 子代理（chat 模型 → work 模型）运行进度：桌面端「工作」页/会话页侧栏实时展示
   workStart: 'work.start',

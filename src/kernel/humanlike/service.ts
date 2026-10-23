@@ -138,6 +138,8 @@ export class HumanlikeService {
   /** 训练样本池（环形，只入不出；随权重一起落盘，冷启动不从头学） */
   private gateRows: GateSample[] = [];
   private lastFitRows = 0;
+  /** 当前人格的叫醒词（canon.json 的 aliases，由 chat 插件推送）：与 QQ 昵称同一条提及通道 */
+  private mentionAliases: string[] = [];
 
   constructor(private opts: HumanlikeServiceOptions) {
     this.now = opts.now ?? Date.now;
@@ -153,6 +155,31 @@ export class HumanlikeService {
 
   get config(): HumanlikeConfig {
     return this.opts.config() ?? DEFAULT_HUMANLIKE;
+  }
+
+  /**
+   * 换人格时更新叫醒词。只收 2 字以上的词：单字（鱼/鲸）会在「鱼香肉丝」里误触；
+   * 纯 ASCII 在匹配时按词边界处理（见 mentionHit）。
+   */
+  setMentionAliases(list: unknown): void {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of Array.isArray(list) ? list : []) {
+      const s = String(raw ?? '').trim();
+      if ([...s].length < 2 || s.length > 24) continue;
+      const key = s.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(s);
+      if (out.length >= 24) break;
+    }
+    this.mentionAliases = out;
+  }
+
+  /** 判断"在跟我说话"时认的全部名字：QQ 昵称 + 当前人格叫醒词 */
+  private mentionNames(): string[] {
+    const name = this.opts.selfNickname().trim();
+    return name ? [name, ...this.mentionAliases] : [...this.mentionAliases];
   }
 
   /** 会话键（与 pipeline 的 chatKey 同构） */
@@ -413,7 +440,7 @@ export class HumanlikeService {
       effectiveFrequency: frequency,
       idleSeconds,
       idleReachedAverage: comp.reached,
-    }, this.opts.selfNickname());
+    }, this.mentionNames());
 
     const mode = cfg.timing.replyTriggerMode;
     const threshold = mode === 'frequency' ? Number.POSITIVE_INFINITY : cfg.timing.necessityThreshold;
@@ -923,8 +950,7 @@ export class HumanlikeService {
 
   private mentioned(event: ChatEvent): boolean {
     if (event.isReplyToMe) return true;
-    const name = this.opts.selfNickname();
-    return !!name && event.text.includes(name);
+    return this.mentionNames().some((name) => mentionHit(event.text, name));
   }
 
   private timer(fn: () => void, ms: number): NodeJS.Timeout {
@@ -942,6 +968,7 @@ export class HumanlikeService {
       pending: st.buffer.length,
       consecutiveNoAction: st.consecutiveNoAction,
       backoffUntil: st.backoffUntil,
+      mentionAliases: [...this.mentionAliases],
       averageIntervalSeconds: this.averageInterval(st),
       recentSelf: self,
       recentTotal: total,
@@ -990,4 +1017,15 @@ export interface SendPlan {
   segments: MsgSegment[];
   /** 发出这条之前的等待（毫秒）；第一条为 0 */
   pauseMs: number;
+}
+
+/**
+ * 提及命中：中文按子串（与旧口径一致）；纯 ASCII 按词边界，避免 `bot` 命中 `robot`。
+ * 大小写不敏感只对 ASCII 生效——中文没有大小写。
+ */
+function mentionHit(text: string, name: string): boolean {
+  if (!name) return false;
+  if (!/^[\x20-\x7e]+$/.test(name)) return text.includes(name);
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Za-z0-9_])${esc}([^A-Za-z0-9_]|$)`, 'i').test(text);
 }

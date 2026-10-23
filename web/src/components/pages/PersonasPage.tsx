@@ -23,6 +23,8 @@ interface LoreRow { keys: string[]; constant?: boolean; priority?: number; conte
 /** canon.json 的形状。各层都留着索引签名：_comment 与以后新加的键要能原样带回去，不能在编辑时被吃掉 */
 interface CanonFile {
   name?: string;
+  /** 群里叫它用的外号：命中即视为"在叫它"（与 QQ 昵称同一条提及通道） */
+  aliases?: string[];
   canon: { protagonist: string[]; world: string[]; cast: CastRow[]; language?: string; [k: string]: unknown };
   perspective?: string;
   voice: { style?: string; examples: ExampleRow[]; post_history?: string; [k: string]: unknown };
@@ -41,6 +43,7 @@ function normalize(raw: any): CanonFile {
   return {
     ...c,
     name: typeof c.name === 'string' ? c.name : '',
+    aliases: strList(c.aliases),
     canon: {
       ...canon,
       protagonist: strList(canon.protagonist),
@@ -70,6 +73,7 @@ function clean(d: CanonFile): CanonFile {
   const drop = (a: string[]) => a.map((s) => s.trim()).filter(Boolean);
   return {
     ...d,
+    aliases: drop(d.aliases ?? []),
     canon: {
       ...d.canon,
       protagonist: drop(d.canon.protagonist),
@@ -270,6 +274,7 @@ function PersonaDetail({ persona, isDefault, onSaved }: {
         {isDefault && <span className="tag accent">默认人格</span>}
         <span className="tag">{draft.canon.protagonist.length} 条主角记号</span>
         <span className="tag">{draft.canon.world.length} 条世界</span>
+        <span className="tag">{draft.aliases?.length ?? 0} 个叫醒词</span>
         <span className="tag">{draft.lore.length} 条世界事实</span>
         <span className="tag">{draft.voice.examples.length} 条语气样例</span>
         {dirty && <span className="tag warn">未保存</span>}
@@ -291,6 +296,10 @@ function PersonaDetail({ persona, isDefault, onSaved }: {
           <div className="mset-field">
             <label className="mset-flabel">名称</label>
             <BrandInput value={draft.name ?? ''} spellCheck={false} onChange={(e) => patch({ name: e.target.value })} />
+          </div>
+          <div className="mset-field">
+            <label className="mset-flabel">叫醒词<Hint text="群聊里说到这些词就算在叫它；@ 与回复它的消息始终直接唤醒" /></label>
+            <KeyInput value={draft.aliases ?? []} onChange={(v) => patch({ aliases: v })} />
           </div>
           <Lines label="主角记号" value={draft.canon.protagonist} rows={3}
             onChange={(v) => patchCanon({ protagonist: v })} />

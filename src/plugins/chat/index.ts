@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PluginContext, LLMRequestContext, ChatMessage } from '../../kernel/types.ts';
+import { busEvents } from '../../kernel/bus.ts';
 import type { SessionLogEntry } from '../../kernel/sessionlog.ts';
 import {
   EXTRACT_SYSTEM, buildExtractPrompt, claimTurns, dueGroups, parseFacts, pushTurn, settle,
@@ -57,6 +58,8 @@ interface PersonaCanon {
   };
   /** 独立于 canon 的个体价值观（HDSI Perspective） */
   perspective?: string;
+  /** 群里叫它用的外号：命中即视为"在叫它"（与 QQ 昵称同一条提及通道） */
+  aliases?: string[];
   voice: {
     style?: string;
     examples: { user: string; assistant: string }[];
@@ -123,6 +126,20 @@ export function setup(ctx: PluginContext): void {
     if (selected && selected !== 'auto' && personas.has(selected)) return selected;
     return String((ctx.config as any)?.persona?.default ?? 'whale-girl');
   }
+
+  /** 把当前人格的叫醒词推给内核拟人层：换人格/改 canon 后立即生效，不用重启 */
+  function publishAliases(): void {
+    const id = activePersonaId();
+    const raw = personas.get(id)?.canon?.aliases;
+    const aliases = Array.isArray(raw) ? raw.map((x) => String(x)) : [];
+    ctx.bus.emit(busEvents.personaAliases, { personaId: id, aliases });
+    ctx.log.info(`人格 ${id} 叫醒词：${aliases.length ? aliases.join('/') : '无'}`);
+  }
+  publishAliases();
+  // 通过配置页换默认人格时也跟着换（active_persona 状态目前没有设置入口）
+  ctx.on(busEvents.configChanged, () => publishAliases());
+  // 插件卸载/热重载时清掉，别让旧人格的叫醒词在没载入人格时还生效
+  ctx.onDispose(() => ctx.bus.emit(busEvents.personaAliases, { personaId: '', aliases: [] }));
 
   // ---------- 后台学习：表达 / 画像 / 聊天回想 ----------
   // 三条通道共用「session.log」这一份入站/出站流水：
@@ -973,6 +990,7 @@ export function setup(ctx: PluginContext): void {
       }
       writeFileSync(join(p.dir, payload.file), content, 'utf-8');
       loadPersonas();
+      publishAliases();   // 叫醒词改了就换，不用等重启
       ctx.log.info(`人格 ${payload.personaId}/${payload.file} 已更新并热加载`);
       done(true);
     } catch (e) {
@@ -1003,6 +1021,7 @@ export function setup(ctx: PluginContext): void {
         lore: [],
       });
       loadPersonas();
+      publishAliases();
       ctx.log.info(`人格 ${id}（${name}）已创建`);
       done(true);
     } catch (e) {

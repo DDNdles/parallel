@@ -67,6 +67,15 @@ test('必要性：私聊/提及各自的相关性档位（100/80/40）', () => {
   assert.ok(scoreReplyNecessity(input({ hasMention: true })).detail.includes('提及'));
 });
 
+test('必要性：人格叫醒词也参与征询判定（昵称之外的名字）', () => {
+  // 普通群聊、非直接点名：文本里要出现"被认可的名字"，「鲸鲸有什么建议」才算征询
+  const without = scoreReplyNecessity(input({ texts: ['鲸鲸有什么建议'] }), '麦麦');
+  assert.ok(!without.detail.includes('征询'), without.detail);
+  const withAlias = scoreReplyNecessity(input({ texts: ['鲸鲸有什么建议'] }), ['麦麦', '鲸鲸']);
+  assert.ok(withAlias.detail.includes('征询'), withAlias.detail);
+  assert.equal(withAlias.detail.includes('强相关'), false, '这条测试只走内容分，不是提及直通');
+});
+
 test('必要性：内容是加分项，纯短反应是减分项', () => {
   // 只有 @ 才能把普通发言拉过线；内容分只贡献 15~55
   const asked = scoreReplyNecessity(input({ texts: ['这个怎么弄'], hasAt: true }));
@@ -366,6 +375,26 @@ test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消
   assert.equal(at.action, 'pass');
   assert.equal((at as { events: ChatEvent[] }).events.length, 2, '攒着的那条跟在后面一起交出去');
   assert.equal((at as { events: ChatEvent[] }).events[0].text, '早上好');
+  svc.dispose();
+});
+
+test('服务：人格叫醒词命中视为提及，并把攒着的消息一起带上', () => {
+  const { svc } = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true } });
+  svc.setMentionAliases(['鲸鲸', '大肥鱼']);
+  svc.ingest(ev('今天吃啥'), { isCommand: false });
+  const r = svc.ingest(ev('鲸鲸在吗'), { isCommand: false });
+  assert.equal(r.action, 'pass');
+  assert.equal((r as { events: ChatEvent[] }).events.length, 2);
+  svc.dispose();
+});
+
+test('服务：叫醒词去掉单字，ASCII 按词边界（robot 不算 bot）', () => {
+  const { svc } = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true } });
+  svc.setMentionAliases(['鱼', 'bot', 'BOT']);
+  // 单字「鱼」被丢弃：鱼香肉丝不误触；robot 里的 bot 也不该命中
+  assert.equal(svc.ingest(ev('晚上吃鱼香肉丝'), { isCommand: false }).action, 'handled');
+  assert.equal(svc.ingest(ev('robot 在吗'), { isCommand: false }).action, 'handled');
+  assert.equal(svc.ingest(ev('bot 在吗'), { isCommand: false }).action, 'pass');
   svc.dispose();
 });
 

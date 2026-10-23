@@ -110,13 +110,16 @@ function requestReason(text: string, directContext: boolean): string {
   return '';
 }
 
-function opinionReason(text: string, directContext: boolean, botName: string): string {
+function opinionReason(text: string, directContext: boolean, botNames: string[]): string {
   if (text.includes('不怎么看')) return '';
-  if (!directContext && botName && !text.includes(botName)) return '';
+  if (!directContext && botNames.length && !botNames.some((n) => text.includes(n))) return '';
   const hits = OPINION_TERMS.filter((t) => text.includes(t));
   if (hits.length) return hits.join('/');
-  const name = botName ? botName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '你';
-  if (new RegExp(`(?:你|${name}).{0,6}怎么看|怎么看.{0,6}(?:你|${name})`).test(text)) return '怎么看';
+  // 认的名字可能是昵称 + 人格叫醒词：任何一个出现在「怎么看」附近都算征询
+  const names = (botNames.length ? botNames : ['你'])
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
+  if (new RegExp(`(?:你|${names}).{0,6}怎么看|怎么看.{0,6}(?:你|${names})`).test(text)) return '怎么看';
   return '';
 }
 
@@ -124,7 +127,7 @@ function scoreContent(
   cleaned: string[],
   combined: string,
   directContext: boolean,
-  botName: string,
+  botNames: string[],
 ): { score: number; reasons: string[] } {
   let score = 0;
   const reasons: string[] = [];
@@ -133,7 +136,7 @@ function scoreContent(
   const req = requestReason(combined, directContext);
   if (req) { score += 20; reasons.push(`请求:${req}`); }
 
-  const op = opinionReason(combined, directContext, botName);
+  const op = opinionReason(combined, directContext, botNames);
   if (op) { score += 20; reasons.push(`征询:${op}`); }
 
   const len = [...combined].length;
@@ -174,8 +177,12 @@ export function presencePenalty(recentSelfReplies: number, recentWindowMessages:
   return Math.round(NECESSITY_RECENT_SELF_PENALTY_MAX * progress);
 }
 
-export function scoreReplyNecessity(input: NecessityInput, botName = ''): NecessityScore {
+export function scoreReplyNecessity(input: NecessityInput, botName: string | string[] = ''): NecessityScore {
   const threshold = Math.max(1, input.triggerThreshold);
+  // 昵称 + 人格叫醒词：普通群聊里「鲸鲸你怎么看」这种句式要靠它才算征询
+  const botNames = (Array.isArray(botName) ? botName : [botName])
+    .map((s) => String(s ?? '').trim())
+    .filter(Boolean);
 
   let relevance: number;
   let relevanceReason: string;
@@ -187,7 +194,7 @@ export function scoreReplyNecessity(input: NecessityInput, botName = ''): Necess
   const directContext = relevance > 0;
   const cleaned = input.texts.map(stripNecessityNoise);
   const combined = cleaned.filter(Boolean).join('\n');
-  const content = scoreContent(cleaned, combined, directContext, botName);
+  const content = scoreContent(cleaned, combined, directContext, botNames);
   const pressure = pressureScore(input.pendingCount, threshold, input.idleReachedAverage);
   const penalty = presencePenalty(input.recentSelfReplies, input.recentWindowMessages);
 
