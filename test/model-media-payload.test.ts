@@ -423,6 +423,33 @@ test('动图表情（QQ 存成 .png 但内容是两帧 GIF）：进请求体的�
   assert.match(textOf(blocks), /这个表情好好笑/, '真人正文仍要在');
 });
 
+// 同一条动图在 200 条窗口里被反复发：每出现一次就摊一张 3×3 拼图，几次重复就是几十张"同一只吉他"，
+// 模型会把它判成刷屏。去重后只附第一张，后面只留一句"同一条又出现了一次"。
+test('同一条动图在窗口里重复出现：只附一次分帧拼图，后面的只留说明', async () => {
+  const bundled = join(process.cwd(), 'data', 'bin', 'ffmpeg.exe');
+  if (existsSync(bundled)) {
+    const { setFfmpegCandidate } = await import('../src/kernel/services/media.ts');
+    setFfmpegCandidate(bundled);
+  }
+  const { toPiMessages } = await import('../src/kernel/services/pi-ai.ts');
+  const att = { kind: 'image', url: URL_OF('anim.gif'), mime: 'image/gif' };
+  const r = await toPiMessages(
+    [
+      { role: 'user', content: '第一次发这个表情', ts: 1 },
+      { role: 'user', content: '又发了一次', ts: 2 },
+    ] as any,
+    { id: 'stub-model', provider: '' },
+    '',
+    { attachmentsFor: () => [att as any] },
+  );
+  const blocks = (m: any) => (Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }]);
+  assert.equal(has(blocks(r.messages[0]), 'image').length, 1, '第一次要附图');
+  assert.equal(has(blocks(r.messages[1]), 'image').length, 0, '同一条动图不再重复附图');
+  assert.match(textOf(blocks(r.messages[1])), /同一条动图又出现了一次/);
+  assert.match(textOf(blocks(r.messages[1])), /第 2 次/);
+  assert.match(textOf(blocks(r.messages[1])), /又发了一次/, '重复那条的正文不能被吃掉');
+});
+
 // ---------------- 视频：没有公网 URL 时的内联兜底 ----------------
 
 test('视频没有公网 URL、只有本机文件且 ≤20MB：读成 base64 内联，不是丢掉', async () => {

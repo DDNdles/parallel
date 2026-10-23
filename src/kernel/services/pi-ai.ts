@@ -29,6 +29,7 @@
 // ============================================================
 
 import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import type { ChatMessage, LLMChatRequest, LLMResponse, LLMUsage, MessageAttachment, ToolCall, ToolDef } from '../types.ts';
 import { fetchBuffer, findFfmpeg, toWavFile, isAnimatedImage, animatedToSheetFile, animatedSheetNote } from './media.ts';
 
@@ -182,6 +183,8 @@ export async function toPiMessages(
   const lifted: string[] = [];
   const imageWarnings: string[] = [];
   let failedImages = 0;
+  /** 同一条动图在窗口里可能被反复发：只附一次分帧拼图，后面的只留一句话（否则一 GIF 变几十张图，模型会当刷屏） */
+  const seenAnimated = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role === 'system') {
@@ -193,7 +196,7 @@ export async function toPiMessages(
       const notes: string[] = [];
       const own = opt?.attachmentsFor?.(i);
       if (own?.length) {
-        const loaded = await loadImages(own);
+        const loaded = await loadImages(own, seenAnimated);
         images.push(...loaded.images);
         notes.push(...loaded.notes);
         imageWarnings.push(...loaded.warnings);
@@ -248,6 +251,7 @@ export async function toPiMessages(
  *  抽帧失败不静默丢：退回原图（至少还有首帧），原因进 `notes` 由调用方报掉。 */
 async function loadImages(
   attachments: LLMChatRequest['attachments'],
+  seenAnimated?: Map<string, number>,
 ): Promise<{ images: any[]; failed: number; notes: string[]; warnings: string[] }> {
   const images: any[] = [];
   const notes: string[] = [];
@@ -257,7 +261,18 @@ async function loadImages(
     if (a.kind !== 'image') continue;
     const buf = await loadBuffer(a);
     if (!buf) { failed++; continue; }
-    if (isAnimatedImage(buf)) {
+    const animated = isAnimatedImage(buf);
+    if (animated && seenAnimated) {
+      // 按内容去重：同一条动图换名字/换 URL 也算同一条；重复的只留说明，不再重复附图
+      const key = createHash('sha1').update(buf).digest('hex');
+      const n = (seenAnimated.get(key) ?? 0) + 1;
+      seenAnimated.set(key, n);
+      if (n > 1) {
+        notes.push(`（同一条动图又出现了一次，这是第 ${n} 次；内容相同，不再重复附图，不是多张不同的图）`);
+        continue;
+      }
+    }
+    if (animated) {
       try {
         const sheet = await animatedToSheetFile(buf);
         // 只解出一帧（误判/单帧动图）：摊开没有意义，按原图送、不加说明
