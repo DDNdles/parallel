@@ -275,6 +275,12 @@ function analyzeChat(chatKey, entries) {
       histogram: bubbleHist,
     },
     replyTurnsPer100Inbound: inbound.length ? +((turns.length / inbound.length) * 100).toFixed(1) : null,
+    // 频率模式真正的开口率：@/提及是强制回复，不能算进"太吵"；看 frequency 开口 / 非@入站
+    frequencyTurnsPer100NonAt: (() => {
+      const nonAt = inbound.length - atMe;
+      const freq = openReasons.frequency ?? 0;
+      return nonAt > 0 ? +((freq / nonAt) * 100).toFixed(1) : null;
+    })(),
     botShare: inbound.length + outbound.length ? +(outbound.length / (inbound.length + outbound.length)).toFixed(3) : null,
     opens: { total: opens.length, byReason: openReasons },
     waits,
@@ -321,6 +327,11 @@ const totals = {
   decisions: chats.reduce((m, c) => { for (const [k, v] of Object.entries(c.decisions)) m[k] = (m[k] ?? 0) + v; return m; }, {}),
   errors: sum((c) => c.errors),
   replyTurnsPer100Inbound: sum((c) => c.inbound) ? +((sum((c) => c.turns) / sum((c) => c.inbound)) * 100).toFixed(1) : null,
+  frequencyTurnsPer100NonAt: (() => {
+    const nonAt = sum((c) => c.inbound) - sum((c) => c.atMe);
+    const freq = chats.reduce((n, c) => n + (c.opens.byReason.frequency ?? 0), 0);
+    return nonAt > 0 ? +((freq / nonAt) * 100).toFixed(1) : null;
+  })(),
   botShare: (sum((c) => c.inbound) + sum((c) => c.outbound)) ? +(sum((c) => c.outbound) / (sum((c) => c.inbound) + sum((c) => c.outbound))).toFixed(3) : null,
   avgBubblesPerTurn: (() => {
     const counts = [];
@@ -376,7 +387,8 @@ if (has('--markdown')) {
     `interrupt=${params.interrupt.probability} replyMax=${params.outgoing.replyMaxCharacters} bubble=${params.outgoing.bubbleSoftMaxCharacters}`);
   lines.push('');
   lines.push(`总量：入站 ${totals.inbound}（${totals.uniqueSenders} 人，@我 ${totals.atMe}）/ 出站 ${totals.outbound} 条、${totals.turns} 轮 / ` +
-    `每百条入站回 ${fmt(totals.replyTurnsPer100Inbound)} 轮 / bot 消息占比 ${fmt(totals.botShare)} / 平均每轮 ${fmt(totals.avgBubblesPerTurn)} 条`);
+    `每百条入站回 ${fmt(totals.replyTurnsPer100Inbound)} 轮 / frequency 开口 ${totals.openReasons.frequency ?? 0} 次（${fmt(totals.frequencyTurnsPer100NonAt)}/百条非@）/ ` +
+    `bot 消息占比 ${fmt(totals.botShare)} / 平均每轮 ${fmt(totals.avgBubblesPerTurn)} 条`);
   const reasons = Object.entries(totals.openReasons).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
   const decs = Object.entries(totals.decisions).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
   lines.push(`开口 ${totals.opens}（${reasons}）/ 沉默评估 ${totals.waits} / 其它决策 ${decs} / 错误 ${totals.errors + (health.errorsInWindow ?? 0)}`);
@@ -384,12 +396,12 @@ if (has('--markdown')) {
   if (!health.reachable) lines.push('⚠ 内核 /api/state 不可达（本小时报告只来自会话日志）');
   else lines.push(`内核：协议端 ${health.connected ? '在线' : '离线'}，${health.nickname ?? ''} ${health.selfId ?? ''}`);
   lines.push('');
-  lines.push('| 会话 | 入站 | @我 | 出站 | 轮数 | 回轮/百条 | bot占比 | 开口 | 沉默 | 打断/作废 | 空回复 | 重复重写 | 限速 | 平均/最长 气泡 | 首气泡延迟 p50/p90 |');
-  lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
+  lines.push('| 会话 | 入站 | @我 | 出站 | 轮数 | 回轮/百条 | freq/非@百条 | bot占比 | 开口 | 沉默 | 打断/作废 | 空回复 | 重复重写 | 限速 | 平均/最长 气泡 | 首气泡延迟 p50/p90 |');
+  lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
   for (const c of chats) {
     const d = c.decisions;
     const lat = c.latencyMs.agentStartToFirstBubble;
-    lines.push(`| ${c.chatKey} | ${c.inbound} | ${c.atMe} | ${c.outbound} | ${c.turns} | ${fmt(c.replyTurnsPer100Inbound)} | ${fmt(c.botShare)} | ${c.opens.total} | ${c.waits.total} | ${(d.generation_interrupted ?? 0) + (d.generation_aborted ?? 0)} | ${d.empty_reply ?? 0} | ${d.repetition_retry ?? 0} | ${(d.rate_limited ?? 0) + (d.rate_truncated ?? 0)} | ${fmt(c.bubbles.perTurn.avg)}/${fmt(c.bubbles.perTurn.max)} | ${fmt(lat.p50)}/${fmt(lat.p90)}ms |`);
+    lines.push(`| ${c.chatKey} | ${c.inbound} | ${c.atMe} | ${c.outbound} | ${c.turns} | ${fmt(c.replyTurnsPer100Inbound)} | ${fmt(c.frequencyTurnsPer100NonAt)} | ${fmt(c.botShare)} | ${c.opens.total} | ${c.waits.total} | ${(d.generation_interrupted ?? 0) + (d.generation_aborted ?? 0)} | ${d.empty_reply ?? 0} | ${d.repetition_retry ?? 0} | ${(d.rate_limited ?? 0) + (d.rate_truncated ?? 0)} | ${fmt(c.bubbles.perTurn.avg)}/${fmt(c.bubbles.perTurn.max)} | ${fmt(lat.p50)}/${fmt(lat.p90)}ms |`);
   }
   console.log(lines.join('\n'));
 } else {
