@@ -374,7 +374,8 @@ export class Pipeline {
    *
    * 命令（`/work`）是显式意图，不掷骰子：它本身就该立刻执行，顺手把没说完的话截断。
    * 只有 chat 轮的回复登记了在途（`sendScene` 传 `interruptible`）：命令回执、跟屏复读、
-   * 桌面端手动发言都打断不到 —— 那些是"必须说完"的话。
+   * 桌面端手动发言都打断不到 —— 那些是"必须说完"的话。@ 触发的轮次同样传 false：
+   * @ 必回，插话打断对它直接失效。
    */
   private maybeInterrupt(chat: ChatRef, event: ChatEvent): void {
     const cfg = this.humanlike.config.interrupt;
@@ -715,6 +716,8 @@ export class Pipeline {
     const active = this.activeTurns.get(chatKey) ?? 0;
     /** 汇报轮：不是闲聊，不套聊天风格，也不参与生成期打断 */
     const isReport = !!opts?.report;
+    /** 这一轮由 @ 触发：@ 必回，插话打断对它直接失效（生成期与气泡期都不打断） */
+    const forcedAt = (opts?.batch?.length ? opts.batch : [event]).some((e) => e.isAtMe);
 
     // 检查本群是否有任何生效中的插件能提供工具/人格；全关时按配置提示管理员
     // 汇报轮的产物由系统合并成聊天记录，不再给模型 deliver_file（避免它又单独发一遍文件）
@@ -746,8 +749,9 @@ export class Pipeline {
     this.turnMeta.set(event.chatId, {
       chatKey,
       phase: 'generating',
-      // 汇报轮不参与生成期打断：work 的结论必须讲完；普通聊天与主动轮都可以被新消息打断
-      interruptible: !isReport,
+      // 汇报轮不参与生成期打断：work 的结论必须讲完；@ 轮同样不可打断（@ 必回）；
+      // 普通聊天与主动轮都可以被新消息打断
+      interruptible: !isReport && !forcedAt,
     });
     this.activeTurns.set(chatKey, active + 1);
 
@@ -995,7 +999,8 @@ export class Pipeline {
       // 不再把"门开了"当成"模型开口了"（2026-10-18 修）。
       this.humanlike.noteTurnOutcome(chat, opts?.gateId, !isSilentScene(finalReply));
       await this.sendScene(chat, finalReply, this.quoteTargetOf(event), opts?.mention,
-        opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined);
+        opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined,
+        !forcedAt);
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
@@ -1111,6 +1116,8 @@ export class Pipeline {
     mention?: { userId: string; nickname?: string },
     /** 汇报轮：正文 + 产物合并成一条聊天记录；普通轮不传 */
     forward?: { artifacts: string[]; userId: string; nickname?: string },
+    /** 这轮的气泡是否允许被插话砍掉；@ 轮与汇报轮传 false */
+    interruptible = true,
   ): Promise<void> {
     if (forward) {
       // 一条聊天记录：汇报正文整段进首节点（不按聊天气泡切/50 字截断），产物文件各占一个节点
@@ -1143,7 +1150,7 @@ export class Pipeline {
       plans[0].segments.unshift({ type: 'at', data: { qq: mention.userId } });
     }
     if (quoteTarget) plans[0].segments.unshift({ type: 'reply', data: { id: quoteTarget } });
-    const { sent, aborted, sentTexts } = await this.chat.sendPlanned(chat, plans, { interruptible: true });
+    const { sent, aborted, sentTexts } = await this.chat.sendPlanned(chat, plans, { interruptible });
     if (aborted) {
       // 一条都没发出去就被打断：不记 spoke（打断不是她的犹豫，不该推进空闲退避），也不回灌历史
       if (sent <= 0) return;

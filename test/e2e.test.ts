@@ -929,7 +929,7 @@ test('拟人化：触发消息被后来的消息刷远时，回复自动挂引�
   }
 });
 
-test('拟人化：模型还在生成时插话，按概率直接打断并丢弃这一轮', async () => {
+test('拟人化：模型还在生成时插话，按概率直接打断并丢弃这一轮（非 @ 轮）', async () => {
   await quiesce();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
   mock.actions.length = 0;
@@ -937,15 +937,17 @@ test('拟人化：模型还在生成时插话，按概率直接打断并丢弃�
   const timing = kernel.config.config.humanlike.timing as unknown as {
     replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
     pendingThreshold: number;
+    mentionedBotReply: boolean;
   };
-  const saved = { p: ic.probability, mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
+  const saved = { p: ic.probability, mode: timing.replyTriggerMode, pending: timing.pendingThreshold, mention: timing.mentionedBotReply };
   ic.probability = 1;
-  // 第二句普通消息不该触发一轮：频率档 + 很高的门槛，保证断言只看"第一轮有没有被 abort"
+  // 用「提到名字」触发、不走 @；第二句普通消息不该触发一轮：频率档 + 很高的门槛
   timing.replyTriggerMode = 'frequency';
   timing.pendingThreshold = 100;
+  timing.mentionedBotReply = true;
   try {
     mockProvider.script.push({ content: '这句不该发出去', delayMs: 1200 });
-    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '你先想着', atMe: true, nickname: '小明' });
+    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: 'parallel-test 你先想着', atMe: false, nickname: '小明' });
     await new Promise((r) => setTimeout(r, 200));
     mock.sendGroupMessage({ groupId: GROUP, userId: 10002, text: '插一句', nickname: '阿强' });
     // 等到模型原本该吐字的时点之后：如果 abort 没生效，这里会看到那条回复
@@ -955,6 +957,42 @@ test('拟人化：模型还在生成时插话，按概率直接打断并丢弃�
     const gates = kernel.sessionLog.tail(String(GROUP), 'group', 80)
       .filter((e) => e.type === 'gate' && (e.data as { decision?: string } | undefined)?.decision === 'generation_interrupted');
     assert.ok(gates.length >= 1, '应留下 generation_interrupted 的 gate 记录');
+  } finally {
+    ic.probability = saved.p;
+    timing.replyTriggerMode = saved.mode;
+    timing.pendingThreshold = saved.pending;
+    timing.mentionedBotReply = saved.mention;
+  }
+});
+
+test('拟人化：@ 触发的一轮无视插话打断，回复照常发出', async () => {
+  await quiesce();
+  const G = 4582;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  mock.actions.length = 0;
+  const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
+  const timing = kernel.config.config.humanlike.timing as unknown as {
+    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    pendingThreshold: number;
+  };
+  const saved = { p: ic.probability, mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
+  ic.probability = 1;
+  timing.replyTriggerMode = 'frequency';
+  timing.pendingThreshold = 100;
+  try {
+    mockProvider.script.push({ content: '这句必须发出去', delayMs: 1200 });
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '你先想着', atMe: true, nickname: '小明' });
+    await new Promise((r) => setTimeout(r, 200));
+    mock.sendGroupMessage({ groupId: G, userId: 10002, text: '插一句', nickname: '阿强' });
+    await new Promise((r) => setTimeout(r, 1800));
+    const sent = mock.actions
+      .filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(G))
+      .map((a) => (a.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join(''))
+      .join('');
+    assert.ok(sent.includes('这句必须发出去'), `@ 轮不该被插话打断，实际发出: ${JSON.stringify(sent)}`);
+    const gates = kernel.sessionLog.tail(String(G), 'group', 80)
+      .filter((e) => e.type === 'gate' && (e.data as { decision?: string } | undefined)?.decision === 'generation_interrupted');
+    assert.equal(gates.length, 0, '@ 轮不应留下 generation_interrupted');
   } finally {
     ic.probability = saved.p;
     timing.replyTriggerMode = saved.mode;
@@ -1222,6 +1260,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   const hl = kernel.config.config.humanlike;
   const savedOut = { ...hl.outgoing };
   const savedIt = { ...hl.interrupt };
+  const savedMention = hl.timing.mentionedBotReply;
   // 每条后续气泡等 2 秒（真实默认是"基础 1s + 字数/8"）：给打断留一个确定的窗口
   hl.outgoing.typingEnabled = true;
   hl.outgoing.typingBaseDelaySeconds = 2;
@@ -1229,11 +1268,12 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   hl.outgoing.typingJitterRatio = 0;
   hl.interrupt.enable = true;
   hl.interrupt.probability = 1;      // 测试要确定性：概率 1 = 一定打断
+  hl.timing.mentionedBotReply = true; // 用名字提及触发、不走 @（@ 轮已规定不可打断）
   const chat = { platform: 'qq', type: 'group' as const, chatId: String(G) };
   try {
     mock.actions.length = 0;
     mockProvider.script.push({ content: '第一句。第二句。第三句。' });
-    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
+    mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: 'parallel-test 在吗', atMe: false, nickname: '小明' });
     const sendsOf = () => mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(G));
     // 等第一条气泡落地：此刻循环正卡在"第二条之前的 2 秒打字停顿"里
     await until(() => sendsOf().length === 1, 8000, '第一条气泡');
@@ -1254,6 +1294,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   } finally {
     Object.assign(hl.outgoing, savedOut);
     Object.assign(hl.interrupt, savedIt);
+    hl.timing.mentionedBotReply = savedMention;
   }
 });
 

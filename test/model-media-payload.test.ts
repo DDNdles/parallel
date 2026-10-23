@@ -29,9 +29,11 @@ const MEMBER = 20001;
 const MASTER = 20010;
 const RES_ID = 'res-media-1';
 /** 人设主体从当前内置人格读取：断言"设定进了 system 且只进一次"，不绑死某个人格版本 */
-const PERSONA_BODY = String((JSON.parse(readFileSync(
+const CANON = JSON.parse(readFileSync(
   join(process.cwd(), 'src/plugins/chat/personas/whale-girl/canon.json'), 'utf-8',
-)) as { canon: { protagonist: string[] } }).canon.protagonist[0]);
+)) as { canon: { protagonist: string[]; voice?: { post_history?: string } } };
+const PERSONA_BODY = String(CANON.canon.protagonist[0]);
+const POST_HISTORY = String(CANON.canon.voice?.post_history ?? '');
 
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082', 'hex');
 /** 合法的最小 WAV：RIFF/fmt/data，data 段放几个字节的"静音" */
@@ -234,11 +236,16 @@ test('人格设定不再占 user 轮：去重后的设定进 system，最后一�
   assert.match(textOf(Array.isArray(last?.content) ? last.content : []), /你还记得我是谁吗/, '最后一条 user 必须是真人那句');
   assert.ok(!allUserText(body).includes('【人格强化'), '人格强化不该以 user 轮出现（模型会当成对方念的话）');
   const sys = (body?.messages ?? []).filter((m: any) => m?.role === 'system').map((m: any) => String(m.content ?? '')).join('\n');
-  // 2026-10-18 反重复：protagonist 与 voice.post_history 是同一整段时只注入一次，
-  // 避免人设名一轮被强化两遍。
+  // 2026-10-18 反重复：protagonist 与 voice.post_history 是同一整段时只注入一次；
+  // 当前 canon 的 post_history 含额外的一句「梁文峰…」，两段已不再重复，此时应作为强化语注入。
   assert.ok(sys.includes(PERSONA_BODY), '人设主体要落在 system 里');
-  assert.equal(sys.split(PERSONA_BODY).length - 1, 1, 'protagonist/post_history 重复段只注入一次');
-  assert.ok(!sys.includes('【人格强化'), '重复的 post_history 不再注入');
+  assert.equal(sys.split(PERSONA_BODY).length - 1, 1, 'protagonist 只注入一次');
+  const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase();
+  const post = norm(POST_HISTORY);
+  const main = norm(CANON.canon.protagonist.join('\n'));
+  const duplicate = !!post && (post === main || main.includes(post) || post.includes(main));
+  if (duplicate) assert.ok(!sys.includes('【人格强化'), '重复的 post_history 不再注入');
+  else assert.ok(sys.includes(POST_HISTORY.trim()), '不重复的 post_history 要作为强化语注入');
 });
 
 test('聊天记录里的图与音视频：下载预算内的全部跟着记录一起进这一发请求', async () => {
