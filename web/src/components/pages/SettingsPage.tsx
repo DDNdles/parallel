@@ -491,9 +491,10 @@ export default function SettingsPage() {
                   <PillSelect align="left" value={timingScope} label="作用会话"
                     options={[
                       { v: '', t: '默认（所有会话）' },
-                      ...chats.map((chat) => ({
+                      // 回复时机只对群聊门控生效；私聊固定必回，不列进来（列了也是空旋钮）
+                      ...chats.filter((chat) => chat.chatType !== 'private').map((chat) => ({
                         v: `${chat.chatType}_${chat.chatId}`,
-                        t: chat.title ? `${chat.title}（${chat.chatId}）` : `${chat.chatType === 'private' ? '私聊' : '群'} ${chat.chatId}`,
+                        t: chat.title ? `${chat.title}（${chat.chatId}）` : `群 ${chat.chatId}`,
                       })),
                     ]}
                     onChange={switchTimingScope} />
