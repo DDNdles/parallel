@@ -17,12 +17,23 @@ test('QQ 表情：编号与名称互查，未知名称不硬猜', () => {
   assert.equal(qqFaceId('疑问'), '32');
   assert.equal(qqFaceId('14'), '14');
   assert.equal(qqFaceId('没有这个表情'), undefined);
+  // 模型常把名字写短：语义明确的简称补上，多义的（笑）继续不猜
+  assert.equal(qqFaceId('呜呜'), '386', '呜呜 → 呜呜呜');
+  assert.equal(qqFaceId('哭'), '9', '哭 → 大哭');
+  assert.equal(qqFaceId('笑'), undefined, '笑有多义候选，不硬猜');
   assert.equal(faceTokensToNames('收到[表情:32]'), '收到[表情:疑问]');
   assert.equal(faceTokensToNames('[表情:9999]'), '[表情:9999]', '不认识的编号保持原样');
   assert.deepEqual(faceTokensToSegments('好[表情/微笑]呀'), [
     { type: 'text', data: { text: '好' } },
     { type: 'face', data: { id: '14' } },
     { type: 'text', data: { text: '呀' } },
+  ]);
+  assert.deepEqual(faceTokensToSegments('写不出来[表情:呜呜]'), [
+    { type: 'text', data: { text: '写不出来' } },
+    { type: 'face', data: { id: '386' } },
+  ]);
+  assert.deepEqual(faceTokensToSegments('[表情:哭]'), [
+    { type: 'face', data: { id: '9' } },
   ]);
   // 认不出来的令牌不吞字
   assert.deepEqual(faceTokensToSegments('不存在的[表情/没有这个]'), [

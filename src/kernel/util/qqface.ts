@@ -13,6 +13,15 @@ import { QQ_FACE_NAMES } from './qqface-names.ts';
 
 const NAME_TO_ID = new Map(Object.entries(QQ_FACE_NAMES).map(([id, name]) => [name, id] as const));
 
+/**
+ * 常见手滑/简称 → 编号。只补语义明确的，不猜多义：
+ * 「笑」能对上微笑/大笑/偷笑等十几个名字，不进这张表；这类拿不准时让模型写编号。
+ */
+const FACE_ALIASES: Record<string, string> = {
+  '呜呜': '386',   // 呜呜呜
+  '哭': '9',       // 大哭
+};
+
 /** 出站令牌：`[表情/微笑]` / `[表情:14]` / `[表情：呲牙]` */
 const TOKEN = /\[表情[:：/／]([^\[\]\n]+)\]/g;
 
@@ -26,7 +35,16 @@ export function qqFaceId(raw: unknown): string | undefined {
   const s = String(raw ?? '').trim().replace(/^\[|\]$/g, '').replace(/^表情[:：/／]?/, '').trim();
   if (!s) return undefined;
   if (/^\d+$/.test(s)) return s;
-  return NAME_TO_ID.get(s);
+  const exact = NAME_TO_ID.get(s);
+  if (exact) return exact;
+  const alias = FACE_ALIASES[s];
+  if (alias) return alias;
+  // 唯一的子串命中才认（「呜呜」→「呜呜呜」）；有多个候选就说明有歧义，继续不猜
+  if ([...s].length >= 2) {
+    const hits = Object.entries(QQ_FACE_NAMES).filter(([, name]) => name.includes(s) || s.includes(name));
+    if (hits.length === 1) return hits[0][0];
+  }
+  return undefined;
 }
 
 /** 正文里的编号占位换成中文名（给模型读）；不认识的编号保留原样 */
