@@ -15,7 +15,7 @@ export type SessionLogType =
   | 'poke'
   /** 上下文压缩：这条之前的消息在后续请求里由 summary 代替（对齐 pi 的 compaction 条目） */
   | 'compaction'
-  /** 拟人层决策：这一轮为什么开口 / 为什么沉默（含必要性打分与空窗补偿明细） */
+  /** 拟人层决策：这一轮为什么开口 / 为什么沉默（含开口概率、动态预算与空窗补偿明细） */
   | 'gate';
 
 export interface SessionLogEntry {

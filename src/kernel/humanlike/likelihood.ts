@@ -1,38 +1,36 @@
 /**
- * 开口概率模型 + 动态门控 —— 对齐 MaiBot 主线 2026-10 之后的路线
- * （`reply_likelihood.py` 日志拟合逻辑回归 + `dynamic_gate.py` 动态阈值）。
+ * 开口概率 + 动态预算门控 —— 对齐 MaiBot 主线 `dynamic` 模式：
+ * `src/maisaka/turn_trigger/reply_likelihood.py` 与 `dynamic_gate.py`。
  *
- * 旧的「80 分必要性启发式」（necessity.ts，MaiBot 已退役的 offline 版本）在这里
- * **降级成先验特征**：它的公式仍负责快速算出「这条内容值不值一提」的样貌，
- * 但最终开不开口由概率与**每会话自适应阈值**决定：
- *   - 冷启动用手工先验权重，行为与旧公式同量级；
- *   - 每次评估都产生一行带特征与结果的样本（进 `gate-model.json` 的环形样本池）；
- *   - 攒够样本就 SGD 重训，权重落盘 —— 与 MaiBot"从日志里学"同一条路。
+ * 两块职责分开：
+ *  1. **概率**：8 个会话结构特征 → 逻辑回归 → 这批消息会让 chat 轮开口的概率。
+ *     特征与先验权重逐项对齐 MaiBot；权重是离线拟合的结果，这里作为先验。
+ *  2. **门控**：1 小时窗口里按 talk_value 折算目标回复量，用窗口内概率的分位点当阈值。
+ *     概率只负责排序，真正决定"放几个"的是预算。
  *
- * 防坑：MaiBot 的拟合权重里有一条「最近消息数 -0.0367/条」的衰减项，热群里会把
- * 放行概率压到 0.0001 与静态阈值失配、形成正反馈锁死（Issue #2109）。
- * 这里的对应防御有两道：特征里不收"纯消息条数衰减"这一维；阈值有硬下界，
- * 连续沉默时只降不破底。
+ * 与 MaiBot 的唯一有意差异：MaiBot 用无门控时期 Planner 首轮的 `no_reply` 当拟合标签；
+ * 这里用**模型最终有没有真说话**（`noteTurnOutcome` 的回执）当标签。先验仍是 MaiBot 的权重，
+ * 样本攒够后只在先验邻域内重训，避免少量新样本把行为带跑。
  */
 
-/** 一次评估的输入特征（来自 necessity 公式的各分项 + 门控现场） */
+/** 一次评估的输入特征（口径与 MaiBot ReplyLikelihoodInput 一致） */
 export interface GateFeatures {
-  /** 相关性 0~100（@/提及/私聊/focus，necessity 的 relevance 分项） */
-  relevance: number;
-  /** 内容分（问题/请求/征询/长文本 加分，短反应倒扣） */
-  content: number;
-  /** 积压压力分 0~100 */
-  pressure: number;
-  /** 存在感惩罚 0~25 */
-  presence: number;
-  /** 空窗补偿是否达成（0/1） */
-  comp: 0 | 1;
-  /** 当前生效频率 0~1 */
-  freq: number;
-  /** 当前积压条数 */
-  pending: number;
-  /** 空窗/平均消息间隔，cap 1（0 = 没有可用节奏） */
-  idleRatio: number;
+  /** 这批消息是否提到 bot（名字 / 叫醒词 / 回复 bot；@ 由强制触发在门外处理） */
+  mentionBot: boolean;
+  /** 是否 @ 了 bot 以外的人（两人对话/点名别人时应该更安静） */
+  atOther: boolean;
+  /** 是否带问号 */
+  hasQuestionMark: boolean;
+  /** 是否全是表情/图片/语音等媒体占位 */
+  placeholderOnly: boolean;
+  /** 最近 5 分钟里 bot 发言占全部消息的比例（0~1） */
+  recentSelfRatio: number;
+  /** 最近 5 分钟的消息总数（含 bot） */
+  recentMessageCount: number;
+  /** 距 bot 上一次真正发言的秒数；从没说过给 3600 */
+  secondsSinceBotMessage: number;
+  /** 当前待处理消息条数（特征里封顶 20，与 MaiBot 一致） */
+  pendingCount: number;
 }
 
 /** 线性 logit 权重：`z = bias + Σ w[i] · scaled_f[i]` */
@@ -42,34 +40,67 @@ export interface GateWeights {
   w: number[];
 }
 
-/** 训练样本：特征向量（已缩放）+ 这一次评估的实际结果（1=开口 0=沉默） */
+/** 训练样本：特征向量（已缩放）+ 这一次的实际结果（1=模型真说话 0=模型没说话） */
 export interface GateSample {
-  /** 缩放后的特征向量 */
   f: number[];
   y: 0 | 1;
 }
 
 /**
- * 先验权重。缩放口径见 likelihoodFeatureVector：
- * rel/100、content/50、pressure/100、presence/25、comp、freq、log1p(pending)/3、min(1,idleRatio)。
- * 校准目标：@/大积压/空窗达成 高概率；普通短反应 低概率；量级上与旧 necessityThreshold≈80 相当
- * ——但它只是先验，重训后会按真实会话结果自动校准。
+ * MaiBot `reply_likelihood.py` 的原始权重。
+ * 保留一份原文，方便以后重新拟合时对照；真正参与计算的是下面缩放后的先验。
+ *
+ * 原始特征口径：recent_message_count 是原条数、seconds_since_bot 取 log1p、pending 封顶 20。
+ * 为了让在线重训的梯度量级稳定，特征向量把这三项分别除以 50 / 5 / 20，
+ * 权重同比放大，先验概率与 MaiBot 逐位等价。
+ */
+export const MAIBOT_RAW_WEIGHTS = {
+  bias: -1.2005,
+  mentionBot: 1.5852,
+  atOther: -1.1157,
+  hasQuestionMark: 0.4807,
+  placeholderOnly: -1.0281,
+  recentSelfRatio: 2.6525,
+  recentMessageCount: -0.0367,
+  logSecondsSinceBotMessage: 0.0571,
+  pendingCount: 0.1012,
+} as const;
+
+/** 特征缩放口径（与 MAIBOT_RAW_WEIGHTS 配套） */
+export const GATE_FEATURE_SCALES = {
+  recentMessageCount: 50,
+  logSecondsSinceBotMessage: 5,
+  pendingCount: 20,
+} as const;
+
+/**
+ * 先验权重（已按 GATE_FEATURE_SCALES 缩放）。
+ * 校准目标：提到 bot / 积压多 / 很久没说话 → 高概率；@ 别人 / 纯媒体 / 自己刚说过 → 低概率。
  */
 export const DEFAULT_GATE_WEIGHTS: GateWeights = {
-  bias: -1.55,
-  w: [2.35, 0.85, 1.7, -1.15, 1.25, 0.55, 0.3, 0.35],
+  bias: MAIBOT_RAW_WEIGHTS.bias,
+  w: [
+    MAIBOT_RAW_WEIGHTS.mentionBot,
+    MAIBOT_RAW_WEIGHTS.atOther,
+    MAIBOT_RAW_WEIGHTS.hasQuestionMark,
+    MAIBOT_RAW_WEIGHTS.placeholderOnly,
+    MAIBOT_RAW_WEIGHTS.recentSelfRatio,
+    MAIBOT_RAW_WEIGHTS.recentMessageCount * GATE_FEATURE_SCALES.recentMessageCount,
+    MAIBOT_RAW_WEIGHTS.logSecondsSinceBotMessage * GATE_FEATURE_SCALES.logSecondsSinceBotMessage,
+    MAIBOT_RAW_WEIGHTS.pendingCount * GATE_FEATURE_SCALES.pendingCount,
+  ],
 };
 
 export function likelihoodFeatureVector(f: GateFeatures): number[] {
   return [
-    clamp01(f.relevance / 100),
-    clamp01(f.content / 50),
-    clamp01(f.pressure / 100),
-    clamp01(f.presence / 25),
-    f.comp ? 1 : 0,
-    clamp01(f.freq),
-    Math.log1p(Math.max(0, f.pending)) / 3,
-    clamp01(Math.max(0, f.idleRatio)),
+    f.mentionBot ? 1 : 0,
+    f.atOther ? 1 : 0,
+    f.hasQuestionMark ? 1 : 0,
+    f.placeholderOnly ? 1 : 0,
+    clamp01(f.recentSelfRatio),
+    Math.max(0, f.recentMessageCount) / GATE_FEATURE_SCALES.recentMessageCount,
+    Math.log1p(Math.max(0, f.secondsSinceBotMessage)) / GATE_FEATURE_SCALES.logSecondsSinceBotMessage,
+    Math.min(GATE_FEATURE_SCALES.pendingCount, Math.max(0, f.pendingCount)) / GATE_FEATURE_SCALES.pendingCount,
   ];
 }
 
@@ -119,7 +150,6 @@ export function fitWeights(
       bias -= lr * (err + l2 * bias);
     }
   }
-  // 夹回先验邻域
   for (let k = 0; k < dim; k++) w[k] = clampTo((prior.w[k] ?? 0), w[k] ?? 0, 2.5);
   bias = clampTo(prior.bias, bias, 3);
   return { bias, w };
@@ -135,37 +165,209 @@ function clamp01(n: number): number {
   return Math.min(1, Math.max(0, n));
 }
 
-// ------------------------------------------------------------ 动态阈值
+// ------------------------------------------------------------ 动态预算门控
 
-/** 阈值的硬边界：不破底（防 #2109 锁死）、不上顶（防话痨放大） */
-export const GATE_THRESHOLD_MIN = 0.15;
-export const GATE_THRESHOLD_MAX = 0.85;
+/** 统计窗口：1 小时（MaiBot REPLY_WINDOW_SECONDS） */
+export const DYNAMIC_GATE_REPLY_WINDOW_SECONDS = 3600;
+/** 虚拟轮次：40 秒内到达的消息只计一次"预计回复"（MaiBot VIRTUAL_ROUND_SECONDS） */
+export const DYNAMIC_GATE_VIRTUAL_ROUND_SECONDS = 40;
+/** 一次 @/提及强制触发预计占用的回复数（MaiBot 拟合均值） */
+export const DYNAMIC_GATE_FORCED_TURN_EXPECTED_REPLIES = 0.91;
+/** 窗口内评分少于该值时改用离线静态阈值表 */
+export const DYNAMIC_GATE_MIN_WINDOW_SCORE_COUNT = 20;
+/** 已计入预计回复的消息 id 上限（防内存无界） */
+const DYNAMIC_GATE_MAX_COUNTED_MESSAGE_IDS = 2000;
 
-export interface GateWindow {
-  /** 窗口内评估次数 */
-  evaluations: number;
-  /** 窗口内开口次数 */
-  spoke: number;
+/** 离线统计表：保留比例 → 概率阈值（MaiBot 原表） */
+export const DYNAMIC_GATE_STATIC_KEEP_RATIO_THRESHOLDS: ReadonlyArray<readonly [number, number]> = [
+  [0.0, 1.0],
+  [0.1, 0.605],
+  [0.2, 0.482],
+  [0.3, 0.430],
+  [0.4, 0.376],
+  [0.5, 0.336],
+  [0.6, 0.313],
+  [0.7, 0.290],
+  [0.8, 0.250],
+  [0.9, 0.206],
+  [1.0, 0.0],
+];
+
+export interface DynamicGateDecision {
+  shouldTrigger: boolean;
+  probability: number;
+  threshold: number;
+  expectedReplies: number;
+  targetReplies: number;
+  actualReplies: number;
+  keepRatio: number;
+  detail: string;
 }
 
 /**
- * 每会话阈值控制器的纯函数：说过头往上收、一直不吭声往下放。
- * 窗口径 20 分钟、步长小（±0.06~0.08），一晚也不会跑飞。
+ * 每会话一份的动态预算门控：让窗口内实际回复次数贴近
+ * `talk_value × 预计回复次数`。
+ *
+ * 预计回复按 40 秒虚拟轮次累计；@/提及强制触发按 0.91 计。
+ * 反馈只收紧、不放宽：一波消息刚到时预计数先涨、实际回复还没跟上，
+ * 若据此放宽，等这波过去就没机会收回来，回复会系统性偏多（MaiBot 原注释）。
  */
-export function nextGateThreshold(cur: number, win: GateWindow): { next: number; changed: boolean; why: string } {
-  const c = clampThreshold(cur);
-  // 20 分钟里开了 4 次以上：这口气说得有点多，阈值上抬
-  if (win.spoke >= 4 && win.evaluations >= 4) {
-    return { next: clampThreshold(c + 0.08), changed: c < GATE_THRESHOLD_MAX, why: `20min 开口 ${win.spoke} 次，阈值上抬` };
+export class DynamicReplyGate {
+  private proactiveScores: { at: number; p: number }[] = [];
+  private forcedExpectations: { at: number; value: number }[] = [];
+  private replyTimes: number[] = [];
+  private countedMessageIds = new Set<string>();
+  private countedMessageOrder: string[] = [];
+  private openRoundStartedAt: number | null = null;
+  private lastDecision: DynamicGateDecision | null = null;
+
+  constructor(private windowSeconds = DYNAMIC_GATE_REPLY_WINDOW_SECONDS) {}
+
+  /** 返回尚未计入预计回复的消息 id，并把它们标记为已计入（同一批消息不重复累计） */
+  takeUncountedMessageIds(ids: string[]): string[] {
+    const out: string[] = [];
+    for (const raw of ids) {
+      const id = String(raw ?? '');
+      if (!id || this.countedMessageIds.has(id)) continue;
+      out.push(id);
+      this.countedMessageIds.add(id);
+      this.countedMessageOrder.push(id);
+    }
+    while (this.countedMessageOrder.length > DYNAMIC_GATE_MAX_COUNTED_MESSAGE_IDS) {
+      const drop = this.countedMessageOrder.shift();
+      if (drop) this.countedMessageIds.delete(drop);
+    }
+    return out;
   }
-  // 评估了 5 次都沉默：放低门槛，别把自己憋成哑巴（Issue #2109 的反面预防）
-  if (win.evaluations >= 5 && win.spoke === 0) {
-    return { next: clampThreshold(c - 0.06), changed: c > GATE_THRESHOLD_MIN, why: `20min 沉默 ${win.evaluations} 次，阈值下调` };
+
+  isRoundOpen(now: number): boolean {
+    return this.openRoundStartedAt !== null
+      && now - this.openRoundStartedAt < DYNAMIC_GATE_VIRTUAL_ROUND_SECONDS * 1000;
   }
-  return { next: c, changed: false, why: '' };
+
+  /** 记录当前虚拟轮次的预计回复量；同一轮次内覆盖上一次的值 */
+  recordProactiveDemand(probability: number, now: number): void {
+    if (this.isRoundOpen(now) && this.proactiveScores.length) {
+      this.proactiveScores[this.proactiveScores.length - 1].p = probability;
+      return;
+    }
+    this.openRoundStartedAt = now;
+    this.proactiveScores.push({ at: now, p: probability });
+  }
+
+  /** 真正放行一轮：结束当前虚拟轮次 */
+  closeRound(): void {
+    this.openRoundStartedAt = null;
+  }
+
+  /** @/提及强制触发：按实测均值占用回复额度，并结束当前虚拟轮次 */
+  recordForcedTurn(now: number): void {
+    this.closeRound();
+    this.forcedExpectations.push({ at: now, value: DYNAMIC_GATE_FORCED_TURN_EXPECTED_REPLIES });
+  }
+
+  /** 模型最终真的说话了：记一次实际回复 */
+  recordReply(now: number): void {
+    this.replyTimes.push(now);
+  }
+
+  evaluate(probability: number, frequency: number, now: number): DynamicGateDecision {
+    this.prune(now);
+    const proactiveScores = this.proactiveScores.map((x) => x.p);
+    const expectedProactive = proactiveScores.reduce((a, b) => a + b, 0);
+    const expectedForced = this.forcedExpectations.reduce((a, b) => a + b.value, 0);
+    const expectedTotal = expectedProactive + expectedForced;
+    const actualReplies = this.replyTimes.length;
+    const normalizedFrequency = Math.min(1, Math.max(0, Number(frequency) || 0));
+    const targetReplies = normalizedFrequency * expectedTotal;
+
+    let keepRatio: number;
+    if (normalizedFrequency >= 1) {
+      keepRatio = 1;
+    } else if (expectedProactive <= 0) {
+      keepRatio = normalizedFrequency;
+    } else {
+      const feedforwardRatio = (targetReplies - expectedForced) / expectedProactive;
+      const feedbackFactor = Math.min(
+        1,
+        Math.max(0, 1 + (targetReplies - actualReplies) / Math.max(1, targetReplies)),
+      );
+      keepRatio = Math.min(1, Math.max(0, feedforwardRatio * feedbackFactor));
+    }
+
+    const threshold = this.resolveThreshold(proactiveScores, expectedProactive, keepRatio);
+    const decision: DynamicGateDecision = {
+      shouldTrigger: probability >= threshold,
+      probability,
+      threshold,
+      expectedReplies: expectedTotal,
+      targetReplies,
+      actualReplies,
+      keepRatio,
+      detail: `概率=${probability.toFixed(3)} 阈值=${threshold.toFixed(3)} `
+        + `预计回复=${expectedTotal.toFixed(1)} 目标=${targetReplies.toFixed(1)} `
+        + `已回复=${actualReplies} 保留比例=${keepRatio.toFixed(2)}`,
+    };
+    this.lastDecision = decision;
+    return decision;
+  }
+
+  /** 供状态页/测试读取；不改窗口 */
+  snapshot(now: number): {
+    scores: number;
+    expectedReplies: number;
+    targetReplies: number;
+    actualReplies: number;
+    threshold: number;
+    keepRatio: number;
+    roundOpen: boolean;
+  } {
+    this.prune(now);
+    const expectedProactive = this.proactiveScores.reduce((a, b) => a + b.p, 0);
+    const expectedForced = this.forcedExpectations.reduce((a, b) => a + b.value, 0);
+    return {
+      scores: this.proactiveScores.length,
+      expectedReplies: expectedProactive + expectedForced,
+      targetReplies: this.lastDecision?.targetReplies ?? 0,
+      actualReplies: this.replyTimes.length,
+      threshold: this.lastDecision?.threshold ?? 0,
+      keepRatio: this.lastDecision?.keepRatio ?? 0,
+      roundOpen: this.openRoundStartedAt !== null,
+    };
+  }
+
+  private prune(now: number): void {
+    const expireBefore = now - this.windowSeconds * 1000;
+    while (this.proactiveScores.length && this.proactiveScores[0].at < expireBefore) this.proactiveScores.shift();
+    while (this.forcedExpectations.length && this.forcedExpectations[0].at < expireBefore) this.forcedExpectations.shift();
+    while (this.replyTimes.length && this.replyTimes[0] < expireBefore) this.replyTimes.shift();
+  }
+
+  private resolveThreshold(scores: number[], expectedProactive: number, keepRatio: number): number {
+    if (keepRatio >= 1) return 0;
+    if (keepRatio <= 0) return 1;
+    if (scores.length < DYNAMIC_GATE_MIN_WINDOW_SCORE_COUNT) return staticThreshold(keepRatio);
+
+    const budget = keepRatio * expectedProactive;
+    let accumulated = 0;
+    for (const score of [...scores].sort((a, b) => b - a)) {
+      accumulated += score;
+      if (accumulated >= budget) return score;
+    }
+    return 0;
+  }
 }
 
-export function clampThreshold(v: number): number {
-  if (!Number.isFinite(v)) return 0.5;
-  return Math.min(GATE_THRESHOLD_MAX, Math.max(GATE_THRESHOLD_MIN, v));
+/** 保留比例 → 阈值：窗口样本不足时按 MaiBot 的离线表线性插值 */
+export function staticThreshold(keepRatio: number): number {
+  const ratio = Math.min(1, Math.max(0, keepRatio));
+  for (let i = 0; i < DYNAMIC_GATE_STATIC_KEEP_RATIO_THRESHOLDS.length - 1; i++) {
+    const [lowRatio, lowThreshold] = DYNAMIC_GATE_STATIC_KEEP_RATIO_THRESHOLDS[i];
+    const [highRatio, highThreshold] = DYNAMIC_GATE_STATIC_KEEP_RATIO_THRESHOLDS[i + 1];
+    if (ratio <= highRatio) {
+      const progress = highRatio === lowRatio ? 0 : (ratio - lowRatio) / (highRatio - lowRatio);
+      return lowThreshold + (highThreshold - lowThreshold) * progress;
+    }
+  }
+  return 0;
 }

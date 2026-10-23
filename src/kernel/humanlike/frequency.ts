@@ -101,11 +101,35 @@ export function backoffBypassed(cfg: BackoffConfig, pendingCount: number): boole
 }
 
 /**
- * 轰炸降频惩罚（2026-10-17 用户裁定）：最近 10 秒的入站条数超过 5 条后，
- * 每多一条给开口门槛 +0.05，封顶 +0.3。群里刷屏时她先看戏 —— 信息是过载的，
- * 晚一点接反而接得准（配合"被刷远自动引用"）。只叠加在默认的 likelihood 模式上。
+ * 空窗补偿 —— 移植自 MaiBot `turn_gates.py` 的 `_calculate_idle_compensation`。
+ *
+ * 把沉默时长按群的平均消息节奏折算成「等效消息数」，加在真实积压条数上：
+ *   idle_equivalent = min(沉默秒数 / 平均间隔, 阈值 - 1)      ← 封顶是双保险
+ *   equivalent      = 积压条数 + idle_equivalent
+ * 群越活跃（平均间隔越小）折算得越快，于是潜水久了也能自然插一嘴；
+ * 封顶 + `pending = 0` 直接拒绝，保证**至少要有一条真实新消息**才可能触发，
+ * 杜绝纯靠沉默累积反复自我唤醒（MaiBot 的注释原话）。
  */
-export function burstGatePenalty(recentInbound10s: number): number {
-  const n = Math.max(0, Math.round(recentInbound10s));
-  return Math.min(0.3, Math.max(0, (n - 5) * 0.05));
+export function idleCompensation(opts: {
+  pendingCount: number;
+  triggerThreshold: number;
+  idleSeconds: number;
+  averageIntervalSeconds: number | null;
+}): { reached: boolean; delaySeconds: number; detail: string } {
+  const threshold = Math.max(1, opts.triggerThreshold);
+  if (opts.pendingCount < 1) {
+    return { reached: false, delaySeconds: 0, detail: 'pending=0，不允许纯沉默触发' };
+  }
+  const avg = opts.averageIntervalSeconds;
+  if (avg === null || !Number.isFinite(avg) || avg <= 0) {
+    return { reached: false, delaySeconds: 0, detail: '平均消息间隔不可用，无法进行空窗补偿' };
+  }
+  const idleEquivalent = Math.min(opts.idleSeconds / avg, Math.max(0, threshold - 1));
+  const equivalent = opts.pendingCount + idleEquivalent;
+  const detail = `平均间隔=${avg.toFixed(2)}s 空窗=${opts.idleSeconds.toFixed(2)}s `
+    + `空窗折算=${idleEquivalent.toFixed(2)} 等效消息数=${equivalent.toFixed(2)}/${threshold}`;
+  if (equivalent >= threshold) return { reached: true, delaySeconds: 0, detail: `${detail} 判定=空窗补偿` };
+
+  const delay = Math.max(0, (threshold - opts.pendingCount) * avg - opts.idleSeconds);
+  return { reached: false, delaySeconds: delay, detail: `${detail} 延迟=${delay.toFixed(2)}s` };
 }

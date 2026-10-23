@@ -137,13 +137,12 @@ export const DEFAULT_CONFIG = {
       typingJitterRatio: 0.3,             // 打字延迟随机浮动比例（0 = 固定）；整体下限固定 250ms
       maxMessageCharacters: 2000,         // 单条可见消息最大字符数（平台硬上限的安全垫）
     },
-    // ② 什么时候开口（MaiBot ChatReplyTimingConfig + reply_necessity）
+    // ② 什么时候开口（对齐 MaiBot ChatReplyTimingConfig：frequency / dynamic）
     timing: {
-      // 开口概率（拟合回归 + 动态门控）是默认触发方式；旧 necessity 留作对照
-      replyTriggerMode: 'likelihood' as 'likelihood' | 'necessity' | 'frequency',
-      pendingThreshold: 12,               // 攒够几条就思考（frequency 的门槛 / necessity 的压力单位）
-      necessityThreshold: 80,             // necessity 模式的分数门槛（MaiBot 常量）
-      talkValue: 1,                       // 群聊频率 0–1，越小越安静
+      // MaiBot 源码默认是 frequency；dynamic（这里叫 likelihood）要显式切
+      replyTriggerMode: 'frequency' as 'likelihood' | 'frequency',
+      pendingThreshold: 12,               // frequency 门槛；likelihood 下是最小批次（parallel 没有 Planner wait）
+      talkValue: 1,                       // 群聊频率 0–1：frequency 下 0=静默；likelihood 下是 1 小时目标回复率
       privateTalkValue: 1,
       enableRules: false,                 // 按群/时段单独调频率
       rules: [
@@ -367,7 +366,7 @@ export class ConfigStore {
     // 迁移：上下文时间窗（contextMinutes）已删，改为只按 storage.historyLimit 条数截断
     delete (this.config.storage as any).contextMinutes;
     // 迁移：风控里的「随机抖动」与「唤醒方式/唤醒词」已并入拟人化（回复前的等待归打字节奏，
-    // 要不要理人归必要性打分），配置里残留的旧键在这里清掉，别让它们一直躺在文件里当死配置。
+    // 要不要理人归拟人层门控），配置里残留的旧键在这里清掉，别让它们一直躺在文件里当死配置。
     for (const k of ['jitterMinMs', 'jitterMaxMs', 'groupWake', 'wakeWords'] as const) {
       delete (this.config.risk as any)[k];
     }
@@ -385,9 +384,9 @@ export class ConfigStore {
     delete (this.config.llm as any).maxToolRounds;
     const hlTiming = (this.config.humanlike as any).timing;
     if (hlTiming && typeof hlTiming === 'object') {
-      // 开口侧 2026-10-16 换「日志拟合 + 动态门控」（MaiBot 主线路线）：老配置里
-      // 没被刻意改成 frequency 的 necessity 一并切到 likelihood，用户选项不丢
+      // 必要性模式已删（2026-10-23）：老配置里的 necessity 一律切到 likelihood
       if (hlTiming.replyTriggerMode === 'necessity') hlTiming.replyTriggerMode = 'likelihood';
+      delete hlTiming.necessityThreshold;
       delete hlTiming.replyStyle;
     }
     // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费

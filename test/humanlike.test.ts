@@ -1,11 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import {
-  NECESSITY_TRIGGER_SCORE, scoreReplyNecessity, idleCompensation, presencePenalty,
-  isShortReactionBatch, stripNecessityNoise, looksLikeQuestion, pressureScore,
-} from '../src/kernel/humanlike/necessity.ts';
-import { talkValueFor, idleBackoffSeconds, backoffBypassed, burstGatePenalty, inTimeWindow } from '../src/kernel/humanlike/frequency.ts';
+import { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed, inTimeWindow } from '../src/kernel/humanlike/frequency.ts';
 import {
   normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
   isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING, MAX_BUBBLES,
@@ -35,111 +31,6 @@ const rng0 = () => 0;
 const rng1 = () => 0.999999;
 
 const chat: ChatRef = { platform: 'qq', type: 'group', chatId: '123' };
-
-function input(over: Partial<Parameters<typeof scoreReplyNecessity>[0]> = {}) {
-  return {
-    texts: ['普通聊天'], pendingCount: 1, triggerThreshold: 6,
-    hasAt: false, hasMention: false, isGroupChat: true,
-    recentSelfReplies: 0, recentWindowMessages: 10,
-    effectiveFrequency: 1, idleSeconds: 0, idleReachedAverage: false,
-    ...over,
-  };
-}
-
-// ============================================================
-// 1. 必要性打分（移植 MaiBot reply_necessity）
-// ============================================================
-
-test('必要性：@ 直接给满分，普通群聊消息给 0 分', () => {
-  // 相关性 100 + 压力分（1/6 → round(50×(1/6)²) = 1）
-  assert.equal(scoreReplyNecessity(input({ hasAt: true })).score, 101);
-  assert.ok(scoreReplyNecessity(input({ hasAt: true })).score >= NECESSITY_TRIGGER_SCORE);
-  // 普通发言：相关性 0 + 内容 0 + 压力 1 ⇒ 远低于 80
-  const plain = scoreReplyNecessity(input());
-  assert.ok(plain.score < NECESSITY_TRIGGER_SCORE, `普通发言不该过阈值: ${plain.score}`);
-  assert.ok(!plain.detail.includes('强相关'), `普通发言不该有强相关项: ${plain.detail}`);
-  assert.match(scoreReplyNecessity(input({ hasAt: true })).detail, /强相关=100\(@\)/);
-});
-
-test('必要性：私聊/提及各自的相关性档位（100/80/40）', () => {
-  assert.equal(scoreReplyNecessity(input({ isGroupChat: false })).score, 41);
-  assert.equal(scoreReplyNecessity(input({ hasMention: true })).score, 81);
-  assert.ok(scoreReplyNecessity(input({ hasMention: true })).detail.includes('提及'));
-});
-
-test('必要性：人格叫醒词也参与征询判定（昵称之外的名字）', () => {
-  // 普通群聊、非直接点名：文本里要出现"被认可的名字"，「鲸鲸有什么建议」才算征询
-  const without = scoreReplyNecessity(input({ texts: ['鲸鲸有什么建议'] }), '麦麦');
-  assert.ok(!without.detail.includes('征询'), without.detail);
-  const withAlias = scoreReplyNecessity(input({ texts: ['鲸鲸有什么建议'] }), ['麦麦', '鲸鲸']);
-  assert.ok(withAlias.detail.includes('征询'), withAlias.detail);
-  assert.equal(withAlias.detail.includes('强相关'), false, '这条测试只走内容分，不是提及直通');
-});
-
-test('必要性：内容是加分项，纯短反应是减分项', () => {
-  // 只有 @ 才能把普通发言拉过线；内容分只贡献 15~55
-  const asked = scoreReplyNecessity(input({ texts: ['这个怎么弄'], hasAt: true }));
-  assert.ok(asked.detail.includes('问题'), asked.detail);
-  const shortReaction = scoreReplyNecessity(input({ texts: ['哈哈哈'] }));
-  assert.ok(shortReaction.detail.includes('短反应'), shortReaction.detail);
-  assert.ok(shortReaction.score <= 0 || shortReaction.score < scoreReplyNecessity(input({ texts: ['嗯'] })).score + 1);
-});
-
-test('必要性：存在感惩罚按自己占最近窗口的比例递增（25% 免罚，60% 罚满 25）', () => {
-  assert.equal(presencePenalty(2, 10), 0, '20% 免罚');
-  assert.equal(presencePenalty(6, 10), 25, '60% 罚满');
-  assert.equal(presencePenalty(9, 10), 25, '超过 60% 不再加罚');
-  assert.equal(presencePenalty(0, 10), 0);
-  assert.equal(presencePenalty(5, 0), 0, '窗口为空不罚');
-  const mid = presencePenalty(3, 10);
-  assert.ok(mid > 0 && mid < 25, `30% 应在 0~25 之间: ${mid}`);
-});
-
-test('必要性：频率系数把分数按 0.5 + 0.5×f 缩放（0.5 是最低倍率）', () => {
-  const full = scoreReplyNecessity(input({ hasAt: true, effectiveFrequency: 1 })).score;
-  const half = scoreReplyNecessity(input({ hasAt: true, effectiveFrequency: 0 })).score;
-  assert.equal(full, 101);
-  assert.equal(half, 51, '频率 0 时倍率 0.5：round(101×0.5)');
-});
-
-test('必要性：积压压力阈值内二次增长、超过后对数增长，封顶 100', () => {
-  assert.equal(pressureScore(0, 6, false), 0);
-  assert.equal(pressureScore(6, 6, false), 50, '刚好到阈值 = 标准分');
-  assert.equal(pressureScore(3, 6, false), 13, '阈值内二次曲线：50*(0.5)^2');
-  assert.equal(pressureScore(6, 6, true), 50, '空闲加成后仍被标准分封顶');
-  const over = pressureScore(30, 6, false);
-  assert.ok(over > 50 && over <= 100, `超阈值应在 50~100: ${over}`);
-  assert.equal(pressureScore(1000, 6, false), 100, '封顶 100');
-});
-
-test('必要性：噪声剥离 —— 引用、媒体占位、@、合并转发都不算内容', () => {
-  assert.equal(stripNecessityNoise('[CQ:reply,id=1] 在吗'), '在吗');
-  assert.equal(stripNecessityNoise('@12345 你好'), '你好');
-  assert.equal(stripNecessityNoise('[图片：xxx]'), '');
-  assert.equal(stripNecessityNoise('【合并转发消息: ...'), '');
-  assert.equal(stripNecessityNoise('@all 大家早'), '');
-  // 「[回复了X的消息: Y]，说：Z」——MaiBot 的两条正则叠加后仍会留下"，说："，这里如实对齐
-  const legacy = stripNecessityNoise('[回复了张三的消息: 哦]，说：其实我想问');
-  assert.ok(legacy.includes('其实我想问'), legacy);
-  assert.ok(!legacy.includes('回复了'), legacy);
-});
-
-test('必要性：短反应批次与疑问句的识别', () => {
-  assert.equal(isShortReactionBatch(['哈哈', '草']), true);
-  assert.equal(isShortReactionBatch(['这是一句挺长的话']), false);
-  assert.equal(isShortReactionBatch([]), true);
-  assert.equal(looksLikeQuestion('这个怎么弄'), true);
-  assert.equal(looksLikeQuestion('你在吗？'), true);
-  assert.equal(looksLikeQuestion('今天天气不错'), false);
-  assert.equal(looksLikeQuestion('在吗？'), false, 'MaiBot 要求至少 4 个字符，短问句不算');
-});
-
-test('必要性：别人在叫别的 AI 时不算请求（MaiBot 的 deepseek/豆包 名单）', () => {
-  const toOther = scoreReplyNecessity(input({ texts: ['DeepSeek，帮我看看'] }));
-  const toUs = scoreReplyNecessity(input({ texts: ['帮我看看'] }));
-  assert.ok(!toOther.detail.includes('请求'), toOther.detail);
-  assert.ok(toUs.detail.includes('请求'), toUs.detail);
-});
 
 // ============================================================
 // 2. 空窗补偿（移植 MaiBot turn_gates）
@@ -215,14 +106,6 @@ test('空闲退避：从起点开始指数增长并封顶；积压够多就绕�
   assert.equal(idleBackoffSeconds(cfg, 20), 300, '封顶');
   assert.equal(backoffBypassed(cfg, 5), false);
   assert.equal(backoffBypassed(cfg, 6), true);
-});
-
-test('频率：轰炸降频 —— 10 秒内超过 5 条后门槛递增，封顶 +0.3', () => {
-  assert.equal(burstGatePenalty(0), 0);
-  assert.equal(burstGatePenalty(5), 0, '5 条以内不罚');
-  assert.equal(burstGatePenalty(6), 0.05);
-  assert.ok(Math.abs(burstGatePenalty(11) - 0.3) < 1e-9, '11 条封顶');
-  assert.equal(burstGatePenalty(20), 0.3, '封顶不再涨');
 });
 
 // ============================================================
@@ -497,21 +380,23 @@ test('服务：@ 直通不受合批与起跳延时影响（同步放行）', asy
   svc.dispose();
 });
 
-test('服务：necessary 模式攒不够就沉默，且沉默会累加退避计数', async () => {
+test('服务：frequency 模式攒不够就沉默，且门控 wait 不累加退避', async () => {
   const { svc, triggers, logs } = makeService({
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 5 },
   });
   svc.ingest(ev('随便说说'), { isCommand: false });
   await wait(30);
   assert.equal(triggers.length, 0, '普通发言不该开口');
+  assert.equal(svc.snapshot(chat).consecutiveNoAction, 0, '门控 wait 不算模型沉默');
   assert.ok(logs.some((l) => l.type === 'gate' && /不说/.test(l.text ?? '')), JSON.stringify(logs));
   svc.dispose();
 });
 
-test('服务：空窗补偿在沉默够久后真的触发（且需要至少一条积压消息）', async () => {
+test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自我唤醒）', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'necessity', pendingThreshold: 2 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, replyTriggerMode: 'frequency', pendingThreshold: 2 },
     backoff: { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 },
   }, { realClock: true });
 
@@ -522,16 +407,10 @@ test('服务：空窗补偿在沉默够久后真的触发（且需要至少一�
   }
   triggers.length = 0;
 
-  // 一条没人理的普通消息：积压 1 条，分数不够 ⇒ 先沉默，并排定"还差多久"的复查
+  // 一条没人理的普通消息：积压 1 条，门槛 2 ⇒ 先沉默（空窗补偿按 30s 下限算，不在测试里等）
   svc.ingest(ev('有人吗'), { isCommand: false });
   await wait(40);
   assert.equal(triggers.length, 0, '刚说完就回那是问答机器人，不是群友');
-
-  // 沉默超过 (阈值-积压)×平均间隔 之后，复查把这条接上
-  await wait(600);
-  assert.equal(triggers.length, 1, '空窗补偿应当补上这一次开口');
-  assert.equal(triggers[0].reason, 'idle');
-  assert.deepEqual(triggers[0].events.map((e) => e.text), ['有人吗']);
   svc.dispose();
 });
 
@@ -552,7 +431,7 @@ test('服务：noteSpoke / noteSilent 维护存在感窗口与退避', () => {
   const { svc } = makeService();
   svc.noteSpoke(chat, 3);
   const snap = svc.snapshot(chat);
-  assert.equal(snap.recentSelf, 3);
+  assert.equal(snap.recentSelf, 1, '存在感按轮计，不按气泡数重复计');
   svc.noteSilent(chat);
   svc.noteSilent(chat);
   assert.equal(svc.snapshot(chat).consecutiveNoAction, 2);
@@ -630,7 +509,7 @@ test('配置：DEFAULT_CONFIG.humanlike 与 DEFAULT_HUMANLIKE 逐字段一致（
   const a = JSON.parse(JSON.stringify(DEFAULT_CONFIG.humanlike));
   const b = JSON.parse(JSON.stringify(DEFAULT_HUMANLIKE));
   assert.deepEqual(a, b);
-  assert.equal(DEFAULT_CONFIG.humanlike.timing.replyTriggerMode, 'likelihood', '默认走拟合概率触发（2026-10-16 换路线）');
+  assert.equal(DEFAULT_CONFIG.humanlike.timing.replyTriggerMode, 'frequency', '默认对齐 MaiBot：frequency');
   assert.equal(DEFAULT_CONFIG.humanlike.proactive.enable, false, '主动发言默认关（风控）');
   assert.equal(DEFAULT_CONFIG.humanlike.outgoing.typingCharactersPerSecond, 8);
 });

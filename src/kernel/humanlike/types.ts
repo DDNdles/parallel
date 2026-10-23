@@ -25,15 +25,16 @@ export type { RepeatConfig } from './repeat.ts';
 
 export interface TimingConfig {
   /**
-   * likelihood = 开口概率（日志拟合回归 + 每会话动态门控，MaiBot 2026-10 主线路线，默认）；
-   * necessity = 综合内容/积压/存在感打分的旧启发式（MaiBot 已退役，留作对照）；
-   * frequency = 只看攒了多少条。
+   * likelihood = 开口概率 + 1 小时动态预算门控（对齐 MaiBot `dynamic` 模式）；
+   * frequency = 只看攒了多少条（对齐 MaiBot `frequency` 模式）。
    */
-  replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
-  /** 攒够几条就进 agent loop（frequency 模式的门槛；necessity 模式下是压力分的单位） */
+  replyTriggerMode: 'likelihood' | 'frequency';
+  /**
+   * frequency 模式的触发门槛；likelihood 模式下作为**最小批次**：
+   * 不够这么多条就不进入概率判定（parallel 没有 Planner 的 wait 步骤，
+   * 没有这道闸门时 talk_value=1 会变成每条消息都开一轮 chat）。
+   */
   pendingThreshold: number;
-  /** necessity 模式的分数门槛（likelihood 模式下不参与判定） */
-  necessityThreshold: number;
   talkValue: number;
   privateTalkValue: number;
   enableRules: boolean;
@@ -133,9 +134,8 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
   poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   timing: {
-    replyTriggerMode: 'likelihood',
+    replyTriggerMode: 'frequency',
     pendingThreshold: 12,
-    necessityThreshold: 80,
     talkValue: 1,
     privateTalkValue: 1,
     enableRules: false,
@@ -169,7 +169,7 @@ export interface TriggerBatch {
    * 触发原因。`private` = 私聊合批到点：只说明"攒够了"，**不代表做过开口判定**
    * （私聊必回、不参与打分，见 service.ingest 的私聊分支）。
    */
-  reason: 'at' | 'mention' | 'likelihood' | 'necessity' | 'frequency' | 'idle' | 'proactive' | 'private';
+  reason: 'at' | 'mention' | 'likelihood' | 'frequency' | 'idle' | 'proactive' | 'private';
   detail: string;
   /**
    * likelihood 门控的样本回执号：开口时创建，pipeline 在这一轮结束后用它回报

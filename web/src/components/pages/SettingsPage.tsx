@@ -20,8 +20,8 @@ interface Humanlike {
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
   timing: {
-    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
-    pendingThreshold: number; necessityThreshold: number;
+    replyTriggerMode: 'likelihood' | 'frequency';
+    pendingThreshold: number;
     talkValue: number; privateTalkValue: number;
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
     mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
@@ -93,9 +93,8 @@ interface EndStatus {
 interface PlugCfg { values: Record<string, unknown>; globalDefault: boolean }
 
 const TRIGGERS: PillOpt[] = [
-  { v: 'likelihood', t: '拟合概率' },
-  { v: 'necessity', t: '必要性' },
   { v: 'frequency', t: '频率' },
+  { v: 'likelihood', t: '拟合概率' },
 ];
 const RHYTHM_MODES: PillOpt[] = [
   { v: 'gentle', t: '温和（仅完全同构才判定）' },
@@ -438,31 +437,25 @@ export default function SettingsPage() {
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-field">
                 <PillSelect align="left" value={h.timing.replyTriggerMode} options={TRIGGERS} label="触发方式"
-                  onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'necessity' | 'frequency' } }, true)} />
+                  onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'frequency' } }, true)} />
               </div>
               <div className="set-grid">
-                {triggerMode === 'frequency' && (
-                  <Num label="触发所需积压条数" hint="频率模式的开口门槛：攒够这么多条才进模型" value={h.timing.pendingThreshold}
-                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
-                )}
-                {triggerMode === 'necessity' && (<>
-                  <Num label="必要性分数阈值（0-200）" hint="内容/请求/积压/存在感综合分达到它才开口" value={h.timing.necessityThreshold}
-                    onChange={(v) => patchH({ timing: { ...h.timing, necessityThreshold: v } })} />
-                  <Num label="积压压力基准条数" hint="积压压力与空窗补偿按这个条数折算" value={h.timing.pendingThreshold}
-                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
-                </>)}
-                {triggerMode === 'likelihood' && (
-                  <Num label="积压压力基准条数" hint="概率门控的积压压力与空窗补偿按这个条数折算" value={h.timing.pendingThreshold}
-                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
-                )}
-                <Num label="群聊频率（0-1）" value={h.timing.talkValue}
+                <Num
+                  label={triggerMode === 'frequency' ? '触发所需积压条数' : '最小批次条数'}
+                  hint={triggerMode === 'frequency'
+                    ? '频率模式的开口门槛：攒够这么多条才进模型'
+                    : '攒够这么多条才进入概率判定；不够就不打扰'}
+                  value={h.timing.pendingThreshold}
+                  onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
+                <Num label="群聊频率（0-1）"
+                  hint={triggerMode === 'frequency'
+                    ? '0 = 静默；频率模式的实际门槛由上面的积压条数决定'
+                    : '1 小时目标回复率：1 = 不设限，越小越安静，0 = 静默'}
+                  value={h.timing.talkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, talkValue: v } })} />
                 <Num label="私聊频率（0-1）" value={h.timing.privateTalkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, privateTalkValue: v } })} />
               </div>
-              {triggerMode === 'likelihood' && (
-                <div className="mset-group-e">拟合概率使用每会话自适应门控（0.15–0.85），没有手动分数线；@/提及仍直通。</div>
-              )}
               <div className="mset-models" style={{ marginTop: 14 }}>
                 <div className="mset-mrow">
                   <span className="plg-v">被 @ 时必定回复</span>

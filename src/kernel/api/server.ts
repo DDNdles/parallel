@@ -1284,8 +1284,8 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   if (timing && typeof timing === 'object') {
     const t = target.timing;
     if ('replyTriggerMode' in timing) {
-      if (timing.replyTriggerMode !== 'likelihood' && timing.replyTriggerMode !== 'necessity' && timing.replyTriggerMode !== 'frequency') {
-        return '回复触发模式只能是 likelihood 或 necessity 或 frequency';
+      if (timing.replyTriggerMode !== 'likelihood' && timing.replyTriggerMode !== 'frequency') {
+        return '回复触发模式只能是 likelihood 或 frequency';
       }
       t.replyTriggerMode = timing.replyTriggerMode;
     }
@@ -1294,7 +1294,6 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     applyBool(t, timing, 'focusMode');
     applyBool(t, timing, 'enableRules');
     let e = applyNum(t, timing, 'pendingThreshold', 1, 100, '条数阈值'); if (e) return e;
-    e = applyNum(t, timing, 'necessityThreshold', 0, 200, '必要性阈值'); if (e) return e;
     e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
     e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;
     if (Array.isArray(timing.rules)) {

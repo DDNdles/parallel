@@ -935,7 +935,7 @@ test('拟人化：模型还在生成时插话，按概率直接打断并丢弃�
   mock.actions.length = 0;
   const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    replyTriggerMode: 'likelihood' | 'frequency';
     pendingThreshold: number;
     mentionedBotReply: boolean;
   };
@@ -972,7 +972,7 @@ test('拟人化：@ 触发的一轮无视插话打断，回复照常发出', asy
   mock.actions.length = 0;
   const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    replyTriggerMode: 'likelihood' | 'frequency';
     pendingThreshold: number;
   };
   const saved = { p: ic.probability, mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
@@ -1008,7 +1008,7 @@ test('后台表达学习：群里攒够消息后学一条，下一轮 system 里
   const ec = kernel.config.config.humanlike.expression as unknown as Record<string, unknown>;
   const saved = { ...ec };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'necessity' | 'frequency';
+    replyTriggerMode: 'likelihood' | 'frequency';
     pendingThreshold: number;
   };
   const savedT = { mode: timing.replyTriggerMode, pending: timing.pendingThreshold };
