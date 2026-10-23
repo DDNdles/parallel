@@ -55,24 +55,29 @@ export function faceTokensToNames(text: string): string {
   });
 }
 
-/** 一段可见正文 → 发送段：认得出的表情令牌变成 face 段，其余保持 text（不丢字） */
+/** 切坏的表情残片：没闭合的尾部令牌、以及只剩 `183]` 的碎泡。这些不发字面量。 */
+function cleanBrokenFace(text: string): string {
+  return String(text ?? '')
+    .replace(/\[表情[:：/／]?[^\[\]\n]*$/, '')
+    .replace(/^\s*\d{1,4}\]\s*$/, '')
+    .trim();
+}
+
+/** 一段可见正文 → 发送段：认得出的表情令牌变成 face 段；认不出/切坏的令牌整段丢掉，不发字面量 */
 export function faceTokensToSegments(text: string): MsgSegment[] {
   const src = String(text ?? '');
   const out: MsgSegment[] = [];
   let last = 0;
-  let found = false;
   TOKEN.lastIndex = 0;
   for (let m = TOKEN.exec(src); m; m = TOKEN.exec(src)) {
-    const id = qqFaceId(m[1]);
-    if (!id) continue;
-    found = true;
-    const before = src.slice(last, m.index);
+    const before = cleanBrokenFace(src.slice(last, m.index));
     if (before) out.push({ type: 'text', data: { text: before } });
-    out.push({ type: 'face', data: { id } });
+    const id = qqFaceId(m[1]);
+    // 认不出的令牌不再保留字面量：`[表情/没有这个]` 发出去只会露出标记
+    if (id) out.push({ type: 'face', data: { id } });
     last = m.index + m[0].length;
   }
-  if (!found) return [{ type: 'text', data: { text: src } }];
-  const tail = src.slice(last);
+  const tail = cleanBrokenFace(src.slice(last));
   if (tail) out.push({ type: 'text', data: { text: tail } });
   return out;
 }

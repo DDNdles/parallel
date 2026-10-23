@@ -130,6 +130,24 @@ export function trimAtSentence(text: string, maxChars: number): string {
 }
 
 /**
+ * 表情令牌 `[表情:183]` / `[表情/微笑]` 在气泡里是原子：切分不能在令牌内部落刀。
+ * 面具按 code point 对齐（splitLongBubble 里用的是 [...rest]）。
+ */
+function faceTokenMask(chars: string[]): boolean[] {
+  const mask = new Array(chars.length).fill(false);
+  for (let i = 0; i + 3 < chars.length; i++) {
+    if (chars[i] !== '[' || chars[i + 1] !== '表' || chars[i + 2] !== '情') continue;
+    if (!'：:/／'.includes(chars[i + 3])) continue;
+    let j = i + 4;
+    while (j < chars.length && chars[j] !== ']' && chars[j] !== '[' && chars[j] !== '\n') j++;
+    if (chars[j] !== ']') continue; // 没闭合的令牌不保护，交给出站清洗丢掉残片
+    for (let k = i; k <= j; k++) mask[k] = true;
+    i = j;
+  }
+  return mask;
+}
+
+/**
  * 单条句子超过目标字数时，优先在逗号/顿号/冒号处补切；没有可切点再按 40 字硬切。
  * 切点离句首太近（<8 字）或剩余太短（<4 字）时不切，避免切出碎泡。
  */
@@ -139,10 +157,11 @@ function splitLongBubble(text: string, softMax: number): string[] {
   let rest = String(text ?? '').trim();
   while ([...rest].length > limit) {
     const chars = [...rest];
+    const mask = faceTokenMask(chars);
     const scanTo = Math.min(limit, chars.length);
     let cut = -1;
     for (let i = scanTo - 1; i >= 8; i--) {
-      if (SOFT_BREAKS.has(chars[i])) { cut = i; break; }
+      if (SOFT_BREAKS.has(chars[i]) && !mask[i]) { cut = i; break; }
     }
     if (cut >= 8 && chars.length - cut - 1 >= 4) {
       out.push(chars.slice(0, cut + 1).join('').trim());
@@ -154,6 +173,17 @@ function splitLongBubble(text: string, softMax: number): string[] {
       // 优先在靠后的空格处切；中文没有空格就按 40 字切
       for (let i = HARD_BUBBLE_CHARS - 1; i >= Math.floor(HARD_BUBBLE_CHARS / 2); i--) {
         if (/\s/.test(chars[i])) { hard = i; break; }
+      }
+      // 硬切点落在表情令牌里：挪到令牌之后；令牌在末尾就挪到令牌之前
+      if ((hard > 0 && mask[hard - 1]) || mask[hard]) {
+        let e = hard;
+        while (e < chars.length && mask[e]) e++;
+        if (e < chars.length) hard = e;
+        else {
+          let s = hard;
+          while (s > 0 && mask[s - 1]) s--;
+          hard = Math.max(1, s);
+        }
       }
       out.push(chars.slice(0, hard).join('').trim());
       rest = chars.slice(hard).join('').trim();

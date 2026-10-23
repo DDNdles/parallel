@@ -35,10 +35,15 @@ test('QQ 表情：编号与名称互查，未知名称不硬猜', () => {
   assert.deepEqual(faceTokensToSegments('[表情:哭]'), [
     { type: 'face', data: { id: '9' } },
   ]);
-  // 认不出来的令牌不吞字
+  // 认不出来的令牌整段丢掉：不再把 `[表情/没有这个]` 当正文发出去
   assert.deepEqual(faceTokensToSegments('不存在的[表情/没有这个]'), [
-    { type: 'text', data: { text: '不存在的[表情/没有这个]' } },
+    { type: 'text', data: { text: '不存在的' } },
   ]);
+  // 切坏的残片（没闭合的 `[表情`、只剩 `183]`）同样不发
+  assert.deepEqual(faceTokensToSegments('光是看文字本鱼嘴角就已经开始抽痛了[表情'), [
+    { type: 'text', data: { text: '光是看文字本鱼嘴角就已经开始抽痛了' } },
+  ]);
+  assert.deepEqual(faceTokensToSegments('183]'), []);
 });
 
 async function until<T>(fn: () => T | undefined | null | false, timeoutMs = 8000, what = 'condition'): Promise<T> {

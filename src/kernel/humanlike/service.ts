@@ -890,10 +890,14 @@ export class HumanlikeService {
    *  模型写的 `[表情/微笑]` 在这里切成真正的 face 段（文字与表情可以在同一条气泡里）。 */
   private plan(bubbles: string[]): SendPlan[] {
     const cfg = this.config.outgoing;
-    return bubbles.map((text, i) => ({
-      segments: faceTokensToSegments(text),
-      pauseMs: i === 0 || !cfg.typingEnabled ? 0 : typingDelayMs(text, cfg),
-    }));
+    return bubbles
+      .map((text) => ({ text, segments: faceTokensToSegments(text) }))
+      // 整条只是切坏的表情标记（如 `183]`）时没有可发内容：直接丢掉这条气泡
+      .filter((p) => p.segments.some((s) => s.type === 'face' || String(s.data.text ?? '').trim()))
+      .map((p, i) => ({
+        segments: p.segments,
+        pauseMs: i === 0 || !cfg.typingEnabled ? 0 : typingDelayMs(p.text, cfg),
+      }));
   }
 
   // ------------------------------------------------------------ 状态维护

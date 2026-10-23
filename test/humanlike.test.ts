@@ -256,6 +256,14 @@ test('投递：长逗号链在逗号处补切，短逗号句仍保持一条', ()
   assert.ok(out.every((x) => [...x].length <= 24), `补切后单条应不超过目标字数: ${JSON.stringify(out)}`);
 });
 
+test('投递：表情令牌是原子，补切不会把它切成 [表情 / 183]', () => {
+  const text = '光是看文字本鱼嘴角就已经开始抽痛了[表情:183]纯天然无添加对称唇钉是吧，哈人！';
+  const out = splitIntoBubbles(text);
+  assert.ok(out.some((b) => b.includes('[表情:183]')), `令牌要完整留在同一条气泡里: ${JSON.stringify(out)}`);
+  assert.ok(out.every((b) => !/\[表情$/.test(b)), `不能以没闭合的 [表情 结尾: ${JSON.stringify(out)}`);
+  assert.ok(!out.includes('183]'), `不能出现只剩 183] 的碎泡: ${JSON.stringify(out)}`);
+});
+
 test('投递：无标点超长句按 40 字硬切兜底', () => {
   const text = '我年华虚度空有一身游荡的疲倦面对群星我无限惭愧我回首往事如烟而如今我依然在路上继续走';
   const out = splitIntoBubbles(text);

@@ -188,7 +188,9 @@ export class ChatService implements ChatSendService {
 
   async sendText(chat: ChatRef, text: string): Promise<void> {
     // 桌面端手打、命令回复、系统通报都走这里：`[表情/微笑]` 同样能发成真表情
-    await this.send(chat, faceTokensToSegments(text));
+    const segments = faceTokensToSegments(text);
+    if (!segments.length) return; // 整条都是切坏/认不出的表情标记：不发空消息
+    await this.send(chat, segments);
   }
 
   /**
