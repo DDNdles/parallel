@@ -137,11 +137,10 @@ export const DEFAULT_CONFIG = {
       typingJitterRatio: 0.3,             // 打字延迟随机浮动比例（0 = 固定）；整体下限固定 250ms
       maxMessageCharacters: 2000,         // 单条可见消息最大字符数（平台硬上限的安全垫）
     },
-    // ② 什么时候开口（对齐 MaiBot ChatReplyTimingConfig：frequency / dynamic）
+    // ② 什么时候开口（frequency：攒够积压条数就进一轮）
     timing: {
-      // MaiBot 源码默认是 frequency；dynamic（这里叫 likelihood）要显式切
-      replyTriggerMode: 'frequency' as 'likelihood' | 'frequency',
-      talkValue: 1,                       // 群聊频率 0–1：frequency 下门槛=ceil(1/值)；likelihood 下是 1 小时目标回复率
+      pendingThreshold: 12,               // 攒够几条消息才进模型（开口门槛）
+      talkValue: 1,                       // 群聊频率开关：0 = 静默；>0 不改变条数门槛
       privateTalkValue: 1,
       enableRules: false,                 // 按群/时段单独调频率
       rules: [
@@ -385,10 +384,9 @@ export class ConfigStore {
     delete (this.config.llm as any).maxToolRounds;
     const hlTiming = (this.config.humanlike as any).timing;
     if (hlTiming && typeof hlTiming === 'object') {
-      // 必要性模式已删（2026-10-23）：老配置里的 necessity 一律切到 likelihood
-      if (hlTiming.replyTriggerMode === 'necessity') hlTiming.replyTriggerMode = 'likelihood';
+      // 拟合概率 / 必要性两种触发方式已删（2026-10-23 用户定）：老配置里的选择与专用阈值清掉
+      delete hlTiming.replyTriggerMode;
       delete hlTiming.necessityThreshold;
-      delete hlTiming.pendingThreshold;
       delete hlTiming.replyStyle;
     }
     // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费

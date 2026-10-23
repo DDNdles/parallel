@@ -149,7 +149,7 @@ function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachmen
 
 /**
  * 消息流水线（AstrBot 式分层 + 内置拟人层）：
- * 入站归一化 → 黑名单 → **拟人层门控**（@ 直通；群聊按频率/拟合概率 + 防抖合并；私聊不打分但同样合批）
+ * 入站归一化 → 黑名单 → **拟人层门控**（@ 直通；群聊按积压条数 + 防抖合并；私聊不打分但同样合批）
  * → 插件钩子 → 命令分发 / AgentLoop → **逐条分段发送**。
  *
  * 与重构前的差别只在 chat 区：唤醒判定从「@ 或唤醒词」换成 MaiBot 那套打分，
@@ -349,14 +349,11 @@ export class Pipeline {
 
   /** 拟人层攒够消息后的回调（也用于主动发言轮：events 为空） */
   enqueueBatch(batch: TriggerBatch): void {
-    // 频率/拟合概率/空窗补偿放行的轮次，模型可以像 Planner 一样选择 wait；
-    // @/提及/私聊/命令是硬触发，不能靠沉默逃掉。
-    const waitable = batch.reason === 'likelihood' || batch.reason === 'frequency' || batch.reason === 'idle';
     if (!batch.events.length) {
-      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail, gateId: batch.gateId, waitable });
+      this.enqueue([this.syntheticEvent(batch.chat)], { proactive: batch.detail });
       return;
     }
-    this.enqueue(batch.events, { gateId: batch.gateId, waitable });
+    this.enqueue(batch.events);
   }
 
   /** 主动发言轮没有真实消息，构造一个只用来承载"哪个会话"的空事件 */
@@ -370,7 +367,7 @@ export class Pipeline {
     };
   }
 
-  private enqueue(events: ChatEvent[], opts: { proactive?: string; gateId?: string; waitable?: boolean } = {}): void {
+  private enqueue(events: ChatEvent[], opts: { proactive?: string } = {}): void {
     const carrier = events[events.length - 1];
     if (!carrier) return;
     const key = `${carrier.type}_${carrier.chatId}`;
@@ -379,7 +376,6 @@ export class Pipeline {
       // 已有轮次在跑：入队（队列长度受限防堆积）
       if (this.queueLen(key) > 5) {
         this.sessionLog.append(carrier.chatId, carrier.type, { type: 'system', role: 'system', text: '消息积压，已丢弃' });
-        this.humanlike.dropGate(carrier, opts.gateId);
         return;
       }
     }
@@ -503,7 +499,7 @@ export class Pipeline {
 
   // ---------------------------------------------------------------- 处理
 
-  private async process(events: ChatEvent[], opts: { proactive?: string; gateId?: string; waitable?: boolean } = {}): Promise<void> {
+  private async process(events: ChatEvent[], opts: { proactive?: string } = {}): Promise<void> {
     if (!events.length) return;
     const event = events[events.length - 1];
     const chatKey = `${event.type}_${event.chatId}`;
@@ -511,7 +507,6 @@ export class Pipeline {
     // 隐藏会话兜底：主动发言轮不经过 submit()，隐藏之前攒下的批次也会流到这里。
     // 静默丢弃、不写会话流（隐藏是主人自己的动作，不需要每轮解释"为什么没说话"）。
     if (this.chatHidden(event)) {
-      this.humanlike.dropGate(event, opts.gateId);
       return;
     }
 
@@ -540,7 +535,6 @@ export class Pipeline {
     const allowed = events.filter((e) => !this.memory.getProfile(e.userId).blocked);
     if (!allowed.length) {
       this.sessionLog.append(event.chatId, event.type, { type: 'system', role: 'system', text: `黑名单用户 ${event.userId}，忽略` });
-      this.humanlike.dropGate(event, opts.gateId);
       return;
     }
 
@@ -551,7 +545,7 @@ export class Pipeline {
     event.role = role;
     const text = event.text.trim();
 
-    // 「要不要理这条」只有拟人层一处判（群聊：频率/拟合概率 / @必回；私聊与命令直通）。
+    // 「要不要理这条」只有拟人层一处判（群聊：积压条数 / @必回；私聊与命令直通）。
     // 这里不再补第二套唤醒判定 —— 两处判同一件事时，总有一处是死的。
 
     // ---- 插件 onChatMessage 钩子（仅本群生效中的插件） ----
@@ -587,11 +581,10 @@ export class Pipeline {
         text: `重复消息（与 ${Math.max(1, Math.round((Date.now() - prev.at) / 1000))} 秒前那轮一字不差），不再重复回答`,
         data: { decision: 'duplicate_ignored' },
       });
-      this.humanlike.dropGate(event, opts.gateId);
       return;
     }
     this.lastTurn.set(chatKey, { text: dupText(userText), at: Date.now(), spoke: false });
-    await this.agentTurn(event, role, chatKey, { userText, batch: allowed, gateId: opts.gateId, waitable: opts.waitable });
+    await this.agentTurn(event, role, chatKey, { userText, batch: allowed });
   }
 
   // ---------------- 命令 ----------------
@@ -758,10 +751,6 @@ export class Pipeline {
       proactive?: boolean;
       /** 本轮合并进来的整批事件（媒体按各自的来源聚合；不给就按 carrier 单事件取） */
       batch?: ChatEvent[];
-      /** 拟人层开口时发的样本回执号（pipeline 用它回报模型最终有没有真说话） */
-      gateId?: string;
-      /** 频率/拟合概率放行的轮次：允许模型输出 [silent] 当 wait（MaiBot Planner 语义） */
-      waitable?: boolean;
     },
   ): Promise<void> {
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
@@ -781,8 +770,6 @@ export class Pipeline {
       (lp) => lp.manifest.category === 'persona' && lp.state === 'loaded' && this.plugins.effectiveEnabled(lp.manifest.id, event.chatId),
     );
     if (tools.length === 0 && !anyToolsInGroup && !anyChatPersona) {
-      // 这一轮不会叫模型：把开口样本回执掉，别让它挂到下一轮
-      this.humanlike.dropGate(event, opts?.gateId);
       if (event.type === 'group' && this.config.config.risk.silentWhenNothingEnabled) {
         if (roleAtLeastRole(role, 'admin')) {
           const last = this.adminHintAt.get(chatKey) ?? 0;
@@ -877,19 +864,6 @@ export class Pipeline {
         systemSections.push({
           order: 440, title: 'chat-style',
           text: chatOutputStyleText({ maxChars: out.replyMaxCharacters }),
-        });
-      }
-      // 频率/拟合概率放行的轮次：给模型一个 Planner 式 wait 出口。
-      // 只在这些轮次出现；@/提及/私聊/命令是硬触发，不能靠 [silent] 逃掉。
-      if (!isReport && opts?.waitable) {
-        systemSections.push({
-          order: 442, title: 'wait-option',
-          text: [
-            '# 可以先不接',
-            '- 这一轮不是别人叫你，是你自己判断要不要插话。',
-            '- 如果现在不适合接，只输出 [silent]（不要写别的字，不要解释）。',
-            '- 想接就正常说；别为了回应而回应。',
-          ].join('\n'),
         });
       }
       // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。
@@ -987,7 +961,6 @@ export class Pipeline {
       // abort 是否被 pi-agent-core 立刻兑现因供应商而异，所以这里再兜一层。
       const turn = this.turnMeta.get(event.chatId);
       if (turn?.abortReason === 'generation') {
-        this.humanlike.dropGate(event, opts?.gateId);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system',
           text: '生成期被打断：模型输出已丢弃，等下一轮',
@@ -1001,7 +974,6 @@ export class Pipeline {
       // 没接模型 / 额度耗尽 / 链全挂会被吞成空回复：这轮一个字不发，只落 gate 条目。
       // 群里出现"没答好请再问一次"式的托词比沉默更伤人设，失败细节都在报错中心与会话流里。
       if (!finalReply.trim()) {
-        this.humanlike.noteTurnOutcome(chat, opts?.gateId, false);
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system', text: '本轮没有产出内容（模型未接入或请求失败），保持沉默',
@@ -1012,7 +984,6 @@ export class Pipeline {
 
       // 主动发言轮允许沉默（[silent] 标记 = 模型选择这轮不说话）
       if (opts?.proactive && isSilentScene(finalReply)) {
-        this.humanlike.noteTurnOutcome(chat, opts?.gateId, false);
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system', text: '主动发言：模型选择这次不说话',
@@ -1028,7 +999,6 @@ export class Pipeline {
         if (hit) {
           const retried = await this.rewriteRepetition(ctx, finalReply, hit.phrase, event, ac.signal);
           if (ac.signal.aborted || this.turnMeta.get(event.chatId)?.abortReason === 'generation') {
-            this.humanlike.dropGate(event, opts?.gateId);
             return;
           }
           if (retried && !isSilentScene(retried)) {
@@ -1067,9 +1037,6 @@ export class Pipeline {
       // 重写结束、真正进入发送阶段：之后的插话交给气泡级打断，不再 abort 模型
       if (turn) turn.phase = 'sending';
 
-      // 模型最终有没有真说话：以 afterLLM 之后的可见正文为准。回 [silent] / 空输出都记 0，
-      // 不再把"门开了"当成"模型开口了"（2026-10-18 修）。
-      this.humanlike.noteTurnOutcome(chat, opts?.gateId, !isSilentScene(finalReply));
       const quoteTarget = canQuoteTurn(event, opts) ? this.quoteTargetOf(event) : undefined;
       await this.sendScene(chat, finalReply, quoteTarget, opts?.mention,
         opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined,
@@ -1078,8 +1045,6 @@ export class Pipeline {
     } catch (e) {
       const msg = (e as Error).message;
       const turn = this.turnMeta.get(event.chatId);
-      // 打断/异常结束：样本丢掉，别把"没来得及回"当成"模型不想回"
-      this.humanlike.dropGate(event, opts?.gateId);
       // 生成期打断是预期内的事件，不是模型故障：静默收尾，别往报错中心写
       if (ac.signal.aborted && turn?.abortReason === 'generation') return;
       // 模型请求失败（没接模型/额度不足/链全挂）等异常一律不在群里出声：

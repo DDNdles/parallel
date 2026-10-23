@@ -24,11 +24,9 @@ export type { JargonConfig } from './jargon.ts';
 export type { RepeatConfig } from './repeat.ts';
 
 export interface TimingConfig {
-  /**
-   * likelihood = 开口概率 + 1 小时动态预算门控（对齐 MaiBot `dynamic` 模式）；
-   * frequency = 攒够 ceil(1/talk_value) 条进一轮（对齐 MaiBot `frequency` 模式）。
-   */
-  replyTriggerMode: 'likelihood' | 'frequency';
+  /** 攒够这么多条消息才进一轮（frequency 模式的开口门槛） */
+  pendingThreshold: number;
+  /** 群聊频率开关：0 = 静默；大于 0 时不改变条数门槛 */
   talkValue: number;
   privateTalkValue: number;
   enableRules: boolean;
@@ -128,7 +126,7 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
   poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   timing: {
-    replyTriggerMode: 'frequency',
+    pendingThreshold: 12,
     talkValue: 1,
     privateTalkValue: 1,
     enableRules: false,
@@ -162,11 +160,6 @@ export interface TriggerBatch {
    * 触发原因。`private` = 私聊合批到点：只说明"攒够了"，**不代表做过开口判定**
    * （私聊必回、不参与打分，见 service.ingest 的私聊分支）。
    */
-  reason: 'at' | 'mention' | 'likelihood' | 'frequency' | 'idle' | 'proactive' | 'private';
+  reason: 'at' | 'mention' | 'frequency' | 'idle' | 'proactive' | 'private';
   detail: string;
-  /**
-   * likelihood 门控的样本回执号：开口时创建，pipeline 在这一轮结束后用它回报
-   * 「模型最终有没有真说话」。没有它就只能拿"门开没开"当标签（自指），已在 2026-10-18 修掉。
-   */
-  gateId?: string;
 }

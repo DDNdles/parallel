@@ -935,15 +935,14 @@ test('拟人化：模型还在生成时插话，按概率直接打断并丢弃�
   mock.actions.length = 0;
   const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'frequency';
+    pendingThreshold: number;
     talkValue: number;
     mentionedBotReply: boolean;
   };
-  const saved = { p: ic.probability, mode: timing.replyTriggerMode, talk: timing.talkValue, mention: timing.mentionedBotReply };
+  const saved = { p: ic.probability, pending: timing.pendingThreshold, mention: timing.mentionedBotReply };
   ic.probability = 1;
-  // 用「提到名字」触发、不走 @；第二句普通消息不该触发一轮：频率档 + 很高的门槛
-  timing.replyTriggerMode = 'frequency';
-  timing.talkValue = 0.01;
+  // 用「提到名字」触发、不走 @；第二句普通消息不该触发一轮：门槛抬到 100
+  timing.pendingThreshold = 100;
   timing.mentionedBotReply = true;
   try {
     mockProvider.script.push({ content: '这句不该发出去', delayMs: 1200 });
@@ -959,8 +958,7 @@ test('拟人化：模型还在生成时插话，按概率直接打断并丢弃�
     assert.ok(gates.length >= 1, '应留下 generation_interrupted 的 gate 记录');
   } finally {
     ic.probability = saved.p;
-    timing.replyTriggerMode = saved.mode;
-    timing.talkValue = saved.talk;
+    timing.pendingThreshold = saved.pending;
     timing.mentionedBotReply = saved.mention;
   }
 });
@@ -972,13 +970,11 @@ test('拟人化：@ 触发的一轮无视插话打断，回复照常发出', asy
   mock.actions.length = 0;
   const ic = kernel.config.config.humanlike.interrupt as unknown as { probability: number };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'frequency';
-    talkValue: number;
+    pendingThreshold: number;
   };
-  const saved = { p: ic.probability, mode: timing.replyTriggerMode, talk: timing.talkValue };
+  const saved = { p: ic.probability, pending: timing.pendingThreshold };
   ic.probability = 1;
-  timing.replyTriggerMode = 'frequency';
-  timing.talkValue = 0.01;
+  timing.pendingThreshold = 100;
   try {
     mockProvider.script.push({ content: '这句必须发出去', delayMs: 1200 });
     mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '你先想着', atMe: true, nickname: '小明' });
@@ -995,8 +991,7 @@ test('拟人化：@ 触发的一轮无视插话打断，回复照常发出', asy
     assert.equal(gates.length, 0, '@ 轮不应留下 generation_interrupted');
   } finally {
     ic.probability = saved.p;
-    timing.replyTriggerMode = saved.mode;
-    timing.talkValue = saved.talk;
+    timing.pendingThreshold = saved.pending;
   }
 });
 
@@ -1008,10 +1003,9 @@ test('后台表达学习：群里攒够消息后学一条，下一轮 system 里
   const ec = kernel.config.config.humanlike.expression as unknown as Record<string, unknown>;
   const saved = { ...ec };
   const timing = kernel.config.config.humanlike.timing as unknown as {
-    replyTriggerMode: 'likelihood' | 'frequency';
-    talkValue: number;
+    pendingThreshold: number;
   };
-  const savedT = { mode: timing.replyTriggerMode, talk: timing.talkValue };
+  const savedT = { pending: timing.pendingThreshold };
   ec.enable = true; ec.minMessages = 4; ec.idleSeconds = 0; ec.maxPerChat = 24; ec.injectMax = 4;
   mockProvider.expressionReply = '{"expressions":[{"situation":"有人问在吗","style":"在的在的","keys":["在吗"]}]}';
   try {
@@ -1019,9 +1013,8 @@ test('后台表达学习：群里攒够消息后学一条，下一轮 system 里
     mockProvider.script.push({ content: '在的' });
     mock.sendGroupMessage({ groupId: G, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
     await mock.waitForReply(G, 8000);
-    // 之后普通消息不触发回复（频率档 + 极高门槛），只进学习队列
-    timing.replyTriggerMode = 'frequency';
-    timing.talkValue = 0.01;
+    // 之后普通消息不触发回复（门槛抬到 100），只进学习队列
+    timing.pendingThreshold = 100;
     for (const text of ['今天好热', '确实好热', '开空调吧', '在吗']) {
       mock.sendGroupMessage({ groupId: G, userId: 10002, text, nickname: '阿强' });
       await new Promise((r) => setTimeout(r, 60));
@@ -1039,8 +1032,7 @@ test('后台表达学习：群里攒够消息后学一条，下一轮 system 里
   } finally {
     for (const k of Object.keys(ec)) delete ec[k];
     Object.assign(ec, saved);
-    timing.replyTriggerMode = savedT.mode;
-    timing.talkValue = savedT.talk;
+    timing.pendingThreshold = savedT.pending;
     mockProvider.expressionReply = '{"expressions":[]}';
     kernel.container.setGroupState('chat', String(G), false, String(MASTER));
     mock.actions.length = 0;

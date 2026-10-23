@@ -20,7 +20,7 @@ interface Humanlike {
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
   timing: {
-    replyTriggerMode: 'likelihood' | 'frequency';
+    pendingThreshold: number;
     talkValue: number; privateTalkValue: number;
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
     mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
@@ -91,10 +91,6 @@ interface EndStatus {
 /** GET /api/plugins/:id/config 的返回 */
 interface PlugCfg { values: Record<string, unknown>; globalDefault: boolean }
 
-const TRIGGERS: PillOpt[] = [
-  { v: 'frequency', t: '频率' },
-  { v: 'likelihood', t: '拟合概率' },
-];
 const RHYTHM_MODES: PillOpt[] = [
   { v: 'gentle', t: '温和（仅完全同构才判定）' },
   { v: 'balanced', t: '平衡（加语气与字数判据）' },
@@ -197,7 +193,6 @@ export default function SettingsPage() {
     maxPhrases: 3, retry: true, maxStrikes: 3,
   };
   const intr = h.interrupt;
-  const triggerMode = h.timing?.replyTriggerMode;
   const patch = (p: Partial<Config>) => setC({ ...c, ...p });
   /** 即时保存：本地 state 先行；immediate=true（开关/选择类单次事件）立即发，输入框默认 600ms 防抖只发最后一拍 */
   const autoSave = (key: string, delay: number, body: Record<string, unknown>) => {
@@ -440,15 +435,13 @@ export default function SettingsPage() {
           {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
-              <div className="mset-field">
-                <PillSelect align="left" value={h.timing.replyTriggerMode} options={TRIGGERS} label="触发方式"
-                  onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'frequency' } }, true)} />
-              </div>
               <div className="set-grid">
+                <Num label="触发所需积压条数"
+                  hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
+                  value={h.timing.pendingThreshold}
+                  onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
                 <Num label="群聊频率（0-1）"
-                  hint={triggerMode === 'frequency'
-                    ? '触发门槛 = ceil(1/频率)：1 = 每条都判断，0.2 ≈ 每 5 条，0 = 静默'
-                    : '1 小时目标回复率：1 = 不设限，越小越安静，0 = 静默'}
+                  hint="0 = 静默；大于 0 时开口条数只看上面的积压条数"
                   value={h.timing.talkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, talkValue: v } })} />
                 <Num label="私聊频率（0-1）" value={h.timing.privateTalkValue}

@@ -1,8 +1,7 @@
 /**
  * 拟人化层（内核自有，不在插件体系里）。这里只做导出，实现分两侧：
- *  什么时候开口（移植 MaiBot，保留）：
- *  - `likelihood.ts` 开口概率 + 1 小时动态预算门控（MaiBot reply_likelihood + dynamic_gate）
- *  - `frequency.ts`  发言频率规则、空窗补偿与空闲退避（移植 MaiBot talk_value_rules + idle_backoff）
+ *  什么时候开口（frequency 模式）：
+ *  - `frequency.ts`  攒够积压条数放行、空窗补偿、发言频率规则与空闲退避
  *  怎么说 / 拆几条 / 隔多久（2026-10-17 起为**纯程序**，HDSI 的小说格式与 Alter 已删）：
  *  - `delivery.ts`   出站投递：按句分条 + 句边截断 + 打字节奏
  *  - `interrupt.ts`  出站打断：对面插话时把还没发的气泡砍掉（纯程序，不叫模型）

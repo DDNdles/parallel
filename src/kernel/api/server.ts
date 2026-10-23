@@ -1334,17 +1334,14 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   const timing = body.timing as Record<string, unknown> | undefined;
   if (timing && typeof timing === 'object') {
     const t = target.timing;
-    if ('replyTriggerMode' in timing) {
-      if (timing.replyTriggerMode !== 'likelihood' && timing.replyTriggerMode !== 'frequency') {
-        return '回复触发模式只能是 likelihood 或 frequency';
-      }
-      t.replyTriggerMode = timing.replyTriggerMode;
-    }
     applyBool(t, timing, 'mentionedBotReply');
     applyBool(t, timing, 'inevitableAtReply');
     applyBool(t, timing, 'focusMode');
     applyBool(t, timing, 'enableRules');
-    let e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
+    // 拟合概率已删（2026-10-23）：老页面回放的 replyTriggerMode 一律忽略，不写回配置
+    delete (t as Record<string, unknown>).replyTriggerMode;
+    let e = applyNum(t, timing, 'pendingThreshold', 1, 200, '触发所需积压条数'); if (e) return e;
+    e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
     e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;
     if (Array.isArray(timing.rules)) {
       const rules: Record<string, unknown>[] = [];
