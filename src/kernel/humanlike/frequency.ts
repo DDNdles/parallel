@@ -2,8 +2,8 @@
  * 发言频率与空闲退避 —— 移植自 MaiBot `official_configs.ChatReplyTimingConfig`
  * 与 `src/maisaka/idle_backoff.py`。
  *
- * 2026-10-23 起「按群聊与时段单独调整频率」整层删除（用户改要每个会话单独配拟人化）：
- * 频率只剩两个开关（群聊/私聊 talkValue），会话差异走 `timingOverrides`。
+ * 2026-10-23 起只分群聊/私聊两档（先删按群聊与时段规则，再删按单个会话覆盖）：
+ * 频率只剩两个开关（群聊/私聊 talkValue），其余时机参数全局共用一套。
  */
 
 import type { ChatRef } from '../types.ts';

@@ -67,9 +67,8 @@ export interface HumanlikeConfig {
   repeat: RepeatConfig;
   /** 戳一戳（chat 工具）：有明确指向/犯贱时的社交动作；冷却与小时上限是硬护栏 */
   poke: { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
+  /** 回复时机（群聊/私聊同一个对象；talkValue 与 privateTalkValue 各自生效） */
   timing: TimingConfig;
-  /** 每个会话单独的回复时机覆盖（key = `group_123` / `private_456`）；没有就跟随 timing */
-  timingOverrides: Record<string, TimingConfig>;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
   /**
@@ -133,7 +132,6 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
     onlyReplyWhenAt: false,
     focusMode: false,
   },
-  timingOverrides: {},
   outgoing: { ...DEFAULT_OUTGOING },
   interrupt: { enable: true, probability: 0.8 },
   merge: { enable: true, windowMs: 2000, maxWaitMs: 6000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },

@@ -2,7 +2,7 @@
 import { FadeName } from '@/components/FadeName';
 /** 设置：左分节导航（QQ 接入 / 模型 / 搜索 / 风控 / 拟人化 / 记忆）+ 右表单；协议端选择与可用性检测都在「QQ 接入」里 */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { get, post, del, fmtTime } from '@/lib/api';
+import { get, post, fmtTime } from '@/lib/api';
 import { useSave } from '@/lib/useSave';
 import { BrandInput } from '@/components/BrandInput';
 import { PillSelect, type PillOpt } from '@/components/PillSelect';
@@ -163,8 +163,6 @@ export default function SettingsPage() {
   const loadCfg = useCallback(async () => {
     const cfg: Config = await get('/api/config');
     setC(cfg);
-    // 默认回复时机留一份：切回「默认」或恢复会话默认时用它还原
-    defaultTiming.current = cfg.humanlike.timing;
     setQq(cfg.ui?.expectedQq ?? '');
     refreshInfo();
     loadPlug();
@@ -179,27 +177,8 @@ export default function SettingsPage() {
     return () => clearInterval(t);
   }, [sec, checking, runCheck]);
 
-  /** 全部已知会话（「作用会话」下拉数据源）；进拟人化分节时拉一次 */
-  const [chats, setChats] = useState<{ chatId: string; chatType: string; title?: string }[]>([]);
-  /** 回复时机的编辑范围：'' = 默认（所有会话），chatKey = 某个会话单独的覆盖 */
-  const [timingScope, setTimingScope] = useState('');
-  const [timingOverride, setTimingOverride] = useState<Humanlike['timing'] | null>(null);
-  const defaultTiming = useRef<Humanlike['timing'] | null>(null);
-  useEffect(() => {
-    if (sec !== 'humanlike') return;
-    get('/api/chats').then((list: unknown) => setChats(Array.isArray(list) ? list : [])).catch(() => {});
-  }, [sec]);
-  // 切到某个会话：读它的覆盖（没有就显示默认），并把它作为「回复时机」的当前值
-  useEffect(() => {
-    if (sec !== 'humanlike' || !timingScope) return;
-    let alive = true;
-    get(`/api/humanlike/timing?chatKey=${encodeURIComponent(timingScope)}`).then((r: any) => {
-      if (!alive) return;
-      setTimingOverride(r.override ?? null);
-      setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: r.effective } } : prev);
-    }).catch(() => {});
-    return () => { alive = false; };
-  }, [sec, timingScope]);
+  /** 回复时机的编辑范围：群聊 / 私聊（2026-10-23 起不再按单个会话覆盖） */
+  const [timingScope, setTimingScope] = useState<'group' | 'private'>('group');
 
   if (!c) return <div className="mset-empty">加载中…</div>;
   const r = c.risk;
@@ -229,44 +208,13 @@ export default function SettingsPage() {
   const patchH = (p: Partial<Humanlike>, immediate = false) => {
     const nh = { ...h, ...p } as Humanlike;
     patch({ humanlike: nh });
-    // 会话覆盖只属于「回复时机」的编辑态：其他分节保存时不能把它写回全局默认
-    const saved = timingScope && defaultTiming.current ? { ...nh, timing: defaultTiming.current } : nh;
-    autoSave('humanlike', immediate ? 0 : 600, { humanlike: saved });
+    autoSave('humanlike', immediate ? 0 : 600, { humanlike: nh });
   };
-  /** 改「回复时机」：默认范围写全局，选中某个会话时写该会话的覆盖 */
+  /** 改「回复时机」：群聊/私聊各一套字段，都写全局配置 */
   const patchTiming = (part: Partial<Humanlike['timing']>, immediate = false) => {
     const nt = { ...h.timing, ...part };
     patch({ humanlike: { ...h, timing: nt } });
-    if (!timingScope) {
-      defaultTiming.current = nt;
-      autoSave('humanlike', immediate ? 0 : 600, { humanlike: { ...h, timing: nt } });
-      return;
-    }
-    setTimingOverride(nt);
-    const key = `timing:${timingScope}`;
-    if (saveTimers.current[key]) clearTimeout(saveTimers.current[key]);
-    saveTimers.current[key] = setTimeout(() => {
-      delete saveTimers.current[key];
-      save('/api/humanlike/timing', { chatKey: timingScope, timing: nt });
-    }, immediate ? 0 : 600);
-  };
-  /** 切「作用会话」：默认 = 还原全局；具体会话 = 让 effect 去拉它的覆盖 */
-  const switchTimingScope = (key: string) => {
-    setTimingScope(key);
-    if (!key) {
-      setTimingOverride(null);
-      const def = defaultTiming.current;
-      if (def) setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: def } } : prev);
-    }
-  };
-  /** 删掉本会话的覆盖，回到默认时机 */
-  const resetTiming = () => {
-    if (!timingScope) return;
-    run(() => del(`/api/humanlike/timing?chatKey=${encodeURIComponent(timingScope)}`), () => {
-      setTimingOverride(null);
-      const def = defaultTiming.current;
-      if (def) setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: def } } : prev);
-    });
+    autoSave('humanlike', immediate ? 0 : 600, { humanlike: { ...h, timing: nt } });
   };
   /** Tavily key：没动过就一直跟着服务端回显（明文回传，跟模型页同一口径） */
   const storedKey = String(plug?.web.values.apiKey ?? '').trim();
@@ -487,52 +435,49 @@ export default function SettingsPage() {
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="set-grid">
                 <div className="mset-field timing-scope">
-                  <label className="mset-flabel">作用会话
-                    {timingScope && timingOverride && (
-                      <button className="timing-reset" onClick={resetTiming}>恢复默认</button>
-                    )}
-                  </label>
+                  <label className="mset-flabel">作用会话</label>
                   <PillSelect align="left" value={timingScope} label="作用会话"
                     options={[
-                      { v: '', t: '默认（所有会话）' },
-                      // 回复时机只对群聊门控生效；私聊固定必回，不列进来（列了也是空旋钮）
-                      ...chats.filter((chat) => chat.chatType !== 'private').map((chat) => ({
-                        v: `${chat.chatType}_${chat.chatId}`,
-                        t: chat.title ? `${chat.title}（${chat.chatId}）` : `群 ${chat.chatId}`,
-                      })),
+                      { v: 'group', t: '群聊' },
+                      { v: 'private', t: '私聊' },
                     ]}
-                    onChange={switchTimingScope} />
+                    onChange={(v) => setTimingScope(v === 'private' ? 'private' : 'group')} />
                 </div>
-                <Num label="触发所需积压条数"
-                  hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
-                  value={h.timing.pendingThreshold}
-                  onChange={(v) => patchTiming({ pendingThreshold: v })} />
-                <Num label="群聊频率（0-1）"
-                  hint="0 = 静默；大于 0 时开口条数只看上面的积压条数"
-                  value={h.timing.talkValue}
-                  onChange={(v) => patchTiming({ talkValue: v })} />
-                <Num label="私聊频率（0-1）" value={h.timing.privateTalkValue}
-                  onChange={(v) => patchTiming({ privateTalkValue: v })} />
-              </div>
-              <div className="mset-models" style={{ marginTop: 14 }}>
-                <div className="mset-mrow">
-                  <span className="plg-v">仅 @ 后才回复</span>
-                  <span className="mset-macts"><Switch on={h.timing.onlyReplyWhenAt}
-                    onChange={() => patchTiming({ onlyReplyWhenAt: !h.timing.onlyReplyWhenAt }, true)} /></span>
-                </div>
-                {!h.timing.onlyReplyWhenAt && (
-                  <div className="mset-mrow">
-                    <span className="plg-v">提到名字时倾向回复</span>
-                    <span className="mset-macts"><Switch on={h.timing.mentionedBotReply}
-                      onChange={() => patchTiming({ mentionedBotReply: !h.timing.mentionedBotReply }, true)} /></span>
-                  </div>
+                {timingScope === 'group' ? (<>
+                  <Num label="触发所需积压条数"
+                    hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
+                    value={h.timing.pendingThreshold}
+                    onChange={(v) => patchTiming({ pendingThreshold: v })} />
+                  <Num label="群聊频率（0-1）"
+                    hint="0 = 静默；大于 0 时开口条数只看上面的积压条数"
+                    decimal value={h.timing.talkValue}
+                    onChange={(v) => patchTiming({ talkValue: v })} />
+                </>) : (
+                  <Num label="私聊频率（0-1）" decimal value={h.timing.privateTalkValue}
+                    onChange={(v) => patchTiming({ privateTalkValue: v })} />
                 )}
-                <div className="mset-mrow">
-                  <span className="plg-v">专注模式<Hint text="不参与群聊活跃度打分，只对强相关的内容说话。" /></span>
-                  <span className="mset-macts"><Switch on={h.timing.focusMode}
-                    onChange={() => patchTiming({ focusMode: !h.timing.focusMode }, true)} /></span>
-                </div>
               </div>
+              {timingScope === 'group' && (
+                <div className="mset-models" style={{ marginTop: 14 }}>
+                  <div className="mset-mrow">
+                    <span className="plg-v">仅 @ 后才回复</span>
+                    <span className="mset-macts"><Switch on={h.timing.onlyReplyWhenAt}
+                      onChange={() => patchTiming({ onlyReplyWhenAt: !h.timing.onlyReplyWhenAt }, true)} /></span>
+                  </div>
+                  {!h.timing.onlyReplyWhenAt && (
+                    <div className="mset-mrow">
+                      <span className="plg-v">提到名字时倾向回复</span>
+                      <span className="mset-macts"><Switch on={h.timing.mentionedBotReply}
+                        onChange={() => patchTiming({ mentionedBotReply: !h.timing.mentionedBotReply }, true)} /></span>
+                    </div>
+                  )}
+                  <div className="mset-mrow">
+                    <span className="plg-v">专注模式<Hint text="不参与群聊活跃度打分，只对强相关的内容说话。" /></span>
+                    <span className="mset-macts"><Switch on={h.timing.focusMode}
+                      onChange={() => patchTiming({ focusMode: !h.timing.focusMode }, true)} /></span>
+                  </div>
+                </div>
+              )}
 
               <div className="mset-sec-h"><span>发送方式</span></div>
               <div className="set-grid" style={{ marginTop: 14 }}>
@@ -724,7 +669,7 @@ export default function SettingsPage() {
   );
 }
 
-function Num({ label, hint, value, onChange }: { label: string; hint?: string; value: number; onChange: (v: number) => void }) {
+function Num({ label, hint, value, onChange, decimal = false }: { label: string; hint?: string; value: number; onChange: (v: number) => void; decimal?: boolean }) {
   return (
     <div className="mset-field">
       <label className="mset-flabel">{label}
@@ -735,7 +680,7 @@ function Num({ label, hint, value, onChange }: { label: string; hint?: string; v
           </span>
         )}
       </label>
-      <BrandInput type="number" value={value} spellCheck={false} onChange={(e) => onChange(Number(e.target.value))} />
+      <BrandInput type="number" decimal={decimal} value={value} spellCheck={false} onChange={(e) => onChange(Number(e.target.value))} />
     </div>
   );
 }

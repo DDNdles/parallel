@@ -60,7 +60,7 @@ test('空窗补偿：积压条数 + 空窗折算才算等效条数，且折算�
 });
 
 // ============================================================
-// 3. 频率与空闲退避（对话差异走 timingOverrides，规则模式已删）
+// 3. 频率与空闲退避（群聊/私聊只差 talkValue，单会话覆盖已删）
 // ============================================================
 
 test('频率：群聊/私聊各自的 talkValue', () => {
@@ -70,19 +70,14 @@ test('频率：群聊/私聊各自的 talkValue', () => {
   assert.equal(talkValueFor({ talkValue: NaN, privateTalkValue: 0.5 }, chat), 1, '非法值回落 1');
 });
 
-test('会话覆盖：timingOverrides 只作用于该会话，其余会话跟随默认', async () => {
+test('回复时机全局一套：改群聊参数同样作用于别的群，没有按会话的覆盖', async () => {
   const { svc, triggers } = makeService({
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
-    timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1 },
-    timingOverrides: {
-      group_123: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
-    },
+    timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
   });
-  assert.equal(svc.timingFor(chat).onlyReplyWhenAt, true, '本会话读到覆盖');
-  assert.equal(svc.timingFor({ ...chat, chatId: '999' }).onlyReplyWhenAt, false, '别的会话仍跟随默认');
   svc.ingest(ev('普通消息'), { isCommand: false });
   await wait(30);
-  assert.equal(triggers.length, 0, '覆盖里的仅 @ 生效：普通消息不开口');
+  assert.equal(triggers.length, 0, '仅 @ 生效：普通消息不开口');
   const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
   assert.equal(at.action, 'pass', '@ 仍然直通');
   svc.dispose();

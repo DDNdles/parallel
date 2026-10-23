@@ -37,7 +37,6 @@ import {
   DEFAULT_HUMANLIKE,
   PRESENCE_WINDOW_SECONDS,
   type HumanlikeConfig,
-  type TimingConfig,
   type TriggerBatch,
 } from './types.ts';
 
@@ -111,29 +110,6 @@ export class HumanlikeService {
     return this.opts.config() ?? DEFAULT_HUMANLIKE;
   }
 
-  /** 会话键：timingOverrides 用它区分群聊/私聊 */
-  private timingKey(chat: ChatRef): string {
-    return `${chat.type}_${chat.chatId}`;
-  }
-
-  /**
-   * 这个会话实际生效的回复时机：有单独配置就用它，否则跟随默认。
-   * 单独配置存的是完整 TimingConfig（页面切到该会话时从默认复制），
-   * 这里再与默认合并一次，只为兼容以后新增的字段。
-   */
-  timingFor(chat: ChatRef): TimingConfig {
-    const cfg = this.config;
-    const ov = cfg.timingOverrides?.[this.timingKey(chat)];
-    return ov ? { ...cfg.timing, ...ov } : cfg.timing;
-  }
-
-  /** 这个会话实际生效的完整拟人化配置（状态接口 / 测试用） */
-  configFor(chat: ChatRef): HumanlikeConfig {
-    const cfg = this.config;
-    const timing = this.timingFor(chat);
-    return timing === cfg.timing ? cfg : { ...cfg, timing };
-  }
-
   /**
    * 换人格时更新叫醒词。只收 2 字以上的词：单字（鱼/鲸）会在「鱼香肉丝」里误触；
    * 纯 ASCII 在匹配时按词边界处理（见 mentionHit）。
@@ -191,7 +167,7 @@ export class HumanlikeService {
   ingest(event: ChatEvent, opts: { isCommand: boolean }): { action: 'pass'; events: ChatEvent[]; merged: boolean } | { action: 'handled' } {
     if (this.disposed) return { action: 'pass', events: [event], merged: false };
     const cfg = this.config;
-    const timing = this.timingFor(event);
+    const timing = cfg.timing;
     const st = this.state(event);
     const now = this.now();
 
@@ -351,8 +327,8 @@ export class HumanlikeService {
       }
     }
     const chat: ChatRef = { platform: carrier.platform, type: carrier.type, chatId: carrier.chatId };
-    // 会话级覆盖优先：每个会话可以单独配回复时机，没配就跟随默认
-    const timing = this.timingFor(chat);
+    // 回复时机是全局一套（群聊/私聊只在频率上分档，没有按会话的覆盖）
+    const timing = cfg.timing;
 
     // 仅 @ 后才回复：群聊普通消息只留在缓冲里当上下文，不评估、不主动开口，也不安排重试
     // （没有 @ 就没有需要重试的判定；@ 到达时 ingest 的直通分支会把这些消息一起带上）。
@@ -462,11 +438,11 @@ export class HumanlikeService {
     if (st.idle) clearTimeout(st.idle);
     if (!cfg.proactive.enable) return;
     // 仅 @ 后才回复：主动起话头也不允许（那是普通开口，不是被点名）
-    if (this.timingFor(chat).onlyReplyWhenAt) return;
+    if (cfg.timing.onlyReplyWhenAt) return;
     st.idle = this.timer(() => {
       st.idle = undefined;
       if (this.disposed) return;
-      if (this.timingFor(chat).onlyReplyWhenAt) return;
+      if (cfg.timing.onlyReplyWhenAt) return;
       if (st.buffer.length) return;                       // 有待处理消息时交给正常门控
       const now = this.now();
       const idleSeconds = st.lastInboundAt ? (now - st.lastInboundAt) / 1000 : 0;
@@ -762,6 +738,7 @@ export class HumanlikeService {
 
   /** 供 UI/排障：某会话当前的拟人层状态快照 */
   snapshot(chat: ChatRef): Record<string, unknown> {
+    const cfg = this.config;
     const st = this.state(chat);
     const now = this.now();
     const { self, total } = this.recentCounts(st, now);
@@ -773,10 +750,10 @@ export class HumanlikeService {
       averageIntervalSeconds: this.averageInterval(st),
       recentSelf: self,
       recentTotal: total,
-      frequency: talkValueFor(this.timingFor(chat), chat),
+      frequency: talkValueFor(cfg.timing, chat),
       idleSeconds: st.lastInboundAt ? (now - st.lastInboundAt) / 1000 : 0,
       secondsSinceBotMessage: st.lastSpokeAt ? (now - st.lastSpokeAt) / 1000 : null,
-      pendingThreshold: this.timingFor(chat).pendingThreshold,
+      pendingThreshold: cfg.timing.pendingThreshold,
     };
   }
 

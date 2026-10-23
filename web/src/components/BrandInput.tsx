@@ -13,8 +13,9 @@ interface Props {
   placeholder?: string;
   /** text / password（password 在文本层里画圆点，绝不回显原文）
    *  number = 只收数字：底层仍是 text（number 类型读 selectionStart 会抛，光标没法镜像），
-   *  顺带也就没有右侧那对上下箭头 */
+   *  顺带也就没有右侧那对上下箭头；decimal = 数字档额外保留一个小数点（频率这类 0-1 字段） */
   type?: 'text' | 'password' | 'number';
+  decimal?: boolean;
   multiline?: boolean;
   rows?: number;
   /** 多行框随内容长高（下限=rows 撑出来的高度）。固定高度的框装不下内容时会把最后半行字裁掉，
@@ -37,7 +38,7 @@ interface Props {
 const COPY = ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing', 'textIndent', 'textTransform'] as const;
 
 export function BrandInput({
-  value, onChange, placeholder, type = 'text', multiline = false, rows = 4, grow = false,
+  value, onChange, placeholder, type = 'text', decimal = false, multiline = false, rows = 4, grow = false,
   autoFocus, spellCheck = false, id, style, className, onKeyDown, onBlur, onFocus, autoComplete,
 }: Props) {
   const fieldRef = useRef<Field | null>(null);
@@ -116,10 +117,12 @@ export function BrandInput({
     onKeyDown?.(e);
   };
   /* 数字档：先抹掉非数字再往上抛。直接改 e.target.value 而不是伪造事件——
-     事件对象指向真控件，改完读到的就是干净值，显示层也才不会和 DOM 脱节 */
+     事件对象指向真控件，改完读到的就是干净值，显示层也才不会和 DOM 脱节。
+     decimal 档保留第一个小数点（频率 0-1；整数档维持原来的纯数字过滤）。 */
   const change = (e: ChangeEvent<Field>) => {
     if (type === 'number') {
-      const clean = e.target.value.replace(/\D/g, '');
+      const keep = decimal ? e.target.value.replace(/[^\d.]/g, '') : e.target.value.replace(/\D/g, '');
+      const clean = decimal ? keep.replace(/(\..*)\./g, '$1') : keep;
       if (clean !== e.target.value) e.target.value = clean;
     }
     onChange(e);
