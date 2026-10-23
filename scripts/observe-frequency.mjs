@@ -361,7 +361,8 @@ try {
     };
     try {
       const errs = await (await fetch('http://127.0.0.1:3080/api/errors', { headers })).json();
-      if (Array.isArray(errs)) health.errorsInWindow = errs.filter((e) => Number(e?.ts) >= from && Number(e?.ts) < to).length;
+      // 只数 error 级：info/warn（容器启动、work 链切模型）混进来会把"错误"数放大
+      if (Array.isArray(errs)) health.errorsInWindow = errs.filter((e) => e?.level === 'error' && Number(e?.ts) >= from && Number(e?.ts) < to).length;
     } catch { /* 错误中心读不到不影响观测 */ }
   }
 } catch { /* 内核没起：照样从日志出报告 */ }
@@ -395,7 +396,7 @@ if (has('--markdown')) {
     `bot 消息占比 ${fmt(totals.botShare)} / 平均每轮 ${fmt(totals.avgBubblesPerTurn)} 条`);
   const reasons = Object.entries(totals.openReasons).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
   const decs = Object.entries(totals.decisions).map(([k, v]) => `${k}:${v}`).join(' ') || '无';
-  lines.push(`开口 ${totals.opens}（${reasons}）/ 沉默评估 ${totals.waits} / 其它决策 ${decs} / 错误 ${totals.errors + (health.errorsInWindow ?? 0)}`);
+  lines.push(`开口 ${totals.opens}（${reasons}）/ 沉默评估 ${totals.waits} / 其它决策 ${decs} / 错误 ${totals.errors}（会话落账）+ ${health.errorsInWindow ?? 0}（错误中心 error 级）`);
   lines.push(`气泡分布：${Object.entries(totals.bubbleHistogram).sort((a, b) => Number(a[0]) - Number(b[0])).map(([k, v]) => `${k}条×${v}`).join(' ') || '无'}`);
   if (!health.reachable) lines.push('⚠ 内核 /api/state 不可达（本小时报告只来自会话日志）');
   else lines.push(`内核：协议端 ${health.connected ? '在线' : '离线'}，${health.nickname ?? ''} ${health.selfId ?? ''}`);
