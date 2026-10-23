@@ -2,70 +2,18 @@
  * 发言频率与空闲退避 —— 移植自 MaiBot `official_configs.ChatReplyTimingConfig`
  * 与 `src/maisaka/idle_backoff.py`。
  *
- * 频率不是单一数字，而是三层：全局 talk_value → 按时段/会话命中的规则覆盖 → 连续不理人的指数退避。
+ * 2026-10-23 起「按群聊与时段单独调整频率」整层删除（用户改要每个会话单独配拟人化）：
+ * 频率只剩两个开关（群聊/私聊 talkValue），会话差异走 `timingOverrides`。
  */
 
 import type { ChatRef } from '../types.ts';
 
-export interface TalkRule {
-  /** 平台；空 = 不限 */
-  platform?: string;
-  /** 会话 id（群号 / 用户号）；空 = 不限 */
-  itemId?: string;
-  /** 聊天流类型；any = 不限 */
-  ruleType?: 'group' | 'private' | 'any';
-  /** 时段 "HH:MM-HH:MM"（可跨零点）、"*" 全天、"" 兜底 */
-  time?: string;
-  /** 命中后的频率 0–1 */
-  value: number;
-}
-
-export interface TalkValueConfig {
-  talkValue: number;
-  privateTalkValue: number;
-  enableRules: boolean;
-  rules: TalkRule[];
-}
-
-/** 判断一份时刻是否落在规则时段内（支持 23:00-02:00 这种跨零点） */
-export function inTimeWindow(time: string | undefined, minuteOfDay: number): boolean {
-  const t = String(time ?? '').trim();
-  if (!t) return false;          // 空 = 不按时间匹配（交给调用方当兜底）
-  if (t === '*') return true;
-  const m = t.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
-  if (!m) return false;
-  const start = Number(m[1]) * 60 + Number(m[2]);
-  const end = Number(m[3]) * 60 + Number(m[4]);
-  if (start <= end) return minuteOfDay >= start && minuteOfDay <= end;
-  return minuteOfDay >= start || minuteOfDay <= end;
-}
-
-/** 规则是否作用在这个会话上（只看平台 / 会话 id / 聊天流类型，不看时间） */
-function matchesSession(rule: TalkRule, chat: ChatRef): boolean {
-  if (rule.platform && rule.platform !== chat.platform) return false;
-  if (rule.itemId && String(rule.itemId) !== String(chat.chatId)) return false;
-  const rt = rule.ruleType ?? 'any';
-  return rt === 'any' || rt === chat.type;
-}
-
 /**
- * 求当前生效的发言频率（0–1）。
- * 时间留空的规则是**兜底**：只有在没有任何带时段的规则命中时才用它，
- * 否则一条 `time: ''` 的规则会把所有时段规则都盖掉。同层多条命中取最后一条。
+ * 求当前生效的发言频率（0–1）。私聊用 privateTalkValue，群聊用 talkValue。
+ * 只当静默开关：0 = 不说话，大于 0 不改变积压条数门槛。
  */
-export function talkValueFor(cfg: TalkValueConfig, chat: ChatRef, now = new Date()): number {
-  const base = chat.type === 'private' ? cfg.privateTalkValue : cfg.talkValue;
-  if (!cfg.enableRules || !cfg.rules?.length) return clamp01(base);
-  const minuteOfDay = now.getHours() * 60 + now.getMinutes();
-  let timed: number | null = null;
-  let fallback: number | null = null;
-  for (const rule of cfg.rules) {
-    if (!matchesSession(rule, chat)) continue;
-    const t = String(rule.time ?? '').trim();
-    if (!t) { fallback = clamp01(Number(rule.value)); continue; }
-    if (inTimeWindow(t, minuteOfDay)) timed = clamp01(Number(rule.value));
-  }
-  return timed ?? fallback ?? clamp01(base);
+export function talkValueFor(cfg: { talkValue: number; privateTalkValue: number }, chat: ChatRef): number {
+  return clamp01(chat.type === 'private' ? cfg.privateTalkValue : cfg.talkValue);
 }
 
 function clamp01(n: number): number {

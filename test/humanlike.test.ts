@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed, inTimeWindow } from '../src/kernel/humanlike/frequency.ts';
+import { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed } from '../src/kernel/humanlike/frequency.ts';
 import {
   normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
   isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING, MAX_BUBBLES,
@@ -60,40 +60,32 @@ test('空窗补偿：积压条数 + 空窗折算才算等效条数，且折算�
 });
 
 // ============================================================
-// 3. 频率规则与空闲退避（移植 MaiBot talk_value_rules / idle_backoff）
+// 3. 频率与空闲退避（对话差异走 timingOverrides，规则模式已删）
 // ============================================================
 
-test('频率：全局值 + 规则覆盖 + 时段（含跨零点）', () => {
-  const base = { talkValue: 1, privateTalkValue: 0.5, enableRules: false, rules: [] };
+test('频率：群聊/私聊各自的 talkValue', () => {
+  const base = { talkValue: 1, privateTalkValue: 0.5 };
   assert.equal(talkValueFor(base, chat), 1);
   assert.equal(talkValueFor(base, { ...chat, type: 'private' }), 0.5);
-
-  const withRules = {
-    ...base,
-    enableRules: true,
-    rules: [
-      { ruleType: 'group' as const, itemId: '', platform: '', time: '00:00-08:59', value: 0.2 },
-      { ruleType: 'group' as const, itemId: '', platform: '', time: '', value: 0.9 },
-    ],
-  };
-  assert.equal(talkValueFor(withRules, chat, new Date(2026, 0, 1, 3, 0)), 0.2, '凌晨命中低频率时段');
-  assert.equal(talkValueFor(withRules, chat, new Date(2026, 0, 1, 15, 0)), 0.9, '白天落到兜底规则');
-
-  assert.equal(inTimeWindow('23:00-02:00', 23 * 60 + 30), true);
-  assert.equal(inTimeWindow('23:00-02:00', 1 * 60), true);
-  assert.equal(inTimeWindow('23:00-02:00', 12 * 60), false);
-  assert.equal(inTimeWindow('*', 5), true);
-  assert.equal(inTimeWindow('', 5), false, '空时段交给调用方当兜底');
+  assert.equal(talkValueFor({ talkValue: NaN, privateTalkValue: 0.5 }, chat), 1, '非法值回落 1');
 });
 
-test('频率：规则按会话精确命中，非法输入不炸', () => {
-  const cfg = {
-    talkValue: 1, privateTalkValue: 1, enableRules: true,
-    rules: [{ ruleType: 'group' as const, itemId: '999', platform: '', time: '*', value: 0.1 }],
-  };
-  assert.equal(talkValueFor(cfg, chat), 1, '别的群不受影响');
-  assert.equal(talkValueFor(cfg, { ...chat, chatId: '999' }), 0.1);
-  assert.equal(talkValueFor({ ...cfg, rules: [{ ...cfg.rules[0], value: NaN }] }, { ...chat, chatId: '999' }), 1);
+test('会话覆盖：timingOverrides 只作用于该会话，其余会话跟随默认', async () => {
+  const { svc, triggers } = makeService({
+    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1 },
+    timingOverrides: {
+      group_123: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
+    },
+  });
+  assert.equal(svc.timingFor(chat).onlyReplyWhenAt, true, '本会话读到覆盖');
+  assert.equal(svc.timingFor({ ...chat, chatId: '999' }).onlyReplyWhenAt, false, '别的会话仍跟随默认');
+  svc.ingest(ev('普通消息'), { isCommand: false });
+  await wait(30);
+  assert.equal(triggers.length, 0, '覆盖里的仅 @ 生效：普通消息不开口');
+  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  assert.equal(at.action, 'pass', '@ 仍然直通');
+  svc.dispose();
 });
 
 test('空闲退避：从起点开始指数增长并封顶；积压够多就绕过', () => {

@@ -2,7 +2,7 @@
 import { FadeName } from '@/components/FadeName';
 /** 设置：左分节导航（QQ 接入 / 模型 / 搜索 / 风控 / 拟人化 / 记忆）+ 右表单；协议端选择与可用性检测都在「QQ 接入」里 */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { get, post, fmtTime } from '@/lib/api';
+import { get, post, del, fmtTime } from '@/lib/api';
 import { useSave } from '@/lib/useSave';
 import { BrandInput } from '@/components/BrandInput';
 import { PillSelect, type PillOpt } from '@/components/PillSelect';
@@ -22,7 +22,6 @@ interface Humanlike {
   timing: {
     pendingThreshold: number;
     talkValue: number; privateTalkValue: number;
-    enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
     mentionedBotReply: boolean; onlyReplyWhenAt: boolean; focusMode: boolean;
   };
   merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number; fireDelayMinMs: number; fireDelayMaxMs: number };
@@ -164,6 +163,8 @@ export default function SettingsPage() {
   const loadCfg = useCallback(async () => {
     const cfg: Config = await get('/api/config');
     setC(cfg);
+    // 默认回复时机留一份：切回「默认」或恢复会话默认时用它还原
+    defaultTiming.current = cfg.humanlike.timing;
     setQq(cfg.ui?.expectedQq ?? '');
     refreshInfo();
     loadPlug();
@@ -178,12 +179,27 @@ export default function SettingsPage() {
     return () => clearInterval(t);
   }, [sec, checking, runCheck]);
 
-  /** 全部已知会话（频率规则的「选群聊」下拉数据源）；进拟人化分节时拉一次 */
+  /** 全部已知会话（「作用会话」下拉数据源）；进拟人化分节时拉一次 */
   const [chats, setChats] = useState<{ chatId: string; chatType: string; title?: string }[]>([]);
+  /** 回复时机的编辑范围：'' = 默认（所有会话），chatKey = 某个会话单独的覆盖 */
+  const [timingScope, setTimingScope] = useState('');
+  const [timingOverride, setTimingOverride] = useState<Humanlike['timing'] | null>(null);
+  const defaultTiming = useRef<Humanlike['timing'] | null>(null);
   useEffect(() => {
     if (sec !== 'humanlike') return;
     get('/api/chats').then((list: unknown) => setChats(Array.isArray(list) ? list : [])).catch(() => {});
   }, [sec]);
+  // 切到某个会话：读它的覆盖（没有就显示默认），并把它作为「回复时机」的当前值
+  useEffect(() => {
+    if (sec !== 'humanlike' || !timingScope) return;
+    let alive = true;
+    get(`/api/humanlike/timing?chatKey=${encodeURIComponent(timingScope)}`).then((r: any) => {
+      if (!alive) return;
+      setTimingOverride(r.override ?? null);
+      setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: r.effective } } : prev);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [sec, timingScope]);
 
   if (!c) return <div className="mset-empty">加载中…</div>;
   const r = c.risk;
@@ -213,11 +229,45 @@ export default function SettingsPage() {
   const patchH = (p: Partial<Humanlike>, immediate = false) => {
     const nh = { ...h, ...p } as Humanlike;
     patch({ humanlike: nh });
-    autoSave('humanlike', immediate ? 0 : 600, { humanlike: nh });
+    // 会话覆盖只属于「回复时机」的编辑态：其他分节保存时不能把它写回全局默认
+    const saved = timingScope && defaultTiming.current ? { ...nh, timing: defaultTiming.current } : nh;
+    autoSave('humanlike', immediate ? 0 : 600, { humanlike: saved });
   };
-  /** 改第 i 条频率规则的某个字段（rules 编辑器用） */
-  const setRule = (i: number, part: Partial<Humanlike['timing']['rules'][number]>) =>
-    patchH({ timing: { ...h.timing, rules: h.timing.rules.map((r, j) => (j === i ? { ...r, ...part } : r)) } });
+  /** 改「回复时机」：默认范围写全局，选中某个会话时写该会话的覆盖 */
+  const patchTiming = (part: Partial<Humanlike['timing']>, immediate = false) => {
+    const nt = { ...h.timing, ...part };
+    patch({ humanlike: { ...h, timing: nt } });
+    if (!timingScope) {
+      defaultTiming.current = nt;
+      autoSave('humanlike', immediate ? 0 : 600, { humanlike: { ...h, timing: nt } });
+      return;
+    }
+    setTimingOverride(nt);
+    const key = `timing:${timingScope}`;
+    if (saveTimers.current[key]) clearTimeout(saveTimers.current[key]);
+    saveTimers.current[key] = setTimeout(() => {
+      delete saveTimers.current[key];
+      save('/api/humanlike/timing', { chatKey: timingScope, timing: nt });
+    }, immediate ? 0 : 600);
+  };
+  /** 切「作用会话」：默认 = 还原全局；具体会话 = 让 effect 去拉它的覆盖 */
+  const switchTimingScope = (key: string) => {
+    setTimingScope(key);
+    if (!key) {
+      setTimingOverride(null);
+      const def = defaultTiming.current;
+      if (def) setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: def } } : prev);
+    }
+  };
+  /** 删掉本会话的覆盖，回到默认时机 */
+  const resetTiming = () => {
+    if (!timingScope) return;
+    run(() => del(`/api/humanlike/timing?chatKey=${encodeURIComponent(timingScope)}`), () => {
+      setTimingOverride(null);
+      const def = defaultTiming.current;
+      if (def) setC((prev) => prev ? { ...prev, humanlike: { ...prev.humanlike, timing: def } } : prev);
+    });
+  };
   /** Tavily key：没动过就一直跟着服务端回显（明文回传，跟模型页同一口径） */
   const storedKey = String(plug?.web.values.apiKey ?? '').trim();
   const webKey = tavily ?? storedKey;
@@ -435,82 +485,54 @@ export default function SettingsPage() {
           {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
+              <div className="mset-mrow" style={{ marginBottom: 10 }}>
+                <span className="plg-v">作用会话</span>
+                <span className="mset-macts">
+                  <PillSelect align="left" value={timingScope} label="作用会话"
+                    options={[
+                      { v: '', t: '默认（所有会话）' },
+                      ...chats.map((chat) => ({
+                        v: `${chat.chatType}_${chat.chatId}`,
+                        t: chat.title ? `${chat.title}（${chat.chatId}）` : `${chat.chatType === 'private' ? '私聊' : '群'} ${chat.chatId}`,
+                      })),
+                    ]}
+                    onChange={switchTimingScope} />
+                  {timingScope && timingOverride && (
+                    <button className="chip" style={{ marginLeft: 8 }} onClick={resetTiming}>恢复默认</button>
+                  )}
+                </span>
+              </div>
               <div className="set-grid">
                 <Num label="触发所需积压条数"
                   hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
                   value={h.timing.pendingThreshold}
-                  onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
+                  onChange={(v) => patchTiming({ pendingThreshold: v })} />
                 <Num label="群聊频率（0-1）"
                   hint="0 = 静默；大于 0 时开口条数只看上面的积压条数"
                   value={h.timing.talkValue}
-                  onChange={(v) => patchH({ timing: { ...h.timing, talkValue: v } })} />
+                  onChange={(v) => patchTiming({ talkValue: v })} />
                 <Num label="私聊频率（0-1）" value={h.timing.privateTalkValue}
-                  onChange={(v) => patchH({ timing: { ...h.timing, privateTalkValue: v } })} />
+                  onChange={(v) => patchTiming({ privateTalkValue: v })} />
               </div>
               <div className="mset-models" style={{ marginTop: 14 }}>
                 <div className="mset-mrow">
                   <span className="plg-v">仅 @ 后才回复</span>
                   <span className="mset-macts"><Switch on={h.timing.onlyReplyWhenAt}
-                    onChange={() => patchH({ timing: { ...h.timing, onlyReplyWhenAt: !h.timing.onlyReplyWhenAt } }, true)} /></span>
+                    onChange={() => patchTiming({ onlyReplyWhenAt: !h.timing.onlyReplyWhenAt }, true)} /></span>
                 </div>
                 {!h.timing.onlyReplyWhenAt && (
                   <div className="mset-mrow">
                     <span className="plg-v">提到名字时倾向回复</span>
                     <span className="mset-macts"><Switch on={h.timing.mentionedBotReply}
-                      onChange={() => patchH({ timing: { ...h.timing, mentionedBotReply: !h.timing.mentionedBotReply } }, true)} /></span>
+                      onChange={() => patchTiming({ mentionedBotReply: !h.timing.mentionedBotReply }, true)} /></span>
                   </div>
                 )}
                 <div className="mset-mrow">
                   <span className="plg-v">专注模式<Hint text="不参与群聊活跃度打分，只对强相关的内容说话。" /></span>
                   <span className="mset-macts"><Switch on={h.timing.focusMode}
-                    onChange={() => patchH({ timing: { ...h.timing, focusMode: !h.timing.focusMode } }, true)} /></span>
-                </div>
-                <div className="mset-mrow">
-                  <span className="plg-v">按群聊与时段单独调整频率<Hint text="开启后可用「某个群 + 某个时段」的规则覆盖上面的基准频率，比如夜里调低。" /></span>
-                  <span className="mset-macts"><Switch on={h.timing.enableRules}
-                    onChange={() => patchH({ timing: { ...h.timing, enableRules: !h.timing.enableRules } }, true)} /></span>
+                    onChange={() => patchTiming({ focusMode: !h.timing.focusMode }, true)} /></span>
                 </div>
               </div>
-              {h.timing.enableRules && (
-                <div style={{ marginTop: 12 }}>
-                  <div className="mset-group-t" style={{ marginBottom: 6 }}>
-                    <span className="mset-flabel" style={{ margin: 0 }}>频率规则<Hint text="时段留空＝兜底值；带时段的规则优先，同会话同时段多条命中取最后一条。" /></span>
-                    <button className="chain-add" title="添加规则"
-                      onClick={() => patchH({ timing: { ...h.timing, rules: [...h.timing.rules, { platform: '', itemId: '', ruleType: 'group', time: '', value: 1 }] } }, true)}>
-                      <Icon name="plus" size={14} />
-                    </button>
-                  </div>
-                  <div className="mset-models">
-                    {!h.timing.rules.length && <div className="mset-group-e">还没有规则，点右上 + 添加</div>}
-                    {h.timing.rules.map((rule, i) => (
-                      <div key={i} className="mset-mrow" style={{ gap: 8 }}>
-                        <BrandInput style={{ width: 150 }} type="text" value={rule.time} spellCheck={false}
-                          onChange={(e) => setRule(i, { time: e.target.value })} />
-                        <PillSelect align="left" value={rule.ruleType} label="聊天类型"
-                          options={[{ v: 'group', t: '群聊' }, { v: 'private', t: '私聊' }, { v: 'any', t: '不限' }]}
-                          onChange={(v) => setRule(i, { ruleType: v as 'group' | 'private' | 'any' })} />
-                        <PillSelect align="left" value={rule.itemId} label="作用会话"
-                          options={[
-                            { v: '', t: '全部会话' },
-                            ...chats.map((c) => ({ v: c.chatId, t: c.title ? `${c.title}（${c.chatId}）` : c.chatId })),
-                          ]}
-                          onChange={(v) => {
-                            const chat = chats.find((c) => c.chatId === v);
-                            // 选中具体会话时把类型一并对齐，避免「选了群、类型却停在私聊」这条永不命中的规则
-                            setRule(i, v && chat ? { itemId: v, ruleType: chat.chatType === 'private' ? 'private' : 'group' } : { itemId: v });
-                          }} />
-                        <span style={{ fontSize: 12, color: 'var(--faint)', flex: 'none' }}>频率%</span>
-                        <BrandInput style={{ width: 70 }} type="number" value={Math.round(rule.value * 100)} spellCheck={false}
-                          onChange={(e) => setRule(i, { value: Math.min(100, Math.max(0, Number(e.target.value) || 0)) / 100 })} />
-                        <button className="chain-add" title="删除这条规则"
-                          onClick={() => patchH({ timing: { ...h.timing, rules: h.timing.rules.filter((_, j) => j !== i) } }, true)}>
-                          <Icon name="trash" size={14} />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               <div className="mset-sec-h"><span>发送方式</span></div>
               <div className="set-grid" style={{ marginTop: 14 }}>

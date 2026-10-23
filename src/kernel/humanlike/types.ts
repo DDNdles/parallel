@@ -6,7 +6,7 @@
  */
 
 import { DEFAULT_OUTGOING, type OutgoingConfig } from './delivery.ts';
-import type { BackoffConfig, TalkRule } from './frequency.ts';
+import type { BackoffConfig } from './frequency.ts';
 import type { RepetitionConfig } from './repetition.ts';
 import { DEFAULT_RHYTHM, type RhythmConfig } from './rhythm.ts';
 import { DEFAULT_AGENCY, type AgencyConfig } from './agency.ts';
@@ -15,7 +15,7 @@ import type { JargonConfig } from './jargon.ts';
 import type { RepeatConfig } from './repeat.ts';
 
 export type { OutgoingConfig } from './delivery.ts';
-export type { BackoffConfig, TalkRule, TalkValueConfig } from './frequency.ts';
+export type { BackoffConfig } from './frequency.ts';
 export type { RepetitionConfig } from './repetition.ts';
 export type { RhythmConfig } from './rhythm.ts';
 export type { AgencyConfig, AgencyWindow, ProactiveContactCandidate, AgencyCapacity } from './agency.ts';
@@ -29,8 +29,6 @@ export interface TimingConfig {
   /** 群聊频率开关：0 = 静默；大于 0 时不改变条数门槛 */
   talkValue: number;
   privateTalkValue: number;
-  enableRules: boolean;
-  rules: TalkRule[];
   /** 提到名字更容易回（默认关，与 MaiBot 一致）；仅 @ 模式下不生效 */
   mentionedBotReply: boolean;
   /** 仅 @ 后才回复：群聊普通消息一律不开口（默认关）；私聊与命令不受影响 */
@@ -70,6 +68,8 @@ export interface HumanlikeConfig {
   /** 戳一戳（chat 工具）：有明确指向/犯贱时的社交动作；冷却与小时上限是硬护栏 */
   poke: { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
   timing: TimingConfig;
+  /** 每个会话单独的回复时机覆盖（key = `group_123` / `private_456`）；没有就跟随 timing */
+  timingOverrides: Record<string, TimingConfig>;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
   outgoing: OutgoingConfig;
   /**
@@ -129,15 +129,11 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
     pendingThreshold: 12,
     talkValue: 1,
     privateTalkValue: 1,
-    enableRules: false,
-    rules: [
-      { platform: '', itemId: '', ruleType: 'group', time: '00:00-08:59', value: 0.8 },
-      { platform: '', itemId: '', ruleType: 'group', time: '09:00-18:59', value: 1 },
-    ],
     mentionedBotReply: false,
     onlyReplyWhenAt: false,
     focusMode: false,
   },
+  timingOverrides: {},
   outgoing: { ...DEFAULT_OUTGOING },
   interrupt: { enable: true, probability: 0.8 },
   merge: { enable: true, windowMs: 2000, maxWaitMs: 6000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },

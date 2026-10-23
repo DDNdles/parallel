@@ -13,9 +13,9 @@ export { HumanlikeService, type HumanlikeServiceOptions, type SendPlan } from '.
 export {
   DEFAULT_HUMANLIKE, PRESENCE_WINDOW_SECONDS,
   type HumanlikeConfig, type TimingConfig, type TriggerBatch,
-  type BackoffConfig, type TalkRule, type OutgoingConfig,
+  type BackoffConfig, type OutgoingConfig,
 } from './types.ts';
-export { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed, inTimeWindow } from './frequency.ts';
+export { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed } from './frequency.ts';
 export { shouldInterrupt, type InterruptInput, type InterruptDecision } from './interrupt.ts';
 export {
   DEFAULT_RHYTHM, rhythmSignature, detectCollapse, rhythmNudge, type RhythmConfig,

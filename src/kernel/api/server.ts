@@ -10,6 +10,7 @@ import { newId, nowMs } from '../util/misc.ts';
 import { usageReport } from '../services/usage.ts';
 import { collectRecentArtifacts, workScopeOf } from '../services/work.ts';
 import { isDeliverableArtifact } from '../services/artifacts.ts';
+import type { TimingConfig } from '../humanlike/types.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
 import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
 import { geminiApiBase } from '../services/pi-ai.ts';
@@ -1198,8 +1199,43 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       return send({
         chatKey: m[0],
         ...kernel.humanlike.snapshot(chat),
-        config: kernel.config.config.humanlike,
+        // 状态页显示这个会话实际生效的配置（可能带会话级覆盖）
+        config: kernel.humanlike.configFor(chat),
       });
+    }
+
+    // 每个会话单独的回复时机覆盖：GET 读 / POST 写 / DELETE 恢复默认
+    if (area === 'api' && a === 'humanlike' && b === 'timing') {
+      const key = String(req.method === 'POST' ? body.chatKey : url.searchParams.get('chatKey')).trim();
+      const m = key.match(/^(group|private)_(.+)$/);
+      if (!m) return send({ error: 'chatKey 不合法' }, 400);
+      const chat = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };
+      const hl = kernel.config.config.humanlike;
+      hl.timingOverrides = hl.timingOverrides ?? {};
+      if (req.method === 'GET') {
+        return send({
+          chatKey: key,
+          default: hl.timing,
+          override: hl.timingOverrides[key] ?? null,
+          effective: kernel.humanlike.timingFor(chat),
+        });
+      }
+      if (req.method === 'DELETE') {
+        delete hl.timingOverrides[key];
+        kernel.config.saveConfig();
+        kernel.humanlike.rearmAll();
+        return send({ ok: true, effective: hl.timing });
+      }
+      if (req.method === 'POST') {
+        const parsed = parseTimingConfig((body.timing ?? {}) as Record<string, unknown>);
+        if (typeof parsed === 'string') return send({ error: parsed }, 400);
+        hl.timingOverrides[key] = parsed;
+        kernel.config.saveConfig();
+        // 只改覆盖时不必重载插件；重新武装主动发言计时器，让「仅 @」等开关立即生效
+        kernel.humanlike.rearmAll();
+        return send({ ok: true, override: parsed, effective: kernel.humanlike.timingFor(chat) });
+      }
+      return send({ error: 'method not allowed' }, 405);
     }
 
     // ================= 适配器动作 =================
@@ -1215,9 +1251,32 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
   }
 }
 
+/** 单个会话的回复时机：整份校验，非法值直接拒绝（前端每次提交完整对象） */
+function parseTimingConfig(src: Record<string, unknown>): TimingConfig | string {
+  const numberIn = (key: string, min: number, max: number, label: string): number | string => {
+    const n = Number(src[key]);
+    if (!Number.isFinite(n) || n < min || n > max) return `${label}需要是 ${min}~${max} 之间的数`;
+    return n;
+  };
+  const pendingThreshold = numberIn('pendingThreshold', 1, 200, '触发所需积压条数');
+  if (typeof pendingThreshold === 'string') return pendingThreshold;
+  if (!Number.isInteger(pendingThreshold)) return '触发所需积压条数需要是整数';
+  const talkValue = numberIn('talkValue', 0, 1, '群聊频率');
+  if (typeof talkValue === 'string') return talkValue;
+  const privateTalkValue = numberIn('privateTalkValue', 0, 1, '私聊频率');
+  if (typeof privateTalkValue === 'string') return privateTalkValue;
+  return {
+    pendingThreshold,
+    talkValue,
+    privateTalkValue,
+    mentionedBotReply: !!src.mentionedBotReply,
+    onlyReplyWhenAt: !!src.onlyReplyWhenAt,
+    focusMode: !!src.focusMode,
+  };
+}
+
 /** 拟人化配置的入参白名单：逐字段校验 + 范围钳制，非法值直接拒绝（不静默取默认）。 */
-function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, unknown>): string | undefined {
-  const num = (v: unknown, min: number, max: number, label: string): number | string => {
+function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, unknown>): string | undefined {  const num = (v: unknown, min: number, max: number, label: string): number | string => {
     const n = Number(v);
     if (!Number.isFinite(n) || n < min || n > max) return `${label}需要是 ${min}~${max} 之间的数`;
     return n;
@@ -1337,37 +1396,16 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     applyBool(t, timing, 'mentionedBotReply');
     applyBool(t, timing, 'onlyReplyWhenAt');
     applyBool(t, timing, 'focusMode');
-    applyBool(t, timing, 'enableRules');
-    // 拟合概率已删（2026-10-23）：老页面回放的 replyTriggerMode 一律忽略，不写回配置
+    // 拟合概率已删（2026-10-23）：老页面回放的键一律忽略，不写回配置
     delete (t as Record<string, unknown>).replyTriggerMode;
     // @ 必回已改成无条件硬规则：旧开关写不回来
     delete (t as Record<string, unknown>).inevitableAtReply;
+    // 按群聊/时段的频率规则已删：会话差异改由 timingOverrides 承担
+    delete (t as Record<string, unknown>).enableRules;
+    delete (t as Record<string, unknown>).rules;
     let e = applyNum(t, timing, 'pendingThreshold', 1, 200, '触发所需积压条数'); if (e) return e;
     e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
     e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;
-    if (Array.isArray(timing.rules)) {
-      const rules: Record<string, unknown>[] = [];
-      for (const raw of timing.rules as unknown[]) {
-        if (!raw || typeof raw !== 'object') continue;
-        const r = raw as Record<string, unknown>;
-        const type = String(r.ruleType ?? 'any');
-        if (!['group', 'private', 'any'].includes(type)) return '频率规则的聊天类型只能是 group/private/any';
-        const value = Number(r.value);
-        if (!Number.isFinite(value) || value < 0 || value > 1) return '频率规则的频率需要是 0~1';
-        const time = String(r.time ?? '').trim();
-        if (time && time !== '*' && !/^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$/.test(time)) {
-          return '频率规则的时段要写成 HH:MM-HH:MM、* 或留空';
-        }
-        rules.push({
-          platform: String(r.platform ?? '').trim().slice(0, 32),
-          itemId: String(r.itemId ?? '').trim().slice(0, 64),
-          ruleType: type as 'group' | 'private' | 'any',
-          time,
-          value,
-        });
-      }
-      t.rules = rules;
-    }
   }
 
   // 出站打断（纯程序）：她还在发气泡时对面又开口，按概率把剩下的气泡砍掉

@@ -142,15 +142,12 @@ export const DEFAULT_CONFIG = {
       pendingThreshold: 12,               // 攒够几条消息才进模型（开口门槛）
       talkValue: 1,                       // 群聊频率开关：0 = 静默；>0 不改变条数门槛
       privateTalkValue: 1,
-      enableRules: false,                 // 按群/时段单独调频率
-      rules: [
-        { platform: '', itemId: '', ruleType: 'group' as const, time: '00:00-08:59', value: 0.8 },
-        { platform: '', itemId: '', ruleType: 'group' as const, time: '09:00-18:59', value: 1 },
-      ],
       mentionedBotReply: false,           // 提到名字就更想回（默认关；仅 @ 模式下不生效）
       onlyReplyWhenAt: false,             // 仅 @ 后才回复：群聊普通消息不开口（默认关）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
+    // 每个会话单独的回复时机覆盖（key = group_123 / private_456）；空 = 全部跟随默认
+    timingOverrides: {},
     // ③ 出站打断（纯程序，见 humanlike/interrupt.ts）：她还在发气泡时对面又开口，
     //    按概率把剩下的气泡砍掉；模型还在生成时则直接 abort 这一轮。命令插话必断。
     interrupt: {
@@ -390,6 +387,18 @@ export class ConfigStore {
       delete hlTiming.replyStyle;
       // @ 必回已从开关变成无条件硬规则；旧键清掉，避免桌面上留一个无效开关
       delete hlTiming.inevitableAtReply;
+      // 按群聊/时段的频率规则已删：会话差异改由 humanlike.timingOverrides 承担
+      delete hlTiming.enableRules;
+      delete hlTiming.rules;
+    }
+    // 旧的频率规则（如果有独立块）也一并清掉；timingOverrides 由 deepMerge 补默认 {}
+    delete (this.config.humanlike as any).talkValueRules;
+    const overrides = (this.config.humanlike as any).timingOverrides;
+    if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
+      // 只留形如 group_x / private_x 的键，值按当前 timing 形状兜底
+      for (const key of Object.keys(overrides)) {
+        if (!/^(group|private)_.+$/.test(key)) delete overrides[key];
+      }
     }
     // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费
     delete (this.config.llm as any).historyLimit;
