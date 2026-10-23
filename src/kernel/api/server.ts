@@ -1335,11 +1335,13 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   if (timing && typeof timing === 'object') {
     const t = target.timing;
     applyBool(t, timing, 'mentionedBotReply');
-    applyBool(t, timing, 'inevitableAtReply');
+    applyBool(t, timing, 'onlyReplyWhenAt');
     applyBool(t, timing, 'focusMode');
     applyBool(t, timing, 'enableRules');
     // 拟合概率已删（2026-10-23）：老页面回放的 replyTriggerMode 一律忽略，不写回配置
     delete (t as Record<string, unknown>).replyTriggerMode;
+    // @ 必回已改成无条件硬规则：旧开关写不回来
+    delete (t as Record<string, unknown>).inevitableAtReply;
     let e = applyNum(t, timing, 'pendingThreshold', 1, 200, '触发所需积压条数'); if (e) return e;
     e = applyNum(t, timing, 'talkValue', 0, 1, '群聊频率'); if (e) return e;
     e = applyNum(t, timing, 'privateTalkValue', 0, 1, '私聊频率'); if (e) return e;

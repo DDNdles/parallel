@@ -31,10 +31,10 @@ export interface TimingConfig {
   privateTalkValue: number;
   enableRules: boolean;
   rules: TalkRule[];
-  /** 提到名字更容易回（默认关，与 MaiBot 一致） */
+  /** 提到名字更容易回（默认关，与 MaiBot 一致）；仅 @ 模式下不生效 */
   mentionedBotReply: boolean;
-  /** 被 @ 必回（默认开，与 MaiBot 一致） */
-  inevitableAtReply: boolean;
+  /** 仅 @ 后才回复：群聊普通消息一律不开口（默认关）；私聊与命令不受影响 */
+  onlyReplyWhenAt: boolean;
   /** 专注模式：不参与群聊激活度打分，只认强相关 */
   focusMode: boolean;
 }
@@ -135,7 +135,7 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
       { platform: '', itemId: '', ruleType: 'group', time: '09:00-18:59', value: 1 },
     ],
     mentionedBotReply: false,
-    inevitableAtReply: true,
+    onlyReplyWhenAt: false,
     focusMode: false,
   },
   outgoing: { ...DEFAULT_OUTGOING },

@@ -23,7 +23,7 @@ interface Humanlike {
     pendingThreshold: number;
     talkValue: number; privateTalkValue: number;
     enableRules: boolean; rules: { platform: string; itemId: string; ruleType: 'group' | 'private' | 'any'; time: string; value: number }[];
-    mentionedBotReply: boolean; inevitableAtReply: boolean; focusMode: boolean;
+    mentionedBotReply: boolean; onlyReplyWhenAt: boolean; focusMode: boolean;
   };
   merge: { enable: boolean; windowMs: number; maxWaitMs: number; bufferTtlMs: number; fireDelayMinMs: number; fireDelayMaxMs: number };
   /** 出站打断（纯程序）：她还在发气泡时对面插话，按概率把剩下的气泡砍掉 */
@@ -449,15 +449,17 @@ export default function SettingsPage() {
               </div>
               <div className="mset-models" style={{ marginTop: 14 }}>
                 <div className="mset-mrow">
-                  <span className="plg-v">被 @ 时必定回复</span>
-                  <span className="mset-macts"><Switch on={h.timing.inevitableAtReply}
-                    onChange={() => patchH({ timing: { ...h.timing, inevitableAtReply: !h.timing.inevitableAtReply } }, true)} /></span>
+                  <span className="plg-v">仅 @ 后才回复</span>
+                  <span className="mset-macts"><Switch on={h.timing.onlyReplyWhenAt}
+                    onChange={() => patchH({ timing: { ...h.timing, onlyReplyWhenAt: !h.timing.onlyReplyWhenAt } }, true)} /></span>
                 </div>
-                <div className="mset-mrow">
-                  <span className="plg-v">提到名字时倾向回复</span>
-                  <span className="mset-macts"><Switch on={h.timing.mentionedBotReply}
-                    onChange={() => patchH({ timing: { ...h.timing, mentionedBotReply: !h.timing.mentionedBotReply } }, true)} /></span>
-                </div>
+                {!h.timing.onlyReplyWhenAt && (
+                  <div className="mset-mrow">
+                    <span className="plg-v">提到名字时倾向回复</span>
+                    <span className="mset-macts"><Switch on={h.timing.mentionedBotReply}
+                      onChange={() => patchH({ timing: { ...h.timing, mentionedBotReply: !h.timing.mentionedBotReply } }, true)} /></span>
+                  </div>
+                )}
                 <div className="mset-mrow">
                   <span className="plg-v">专注模式<Hint text="不参与群聊活跃度打分，只对强相关的内容说话。" /></span>
                   <span className="mset-macts"><Switch on={h.timing.focusMode}

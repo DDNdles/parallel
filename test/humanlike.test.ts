@@ -828,3 +828,28 @@ test('重复惩罚：提醒 5 分钟一次；连续重写失败 3 次后不再�
   for (let i = 0; i < 3; i++) svc.noteRepetitionRetry(chat, '梁文峰', false);
   assert.equal(svc.repetitionHit(chat, '梁文峰又来了'), null, '到 maxStrikes 后不再重写');
 });
+
+test('服务：仅 @ 后才回复——普通群消息连门槛都不看，@ 仍直通并把积压一起带上', async () => {
+  const { svc, triggers } = makeService({
+    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
+  });
+  svc.ingest(ev('普通消息'), { isCommand: false });
+  await wait(30);
+  assert.equal(triggers.length, 0, '仅 @ 模式下普通消息不开口（门槛=1 也不看）');
+  assert.equal(svc.snapshot(chat).consecutiveNoAction, 0, '不评估就不该推进退避');
+  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  assert.equal(at.action, 'pass', '@ 仍然直通');
+  assert.equal((at as { events: ChatEvent[] }).events.length, 2, '@ 把攒着的普通消息一起带上');
+  svc.dispose();
+});
+
+test('服务：仅 @ 后才回复——名字提及与叫醒词都不直通', () => {
+  const { svc } = makeService({
+    timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true, onlyReplyWhenAt: true },
+  });
+  svc.setMentionAliases(['鲸鲸']);
+  const r = svc.ingest(ev('鲸鲸在吗'), { isCommand: false });
+  assert.equal(r.action, 'handled', '仅 @ 模式下叫醒词不算 @，只进缓冲');
+  svc.dispose();
+});

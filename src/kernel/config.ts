@@ -147,8 +147,8 @@ export const DEFAULT_CONFIG = {
         { platform: '', itemId: '', ruleType: 'group' as const, time: '00:00-08:59', value: 0.8 },
         { platform: '', itemId: '', ruleType: 'group' as const, time: '09:00-18:59', value: 1 },
       ],
-      mentionedBotReply: false,           // 提到名字就更想回（默认关）
-      inevitableAtReply: true,            // 被 @ 必回（默认开）
+      mentionedBotReply: false,           // 提到名字就更想回（默认关；仅 @ 模式下不生效）
+      onlyReplyWhenAt: false,             // 仅 @ 后才回复：群聊普通消息不开口（默认关）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
     // ③ 出站打断（纯程序，见 humanlike/interrupt.ts）：她还在发气泡时对面又开口，
@@ -388,6 +388,8 @@ export class ConfigStore {
       delete hlTiming.replyTriggerMode;
       delete hlTiming.necessityThreshold;
       delete hlTiming.replyStyle;
+      // @ 必回已从开关变成无条件硬规则；旧键清掉，避免桌面上留一个无效开关
+      delete hlTiming.inevitableAtReply;
     }
     // 每会话历史条数统一在 storage.historyLimit（历史环形缓冲真正读的键）；llm 下那个从来没人消费
     delete (this.config.llm as any).historyLimit;

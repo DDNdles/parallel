@@ -210,14 +210,15 @@ export class HumanlikeService {
     const chatRef: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
 
     // 被 @ 必回：立刻放行，但把已经攒着的消息一起带上（让模型看到完整上下文）
-    if (hasAt && cfg.timing.inevitableAtReply) {
+    if (hasAt) {
       const merged = this.bufferLen(st) > 0;
       const events = this.drain(st, event);
       this.noteForcedTurn(chatRef);
       this.armIdleTimer(chatRef, st, cfg);
       return { action: 'pass', events, merged };
     }
-    if (hasMention && cfg.timing.mentionedBotReply) {
+    // 仅 @ 后才回复：名字提及不再直通（@ 已经在上面处理，私聊走前面的分支不受影响）
+    if (hasMention && cfg.timing.mentionedBotReply && !cfg.timing.onlyReplyWhenAt) {
       const merged = this.bufferLen(st) > 0;
       const events = this.drain(st, event);
       this.noteForcedTurn(chatRef);
@@ -325,6 +326,13 @@ export class HumanlikeService {
       }
     }
     const chat: ChatRef = { platform: carrier.platform, type: carrier.type, chatId: carrier.chatId };
+
+    // 仅 @ 后才回复：群聊普通消息只留在缓冲里当上下文，不评估、不主动开口，也不安排重试
+    // （没有 @ 就没有需要重试的判定；@ 到达时 ingest 的直通分支会把这些消息一起带上）。
+    if (cfg.timing.onlyReplyWhenAt && carrier.type === 'group') {
+      this.logWait(carrier, st, '仅 @ 后才回复：普通群聊消息不触发');
+      return;
+    }
 
     // 专注模式（setting: timing.focusMode）：普通群聊不参与打分，只接 @/提及。
     if (cfg.timing.focusMode && carrier.type === 'group' && !hasAt && !hasMention) {
@@ -435,9 +443,12 @@ export class HumanlikeService {
   private armIdleTimer(chat: ChatRef, st: ChatState, cfg: HumanlikeConfig): void {
     if (st.idle) clearTimeout(st.idle);
     if (!cfg.proactive.enable) return;
+    // 仅 @ 后才回复：主动起话头也不允许（那是普通开口，不是被点名）
+    if (cfg.timing.onlyReplyWhenAt) return;
     st.idle = this.timer(() => {
       st.idle = undefined;
       if (this.disposed) return;
+      if (this.config.timing.onlyReplyWhenAt) return;
       if (st.buffer.length) return;                       // 有待处理消息时交给正常门控
       const now = this.now();
       const idleSeconds = st.lastInboundAt ? (now - st.lastInboundAt) / 1000 : 0;
