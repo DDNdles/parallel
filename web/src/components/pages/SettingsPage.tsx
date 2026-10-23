@@ -485,9 +485,13 @@ export default function SettingsPage() {
           {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
-              <div className="mset-mrow" style={{ marginBottom: 10 }}>
-                <span className="plg-v">作用会话</span>
-                <span className="mset-macts timing-scope">
+              <div className="set-grid">
+                <div className="mset-field timing-scope">
+                  <label className="mset-flabel">作用会话
+                    {timingScope && timingOverride && (
+                      <button className="timing-reset" onClick={resetTiming}>恢复默认</button>
+                    )}
+                  </label>
                   <PillSelect align="left" value={timingScope} label="作用会话"
                     options={[
                       { v: '', t: '默认（所有会话）' },
@@ -498,12 +502,7 @@ export default function SettingsPage() {
                       })),
                     ]}
                     onChange={switchTimingScope} />
-                  {timingScope && timingOverride && (
-                    <button className="chip" style={{ marginLeft: 8 }} onClick={resetTiming}>恢复默认</button>
-                  )}
-                </span>
-              </div>
-              <div className="set-grid">
+                </div>
                 <Num label="触发所需积压条数"
                   hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
                   value={h.timing.pendingThreshold}
