@@ -1,4 +1,4 @@
-import type { PluginContext, LLMRequestContext, ChatRef, WorkLiveStatus } from '../../kernel/types.ts';
+import type { PluginContext, LLMRequestContext, ChatRef, ChatEvent, Role, ToolContext, WorkLiveStatus } from '../../kernel/types.ts';
 import { renderAsk, renderHandoff } from '../../kernel/work-prompt.ts';
 import { workScopeOf } from '../../kernel/services/work.ts';
 import { busEvents } from '../../kernel/bus.ts';
@@ -35,6 +35,81 @@ const WORK = 'work' as const;
 
 /** 任务清单的一条（`todo` 工具维护；system 分节与工具返回值共用同一套标记） */
 interface TodoItem { text: string; status: 'pending' | 'in_progress' | 'done' }
+
+const normName = (s: unknown): string => String(s ?? '').trim().replace(/^@/, '').toLowerCase();
+
+/** 昵称/QQ 号 → 身份（先找本批，再找本会话最近说话的人） */
+function matchSpeaker(
+  raw: string,
+  batch: ChatEvent[],
+  speakers: NonNullable<ToolContext['speakers']>,
+): { userId: string; nickname?: string; role?: Role } | undefined {
+  const exact = batch.find((e) => e.userId === raw || normName(e.nickname) === raw)
+    ?? speakers.find((s) => s.userId === raw || normName(s.nickname) === raw);
+  if (exact) {
+    return {
+      userId: exact.userId,
+      nickname: exact.nickname,
+      role: (exact as ChatEvent).role ?? speakers.find((s) => s.userId === exact.userId)?.role,
+    };
+  }
+  const loose = batch.find((e) => {
+    const n = normName(e.nickname);
+    return n.length > 0 && (n.includes(raw) || raw.includes(n));
+  })
+    ?? speakers.find((s) => {
+      const n = normName(s.nickname);
+      return n.length > 0 && (n.includes(raw) || raw.includes(n));
+    });
+  if (loose) return { userId: loose.userId, nickname: loose.nickname, role: loose.role };
+  return undefined;
+}
+
+/**
+ * 合批轮里 carrier 只是最后说话的人：派活时按 requester（模型点名）或与原话的字符二元组重合度找正主。
+ * 找不到明确的人就退回 carrier（旧行为），宁可不动也不能乱改。
+ */
+export function pickWorkRequester(
+  args: Record<string, unknown>,
+  tctx: Pick<ToolContext, 'event' | 'batch' | 'speakers'>,
+  task: string,
+): { userId: string; nickname?: string; role?: Role } {
+  const batch = tctx.batch?.length ? tctx.batch : [tctx.event];
+  const speakers = tctx.speakers ?? [];
+  const raw = normName(args.requester);
+  if (raw) {
+    const who = matchSpeaker(raw, batch, speakers);
+    if (who) return who;
+  }
+  // 字符二元组：task 通常是在重述某人的原话，重合最高的那条才是正主（并列取更晚的）
+  const grams = (s: string): Set<string> => {
+    const out = new Set<string>();
+    const t = s.replace(/\s+/g, '');
+    for (let i = 0; i + 1 < t.length; i++) {
+      const g = t.slice(i, i + 2);
+      if (/[\p{L}\p{N}]/u.test(g[0]) && /[\p{L}\p{N}]/u.test(g[1])) out.add(g);
+    }
+    return out;
+  };
+  const taskGrams = grams(task);
+  let best: { e: ChatEvent; score: number } | undefined;
+  if (taskGrams.size) {
+    for (const e of batch) {
+      if (!String(e.text ?? '').trim()) continue;
+      let score = 0;
+      for (const g of grams(String(e.text))) if (taskGrams.has(g)) score++;
+      if (!best || score >= best.score) best = { e, score };
+    }
+  }
+  if (best && best.score > 0) {
+    return {
+      userId: best.e.userId,
+      nickname: best.e.nickname,
+      role: best.e.role ?? speakers.find((s) => s.userId === best!.e.userId)?.role,
+    };
+  }
+  return { userId: tctx.event.userId, nickname: tctx.event.nickname, role: tctx.event.role };
+}
 
 export function setup(ctx: PluginContext): void {
   const sb = ctx.sandbox as any;
@@ -98,7 +173,7 @@ export function setup(ctx: PluginContext): void {
   };
   const fmtTok = (n: number): string => n >= 10_000 ? `${(n / 10_000).toFixed(1)} 万` : String(n);
 
-  /** 进度快照 → 给模型转述用的事实（时间/轮次/token 都由程序算好，别让它自己估） */
+  /** 进度快照 → 给模型转述用的事实（时间/轮次/token/清单都由程序算好，别让它自己估） */
   function renderStatus(st: WorkLiveStatus): string {
     const lines: string[] = [];
     if (st.active.length) {
@@ -107,6 +182,19 @@ export function setup(ctx: PluginContext): void {
         const total = r.prompt + r.completion;
         const hit = r.prompt > 0 ? Math.round((r.cacheHit / r.prompt) * 100) : 0;
         lines.push(`- 任务「${r.task}」：已 ${fmtDur(r.elapsedMs)}，第 ${Math.max(1, r.rounds)} 轮，${r.toolCalls} 次工具调用，共 ${fmtTok(total)} token（提示 ${fmtTok(r.prompt)} / 输出 ${fmtTok(r.completion)}，缓存命中 ${hit}%）`);
+        // 任务清单（todo 工具维护）：用户问"做到哪了"时，真正有用的是这个
+        const entry = todos.get(r.id);
+        const items = entry?.items ?? [];
+        if (items.length) {
+          const done = items.filter((t) => t.status === 'done').length;
+          const current = items.find((t) => t.status === 'in_progress') ?? items.find((t) => t.status === 'pending');
+          lines.push(`  清单：${done}/${items.length} 完成${current ? `；${current.status === 'in_progress' ? '正在做' : '接下来'}「${current.text}」` : '（全部完成）'}`);
+          const shown = items.slice(0, 10);
+          for (const it of shown) {
+            lines.push(`   ${it.status === 'done' ? '[x]' : it.status === 'in_progress' ? '[~]' : '[ ]'} ${it.text}`);
+          }
+          if (items.length > shown.length) lines.push(`   …还有 ${items.length - shown.length} 条`);
+        }
         const step = r.step;
         const doing = step?.kind === 'tool' ? `正在用${toolLabel(step.name)}`
           : step?.kind === 'toolResult' ? `刚完成${toolLabel(step.name)}`
@@ -126,6 +214,10 @@ export function setup(ctx: PluginContext): void {
       const state = l.awaiting ? '停下来等回答' : l.ok ? '已完成' : '失败了';
       const agoMin = Math.max(0, Math.round((Date.now() - l.finishedAt) / 60_000));
       lines.push(`最近一次（${agoMin ? `${agoMin} 分钟前` : '刚刚'}）：任务「${l.task}」${state}，用时 ${fmtDur(l.durationMs)}；结论：${l.summary || l.error || '（无）'}`);
+      const lastItems = todos.get(l.id)?.items ?? [];
+      if (lastItems.length) {
+        lines.push(`清单 ${lastItems.filter((t) => t.status === 'done').length}/${lastItems.length} 完成`);
+      }
       if (l.artifacts.length) lines.push(`产物 ${l.artifacts.length} 个：${l.artifacts.slice(0, 5).join('、')}`);
     }
     return lines.join('\n');
@@ -139,29 +231,34 @@ export function setup(ctx: PluginContext): void {
     promptSnippet: '把需要实际动手的活派给工作子代理',
     promptGuidelines: [
       '派活的 task 要自带前因后果：做什么、输入在哪、要交回什么——工作子代理看不到你们的聊天。',
+      '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
-      '活跑完会另外给你一轮汇报：那一轮再讲结论，产物用 deliver_file 发。',
+      '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
     ],
     parameters: {
       type: 'object',
       properties: {
         task: { type: 'string', description: '要它做的事：目标、输入、要交回什么' },
+        requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
       },
       required: ['task'],
     },
     handler: (args, tctx) => {
-      if (!canWork(String(tctx.role))) {
-        return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
-      }
       const task = String(args.task ?? '').trim();
       if (!task) return '（任务为空，没有派出去。先问清对方要做什么。）';
+      // 归属：合批轮里 carrier 只是最后说话的人，按 requester / 原话重合度找真正提需求的人
+      const who = pickWorkRequester(args, tctx, task);
+      const role = String(who.role ?? tctx.role);
+      if (!canWork(role)) {
+        return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
+      }
       if (ctx.work.modelLabel() === '—') {
         return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
       }
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
-      const userId = tctx.event.userId;
-      const nickname = tctx.event.nickname;
+      const userId = who.userId || tctx.event.userId;
+      const nickname = who.nickname || tctx.event.nickname;
       // 等本轮 chat 收尾再开跑：让"好，我去弄"先由人格说出去，也避免 work 的第一发请求
       // 和 chat 的第二轮抢同一份上下文/同一条模型链。agent 中途夭折时用 5s 兜底。
       let started = false;
@@ -172,7 +269,7 @@ export function setup(ctx: PluginContext): void {
         started = true;
         off?.();
         if (timer) clearTimeout(timer);
-        const r = ctx.work.dispatch({ chat, task, userId, nickname, role: String(tctx.role) });
+        const r = ctx.work.dispatch({ chat, task, userId, nickname, role });
         if (!r.ok) ctx.log.warn(`派活没有开跑：${r.reason ?? '未知原因'}`);
       };
       off = ctx.bus.on(busEvents.agentEnd, (p: { chatKey?: string }) => {
@@ -186,12 +283,13 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'work_status',
-    description: '查询当前会话里、问的人自己派的活做到哪了：在跑多久、第几轮、几次工具调用、用了多少 token，有没有停下来等他回答。用户问「做到哪了/还要多久/进度怎么样」时用。只会返回调用者自己的活，看不到别人的。',
+    description: '查询当前会话里、问的人自己派的活做到哪了：已跑多久、第几轮、几次工具调用、用了多少 token、现在在干什么、任务清单做到第几项，有没有停下来等他回答。用户问「做到哪了/还要多久/进度怎么样/在干嘛」时用。只会返回调用者自己的活，看不到别人的。',
     surface: 'chat',
-    promptSnippet: '查自己派的活的进度（用时/轮次/token）',
+    promptSnippet: '查自己派的活的进度（用时/当前动作/任务清单）',
     promptGuidelines: [
       '用户问进度时先查再答；没有在跑的活就如实说没有，不要编。',
-      '时间与 token 用工具给的事实，不要自己估；用你自己的语气说，别报任务编号。',
+      '时间、当前动作和任务清单用工具给的事实，不要自己估；清单有几项完成就报几项，别把没做的说成做完。',
+      '用你自己的语气说，别报任务编号，也别把 [x]/[~]/[ ] 这些内部符号原样念出来。',
     ],
     parameters: { type: 'object', properties: {} },
     handler: (_args, tctx) => {

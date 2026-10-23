@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
+import { pickWorkRequester } from '../src/plugins/work/index.ts';
 
 // ============================================================
 // chat 面的 work 工具（2026-10-21，取代 /work 命令）
@@ -249,6 +250,99 @@ test('work 思考链：thinking 块进思考流，正文单独进正文流', asy
     assert.ok(!think.text.includes('我看一眼'), `正文不能塞进思考：${think.text}`);
     const body = events.find((e) => e.kind === 'text');
     assert.ok(body?.text.includes('我看一眼'), `正文要单独落 text：${body?.text}`);
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('chat 派给 work 的任务不截断：work.start 与列表都保留全文', async () => {
+  const g = await boot('9406');
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const longTask = `任务开头。${'细节'.repeat(400)}`;
+    const startEvents: any[] = [];
+    const off = g.kernel.bus.on(busEvents.workStart, (d: any) => { if (d.chatKey === g.chatKey) startEvents.push(d); });
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '完成' } }] });
+    g.mock.script.push({ content: '好了' });
+    await dispatch.handler({ task: longTask }, g.tctx('10001', 'owner') as any);
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+    const run = await until(
+      () => g.kernel.workRunner.list(10, g.chatKey).find((r) => r.task === longTask),
+      8000, '长任务开跑',
+    );
+    off();
+    assert.equal(run.task.length, longTask.length, '列表里的任务必须是全文');
+    const startEv = startEvents.find((e) => e.id === run.id);
+    assert.equal(startEv?.task, longTask, 'work.start 推给桌面的任务也必须是全文');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('work_dispatch 归属：合批轮里按 requester / 原话找正主，不默认归给最后说话的人', () => {
+  const ev = (userId: string, nickname: string, text: string, role?: string) => ({
+    id: `e_${userId}_${text.slice(0, 4)}`, platform: 'qq', type: 'group' as const, chatId: '9500',
+    userId, nickname, senderRole: 'member' as const, segments: [], text,
+    isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: role as any,
+  });
+  const ask = ev('10001', '君にも嘘をつこう', '整理成文档给我吧', 'owner');
+  const chatter = ev('10002', 'Lawrence', '这弹吉他的动图怎么还在疯狂刷屏啊', 'member');
+  const tctx = {
+    event: chatter,
+    batch: [ask, chatter],
+    speakers: [
+      { userId: '10002', nickname: 'Lawrence', role: 'member' as const, ts: Date.now() },
+      { userId: '10001', nickname: '君にも嘘をつこう', role: 'owner' as const, ts: Date.now() },
+    ],
+  };
+
+  // 模型点名 requester（含 @ 前缀）→ 归给点名的人
+  assert.deepEqual(pickWorkRequester({ requester: '@君にも嘘をつこう' }, tctx, '随便'), {
+    userId: '10001', nickname: '君にも嘘をつこう', role: 'owner',
+  });
+  // 没点名：按原话重合度找（任务里有「文档」，只有君君那句话沾边）
+  assert.equal(pickWorkRequester({}, tctx, '整理成一份完整的 IEEE 论文文档').userId, '10001');
+  // 与整批都不沾边 → 退回 carrier（旧行为），不乱改
+  assert.equal(pickWorkRequester({}, tctx, 'zzz').userId, '10002');
+});
+
+test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状态）', async () => {
+  const g = await boot('9405');
+  try {
+    const chat = g.chat;
+    const agent = g.kernel.container.workAgent();
+    const tools = g.kernel.container.workToolsFor(chat, 'owner', agent, 0);
+    const a = g.kernel.workRunner.run({
+      chat, task: '写一份报告', taskLabel: '写一份报告', userId: '10001', nickname: 'A',
+      role: 'owner', agent, tools, trigger: 'command', depth: 0,
+    });
+    // 第一轮先写清单；第二轮拖 2s 再收尾，中间这段时间查状态
+    g.mock.script.push({
+      content: '先列个清单',
+      toolCalls: [{
+        name: 'todo',
+        args: {
+          items: [
+            { text: '收集资料', status: 'done' },
+            { text: '写正文', status: 'in_progress' },
+            { text: '打包交付', status: 'pending' },
+          ],
+        },
+      }],
+    });
+    g.mock.script.push({ content: '还在写', delayMs: 2000, toolCalls: [{ name: 'work_finish', args: { summary: '写完了' } }] });
+
+    const status = g.tools('owner').find((t) => t.name === 'work_status')!;
+    const text = await until(() => {
+      const s = String(status.handler({}, g.tctx('10001', 'owner') as any));
+      return s.includes('写正文') ? s : undefined;
+    }, 8000, 'todo 清单出现在 status 里');
+    assert.match(text, /清单：1\/3 完成/, text);
+    assert.match(text, /正在做「写正文」/, text);
+    assert.match(text, /\[x\] 收集资料/, text);
+    assert.match(text, /\[~\] 写正文/, text);
+    assert.match(text, /\[ \] 打包交付/, text);
+    await a;
   } finally {
     await g.cleanup();
   }

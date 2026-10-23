@@ -63,8 +63,8 @@ interface Config {
   onebot: { host: string; port: number; reverseWsPath: string };
   ui?: { expectedQq?: string; chatPreview?: boolean };
   llm: { failoverThreshold: number };
-  /** 每会话历史条数在 storage 段（历史环形缓冲真正读的键）；旧内核没这个段，可选 */
-  storage?: { historyLimit: number };
+  /** 每会话历史条数与上下文时间窗在 storage 段；旧内核没这个段，可选 */
+  storage?: { historyLimit: number; contextMinutes?: number };
   /** 收件文件保留天数：内核存的是小时，界面按天给 */
   sandbox?: { inboxKeepDays: number };
   work: Work;
@@ -368,8 +368,10 @@ export default function SettingsPage() {
               </div>
 
               <div className="set-grid" style={{ marginTop: 14 }}>
+                {c.storage?.contextMinutes !== undefined && <Num label="传入上下文时限分钟" value={c.storage.contextMinutes}
+                  onChange={(v) => { patch({ storage: { ...c.storage!, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />}
                 {c.storage && <Num label="每会话历史条数" hint="模型每次读取的最近消息条数" value={c.storage.historyLimit}
-                  onChange={(v) => { patch({ storage: { historyLimit: v } }); autoSave('storage', 600, { storage: { historyLimit: v } }); }} />}
+                  onChange={(v) => { patch({ storage: { ...c.storage!, historyLimit: v } }); autoSave('storage', 600, { storage: { historyLimit: v } }); }} />}
               </div>
 
               <div className="mset-models" style={{ marginTop: 14 }}>

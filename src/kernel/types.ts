@@ -139,9 +139,13 @@ export interface ToolParameterSchema {
 }
 
 export interface ToolContext {
-  event: ChatEvent;            // 触发本轮对话的事件
+  event: ChatEvent;            // 触发本轮对话的事件（合批轮里只是最后一条 carrier）
   chat: ChatRef;
   role: Role;                  // 调用者角色
+  /** 本轮合并进来的整批消息：work_dispatch 据此判断"这活是谁提的"，而不是默认归给最后说话的人 */
+  batch?: ChatEvent[];
+  /** 本会话最近说话的人（昵称 → 身份）：合并轮里 requester 可能是更早某条消息的发言人 */
+  speakers?: { userId: string; nickname: string; role: Role; ts: number }[];
   /** 上下文窗口起点：search_history 用它把"模型眼前就有的那几条"排除掉（同 LLMRequestContext） */
   historyWindowStartTs?: number;
   /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
@@ -287,6 +291,10 @@ export interface LLMRequestContext {
   tools: ToolDef[];            // 本群生效的工具集合
   /** 本轮消息携带的媒体（从消息段解析）；是否真发给模型取决于当前模型的 inputTypes */
   attachments?: MessageAttachment[];
+  /** 本轮合并进来的整批事件（carrier 只是最后一条；工具面判断"谁提的"用它） */
+  batch?: ChatEvent[];
+  /** 本会话最近说话的人（昵称 → 身份）：合并轮里的 requester 可能不在 batch 里（来自更早的历史） */
+  speakers?: { userId: string; nickname: string; role: Role; ts: number }[];
   /**
    * 上下文窗口的起点时刻：`ts >= 这个值` 的消息**模型眼前就有**。
    * search_history 据此只翻窗口外的旧消息——否则它会把模型刚看见的那句当"新线索"还回去，

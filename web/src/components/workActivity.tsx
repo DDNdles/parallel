@@ -54,18 +54,69 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
   const acts: ActRow[] = [];
   let final: string | undefined;
   const pending = new Map<string, ActRow>();          // 工具名 → 还在跑的那一行（结果回来就销账）
+  /**
+   * 思考与正文可能交错流式（先 thinking_delta，再 text_delta，最后 message_end），
+   * 所以收尾/合并都不能只看最后一行：否则同一段思考会先以流式行出现、完整文本再铺一行，
+   * 正文同理——用户看到的就是"思考和工具重复显示了两次"，而且两条流式行各闪一个花押。
+   */
   const finishStream = () => {
-    const prev = acts[acts.length - 1];
-    if (prev?.streaming) { prev.streaming = false; prev.running = false; }
+    for (const row of acts) if (row.streaming) { row.streaming = false; row.running = false; }
   };
-  /** 流式增量只并进同类型的最后一行；思考/正文切换时各起一行 */
+  /** 同一段完整文本重复到达（provider 偶发重复 message_end）时别铺第二行 */
+  const lastFull = new Map<'think' | 'text', string>();
+  /** 边界（工具调用 / 新一轮）：所有增量行到此为止，别再拿上一段的旧行接新消息 */
+  const closeStream = () => {
+    for (const row of acts) if (row.streamed) row.settled = true;
+    finishStream();
+    lastFull.clear();
+  };
+  /** 最近一条还没收到完整正文的流式行（不一定是最后一行） */
+  const openStream = (kind: 'think' | 'text'): ActRow | undefined => {
+    for (let i = acts.length - 1; i >= 0; i--) {
+      const r = acts[i];
+      if (r.kind === kind && r.streamed && !r.settled) return r;
+    }
+    return undefined;
+  };
+  /** 流式增量：同一段并进同一行；思考↔正文切换时只把花押挪到新行，旧行留着别重复 */
   const appendStream = (kind: 'think' | 'text', text: string) => {
+    let row: ActRow | undefined = acts[acts.length - 1];
+    if (!(row?.kind === kind && row.streaming)) row = openStream(kind);
+    if (row) {
+      row.body += text;
+      row.streaming = true;
+      row.running = true;
+      // 同时只让一块在闪：上一块的花押收掉（这是"logo 闪两次"的另一半根因）
+      for (const r of acts) if (r !== row && r.streaming) { r.streaming = false; r.running = false; }
+      return;
+    }
+    finishStream();
+    // 正文常以 "\n\n" 开头；pre-wrap 会把它原样渲染成一大段空行，行首的空行直接去掉
+    acts.push({ kind, subject: '', sub: '', body: text.replace(/^\n+/, ''), streaming: true, running: true, streamed: true });
+  };
+  /** message_end 的完整文本：替换同一段流式行（可能已经不是最后一行），不另起一行 */
+  const applyFull = (kind: 'think' | 'text', text: string) => {
+    const body = text.replace(/^\n+/, '').replace(/\n+$/, '');
+    if (!body.trim()) return;
+    if (lastFull.get(kind) === body) return;   // 同一条完整文本重复到达
+    lastFull.set(kind, body);
+    const row = openStream(kind);
+    if (row) {
+      row.body = body;
+      row.streaming = false;
+      row.running = false;
+      row.settled = true;
+      return;
+    }
     const prev = acts[acts.length - 1];
-    if (prev?.kind === kind && prev.streaming) prev.body += text;
-    else acts.push({ kind, subject: '', sub: '', body: text, streaming: true, running: true });
+    if (prev?.kind === kind && prev.body.trim() === body.trim()) return;
+    acts.push({ kind, subject: '', sub: '', body, settled: true });
   };
   for (const ev of events) {
-    if (ev.kind === 'final') { finishStream(); final = ev.text ?? ''; }
+    if (ev.kind === 'final') {
+      closeStream();
+      final = String(ev.text ?? '').replace(/^\n+/, '').replace(/\n+$/, '');
+    }
     else if (ev.kind === 'delta') {
       // 正文增量：先长成一条流式正文行，message_end 的完整 text 会把它覆盖
       const text = String(ev.text ?? '');
@@ -75,44 +126,38 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
       const text = String(ev.text ?? '');
       if (text) appendStream('think', text);
     } else if (ev.kind === 'thinking') {
-      const text = String(ev.text ?? '');
-      if (!text.trim()) continue;
-      const prev = acts[acts.length - 1];
-      if (prev?.kind === 'think' && prev.streaming) {
-        prev.body = text;                 // 以完整文本为准，补上丢掉的增量
-        prev.streaming = false;
-        prev.running = false;
-      } else if (prev?.kind === 'think') prev.body = prev.body ? `${prev.body}\n\n${text}` : text;
-      else acts.push({ kind: 'think', subject: '', sub: '', body: text });
+      applyFull('think', String(ev.text ?? ''));
     } else if (ev.kind === 'text') {
-      const text = String(ev.text ?? '');
-      if (!text.trim()) continue;
-      const prev = acts[acts.length - 1];
-      if (prev?.kind === 'text' && prev.streaming) {
-        prev.body = text;
-        prev.streaming = false;
-        prev.running = false;
-      } else if (prev?.kind === 'text') prev.body = prev.body ? `${prev.body}\n\n${text}` : text;
-      else acts.push({ kind: 'text', subject: '', sub: '', body: text });
+      applyFull('text', String(ev.text ?? ''));
     } else if (ev.kind === 'tool') {
-      finishStream();
+      closeStream();
       const args = String(ev.args ?? '');
       const head = actHead(ev.name ?? '', args);
       const row: ActRow = { ...head, body: isRun(head.kind) ? `$ ${args}` : args, call: true, running: true };
       acts.push(row);
       pending.set(ev.name ?? '', row);
     } else if (ev.kind === 'toolResult') {
-      finishStream();
+      closeStream();
       const running = pending.get(ev.name ?? '');
-      if (running) { running.running = false; pending.delete(ev.name ?? ''); }
-      pushAct(acts, { ...actHead(ev.name ?? ''), body: ev.text ?? '', meta: ev.meta }, false);
+      if (running) {
+        // 结果折回**发起调用的那一行**（不靠"上一行恰好是它"）：中途夹了别的事件也不会多出一条
+        running.running = false;
+        running.body += '\n\n' + String(ev.text ?? '').replace(/^\n+/, '');
+        if (ev.meta) {
+          running.meta = ev.meta;
+          if (ev.meta.path && !running.path) { running.path = ev.meta.path; running.subject = ev.meta.path; }
+        }
+        pending.delete(ev.name ?? '');
+      } else {
+        pushAct(acts, { ...actHead(ev.name ?? ''), body: String(ev.text ?? '').replace(/^\n+/, ''), meta: ev.meta }, false);
+      }
       // shell/python 顺手改过的文件：每次执行后按快照差异补一行「文件 path +N -M」
       for (const c of ev.meta?.changes ?? []) {
         acts.push({ kind: 'file', subject: c.path, sub: '', path: c.path, body: '',
           meta: { path: c.path, added: c.added, removed: c.removed } });
       }
     } else if (ev.kind === 'compaction') {
-      finishStream();
+      closeStream();
       // 上下文压缩：丢掉的是模型看不到的那部分历史，正文给出摘要（点开可看）
       acts.push({
         kind: 'compact',
@@ -121,7 +166,7 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
         body: ev.summary ?? '',
       });
     } else if (ev.kind === 'settle' && ev.reason === 'max_rounds') {
-      finishStream();
+      closeStream();
       // 正常收尾（terminate）不占行；只有被轮次上限强制收尾才提示
       acts.push({ kind: 'note', subject: '已达工具轮次上限', sub: '强制收尾', body: '' });
     }
@@ -284,6 +329,10 @@ export interface ActRow {
   running?: boolean;
   /** 正在流式接收正文（delta 行）：自动展开，message_end 后收起成普通思考行 */
   streaming?: boolean;
+  /** 这一行来自流式增量：message_end 的完整文本要替换它，而不是再铺一行 */
+  streamed?: boolean;
+  /** 已经收到完整文本：之后的同类增量属于新的一段 */
+  settled?: boolean;
 }
 
 /** 执行类（run_*、python_session、bash）的参数是命令，按 ZCode 加 $ 前缀 */

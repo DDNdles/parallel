@@ -917,9 +917,12 @@ tr:hover td { background: var(--row-hover); }
 .wd-act-h .ic, .wd-act-h .bdg { display: inline-flex; flex: none; color: var(--faint); }
 .wd-act-h .ic { width: 15px; height: 15px; }
 .wd-act-h .bdg { width: 14px; height: 14px; }
-.wd-act-h .lbl { flex: none; color: var(--dim); }
-.wd-act-h .nm { color: var(--text); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 跑完的动作整体压暗（动作词、工具名、路径都退到 faint）；正在跑的那一行亮起来 */
+.wd-act-h .lbl { flex: none; color: var(--faint); }
+.wd-act-h .nm { color: var(--faint); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wd-act-h .sb { font-size: 12px; color: var(--faint); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wd-act-h:hover .nm { color: var(--text); }
+.wd-act.running .nm { color: var(--text); }
 .wd-act-h .add { font-size: 12px; color: var(--ok); }
 .wd-act-h .del { font-size: 12px; color: var(--err); }
 .wd-act-h .wd-chev { flex: none; }
@@ -929,7 +932,8 @@ tr:hover td { background: var(--row-hover); }
 /* 思考正文与工具输出同款：12px、等宽（.wd-act-b 是 pre + mono），只有行高/文字色略作区分 */
 .wd-act-t { margin: 2px 0 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
 /* 模型正文：直接铺开，不套思考折叠行 */
-.wd-text { margin: 4px 0 12px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+/* 正文紧接上下两行：行首/行尾的空行已在 loopActs 里去掉，这里不再留大段外边距 */
+.wd-text { margin: 2px 0 4px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
 .wk-spine .wd-text { margin-left: 22px; }
 /* 正文流式光标与会话页 composer 同款：parallel 花押，宽度=字号、按行高对齐 */
 .wd-text .wd-caret { width: 13px; height: 1.75em; vertical-align: top; }
@@ -954,15 +958,9 @@ tr:hover td { background: var(--row-hover); }
   filter: drop-shadow(0 0 6px color-mix(in srgb, var(--text) 55%, transparent));
   animation: wd-shimmer 1.6s linear infinite;
 }
-.wd-act .sb.wd-think-sum {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--text) 45%, transparent) 0%, color-mix(in srgb, var(--text) 45%, transparent) 30%, var(--text) 50%, color-mix(in srgb, var(--text) 45%, transparent) 70%, color-mix(in srgb, var(--text) 45%, transparent) 100%);
-  background-size: 200% 100%; background-clip: text; -webkit-background-clip: text;
-  color: transparent; -webkit-text-fill-color: transparent;
-}
-.wd-act.running .sb.wd-think-sum {
-  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--text) 55%, transparent));
-  animation: wd-shimmer 1.6s linear infinite;
-}
+/* 扫光只属于动作词（「思考」「终端」这种）；后面的摘要保持普通灰字，不跟着扫 */
+.wd-act .sb.wd-think-sum { color: var(--faint); }
+.wd-act.running .sb.wd-think-sum { color: var(--dim); }
 @keyframes wd-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0% 0; } }
 .wd-chev { display: inline-flex; color: var(--faint); transform: rotate(-90deg); transition: transform var(--dur-fast) var(--ease-out); }
 /* 图标本体朝下，所以静息转 -90° 读作 ">"，展开回正读作 "v" */

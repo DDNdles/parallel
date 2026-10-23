@@ -146,10 +146,10 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
         setRuns((prev) => prev.map((r) => {
           if (r.id !== d.id) return r;
           const evs = r.events ?? [];
-          // 流式增量在本地合并成一条，别让 events 数组按 token 膨胀
-          if (d.ev?.kind === 'delta') {
+          // 流式增量在本地合并成一条（思考与正文各自一条），别让 events 数组按 token 膨胀
+          if (d.ev?.kind === 'delta' || d.ev?.kind === 'thinkingDelta') {
             const last = evs[evs.length - 1];
-            if (last?.kind === 'delta') {
+            if (last?.kind === d.ev.kind) {
               return { ...r, events: [...evs.slice(0, -1), { ...last, text: `${last.text ?? ''}${d.ev.text ?? ''}` }] };
             }
           }
@@ -202,6 +202,8 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
   const run = ownerRuns[0];
   const running = !!run && !run.historical && !run.ok && !run.error && !(run.events ?? []).some((e) => e.kind === 'final');
   const { acts, final } = useMemo(() => loopActs(run?.events ?? [], running), [run, running]);
+  /** 有流式行时行尾已经有一个花押在闪，底部不再重复闪第二个 */
+  const streaming = acts.some((a) => a.streaming);
   /** work 段的指标：优先用结算的 usage（跑完才有），运行中就用事件流里各轮 usage 的累计 */
   const workMetrics = useMemo(() => {
     const m = metricsOf(run?.events ?? [], run?.model, ctxByModel);
@@ -293,7 +295,7 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
 
               {run.error && <div className="wd-final err"><div className="lbl">执行失败</div><div>{run.error}</div></div>}
               {final && <div className="wd-answer">{final}</div>}
-              {running && <div className="wd-running"><WorkPulse /></div>}
+              {running && !streaming && <div className="wd-running"><WorkPulse /></div>}
             </>
           )}
           </div>

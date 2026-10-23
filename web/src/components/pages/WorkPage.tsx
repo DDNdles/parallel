@@ -170,10 +170,10 @@ export default function WorkPage({ cmd }: { cmd?: PageCmd }) {
         const r = prev[d.id];
         if (!r) return prev;
         const evs = r.events ?? [];
-        // 流式增量在本地合并成一条，别让 events 数组按 token 膨胀
-        if (d.ev?.kind === 'delta') {
+        // 流式增量在本地合并成一条（思考与正文各自一条），别让 events 数组按 token 膨胀
+        if (d.ev?.kind === 'delta' || d.ev?.kind === 'thinkingDelta') {
           const last = evs[evs.length - 1];
-          if (last?.kind === 'delta') {
+          if (last?.kind === d.ev.kind) {
             return {
               ...prev,
               [d.id]: { ...r, events: [...evs.slice(0, -1), { ...last, text: `${last.text ?? ''}${d.ev.text ?? ''}` }] },
@@ -320,6 +320,8 @@ function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
   expanded: Record<string, boolean>; onToggle: (k: string) => void;
 }) {
   const timeline = useMemo(() => roundTimeline(run.events ?? [], running), [run.events, running]);
+  /** 有流式行时行尾已经有一个花押在闪，底部不再重复闪第二个 */
+  const streaming = timeline.rounds.some((r) => r.acts.some((a) => a.streaming));
   // awaiting 时 summary 就是那个问题，已经单独成卡，不再重复一遍
   const answer = timeline.final || (!run.awaiting ? run.summary : '');
   const state: [string, string] = running ? ['执行中', 'run'] : run.awaiting ? ['等你回答', 'ask'] : run.error ? ['失败', 'err'] : run.ok ? ['已完成', 'ok'] : ['已结束', 'idle'];
@@ -390,7 +392,7 @@ function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
         </div>
       )}
 
-      {running && <div className="wk-running"><WorkPulse /></div>}
+      {running && !streaming && <div className="wk-running"><WorkPulse /></div>}
 
       {answer && <div className="wk-answer" dangerouslySetInnerHTML={{ __html: mdLite(answer) }} />}
 

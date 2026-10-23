@@ -219,6 +219,9 @@ export function setup(ctx: PluginContext): void {
   function historyLimit(): number {
     return clampInt((ctx.config as any)?.storage?.historyLimit, 1, 500, 200);
   }
+  function contextMinutes(): number {
+    return clampInt((ctx.config as any)?.storage?.contextMinutes, 1, 720, 10);
+  }
 
   /** 学习素材清洗：去掉引用/记录/媒体占位，命令与纯符号不进入学习 */
   function learningText(raw: unknown): string {
@@ -369,12 +372,12 @@ export function setup(ctx: PluginContext): void {
   async function sweepMidterm(): Promise<void> {
     if (disposed || !notesCfg().midtermSummary) return;
     const now = Date.now();
-    // 时间窗已删：模型可见的是最近 historyLimit 条，中期回想只总结落在窗口之外的那一段
-    const keep = historyLimit();
+    // 窗口起点按 2 倍 contextMinutes 保守后移：宁可晚一点总结，也别把模型眼前的消息又还给它
+    const cutoff = now - Math.max(1, contextMinutes()) * 2 * 60_000;
     for (const [key, g] of Object.entries(midtermQueue)) {
       if (runningMid.has(key)) continue;
       if (!Array.isArray(g?.messages) || !g.messages.length) continue;
-      const eligible = g.messages.slice(0, Math.max(0, g.messages.length - keep));
+      const eligible = g.messages.filter((m) => m.ts <= cutoff);
       if (eligible.length < MIDTERM_MIN_MESSAGES) continue;
       const last = eligible[eligible.length - 1];
       if (now - last.ts < 60_000) continue;
@@ -756,7 +759,7 @@ export function setup(ctx: PluginContext): void {
         `# 关于该用户的记忆`,
         `bot 为这位用户记着的长期事实**不随上下文给出**（事实一多就会把眼前的对话挤掉）。需要时自己查：`,
         `- recall_facts <关键词>：查这位用户的长期事实（称呼、身份、喜好、约定、经历）。`,
-        `- search_history <关键词>：翻本会话上下文之外的旧消息原文。`,
+        `- search_history <关键词>：翻本会话上下文时限之外的旧消息原文。`,
         `对方提到「上次、以前、说好了的」而眼前几分钟的上下文对不上时，**先查再答**，别凭空猜；一次就够，查不到就是真没有。`,
       ].join('\n'),
     });

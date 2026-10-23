@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import type { Kernel } from '../kernel.ts';
 import { REASONING_LEVELS, type ModelRef, type ProviderModelCfg } from '../config.ts';
-import { newId, nowMs, truncate } from '../util/misc.ts';
+import { newId, nowMs } from '../util/misc.ts';
 import { usageReport } from '../services/usage.ts';
 import { collectRecentArtifacts, workScopeOf } from '../services/work.ts';
+import { isDeliverableArtifact } from '../services/artifacts.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
 import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
 import { geminiApiBase } from '../services/pi-ai.ts';
@@ -931,16 +932,19 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           const parsed = JSON.parse(row.artifacts ?? '[]');
           if (Array.isArray(parsed)) known = parsed.map(String).filter(Boolean);
         } catch { /* 老行没有 artifacts */ }
-        known = known.filter((a) => !a.startsWith('.skills/') && !a.startsWith('inbox/'));
+        known = known
+          .map((a) => a.trim().replace(/\\/g, '/'))
+          .filter(isDeliverableArtifact);
         const started = Number(row.ts) || nowMs();
         const scanFrom = Math.min(started, started - (Number(row.duration_ms) || 0)) - 5 * 60_000;
         const scanned = collectRecentArtifacts(kernel.sandbox.root(chat), scanFrom);
-        const artifacts = [...new Set([...known, ...scanned])].slice(0, 60);
+        const artifacts = [...new Set([...known, ...scanned])].filter(isDeliverableArtifact).slice(0, 60);
         if (!artifacts.length) return send({ error: '这次运行在沙箱里没有找到可发送的文件' }, 400);
         const st = kernel.adapter?.status() as { selfId?: string; selfNickname?: string; connected?: boolean } | undefined;
         if (!st?.connected) return send({ error: '协议端未连接，稍后再补发' }, 503);
         await kernel.chat.sendForward(chat, {
-          text: `补发上次未跑完任务的产物（${artifacts.length} 个）：${truncate(row.task, 80)}`,
+          // 任务原样带出：chat 派给 work 的任务没有字数上限，这里不能截断（用户 2026-10-23 明令）
+          text: `补发上次未跑完任务的产物（${artifacts.length} 个）：${row.task}`,
           artifacts,
           mention: chat.type === 'group' ? { userId } : undefined,
           selfId: st.selfId,
@@ -1122,7 +1126,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             kernel.llm.resetFailover();
           }
         }
-        // storage 段：每会话历史条数（HistoryStore 环形缓冲真正读的键），保存后立即生效
+        // storage 段：每会话历史条数 + 上下文时间窗（两者同时生效），保存后立即生效
         if (body.storage && typeof body.storage === 'object') {
           const st = body.storage as Record<string, unknown>;
           if (st.historyLimit !== undefined) {
@@ -1130,6 +1134,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             if (!Number.isInteger(n) || n < 1 || n > 500) return send({ error: '每会话历史条数需要是 1~500 的整数' }, 400);
             cfg.storage.historyLimit = n;
             kernel.history.setLimit(n);
+          }
+          // 上下文时间窗（分钟）：模型只看最近这么多分钟的消息，与 historyLimit 条数上限同时生效。
+          // 这里只挡非有限数；范围交给 round+clamp，好让旧配置与页面控件的越界值都能安全落库而不必 400
+          if (st.contextMinutes !== undefined) {
+            const n = Number(st.contextMinutes);
+            if (!Number.isFinite(n)) return send({ error: '上下文时间窗需要是 1~720 的整数' }, 400);
+            cfg.storage.contextMinutes = Math.min(720, Math.max(1, Math.round(n)));
           }
         }
         // sandbox 段：只放收件文件保留天数（内核存小时，sweep 每 10 分钟读一次配置，存完即生效）；

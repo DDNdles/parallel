@@ -21,6 +21,12 @@ export function truncate(s: string, max: number): string {
   return s.slice(0, max) + `…(截断,原长${s.length})`;
 }
 
+/** 给人看的短文本：截断只留省略号，不带内部调试标记（truncate 的标记只该出现在模型/日志里） */
+export function clip(s: string, max: number): string {
+  const t = String(s ?? '');
+  return t.length <= max ? t : t.slice(0, max) + '…';
+}
+
 /** 深合并 target ← source（仅普通对象；source 值为 null 时直接赋值），返回 target */
 export function deepMerge<T extends Record<string, unknown>>(target: T, source: Record<string, unknown>): T {
   for (const [k, v] of Object.entries(source)) {

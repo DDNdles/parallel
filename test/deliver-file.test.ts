@@ -97,7 +97,7 @@ test('deliver_file：没有交付记录时如实说没有，不杜撰文件', as
       },
     } as any);
     const text = typeof r === 'string' ? r : r.content;
-    assert.match(text, /还没有成功交付过文件/);
+    assert.match(text, /还没有产出过文件/);
     assert.equal(g.files.length, 0, '不该发任何文件');
   } finally {
     await g.cleanup();

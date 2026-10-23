@@ -7,12 +7,13 @@ import type { LlmService, UsageSnapshot } from './llm.ts';
 import { usageDelta } from './llm.ts';
 import type { SandboxService } from './sandbox.ts';
 import type { ToolDef, ChatMessage, ChatRef, LLMRequestContext, WorkAgentDef, WorkLiveStatus } from '../types.ts';
-import { newId, nowMs, truncate } from '../util/misc.ts';
+import { newId, nowMs, clip } from '../util/misc.ts';
 import { busEvents } from '../bus.ts';
 import { buildWorkSections, parseWorkHandoff, type PendingAsk } from '../work-prompt.ts';
 import { DEFAULT_WORK_AGENT } from '../work-agent.ts';
 import { readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { ARTIFACT_SKIP_DIRS, ARTIFACT_SKIP_FILE, isDeliverableArtifact } from './artifacts.ts';
 
 /**
  * WorkRunner：work 子代理的执行器。
@@ -112,10 +113,7 @@ export function workScopeOf(userId: string): string {
   return `u${String(userId || '0').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 40)}`;
 }
 
-/** 补扫产物时跳过的目录：收件箱、技能装配、缓存都不是用户要的交付物 */
-const ARTIFACT_SKIP_DIRS = new Set(['inbox', '.skills', '.git', 'node_modules', '__pycache__', '.cache', '.venv', 'venv']);
-/** 补扫产物时跳过的文件：字节码/日志/临时件，以及 `_contact.html` 这类内部预览页 */
-const ARTIFACT_SKIP_FILE = /\.(pyc|pyo|log|tmp|bak|swp)$/i;
+/** 补扫产物时跳过的目录/文件与投递链路共用同一口径（见 services/artifacts.ts） */
 const ARTIFACT_MAX_FILES = 80;
 const ARTIFACT_MAX_FILE_BYTES = 50 * 1024 * 1024;
 const ARTIFACT_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
@@ -261,7 +259,8 @@ export class WorkRunner {
     };
     this.runs.set(id, { ...rec, ok: false, summary: '', rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [], phase: 'running' });
     this.bus.emit(busEvents.workStart, {
-      id, chatKey, task: truncate(taskLabel, 200), model, trigger: input.trigger, chat: reportChat,
+      // 任务原样下发：chat → work 没有字数上限（2026-10-23 用户明令），桌面端按完整原文显示
+      id, chatKey, task: taskLabel, model, trigger: input.trigger, chat: reportChat,
       userId: input.userId, nickname: input.nickname, depth, parentId: input.parentId, agent: agentName,
     });
     this.persist('start', rec, input);
@@ -392,7 +391,7 @@ export class WorkRunner {
         });
       }
       this.bus.emit(busEvents.workDone, {
-        id, chatKey, summary: truncate(result.summary, 400), rounds, toolCalls, durationMs: result.durationMs,
+        id, chatKey, summary: clip(result.summary, 400), rounds, toolCalls, durationMs: result.durationMs,
         artifacts, model, depth, parentId: input.parentId, agent: agentName,
         awaiting: ask ? true : false, question: ask?.question,
         trigger: input.trigger, chat: reportChat, userId: input.userId, nickname: input.nickname,
@@ -460,7 +459,7 @@ export class WorkRunner {
       .filter((r) => r.phase === 'running')
       .sort((a, b) => a.startedAt - b.startedAt)
       .map((r) => ({
-        id: r.id, task: truncate(r.task, 120), startedAt: r.startedAt,
+        id: r.id, task: clip(r.task, 120), startedAt: r.startedAt,
         elapsedMs: Math.max(0, now - r.startedAt), rounds: r.rounds, toolCalls: r.toolCalls,
         ...usageOfEvents(r.events), step: lastStepOf(r.events),
       }));
@@ -471,9 +470,9 @@ export class WorkRunner {
     let last: WorkLiveStatus['last'];
     if (ended) {
       last = {
-        id: ended.id, task: truncate(ended.task, 120), ok: ended.ok, awaiting: !!ended.awaiting,
+        id: ended.id, task: clip(ended.task, 120), ok: ended.ok, awaiting: !!ended.awaiting,
         durationMs: ended.durationMs, finishedAt: ended.finishedAt ?? ended.startedAt + ended.durationMs,
-        summary: truncate(ended.summary, 300), artifacts: ended.artifacts, error: ended.error,
+        summary: clip(ended.summary, 300), artifacts: ended.artifacts, error: ended.error,
       };
     } else {
       // 内核重启过：内存里没有，但那次活确实跑过 —— 从库里补最近一条（仍按 user_id 过滤）
@@ -486,9 +485,9 @@ export class WorkRunner {
         );
         if (row) {
           last = {
-            id: row.id, task: truncate(String(row.task ?? ''), 120), ok: !!row.ok,
+            id: row.id, task: clip(String(row.task ?? ''), 120), ok: !!row.ok,
             awaiting: row.phase === 'await', durationMs: Number(row.duration_ms ?? 0),
-            finishedAt: Number(row.ts ?? 0), summary: truncate(String(row.summary ?? ''), 300),
+            finishedAt: Number(row.ts ?? 0), summary: clip(String(row.summary ?? ''), 300),
             artifacts: parseJsonArray(row.artifacts).map(String), error: row.error ?? undefined,
           };
         }
@@ -506,9 +505,9 @@ export class WorkRunner {
   /** 内存记录 → 列表项（list 与 get 共用，字段口径只写一处） */
   private view(r: RunRecord): any {
     return {
-      id: r.id, chatKey: r.chatKey, task: truncate(r.task, 200), model: r.model,
+      id: r.id, chatKey: r.chatKey, task: r.task, model: r.model,
       agent: r.agentName, depth: r.depth, parentId: r.parentId,
-      ok: r.ok, summary: truncate(r.summary, 500), error: r.error,
+      ok: r.ok, summary: clip(r.summary, 500), error: r.error,
       rounds: r.rounds, toolCalls: r.toolCalls, durationMs: r.durationMs,
       artifacts: r.artifacts, startedAt: r.startedAt, steps: r.steps.slice(-30),
       notes: r.notes, structured: r.structured, awaiting: r.awaiting,
@@ -531,9 +530,9 @@ export class WorkRunner {
                     summary, error, user_id, nickname, ts, artifacts, events, usage
              FROM work_runs ORDER BY ts DESC LIMIT ?`, limit);
       return rows.map((r) => ({
-        id: r.id, chatKey: r.chat_key, task: truncate(String(r.task ?? ''), 200), model: r.model,
+        id: r.id, chatKey: r.chat_key, task: String(r.task ?? ''), model: r.model,
         agent: undefined, depth: 0, parentId: undefined,
-        ok: !!r.ok, summary: truncate(String(r.summary ?? ''), 500), error: r.error ?? undefined,
+        ok: !!r.ok, summary: clip(String(r.summary ?? ''), 500), error: r.error ?? undefined,
         rounds: Number(r.rounds ?? 0), toolCalls: Number(r.tool_calls ?? 0), durationMs: Number(r.duration_ms ?? 0),
         artifacts: parseJsonArray(r.artifacts), startedAt: Number(r.ts ?? 0), steps: [],
         notes: undefined, structured: undefined,
@@ -565,7 +564,10 @@ export class WorkRunner {
       // 失败/中断的活也可能已经产出文件（2026-10-23 论文任务）：有产物就能发，不再要求 ok
       .filter((r) => !r.awaiting && r.artifacts.length > 0)
       .sort((a, b) => b.startedAt - a.startedAt)[0];
-    if (hit) return { runId: hit.id, task: hit.task, artifacts: hit.artifacts, at: hit.startedAt, userId: hit.userId, ok: hit.ok };
+    if (hit) {
+      const artifacts = hit.artifacts.filter(isDeliverableArtifact);
+      if (artifacts.length) return { runId: hit.id, task: hit.task, artifacts, at: hit.startedAt, userId: hit.userId, ok: hit.ok };
+    }
     try {
       const rows = userId
         ? this.db.all<{ id: string; task: string; summary: string; artifacts: string | null; ts: number; user_id: string | null; ok: number }>(
@@ -583,8 +585,9 @@ export class WorkRunner {
           if (Array.isArray(parsed)) artifacts = parsed.map(String).filter(Boolean);
         } catch { /* 老行没有 artifacts 列值时回落到摘要解析 */ }
         if (!artifacts.length) artifacts = parseWorkHandoff(r.summary ?? '').artifacts;
+        artifacts = artifacts.map((a) => a.trim().replace(/\\/g, '/')).filter(isDeliverableArtifact);
         if (artifacts.length) {
-          return { runId: r.id, task: truncate(r.task, 200), artifacts, at: r.ts, userId: r.user_id ?? userId ?? '', ok: !!r.ok };
+          return { runId: r.id, task: clip(r.task, 200), artifacts, at: r.ts, userId: r.user_id ?? userId ?? '', ok: !!r.ok };
         }
       }
     } catch { /* 表缺失等不影响主流程 */ }
@@ -610,10 +613,11 @@ export class WorkRunner {
            tool_calls=excluded.tool_calls, duration_ms=excluded.duration_ms, summary=excluded.summary,
            error=excluded.error, ts=excluded.ts, artifacts=excluded.artifacts,
            events=excluded.events, usage=excluded.usage, nickname=excluded.nickname`,
-        rec.id, rec.chatKey, truncate(input.task, 1000), rec.model, input.trigger, phase,
+        // 落库也存全文：工作页/抽屉从库里回放时不能再出现「…(截断,原长 N)」
+        rec.id, rec.chatKey, input.task, rec.model, input.trigger, phase,
         result?.ok ? 1 : 0, result?.rounds ?? live?.rounds ?? 0, result?.toolCalls ?? live?.toolCalls ?? 0,
         result?.durationMs ?? live?.durationMs ?? 0,
-        truncate(result?.summary ?? '', 4000), result?.error ?? null, input.userId, input.nickname ?? null, nowMs(),
+        clip(result?.summary ?? '', 4000), result?.error ?? null, input.userId, input.nickname ?? null, nowMs(),
         JSON.stringify(result?.artifacts ?? live?.artifacts ?? []),
         JSON.stringify(live?.events ?? []),
         JSON.stringify(result?.usage ?? null),
@@ -660,13 +664,13 @@ function lastStepOf(events: LoopEvent[]): WorkLiveStatus['active'][number]['step
   return undefined;
 }
 
-/** 去重（保序），并把反斜杠归一成正斜杠——沙箱相对路径统一用 / */
+/** 去重（保序）、把反斜杠归一成正斜杠，并丢掉内部文件——沙箱相对路径统一用 / */
 function dedupe(list: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of list) {
     const p = raw.trim().replace(/\\/g, '/');
-    if (!p || seen.has(p)) continue;
+    if (!p || seen.has(p) || !isDeliverableArtifact(p)) continue;
     seen.add(p);
     out.push(p);
   }

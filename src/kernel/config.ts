@@ -294,6 +294,8 @@ export const DEFAULT_CONFIG = {
   },
   storage: {
     historyLimit: 200,                    // 每会话保留并传给模型的近端历史条数
+    // 上下文时间窗（分钟）：agentTurn 按 now-contextMinutes 过滤历史快照；条数上限 storage.historyLimit 同时生效
+    contextMinutes: 10,
   },
 } as const;
 
@@ -362,8 +364,8 @@ export class ConfigStore {
     }
     this.migrateModelChains();
     this.migrateModelReasoning();
-    // 迁移：上下文时间窗（contextMinutes）已删，改为只按 storage.historyLimit 条数截断
-    delete (this.config.storage as any).contextMinutes;
+    // 上下文时间窗（contextMinutes）2026-10-23 恢复：与 historyLimit 条数上限同时生效。
+    // 旧配置文件里没有这个键时由 deepMerge 补默认值（10 分钟），这里不做删除。
     // 迁移：风控里的「随机抖动」与「唤醒方式/唤醒词」已并入拟人化（回复前的等待归打字节奏，
     // 要不要理人归拟人层门控），配置里残留的旧键在这里清掉，别让它们一直躺在文件里当死配置。
     for (const k of ['jitterMinMs', 'jitterMaxMs', 'groupWake', 'wakeWords'] as const) {

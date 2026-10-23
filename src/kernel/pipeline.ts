@@ -123,6 +123,11 @@ function modelTextOf(event: ChatEvent): string {
  * 跨格那一刻整段裁一次。实际覆盖 = 起点（≤ now - N 分钟）到 now，在 N~2N 分钟之间。
  * 网格以 epoch 起算、全体会话共用一把尺子，无需按群错峰。
  */
+export function windowAnchorTs(nowMs: number, minutes: number): number {
+  const span = Math.max(1, Math.round(minutes)) * 60_000;
+  return Math.max(0, Math.floor((Math.max(0, nowMs) - span) / span) * span);
+}
+
 /** 「本轮媒体补传」分节里的媒体名（与 chainStreamFn 的 warn 用同一套中文写法） */
 const MEDIA_KIND_ZH: Record<MessageAttachment['kind'], string> = { image: '图片', audio: '语音', video: '视频' };
 
@@ -190,7 +195,7 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
     r.artifacts?.length ? `产物（会话沙箱内）：${r.artifacts.join('、')}` : '',
     r.notes ? `需要他知道的备注：${r.notes}` : '',
     r.artifacts?.length
-      ? `产物和你的结论会由系统合并成一条「聊天记录」发出：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
+      ? `产物和你的结论会由系统合并成一条「聊天记录」发出（多份产物已打包成一个合集）：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
       : '',
     `请用你自己的语气向发起人汇报（@ 已经带上了），像你自己干完活回话一样；不要提"子代理""模型""系统提示"。`,
   ].filter(Boolean).join('\n');
@@ -241,6 +246,12 @@ export class Pipeline {
    */
   private lastTurn = new Map<string, { text: string; at: number; spoke: boolean }>();
   /**
+   * 本会话最近说话的人（chatKey → 昵称 → 身份）。
+   * 合批轮里 carrier 只是最后一条消息；`work_dispatch` 的 requester 可能指向更早的发言人
+   * （甚至只在历史里的原始需求），工具面靠这份名册把昵称换回 QQ 号与角色。
+   */
+  private speakers = new Map<string, Map<string, { userId: string; nickname: string; role: Role; ts: number }>>();
+  /**
    * 重复消息去重窗口（毫秒）：上一轮刚答过同一句，这段时间内一字不差的重发不再另起一轮。
    * `0` = 关掉去重（测试里同一个群里反复用同一句话触发时用）。
    */
@@ -280,6 +291,8 @@ export class Pipeline {
     // 隐藏会话（桌面端「已隐藏」）：当成没说过——不落账、不记用量、不进拟人层。
     // 附件的下载也在适配器那头就挡掉了；解除隐藏后只恢复"此后的"入站，不补历史。
     if (this.chatHidden(event)) return;
+    // 说话人名册要在门控之前记：被拟人层攒着/放过的消息，同样可能是之后那件活的正主
+    this.rememberSpeaker(event);
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
     // 她还在发气泡时对面又开口：按打断口径把**剩下的气泡**砍掉（纯程序，零模型调用）。
     // 必须放在落账与门控之前 —— 要求是"对面发完立刻生效"，排在后面就白等了。
@@ -313,6 +326,25 @@ export class Pipeline {
     const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
     if (r.action === 'handled') return;
     this.enqueue(r.events);
+  }
+
+  /** 记下"这个昵称是谁"：同名以最新一次为准，超过 300 人按时间淘汰最老的 */
+  private rememberSpeaker(event: ChatEvent): void {
+    if (!event.userId) return;
+    const key = `${event.type}_${event.chatId}`;
+    let m = this.speakers.get(key);
+    if (!m) { m = new Map(); this.speakers.set(key, m); }
+    const nickname = (event.nickname || event.userId).trim();
+    m.set(nickname, {
+      userId: event.userId,
+      nickname,
+      role: (event.role ?? this.resolveRole(event)) as Role,
+      ts: event.ts,
+    });
+    if (m.size > 300) {
+      const old = [...m.entries()].sort((a, b) => a[1].ts - b[1].ts).slice(0, m.size - 300);
+      for (const [k] of old) m.delete(k);
+    }
   }
 
   /** 拟人层攒够消息后的回调（也用于主动发言轮：events 为空） */
@@ -790,21 +822,27 @@ export class Pipeline {
         { order: 300, title: 'trust-boundary', text: TRUST_BOUNDARY_TEXT },
         { order: 400, title: 'context-continuity', text: CONTEXT_CONTINUITY_TEXT },
       ];
-      // ---- 上下文：只按 storage.historyLimit 条数截断（时间窗已删） ----
+      // ---- 上下文时间窗（storage.contextMinutes）+ 条数上限（storage.historyLimit） ----
       // 更早的消息并没有丢：它们仍在历史缓存与会话日志里，由 search_history / recall_facts 现查。
+      // 缓存口径（2026-10-16 用户裁定②）：窗口起点**对齐梳理点**（tumbling 网格）——
+      //   两次梳理之间消息只增不减，供应商前缀缓存才吃得动；跨格那一刻整段裁一次，
+      //   实际覆盖在 N~2N 分钟之间。语义与"严格每轮 N 分钟"不同，这是用户点头换来的。
       const keep = Math.max(1, Math.round(Number(this.config.config.storage.historyLimit) || 200));
-      const windowHistory = this.history.snapshot(chat);
-      // 搜索工具只翻模型眼前没有的那部分：以可见窗口里最早一条的 ts 为界
-      const historyWindowStartTs = windowHistory.find((m) => typeof m.ts === 'number')?.ts;
+      const minutes = Math.max(1, Math.round(Number(this.config.config.storage.contextMinutes) || 10));
+      const sinceTs = windowAnchorTs(Date.now(), minutes);
+      const windowHistory = this.history.snapshot(chat, sinceTs);
+      // 搜索工具只翻模型眼前没有的那部分：窗口起点就是可见历史的下界
+      const historyWindowStartTs = sinceTs;
       if (!isReport) {
         systemSections.push({
           order: 405, title: 'context-window',
           text: [
-            `# 上下文`,
-            `- 你只看到本会话最近的一段消息（最多 ${keep} 条）；更早的消息不在眼前（当时的图片、语音、视频也不会出现）。`,
-            `- **眼前这几条就是你全部可见的对话**。对方只丢来一个词、一句没头没尾的话，那就是真只有这一句：别脑补"前面还说过什么"，照字面接或者问清楚。`,
-            `- 回话前先掂量现有信息够不够：不够就查一次 —— search_history（只翻本会话上下文之外的旧原文）或 recall_facts（翻这位用户的长期记忆）；查完就必须作答，查不到就是真没有，别换个词接着查。`,
-            `- 不要向用户提「上下文、检索记录」这类内部词，查到就自然接上话。`,
+            `# 上下文时限`,
+            `- 你看得到最近这段会话的记录（按 ${minutes} 分钟的窗口对齐梳理点裁剪，实际覆盖最近 ${minutes}~${minutes * 2} 分钟，最多 ${keep} 条）。`,
+            `- **窗口里这几条就是你全部可见的对话**。对方只丢来一个词、一句没头没尾的话，那就是真只有这一句：别脑补"前面还说过什么"，照字面接或者问清楚。`,
+            `- 更早的消息不在上下文里（当时的图片、语音、视频也不会出现）；只有非常久远的话题才可能需要回查。`,
+            `- 回话前先掂量现有信息够不够：不够就查一次 —— search_history（只翻本会话窗口之外的旧原文）或 recall_facts（翻这位用户的长期记忆）；查完就必须作答，查不到就是真没有，别换个词接着查。`,
+            `- 不要向用户提「时限、上下文、梳理、检索记录」这类内部词，查到就自然接上话。`,
           ].join('\n'),
         });
       }
@@ -918,6 +956,10 @@ export class Pipeline {
       let ctx: LLMRequestContext = {
         chat, event, system, systemSections, messages, tools,
         attachments: turnAttachments,
+        // 合批轮里 carrier 只是最后一条：工具面判断"这活是谁提的"要看整批与说话人名册
+        batch: batch.length ? batch : [event],
+        speakers: [...(this.speakers.get(`${event.type}_${event.chatId}`)?.values() ?? [])]
+          .sort((a, b) => b.ts - a.ts).slice(0, 200),
         // 窗口起点交给工具面：search_history 只该翻模型眼前没有的那部分
         historyWindowStartTs,
       };
