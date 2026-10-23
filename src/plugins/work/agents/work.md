@@ -1,7 +1,7 @@
 ---
 name: work
 description: 通用执行体：常驻 Python、浏览器、shell、文件读写；面向交付，产物落在会话沙箱
-tools: delegate, work_finish, work_ask, todo, python_session, python_session_reset, run_python_work, run_bash, browser_open, browser_snapshot, browser_click, browser_type, browser_press, browser_screenshot, sandbox_list, sandbox_read, sandbox_write, sandbox_edit, sandbox_grep, sandbox_glob, send_file, run_python, run_js, web_search, web_fetch, recall_facts, skill, skill_file, skill_install
+tools: delegate, work_finish, work_ask, todo, python_session, python_session_reset, run_python_work, run_bash, browser_open, browser_snapshot, browser_click, browser_type, browser_press, browser_screenshot, sandbox_list, sandbox_read, sandbox_write, sandbox_edit, sandbox_grep, sandbox_glob, run_python, run_js, web_search, web_fetch, recall_facts, skill, skill_file, skill_install
 max_rounds: 0
 ---
 

@@ -241,9 +241,11 @@ test('内置 work.md 存在且声明了白名单（改了名字要同步更新�
   assert.equal(def.name, 'work');
   assert.equal(def.maxRounds, 0, '0 = 无上限（work 的既定语义）');
   assert.ok(def.tools && def.tools.length > 10);
-  for (const must of ['work_finish', 'work_ask', 'python_session', 'sandbox_write', 'send_file', 'web_fetch']) {
+  for (const must of ['work_finish', 'work_ask', 'python_session', 'sandbox_write', 'web_fetch']) {
     assert.ok(def.tools!.includes(must), `白名单缺少 ${must}`);
   }
+  // 2026-10-23 用户定：work 不自己发文件，产物统一由内核打包成一个合集发出
+  assert.ok(!def.tools!.includes('send_file'), 'work 白名单不该再有 send_file');
   assert.ok(def.instructions.includes('work_finish'), '正文要交代收尾方式');
   assert.ok(def.instructions.includes('work_ask'), '正文要交代"停下来问"的用法（白名单里有这个工具）');
 });
@@ -578,9 +580,11 @@ test('工具面：chat 拿不到 work 面工具；work 面 = 白名单；白名�
     // 关键工具确实在（漏了 run_bash 说明门控沙箱又没暴露 runAny）。
     // run_powershell 已随 pwsh 镜像一起删掉（2026-10-22）：Linux 容器里的 pwsh 是空环境，
     // 计算/文本处理走 bash 与 python，工具面不再暴露它。
-    for (const must of ['work_finish', 'work_ask', 'python_session', 'run_bash', 'sandbox_write', 'send_file']) {
+    for (const must of ['work_finish', 'work_ask', 'python_session', 'run_bash', 'sandbox_write']) {
       assert.ok(workNames.has(must), `work 面缺少 ${must}`);
     }
+    // 2026-10-23：work 过程中不许自己发文件（否则交付会在聊天里一条条散着出现）
+    assert.ok(!workNames.has('send_file'), 'work 面不该再有 send_file');
     assert.ok(!workNames.has('run_powershell'), 'work 面不该再有 run_powershell（Linux 不需要 pwsh）');
   } finally {
     await kernel.shutdown();

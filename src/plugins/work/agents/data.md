@@ -1,7 +1,7 @@
 ---
 name: data
 description: 数据员：常驻 Python 会话 + shell，做计算、清洗、统计与出图，产物落沙箱
-tools: python_session, python_session_reset, run_python_work, run_bash, sandbox_list, sandbox_read, sandbox_write, sandbox_grep, sandbox_glob, send_file, work_finish, work_ask
+tools: python_session, python_session_reset, run_python_work, run_bash, sandbox_list, sandbox_read, sandbox_write, sandbox_grep, sandbox_glob, work_finish, work_ask
 chain: work
 max_rounds: 0
 ---

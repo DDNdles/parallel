@@ -308,6 +308,8 @@ test('work_dispatch 归属：合批轮里按 requester / 原话找正主，不�
 
 test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状态）', async () => {
   const g = await boot('9405');
+  // mock 脚本队列是进程级单例：前一个用例可能留下没消费的汇报轮脚本，先清干净
+  g.mock.script.length = 0;
   try {
     const chat = g.chat;
     const agent = g.kernel.container.workAgent();
