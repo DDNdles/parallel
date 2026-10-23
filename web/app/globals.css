@@ -1392,6 +1392,14 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
   border-radius: 999px; background: transparent; color: var(--dim); font-family: var(--sans); font-size: 14px; cursor: pointer; }
 .pf-btn:hover { border-color: var(--border-stronger); color: var(--text); }
 .pf-btn.open { background: var(--bg-active); border-color: var(--border-stronger); color: var(--text); }
+/* 设置页「作用会话」：与同页的数字/文本输入同形（实心圆角框），别看起来像另一套控件 */
+.timing-scope .pf-btn {
+  height: 34px; padding: 0 11px; border-radius: 10px;
+  background: var(--surface-input); color: var(--text); font-size: 13px;
+}
+.timing-scope .pf-btn:hover, .timing-scope .pf-btn.open {
+  background: var(--surface-input); border-color: var(--border-stronger); color: var(--text);
+}
 .pf-chev { display: inline-flex; color: var(--faint); transform: rotate(-90deg); transition: transform var(--dur-fast) var(--ease-out); }
 .pf-chev.open { transform: rotate(0deg); }
 .pf-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 60; width: 224px; padding: 5px;

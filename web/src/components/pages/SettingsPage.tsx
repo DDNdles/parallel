@@ -487,7 +487,7 @@ export default function SettingsPage() {
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="mset-mrow" style={{ marginBottom: 10 }}>
                 <span className="plg-v">作用会话</span>
-                <span className="mset-macts">
+                <span className="mset-macts timing-scope">
                   <PillSelect align="left" value={timingScope} label="作用会话"
                     options={[
                       { v: '', t: '默认（所有会话）' },
