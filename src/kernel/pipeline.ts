@@ -123,11 +123,6 @@ function modelTextOf(event: ChatEvent): string {
  * 跨格那一刻整段裁一次。实际覆盖 = 起点（≤ now - N 分钟）到 now，在 N~2N 分钟之间。
  * 网格以 epoch 起算、全体会话共用一把尺子，无需按群错峰。
  */
-export function windowAnchorTs(nowMs: number, minutes: number): number {
-  const span = Math.max(1, Math.round(minutes)) * 60_000;
-  return Math.max(0, Math.floor((Math.max(0, nowMs) - span) / span) * span);
-}
-
 /** 「本轮媒体补传」分节里的媒体名（与 chainStreamFn 的 warn 用同一套中文写法） */
 const MEDIA_KIND_ZH: Record<MessageAttachment['kind'], string> = { image: '图片', audio: '语音', video: '视频' };
 
@@ -770,24 +765,21 @@ export class Pipeline {
         { order: 300, title: 'trust-boundary', text: TRUST_BOUNDARY_TEXT },
         { order: 400, title: 'context-continuity', text: CONTEXT_CONTINUITY_TEXT },
       ];
-      // ---- 上下文时间窗（storage.contextMinutes）：模型只看得到窗口内的消息 ----
+      // ---- 上下文：只按 storage.historyLimit 条数截断（时间窗已删） ----
       // 更早的消息并没有丢：它们仍在历史缓存与会话日志里，由 search_history / recall_facts 现查。
-      // 缓存口径（2026-10-16 用户裁定②）：窗口起点**对齐梳理点**（tumbling 网格）——
-      //   两次梳理之间消息只增不减，供应商前缀缓存才吃得动；跨格那一刻整段裁一次，
-      //   实际覆盖在 N~2N 分钟之间。语义与"严格每轮 N 分钟"不同，这是用户点头换来的。
-      const minutes = Math.max(1, Math.round(Number(this.config.config.storage.contextMinutes) || 5));
-      const sinceTs = windowAnchorTs(Date.now(), minutes);
-      const windowHistory = this.history.snapshot(chat, sinceTs);
+      const keep = Math.max(1, Math.round(Number(this.config.config.storage.historyLimit) || 200));
+      const windowHistory = this.history.snapshot(chat);
+      // 搜索工具只翻模型眼前没有的那部分：以可见窗口里最早一条的 ts 为界
+      const historyWindowStartTs = windowHistory.find((m) => typeof m.ts === 'number')?.ts;
       if (!isReport) {
         systemSections.push({
           order: 405, title: 'context-window',
           text: [
-            `# 上下文时限`,
-            `- 你看得到最近这段会话的记录（按 ${minutes} 分钟的窗口对齐梳理点裁剪，实际覆盖最近 ${minutes}~${minutes * 2} 分钟）。`,
-            `- **窗口里这几条就是你全部可见的对话**。对方只丢来一个词、一句没头没尾的话，那就是真只有这一句：别脑补"前面还说过什么"，照字面接或者问清楚。`,
-            `- 更早的消息不在上下文里（当时的图片、语音、视频也不会出现）；只有非常久远的话题才可能需要回查。`,
-            `- 回话前先掂量现有信息够不够：不够就查一次 —— search_history（只翻本会话窗口之外的旧原文）或 recall_facts（翻这位用户的长期记忆）；查完就必须作答，查不到就是真没有，别换个词接着查。`,
-            `- 不要向用户提「时限、上下文、梳理、检索记录」这类内部词，查到就自然接上话。`,
+            `# 上下文`,
+            `- 你只看到本会话最近的一段消息（最多 ${keep} 条）；更早的消息不在眼前（当时的图片、语音、视频也不会出现）。`,
+            `- **眼前这几条就是你全部可见的对话**。对方只丢来一个词、一句没头没尾的话，那就是真只有这一句：别脑补"前面还说过什么"，照字面接或者问清楚。`,
+            `- 回话前先掂量现有信息够不够：不够就查一次 —— search_history（只翻本会话上下文之外的旧原文）或 recall_facts（翻这位用户的长期记忆）；查完就必须作答，查不到就是真没有，别换个词接着查。`,
+            `- 不要向用户提「上下文、检索记录」这类内部词，查到就自然接上话。`,
           ].join('\n'),
         });
       }
@@ -889,7 +881,7 @@ export class Pipeline {
         chat, event, system, systemSections, messages, tools,
         attachments: turnAttachments,
         // 窗口起点交给工具面：search_history 只该翻模型眼前没有的那部分
-        historyWindowStartTs: sinceTs,
+        historyWindowStartTs,
       };
 
       // beforeLLM 钩子（人格插件五插槽注入点）

@@ -65,7 +65,7 @@ interface Config {
   ui?: { expectedQq?: string; chatPreview?: boolean };
   llm: { failoverThreshold: number };
   /** 每会话历史条数在 storage 段（历史环形缓冲真正读的键）；旧内核没这个段，可选 */
-  storage?: { historyLimit: number; contextMinutes?: number };
+  storage?: { historyLimit: number };
   /** 收件文件保留天数：内核存的是小时，界面按天给 */
   sandbox?: { inboxKeepDays: number };
   work: Work;
@@ -311,23 +311,15 @@ export default function SettingsPage() {
           {sec === 'chat' && (() => {
             // 旧内核没有这些键就不渲染：重启内核后出现
             const rp = h?.repeat;
-            const st = c.storage;
-            const cm = st?.contextMinutes;
             const setRp = (p: Partial<NonNullable<Humanlike['repeat']>>, immediate = false) =>
               rp && patchH({ repeat: { ...rp, ...p } }, immediate);
             return (
               <>
-                {(cm !== undefined || rp) && (
+                {rp && (
                   <div className="set-grid">
-                    {cm !== undefined && st && (
-                      <Num label="传入上下文时限分钟" value={cm}
-                        onChange={(v) => { patch({ storage: { ...st, contextMinutes: v } }); autoSave('storage', 600, { storage: { contextMinutes: v } }); }} />
-                    )}
-                    {rp && (<>
-                      <Num label="复读触发人数" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
-                      <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
-                      <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
-                    </>)}
+                    <Num label="复读触发人数" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
+                    <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
+                    <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
                   </div>
                 )}
 

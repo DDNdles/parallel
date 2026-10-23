@@ -324,7 +324,7 @@ test('语音容器不是浏览器/对端都认的 wav 时：转得动就转，�
   assert.ok(!JSON.stringify(blocks).includes('bad.silk'), '不要把协议端的文件号当成内容塞进去');
 });
 
-// ---------------- 上下文时间窗：窗口内历史媒体按消息归位，窗口外的不出现 ----------------
+// ---------------- 近端历史：historyLimit 内的媒体按消息归位，超出条数的旧消息不出现 ----------------
 
 const chatOf = (groupId: string) => ({ platform: 'qq', type: 'group' as const, chatId: groupId });
 
@@ -332,10 +332,10 @@ const chatOf = (groupId: string) => ({ platform: 'qq', type: 'group' as const, c
 const systemText = (body: any) => (body?.messages ?? []).filter((m: any) => m?.role === 'system')
   .map((m: any) => String(m.content ?? '')).join('\n');
 
-test('窗口内历史消息带的图：落在它自己那条消息上；音视频按口径补在最新那条 user 尾部', async () => {
+test('近端历史消息带的图：落在它自己那条消息上；音视频按口径补在最新那条 user 尾部', async () => {
   const G = freshGroup();
   const chat = chatOf(G);
-  // 造一条窗口内的历史：真人上一句就带着图与语音（pushUser 带附件，正是 pipeline 入账时的形状）
+  // 造一条近端历史：真人上一句就带着图与语音（pushUser 带附件，正是 pipeline 入账时的形状）
   kernel.history.pushUser(chat, '这是我前面发的那张图', [
     { kind: 'image', path: localFile('hist-window.png', PNG), name: 'hist-window.png', mime: 'image/png' },
     { kind: 'audio', path: localFile('hist-window.wav', WAV), name: 'hist-window.wav', mime: 'audio/wav' },
@@ -343,12 +343,12 @@ test('窗口内历史消息带的图：落在它自己那条消息上；音视�
 
   const since = seen.length;
   send(71001, [{ type: 'text', data: { text: '接着说' } }], G);
-  const body = await nextBody(since, '带窗口历史的请求');
+  const body = await nextBody(since, '带近端历史的请求');
   const users = (body?.messages ?? []).filter((m: any) => m?.role === 'user');
 
   // 历史那条：图长在它自己那条 content 上（不是最新那条）
   const hist = users.find((m: any) => Array.isArray(m.content) && textOf(m.content).includes('这是我前面发的那张图'));
-  assert.ok(hist, `窗口内的历史消息要在请求体里：${JSON.stringify(users.map((m: any) => textOf(Array.isArray(m.content) ? m.content : [])))}`);
+  assert.ok(hist, `近端历史消息要在请求体里：${JSON.stringify(users.map((m: any) => textOf(Array.isArray(m.content) ? m.content : [])))}`);
   const histTypes = hist.content.map((b: any) => b?.type);
   const histImgs = has(hist.content, 'image_url');
   assert.equal(histImgs.length, 1, `历史那条自己的图要归位到它这条上：${JSON.stringify(histTypes)}`);
@@ -359,34 +359,40 @@ test('窗口内历史消息带的图：落在它自己那条消息上；音视�
   const blocks = lastUserBlocks(body);
   assert.match(textOf(blocks), /接着说/);
   assert.equal(has(blocks, 'image_url').length, 0, `本轮没带图，最新那条 user 上就不该有图：${JSON.stringify(blocks.map((b) => b?.type))}`);
-  assert.equal(has(blocks, 'input_audio').length, 1, '窗口内历史的语音要补在最新那条 user 上');
+  assert.equal(has(blocks, 'input_audio').length, 1, '近端历史的语音要补在最新那条 user 上');
 
   // 「本轮媒体补传」要说清这一发带了什么、长在哪：历史拿不到作者，按"更早的消息"标注
   const sys = systemText(body);
   assert.match(sys, /# 本轮媒体补传/, '475 分节要交代这一发的媒体清单');
-  assert.match(sys, /更早的消息：图片×1 \/ 语音×1/, '窗口内历史那条的媒体要列出来');
-  assert.match(sys, /# 上下文时限/, '405 分节要说明只看得到窗口内的消息');
-  assert.match(sys, /按 \d+ 分钟的窗口对齐梳理点裁剪/);
+  assert.match(sys, /更早的消息：图片×1 \/ 语音×1/, '近端历史那条的媒体要列出来');
+  assert.match(sys, /# 上下文/, '405 分节要说明只看得到近端消息');
+  assert.match(sys, /最多 \d+ 条/);
 });
 
-test('窗口外的历史消息不进请求体：它带的图也不出现', async () => {
+test('超出 historyLimit 的旧消息不进请求体：它带的图也不出现', async () => {
   const G = freshGroup();
   const chat = chatOf(G);
-  kernel.history.pushUser(chat, '这是很久以前那张图', [
-    { kind: 'image', path: localFile('hist-old.png', PNG), name: 'hist-old.png', mime: 'image/png' },
-  ]);
-  // pushUser 只盖"现在"：造一条窗口外的记录得把 ts 挪到 30 分钟前（窗口默认 5 分钟）
-  const old = kernel.history.get(chat).find((m) => m.content === '这是很久以前那张图');
-  assert.ok(old, '历史里要有这条');
-  old.ts = Date.now() - 30 * 60_000;
+  const savedLimit = kernel.config.config.storage.historyLimit;
+  kernel.config.config.storage.historyLimit = 2;
+  kernel.history.setLimit(2);
+  try {
+    kernel.history.pushUser(chat, '这是很久以前那张图', [
+      { kind: 'image', path: localFile('hist-old.png', PNG), name: 'hist-old.png', mime: 'image/png' },
+    ]);
+    kernel.history.pushAssistant(chat, '收到一');
+    kernel.history.pushAssistant(chat, '收到二');
 
-  const since = seen.length;
-  send(71002, [{ type: 'text', data: { text: '现在说点别的' } }], G);
-  const body = await nextBody(since, '窗口外历史那一发');
-  assert.ok(!allUserText(body).includes('这是很久以前那张图'), '窗口外的正文不许出现在请求体里');
-  const allBlocks = (body?.messages ?? []).filter((m: any) => m?.role === 'user')
-    .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
-  assert.equal(has(allBlocks, 'image_url').length, 0, '窗口外那条带的图也不许进请求体');
+    const since = seen.length;
+    send(71002, [{ type: 'text', data: { text: '现在说点别的' } }], G);
+    const body = await nextBody(since, '超出条数历史那一发');
+    assert.ok(!allUserText(body).includes('这是很久以前那张图'), '超出 historyLimit 的正文不许出现在请求体里');
+    const allBlocks = (body?.messages ?? []).filter((m: any) => m?.role === 'user')
+      .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
+    assert.equal(has(allBlocks, 'image_url').length, 0, '那条带的图也不许进请求体');
+  } finally {
+    kernel.config.config.storage.historyLimit = savedLimit;
+    kernel.history.setLimit(savedLimit);
+  }
 });
 
 // ---------------- 动图：QQ 的「动画表情」在 chat 主链路上要被摊成分帧拼图 ----------------

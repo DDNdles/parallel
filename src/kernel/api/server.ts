@@ -1020,13 +1020,6 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             cfg.storage.historyLimit = n;
             kernel.history.setLimit(n);
           }
-          // 上下文时间窗（分钟）：模型只看最近这么多分钟的消息，与 historyLimit 条数上限同时生效。
-          // 这里只挡非有限数；范围交给 round+clamp，好让旧配置与页面控件的越界值都能安全落库而不必 400
-          if (st.contextMinutes !== undefined) {
-            const n = Number(st.contextMinutes);
-            if (!Number.isFinite(n)) return send({ error: '上下文时间窗需要是 1~720 的整数' }, 400);
-            cfg.storage.contextMinutes = Math.min(720, Math.max(1, Math.round(n)));
-          }
         }
         // sandbox 段：只放收件文件保留天数（内核存小时，sweep 每 10 分钟读一次配置，存完即生效）；
         // 其余限额（单文件/会话上限、执行超时等）仍走沙箱页「限额与清理」弹窗

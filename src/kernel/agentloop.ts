@@ -599,15 +599,9 @@ export class HistoryStore {
     this.trim(h);
   }
 
-  /**
-   * 取快照（调用方不得修改）。
-   * 给了 `sinceTs` 就只保留上下文时间窗内的条目：带上 ts 的按 `ts >= sinceTs` 筛，
-   * **没有 ts 的保守保留**（字段缺失不该被当成"太旧"而把内容吞掉）。
-   */
-  snapshot(chat: ChatRef, sinceTs?: number): ChatMessage[] {
-    const h = this.get(chat);
-    if (sinceTs === undefined) return [...h];
-    return h.filter((m) => m.ts === undefined || m.ts >= sinceTs);
+  /** 取快照（调用方不得修改）：近端最近 historyLimit 条，时间窗已删 */
+  snapshot(chat: ChatRef): ChatMessage[] {
+    return [...this.get(chat)];
   }
 
   private trim(h: ChatMessage[]): void {

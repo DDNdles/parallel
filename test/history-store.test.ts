@@ -7,20 +7,16 @@ import { join } from 'node:path';
 import { Bus } from '../src/kernel/bus.ts';
 import { HistoryStore } from '../src/kernel/agentloop.ts';
 import { SessionLog } from '../src/kernel/sessionlog.ts';
-import { DEFAULT_CONFIG, freshDefaultConfig } from '../src/kernel/config.ts';
-import { windowAnchorTs } from '../src/kernel/pipeline.ts';
 import type { ChatRef, MessageAttachment } from '../src/kernel/types.ts';
 
 /**
- * 上下文时间窗（storage.contextMinutes）与冷启动重建。
+ * HistoryStore 与冷启动重建。
  *
  * 内存路径与磁盘路径各验一面：
- *  - 内存：pushUser/pushAssistant 落 ts、第三参附件进快照、snapshot(chat, sinceTs) 按窗口筛、
- *    没有 ts 的条目保守保留、trim 的条数裁剪照旧；
- *  - 磁盘：直接写一份 jsonl 夹具再冷启动 get()，验 ts 与附件（顶层 files + 记录节点 files）能重建回来——
- *    重启后时间窗过滤与窗口内媒体重放全靠这一层，丢了等于重启即失忆。
+ *  - 内存：pushUser/pushAssistant 落 ts、第三参附件进快照、trim 的条数裁剪；
+ *  - 磁盘：直接写一份 jsonl 夹具再冷启动 get()，验 ts 与附件（顶层 files + 记录节点 files）能重建回来。
  *
- * agentTurn 那根接线（now - contextMinutes 传给 snapshot）不在这里测：主链路归 model-media-payload。
+ * 上下文只按条数裁剪（storage.historyLimit），没有时间窗。
  */
 
 const GROUP: ChatRef = { platform: 'qq', type: 'group', chatId: '9001' };
@@ -57,7 +53,7 @@ function saveInbox(root: string, name: string, body: string): string {
 
 // ---------------- 内存路径：ts / 附件 / 窗口 / 裁剪 ----------------
 
-test('HistoryStore：pushUser / pushAssistant 带 ts，snapshot(chat, sinceTs) 按窗口筛（含边界）', async () => {
+test('HistoryStore：pushUser / pushAssistant 带 ts，snapshot 返回全量近端历史', async () => {
   const d = tmp();
   try {
     const store = new HistoryStore(new SessionLog(d, new Bus()), 50);
@@ -72,12 +68,7 @@ test('HistoryStore：pushUser / pushAssistant 带 ts，snapshot(chat, sinceTs) �
     const [t1, t2, t3] = all.map((m) => m.ts);
     for (const t of [t1, t2, t3]) assert.equal(typeof t, 'number', '每条都要带 ts');
     assert.ok(t1! < t2! && t2! < t3!, `ts 要单调递增，实际 ${t1}/${t2}/${t3}`);
-
-    // 窗口起点落在中间那条上：`>=` 语义（含边界），只有它和它之后的留下
-    assert.deepEqual(store.snapshot(GROUP, t2).map((m) => m.content), ['第一句的回答', '第二句']);
-    assert.deepEqual(store.snapshot(GROUP, t3).map((m) => m.content), ['第二句']);
-    assert.deepEqual(store.snapshot(GROUP, t3! + 1), [], '起点晚于全部条目 → 空');
-    assert.equal(store.snapshot(GROUP).length, 3, '不给 sinceTs 就是全量（老调用方行为不变）');
+    assert.equal(store.snapshot(GROUP).length, 3);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -122,7 +113,7 @@ test('HistoryStore：trim 条数裁剪仍生效，裁完不以 assistant 开头'
 
 // ---------------- 磁盘路径：冷启动重建 ----------------
 
-test('冷启动重建：ts 跟着回来；没有 ts 的老条目在窗口过滤下保守保留', () => {
+test('冷启动重建：ts 跟着回来；没有 ts 的老条目不伪造时间', () => {
   const d = tmp();
   try {
     const T = 1_700_000_000_000;
@@ -140,10 +131,7 @@ test('冷启动重建：ts 跟着回来；没有 ts 的老条目在窗口过滤�
     assert.equal(msgs[0].ts, T, '落账时的 ts 要原样重建');
     assert.equal(msgs[1].ts, T + 1000);
     assert.equal(msgs[2].ts, undefined, '老行本来就没有 ts，不做假时间');
-
-    // 窗口起点比那两条带 ts 的晚得多：它们被筛掉，没有 ts 的那条留下
-    assert.deepEqual(store.snapshot(GROUP, T + 999_999).map((m) => m.content), ['群友：没有时间戳的老条目']);
-    assert.equal(store.snapshot(GROUP).length, 3, '不给窗口就是全量');
+    assert.equal(store.snapshot(GROUP).length, 3);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -230,7 +218,7 @@ test('冷启动重建：顶层 files 与记录节点 files 归位成 attachments
   }
 });
 
-test('冷启动重建：压缩摘要（无 ts）不被时间窗筛掉', () => {
+test('冷启动重建：压缩摘要（无 ts）接在压缩后的消息之前', () => {
   const d = tmp();
   try {
     const T = 1_700_000_200_000;
@@ -248,42 +236,8 @@ test('冷启动重建：压缩摘要（无 ts）不被时间窗筛掉', () => {
     const msgs = store.get(GROUP);
     assert.deepEqual(msgs.map((m) => m.content.includes('聊过 X')), [true, false], '摘要接在压缩后的消息之前');
     assert.equal(msgs[0].ts, undefined, '摘要本身没有 ts');
-
-    // 窗口收紧到压缩后那一秒之后：带 ts 的被筛掉，摘要（无 ts）按保守语义留下
-    const win = store.snapshot(GROUP, T + 1);
-    assert.equal(win.length, 1);
-    assert.ok(win[0].content.includes('聊过 X'));
-    assert.equal(win[0].ts, undefined);
+    assert.equal(store.snapshot(GROUP).length, 2);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
-});
-
-// ---------------- 默认值 ----------------
-
-test('默认值：storage.contextMinutes 为 5（范围 1~720，白名单在 api/server.ts）', () => {
-  assert.equal(DEFAULT_CONFIG.storage.contextMinutes, 5);
-  // 设置页回填用的是深拷贝，键不能在这一步丢
-  const cfg = freshDefaultConfig() as unknown as { storage: { contextMinutes?: number } };
-  assert.equal(cfg.storage.contextMinutes, 5);
-});
-
-// ---------------- 梳理点对齐（2026-10-16 裁定②）----------------
-
-test('梳理点对齐：窗口起点只在整格边界上动，两次梳理之间只增不减', () => {
-  const span = 5 * 60_000;
-  const base = Math.floor(1_700_000_000_000 / span) * span;   // 对齐网格边界
-  // 同一格内的两次 turn 锚点相同（消息数组因此 append-only，前缀缓存吃得动）
-  const withinCell = base + 1_000;
-  const laterInCell = base + span - 1_000;
-  assert.equal(windowAnchorTs(withinCell, 5), windowAnchorTs(laterInCell, 5));
-  // 锚点 ≤ now - N 分钟，且最多差一格
-  const a = windowAnchorTs(withinCell, 5);
-  assert.ok(a <= withinCell - span && withinCell - span - a < span, `anchor=${a} now-span=${withinCell - span}`);
-  // 跨格那一刻整段跳到下一格
-  const acrossCell = base + span + 1_000;
-  assert.equal(windowAnchorTs(acrossCell, 5), windowAnchorTs(withinCell, 5) + span);
-  // 覆盖范围确实落在 N~2N 分钟之间
-  const coverage = acrossCell - windowAnchorTs(acrossCell, 5);
-  assert.ok(coverage > span && coverage <= 2 * span, `coverage=${coverage / 60_000}min`);
 });
