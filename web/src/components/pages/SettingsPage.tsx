@@ -199,6 +199,7 @@ export default function SettingsPage() {
     maxPhrases: 3, retry: true, maxStrikes: 3,
   };
   const intr = h.interrupt;
+  const triggerMode = h.timing?.replyTriggerMode;
   const patch = (p: Partial<Config>) => setC({ ...c, ...p });
   /** 即时保存：本地 state 先行；immediate=true（开关/选择类单次事件）立即发，输入框默认 600ms 防抖只发最后一拍 */
   const autoSave = (key: string, delay: number, body: Record<string, unknown>) => {
@@ -440,15 +441,28 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ timing: { ...h.timing, replyTriggerMode: v as 'likelihood' | 'necessity' | 'frequency' } }, true)} />
               </div>
               <div className="set-grid">
-                <Num label="触发所需积压条数" hint="频率模式的开口门槛，默认 12" value={h.timing.pendingThreshold}
-                  onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
-                <Num label="必要性分数阈值（0-200）" hint="必要性模式的开口分数线" value={h.timing.necessityThreshold}
-                  onChange={(v) => patchH({ timing: { ...h.timing, necessityThreshold: v } })} />
+                {triggerMode === 'frequency' && (
+                  <Num label="触发所需积压条数" hint="频率模式的开口门槛：攒够这么多条才进模型" value={h.timing.pendingThreshold}
+                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
+                )}
+                {triggerMode === 'necessity' && (<>
+                  <Num label="必要性分数阈值（0-200）" hint="内容/请求/积压/存在感综合分达到它才开口" value={h.timing.necessityThreshold}
+                    onChange={(v) => patchH({ timing: { ...h.timing, necessityThreshold: v } })} />
+                  <Num label="积压压力基准条数" hint="积压压力与空窗补偿按这个条数折算" value={h.timing.pendingThreshold}
+                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
+                </>)}
+                {triggerMode === 'likelihood' && (
+                  <Num label="积压压力基准条数" hint="概率门控的积压压力与空窗补偿按这个条数折算" value={h.timing.pendingThreshold}
+                    onChange={(v) => patchH({ timing: { ...h.timing, pendingThreshold: v } })} />
+                )}
                 <Num label="群聊频率（0-1）" value={h.timing.talkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, talkValue: v } })} />
                 <Num label="私聊频率（0-1）" value={h.timing.privateTalkValue}
                   onChange={(v) => patchH({ timing: { ...h.timing, privateTalkValue: v } })} />
               </div>
+              {triggerMode === 'likelihood' && (
+                <div className="mset-group-e">拟合概率使用每会话自适应门控（0.15–0.85），没有手动分数线；@/提及仍直通。</div>
+              )}
               <div className="mset-models" style={{ marginTop: 14 }}>
                 <div className="mset-mrow">
                   <span className="plg-v">被 @ 时必定回复</span>
