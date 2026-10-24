@@ -31,6 +31,11 @@
       "default": "gemini-3-pro-image",
       "description": "生图模型名（默认 gemini-3-pro-image，可改成别的 Gemini 生图模型）"
     },
+    "fallbackModel": {
+      "type": "string",
+      "default": "gemini-3.1-flash-image",
+      "description": "备用生图模型：主模型 API 层失败（如网关账号池冷却 503）时自动落过去再试一次；留空关闭轮换"
+    },
     "baseUrl": {
       "type": "string",
       "default": "",

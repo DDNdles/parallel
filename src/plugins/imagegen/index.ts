@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
-import type { ChatRef, PluginContext, Role, ToolResult } from '../../kernel/types.ts';
+import type { ChatRef, MsgSegment, PluginContext, Role, ToolResult } from '../../kernel/types.ts';
 import { newId } from '../../kernel/util/misc.ts';
 
 // ============================================================
@@ -45,7 +45,7 @@ export interface GalleryImage {
 }
 
 type GenResult =
-  | { ok: true; id: string; path: string; size: number }
+  | { ok: true; id: string; path: string; size: number; model: string; fallback: boolean }
   | { ok: false; error: string; code: 'config' | 'quota' | 'input' | 'api' | 'storage' };
 
 /**
@@ -127,6 +127,8 @@ export function setup(ctx: PluginContext): void {
       model: String(ctx.userConfig.model ?? '').trim().replace(/^models\//, '') || 'gemini-3-pro-image',
       // 留空走官方地址；直连不通的环境（典型：国内）可填本地网关/代理，如 http://127.0.0.1:8045
       baseUrl: String(ctx.userConfig.baseUrl ?? '').trim().replace(/\/+$/, '') || 'https://generativelanguage.googleapis.com',
+      // 备用模型：主模型 API 层失败（如网关账号池冷却 503）时自动落过去再试一次
+      fallbackModel: String(ctx.userConfig.fallbackModel ?? '').trim().replace(/^models\//, ''),
       weeklyQuota: Number.isFinite(quota) && quota >= 0 ? Math.floor(quota) : 3,
       ownerUnlimited: ctx.userConfig.ownerUnlimited !== false,
     };
@@ -297,7 +299,7 @@ export function setup(ctx: PluginContext): void {
       return { ok: false, code: 'input', error: `生图失败：画面描述太长了（上限 ${PROMPT_MAX_CHARS} 字），精简一点再试。` };
     }
 
-    const { apiKey, model, baseUrl, weeklyQuota, ownerUnlimited } = cfg();
+    const { apiKey, model, baseUrl, fallbackModel, weeklyQuota, ownerUnlimited } = cfg();
     if (!apiKey) {
       return { ok: false, code: 'config', error: '生图失败：还没配置 Gemini API Key，请主人在桌面端「插件 → 生图」里填一个。' };
     }
@@ -325,7 +327,16 @@ export function setup(ctx: PluginContext): void {
     // 占位发生在 await 之前，同一用户的并发调用不会都判定为"还有额度"。
     if (limited) bumpUsage(week, opts.userId, 1);
 
-    const api = await callGemini({ apiKey, model, baseUrl, prompt, refs });
+    // 模型轮换：主模型 API 层失败（503 冷却/429/超时…）且配了不同的备用模型 → 落下去再试一次。
+    // 两边都失败才算这次生图失败；额度只占一次（备用成功就是真出了图）。
+    let usedModel = model;
+    let viaFallback = false;
+    let api = await callGemini({ apiKey, model, baseUrl, prompt, refs });
+    if (!api.ok && fallbackModel && fallbackModel !== model) {
+      usedModel = fallbackModel;
+      viaFallback = true;
+      api = await callGemini({ apiKey, model: fallbackModel, baseUrl, prompt, refs });
+    }
     if (!api.ok) {
       if (limited) bumpUsage(week, opts.userId, -1);
       return { ok: false, code: 'api', error: api.error };
@@ -347,14 +358,14 @@ export function setup(ctx: PluginContext): void {
       id,
       file: written.relPath,
       prompt,
-      model,
+      model: usedModel,
       userId: opts.userId,
       chatId: opts.chat.chatId,
       ts: Date.now(),
       chatRef: opts.chat,
       mime,
     });
-    return { ok: true, id, path: written.relPath, size: written.size };
+    return { ok: true, id, path: written.relPath, size: written.size, model: usedModel, fallback: viaFallback };
   }
 
   // ---------- LLM 工具（work 面） ----------
@@ -393,7 +404,7 @@ export function setup(ctx: PluginContext): void {
       });
       if (!r.ok) return r.error;
       return {
-        content: `已生成 ${r.path}（${r.size} 字节）。要发给用户就用 send_file 传这个路径。`,
+        content: `已生成 ${r.path}（${r.size} 字节${r.fallback ? `，主模型不可用、由备用 ${r.model} 生成` : ''}）。要发给用户就用 send_file 传这个路径。`,
         meta: { path: r.path, artifacts: [r.path] },
       };
     },
@@ -468,6 +479,31 @@ export function setup(ctx: PluginContext): void {
       refs: Array.isArray(body.refs) ? body.refs.map(String) : undefined,
     });
     if (!r.ok) return { status: r.code === 'quota' ? 429 : 400, body: { ok: false, code: r.code, error: r.error } };
-    return { body: { ok: true, id: r.id } };
+    return { body: { ok: true, id: r.id, model: r.model, fallback: r.fallback } };
+  });
+
+  // 画廊补发：把已生成的图按 id 原样发到指定会话（主人从桌面端补发用；限速与出站落账照常走 ChatService）
+  ctx.http.on('POST', '/send', async (req) => {
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const id = String(body.id ?? '').trim();
+    const type = body.type === 'private' ? 'private' : body.type === 'group' ? 'group' : null;
+    const chatId = String(body.chatId ?? '').trim();
+    const text = String(body.text ?? '').trim().slice(0, 200);
+    const rec = gallery().find((g) => g.id === id);
+    if (!rec) return { status: 404, body: { ok: false, error: '没有这张图（id 不存在或已被清理）' } };
+    if (!type || !chatId) return { status: 400, body: { ok: false, error: '要指定 type（group/private）与 chatId' } };
+    let abs: string;
+    try { abs = insideSandbox(rec.chatRef ?? desktopChat(), rec.file); }
+    catch (e) { return { status: 400, body: { ok: false, error: (e as Error).message } }; }
+    const segments: MsgSegment[] = [];
+    if (text) segments.push({ type: 'text', data: { text } });
+    segments.push({ type: 'image', data: { file: abs } });
+    try {
+      const messageId = await ctx.chat.send({ platform: 'qq', type, chatId }, segments);
+      ctx.log.info(`画廊补发 ${id} → ${type}_${chatId}${text ? `（附言：${text.slice(0, 40)}）` : ''}`);
+      return { body: { ok: true, messageId: messageId ?? null } };
+    } catch (e) {
+      return { status: 502, body: { ok: false, error: `发不出去：${(e as Error).message}` } };
+    }
   });
 }

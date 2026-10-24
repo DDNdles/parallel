@@ -793,6 +793,12 @@ export default function SettingsPage() {
                     onChange={(e) => setPlugVal('imagegen', { model: e.target.value })} />
                 </div>
                 <div className="mset-field">
+                  <label className="mset-flabel">备用模型</label>
+                  <BrandInput value={String(gc.fallbackModel ?? '')} spellCheck={false}
+                    placeholder="留空 = 不轮换"
+                    onChange={(e) => setPlugVal('imagegen', { fallbackModel: e.target.value })} />
+                </div>
+                <div className="mset-field">
                   <label className="mset-flabel">接口地址</label>
                   <BrandInput value={String(gc.baseUrl ?? '')} spellCheck={false}
                     placeholder="留空 = 官方地址"

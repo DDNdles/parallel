@@ -119,7 +119,8 @@ test('自然周边界：周一起算，跨年按 ISO 周', () => {
 
 test('额度：API 失败不计数、满 3 张拒绝；PNG 真落盘；参考图进 inline_data', async () => {
   const k = await boot('key-test');
-  const mock = mockGemini([geminiErr(429, 'quota exceeded'), geminiOk(), geminiOk(), geminiOk()]);
+  // 主备两个模型都 429 才算一次失败（模型轮换会先落备用再试一次）
+  const mock = mockGemini([geminiErr(429, 'quota exceeded'), geminiErr(429, 'quota exceeded too'), geminiOk(), geminiOk(), geminiOk()]);
   try {
     // 参考图先放进会话沙箱（真实文件，读成 base64）
     k.kernel.sandbox.write(k.memberChat, 'inbox/ref.png', PNG);
@@ -128,14 +129,15 @@ test('额度：API 失败不计数、满 3 张拒绝；PNG 真落盘；参考图
     assert.match(failed, /生图失败/, failed);
     assert.match(failed, /429/, '配额错误要带状态码说明');
 
-    // 请求格式：x-goog-api-key + 文生图 parts + 参考图 inline_data
-    assert.equal(mock.calls.length, 1);
+    // 请求格式：x-goog-api-key + 文生图 parts + 参考图 inline_data（第一次是主模型，带参考图）
+    assert.equal(mock.calls.length, 2, '主模型失败后落备用模型再试一次');
     assert.equal(mock.calls[0].headers['x-goog-api-key'], 'key-test');
     assert.match(mock.calls[0].url, /models\/gemini-3-pro-image:generateContent$/);
     const parts = mock.calls[0].body.contents[0].parts;
     assert.equal(parts[0].text, '第一张（这次会失败）');
     assert.equal(parts[1].inline_data.mime_type, 'image/png');
     assert.equal(parts[1].inline_data.data, PNG_B64);
+    assert.match(mock.calls[1].url, /gemini-3\.1-flash-image/, '第二次落备用模型');
 
     // 失败那次不计数：还能连做三张，第四张才被拒
     const first = await k.call('第二张');
@@ -170,6 +172,39 @@ test('JPEG：返回字节是 JPEG 时按 .jpg 落盘，不冒充 PNG', async () 
     const rel = out.match(/imagegen\/[^\s（]+\.jpg/)![0];
     const abs = join(k.kernel.sandbox.root(k.privilegedChat), rel);
     assert.deepEqual(readFileSync(abs), JPEG, 'JPEG 内容要原样落进沙箱');
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('模型轮换：主模型 503 自动落备用模型，画廊记实际模型', async () => {
+  const k = await boot('key-test');
+  // 队列：主模型 503 → 备用成功（mockGemini 按 URL 拦截，两次调用靠队列顺序区分）
+  const mock = mockGemini([geminiErr(503, 'account pool cooling'), geminiOk()]);
+  try {
+    const out = await k.call('画一只猫', { role: 'owner' });
+    assert.match(out, /已生成 imagegen\/.+\.(png|jpg)/, out);
+    assert.match(out, /备用/, '要说明是备用模型生成的');
+    assert.equal(mock.calls.length, 2, '主模型失败后要再试一次备用模型');
+    assert.match(mock.calls[0]!.url, /gemini-3-pro-image/, '第一次打主模型');
+    assert.match(mock.calls[1]!.url, /gemini-3\.1-flash-image/, '第二次落备用模型');
+    // 额度只占一次：owner 不限额，看成员侧不受影响即可（此处仅验证调用次数语义）
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('模型轮换：备用也失败才算失败，额度退回', async () => {
+  const k = await boot('key-test');
+  const mock = mockGemini([geminiErr(503, 'a'), geminiErr(503, 'b'), geminiErr(429, 'q'), geminiErr(429, 'q')]);
+  try {
+    const out = await k.call('第一张', { role: 'member' });
+    assert.match(out, /生图失败/, out);
+    const out2 = await k.call('第二张还能画', { role: 'member' });
+    assert.match(out2, /已生成|生图失败/, '失败不计数：第二次仍会真的调 API');
+    assert.equal(mock.calls.length, 4, '两次生成 × 各两个模型');
   } finally {
     mock.restore();
     await k.cleanup();
