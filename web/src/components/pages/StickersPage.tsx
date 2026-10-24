@@ -1,6 +1,6 @@
 'use client';
-/** 表情包库：左标签筛选 + 右网格。描述就地编辑（600ms 防抖保存），标签失焦保存，悬停出删除；
- *  顶栏「上传」钮或把图直接拖进页面（原始字节走 upload 端点）。 */
+/** 表情包库：左标签筛选 + 右网格。描述/标签/时机就地编辑（600ms 防抖保存），标签失焦保存，悬停出删除；
+ *  顶栏「上传」或把图直接拖进页面（原始字节走 upload 端点）；收录时模型自动看图打标，缺标的可整批补。 */
 import { useCallback, useEffect, useRef, useState, type DragEvent } from 'react';
 import { get, post, postRaw, fmtDT } from '@/lib/api';
 import { Icon } from '@/components/Icon';
@@ -9,8 +9,8 @@ import { BlobImg } from '@/components/BlobImg';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 
 interface Sticker {
-  id: string; desc: string; tags: string[]; count: number;
-  lastUsed: number; addedAt: number; source?: { userId: string; nickname: string };
+  id: string; desc: string; tags: string[]; timing: string; count: number;
+  lastUsed: number; addedAt: number;
 }
 
 const OFF = '插件未启用，可在插件页开启';
@@ -23,8 +23,9 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
   const [err, setErr] = useState('');
   const [tag, setTag] = useState('');
   const [drag, setDrag] = useState(false);
-  /** 标签输入草稿：编辑中保留逗号与空格，失焦才拆成数组存 */
-  const [tagDraft, setTagDraft] = useState<Record<string, string>>({});
+  /** 标签/时机输入草稿：编辑中保留逗号与空格，失焦才拆成数组存 */
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [retagging, setRetagging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
@@ -50,24 +51,34 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
   // 顶栏「上传」圆钮 → 打开文件选择
   usePageCmd('stickers', cmd, (kind) => { if (kind === 'upload') fileRef.current?.click(); });
 
-  const saveDesc = (s: Sticker, desc: string) => {
-    setStickers((v) => v.map((x) => (x.id === s.id ? { ...x, desc } : x)));
-    const key = 'desc:' + s.id;
+  const saveField = (s: Sticker, field: 'desc' | 'timing', value: string) => {
+    setStickers((v) => v.map((x) => (x.id === s.id ? { ...x, [field]: value } : x)));
+    const key = field + ':' + s.id;
     if (timers.current[key]) clearTimeout(timers.current[key]);
     timers.current[key] = setTimeout(() => {
       delete timers.current[key];
-      post('/api/plugin/sticker/desc', { id: s.id, desc }).catch((e: Error) => setErr(`未保存：${e.message}`));
+      post('/api/plugin/sticker/desc', { id: s.id, [field]: value }).catch((e: Error) => setErr(`未保存：${e.message}`));
     }, 600);
   };
   const saveTags = (s: Sticker) => {
-    const draft = tagDraft[s.id];
-    if (draft === undefined) return;
-    const tags = draft.split(/[,，、\s]+/).filter(Boolean);
-    if (tags.join(' ') === s.tags.join(' ')) { setTagDraft((d) => { const n = { ...d }; delete n[s.id]; return n; }); return; }
+    const d = draft[s.id];
+    if (d === undefined) return;
+    const tags = d.split(/[,，、\s]+/).filter(Boolean);
+    if (tags.join(' ') === s.tags.join(' ')) { setDraft((v) => { const n = { ...v }; delete n[s.id]; return n; }); return; }
     setStickers((v) => v.map((x) => (x.id === s.id ? { ...x, tags } : x)));
-    post('/api/plugin/sticker/desc', { id: s.id, desc: s.desc, tags })
-      .then(() => setTagDraft((d) => { const n = { ...d }; delete n[s.id]; return n; }))
+    post('/api/plugin/sticker/desc', { id: s.id, tags })
+      .then(() => setDraft((v) => { const n = { ...v }; delete n[s.id]; return n; }))
       .catch((e: Error) => setErr(`未保存：${e.message}`));
+  };
+  /** 整批补标签：把缺 tags 或 timing 的都让模型重新看一遍 */
+  const retag = async () => {
+    setRetagging(true); setErr('');
+    try {
+      const r = await post('/api/plugin/sticker/retag', {}) as { tagged?: number };
+      if (!r.tagged) setErr('没有要补标签的（都已齐全，或自动打标签关着）');
+      reload();
+    } catch (e) { setErr(`补标签失败：${(e as Error).message}`); }
+    finally { setRetagging(false); }
   };
   const remove = async (s: Sticker) => {
     if (!confirm(`删除表情包「${s.desc || s.id}」？`)) return;
@@ -88,6 +99,7 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
 
   const tags = Array.from(new Set(stickers.flatMap((s) => s.tags))).sort();
   const shown = tag ? stickers.filter((s) => s.tags.includes(tag)) : stickers;
+  const untagged = stickers.filter((s) => !s.tags.length || !s.timing).length;
   return (
     <div className={'mset-body' + (drag ? ' stk-drag' : '')}
       onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
@@ -117,6 +129,11 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
           <span className="mset-dic"><Icon name="sticker" size={17} /></span>
           <h2 className="mset-dtitle">表情包</h2>
           <div className="mset-dright">
+            {untagged > 0 && (
+              <button className="mset-add" disabled={retagging} onClick={() => void retag()}>
+                <Icon name="sparkle" size={13} /> {retagging ? '补标签中…' : `补标签（${untagged}）`}
+              </button>
+            )}
             <button className="mset-add" onClick={() => fileRef.current?.click()}>
               <Icon name="upload" size={13} /> 上传
             </button>
@@ -125,7 +142,7 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
         <input ref={fileRef} type="file" accept="image/*" multiple className="hidden"
           onChange={(e) => { if (e.target.files) upload(e.target.files); e.target.value = ''; }} />
         {err && <div className="mset-err">{err}</div>}
-        {!shown.length && <div className="mset-empty">{tag ? `没有带「${tag}」的表情` : '还没有表情包，点右上角上传或把图拖进来'}</div>}
+        {!shown.length && <div className="mset-empty">{tag ? `没有带「${tag}」的表情` : '还没有表情包，点右上角上传或把图拖进来；在 QQ 里让 bot「收下这个」也行'}</div>}
         <div className="stk-grid">
           {shown.map((s) => (
             <div className="stk-card" key={s.id}>
@@ -137,13 +154,14 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
               </span>
               <span className="stk-body">
                 <BrandInput value={s.desc} placeholder="描述" spellCheck={false}
-                  onChange={(e) => saveDesc(s, e.target.value)} />
-                <BrandInput value={tagDraft[s.id] ?? s.tags.join(', ')} placeholder="标签，逗号分隔" spellCheck={false}
-                  onChange={(e) => setTagDraft((d) => ({ ...d, [s.id]: e.target.value }))}
+                  onChange={(e) => saveField(s, 'desc', e.target.value)} />
+                <BrandInput value={draft[s.id] ?? s.tags.join(', ')} placeholder="标签，逗号分隔" spellCheck={false}
+                  onChange={(e) => setDraft((d) => ({ ...d, [s.id]: e.target.value }))}
                   onBlur={() => saveTags(s)} />
+                <BrandInput value={s.timing} placeholder="时机，如：被夸的时候" spellCheck={false}
+                  onChange={(e) => saveField(s, 'timing', e.target.value)} />
                 <span className="stk-meta">
                   用 {s.count} 次
-                  {s.source && <> · {s.source.nickname || s.source.userId}</>}
                   {' · '}{s.lastUsed ? fmtDT(s.lastUsed) : '还没用过'}
                 </span>
               </span>

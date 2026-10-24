@@ -7,16 +7,18 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
+import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 
 // ============================================================
-// 表情包插件（2026-10-24 重写）
+// 表情包插件（2026-10-24 v0.3：明确要求才收 + 模型看图打标）
 //
-//  1. onChatMessage 自动收图：内容去重、每会话（群/私聊）每日上限、跳过 bot 自己、私聊开关；
-//  2. send_sticker：按描述/标签挑图、发出去、计数、冷却；空库不注入提示；
-//  3. steal_sticker：消息内与引用消息里的图都能收，没图明说；
-//  4. REST：列表/改描述/上传（原始字节或 base64）/取图/删除/库容；
-//  5. reload 后数据仍在（plugin_kv 与 data/stickers 都不是进程内存）；
-//  6. 真实 HTTP 的原始字节上传（前端 postRaw 走的就是这条）。
+//  1. steal_sticker：消息内与引用消息里的图都能收；模型打标写入 desc/tags/timing；
+//     打标失败不拦收录（描述退回消息文字）；不记来源；
+//  2. send_sticker：按描述/标签/时机挑图、发出去、计数、冷却；空库不注入提示；
+//  3. REST：列表/改三项/上传（原始字节或 base64，可点名字段）/取图/删除/库容/补打标签；
+//  4. reload 后数据仍在（plugin_kv 与 data/stickers 都不是进程内存）；
+//  5. 真实 HTTP 的原始字节上传（前端 postRaw 走的就是这条）。
+// 模型打标走 mock 引擎的 script 队列；队列空 = 打标失败路径。
 // ============================================================
 
 const freePort = () => new Promise<number>((res) => {
@@ -31,6 +33,11 @@ function png(seed: number): Buffer {
   return Buffer.concat([PNG_HEAD, Buffer.from([seed, seed, seed, seed])]);
 }
 
+/** mock 引擎下一步要回的打标 JSON */
+const tagStep = (desc: string, tags: string[], timing: string): { content: string } => ({
+  content: JSON.stringify({ desc, tags, timing }),
+});
+
 async function boot(opts: { api?: boolean } = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-sticker-'));
   const { Kernel } = await import('../src/kernel/kernel.ts');
@@ -38,7 +45,16 @@ async function boot(opts: { api?: boolean } = {}) {
   const cfg = kernel.config.config as any;
   cfg.onebot.port = await freePort();
   if (opts.api) cfg.ui.port = await freePort();
+  // 打标走 mock 引擎：chat 链指到 mock，script 队列按需塞答复
+  cfg.providers.mock = {
+    label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
+    models: [{ id: 'mock-1', enabled: true }],
+  };
+  cfg.llm.activeProvider = 'mock';
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
   await kernel.boot();
+  const mockEngine = (kernel.llm as unknown as { providers: Map<string, MockEngine> }).providers.get('mock')!;
 
   const chat = { platform: 'ui' as const, type: 'group' as const, chatId: '8801' };
   const plugin = () => kernel.container.get('sticker')!;
@@ -68,7 +84,7 @@ async function boot(opts: { api?: boolean } = {}) {
     await kernel.container.reload('sticker');
   };
   const cleanup = async () => { await kernel.shutdown(); rmSync(dataDir, { recursive: true, force: true }); };
-  return { kernel, dataDir, chat, plugin, toolOf, tctx, rest, restJson, library, configure, cleanup };
+  return { kernel, dataDir, chat, plugin, toolOf, tctx, rest, restJson, library, configure, mockEngine, cleanup };
 }
 
 /** 一条带图的群消息；over 可覆盖 userId/nickname/raw/text 等 */
@@ -88,10 +104,9 @@ function eventOf(chat: { chatId: string }, imgs: { name: string; path: string }[
 
 const asText = (r: any): string => (typeof r === 'string' ? r : String(r?.content ?? ''));
 
-test('onChatMessage：自动收图去重、每日上限、跳过 bot 自己', async () => {
+test('steal_sticker：模型看图打标（desc/tags/timing），失败退回消息文字，不记来源', async () => {
   const k = await boot();
   try {
-    await k.configure({ autoSteal: true, stealDailyCap: 2 });
     const dir = join(k.dataDir, 'src');
     mkdirSync(dir, { recursive: true });
     const write = (name: string, seed: number) => {
@@ -99,88 +114,63 @@ test('onChatMessage：自动收图去重、每日上限、跳过 bot 自己', as
       writeFileSync(p, png(seed));
       return p;
     };
-    const a = write('a.png', 1);
-    const aCopy = write('a-copy.png', 1);
-    const b = write('b.png', 2);
-    const c = write('c.png', 3);
-    const d = write('d.png', 4);
+    const steal = k.toolOf('steal_sticker');
 
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'a.png', path: a }]));
+    // 打标成功：模型回 JSON，库里三项齐全
+    k.mockEngine.script.push(tagStep('白猫捂脸笑', ['猫', '爆笑'], '被逗笑的时候'));
+    let r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [{ name: 'a.png', path: write('a.png', 41) }], { text: '笑死 这个好' })) as any));
+    assert.match(r, /已收下：白猫捂脸笑［猫\/爆笑］（用在被逗笑的时候）/);
     let lib = await k.library();
     assert.equal(lib.length, 1);
-    assert.equal(lib[0].source.nickname, '小明');
-    assert.equal(lib[0].desc, '来自小明的图');
-    assert.equal(lib[0].count, 0);
+    assert.equal(lib[0].desc, '白猫捂脸笑');
+    assert.deepEqual(lib[0].tags, ['猫', '爆笑']);
+    assert.equal(lib[0].timing, '被逗笑的时候');
+    assert.ok(!('source' in lib[0]), '不记来源');
 
-    // bot 自己发的图：即便内容全新也不收
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'd.png', path: d }], {
-      userId: '3344', nickname: 'bot', raw: { self_id: '3344' },
-    }));
-    assert.equal((await k.library()).length, 1, 'bot 自己的图不能收');
+    // 打标失败（队列空 = 回声，不是 JSON）：收录照常，描述退回消息文字
+    r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [{ name: 'b.png', path: write('b.png', 42) }], { text: '这张也收下' })) as any));
+    assert.match(r, /已收下：这张也收下/);
+    lib = await k.library();
+    assert.equal(lib.length, 2);
+    // 同毫秒收录的两张 addedAt 相同，/library 排序不保证先后：按描述找，别按下标
+    const bItem = lib.find((s: any) => s.desc === '这张也收下');
+    assert.ok(bItem, `第二张的描述应是消息文字兜底：${JSON.stringify(lib.map((s) => s.desc))}`);
+    assert.deepEqual(bItem.tags, []);
+    assert.equal(bItem.timing, '');
 
-    // 同一张图换个文件名：按内容 hash 去重，且不占每日额度
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'a-copy.png', path: aCopy }]));
-    assert.equal((await k.library()).length, 1, '同图换文件名要去重');
-
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'b.png', path: b }]));
+    // 同图再收：duplicate
+    r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [{ name: 'a2.png', path: write('a2.png', 41) }])) as any));
+    assert.match(r, /已经在库里/);
     assert.equal((await k.library()).length, 2);
 
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'c.png', path: c }]));
-    assert.equal((await k.library()).length, 2, '每群每日上限 2：第三张不收');
-
-    // 图片落在 <data>/stickers/，id 是内容 hash
-    const stored = readdirSync(join(k.dataDir, 'stickers'));
-    assert.equal(stored.length, 2);
-    assert.ok(stored.every((f) => /^[0-9a-f]{16}\.png$/.test(f)), `文件名应是 hash.png：${stored.join(',')}`);
-    // 键全部 v2: 前缀（旧版索引不会混进来）
-    const keys = k.kernel.db.all<{ key: string }>("SELECT key FROM plugin_kv WHERE plugin_id='sticker'").map((r) => r.key);
-    assert.ok(keys.includes('v2:library'));
-    assert.ok(keys.every((x) => x.startsWith('v2:')), `出现了不带 v2: 前缀的键：${keys.join(',')}`);
-  } finally {
-    await k.cleanup();
-  }
-});
-
-test('自动收图：私聊默认也收，autoStealPrivate 关掉就回到只收群', async () => {
-  const k = await boot();
-  try {
-    // 2026-10-24 真机坑：主人在私聊连甩 29 张表情一张没进库——老规则把私聊整段跳过
-    await k.configure({ autoSteal: true, stealDailyCap: 10 });
-    const dir = join(k.dataDir, 'src');
-    mkdirSync(dir, { recursive: true });
-    const write = (name: string, seed: number) => {
-      const p = join(dir, name);
-      writeFileSync(p, png(seed));
-      return p;
-    };
-
-    const privEvent = (path: string) => eventOf({ chatId: '30959' }, [{ name: 'p.png', path }], {
-      type: 'private', chatId: '30959',
+    // 引用消息：replyTo.files 只有沙箱相对路径，靠 fs.sandbox 解析
+    const inbox = join(k.kernel.sandbox.root(k.chat), 'inbox');
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, 'reply.png'), png(43));
+    k.mockEngine.script.push(tagStep('小狗歪头', ['狗', '疑惑'], '没听懂的时候'));
+    const replyEvent = eventOf(k.chat, [], {
+      files: undefined,
+      text: '看这个',
+      replyTo: { userId: '20002', nickname: '小红', text: '[图片]', files: [{ name: 'reply.png', rel: 'inbox/reply.png' }] },
+      segments: [{ type: 'reply', data: { id: 'm1' } }],
     });
-    await k.plugin().hooks.onChatMessage!(privEvent(write('p1.png', 61)));
-    assert.equal((await k.library()).length, 1, '私聊的图默认也要自动收');
+    r = asText(await steal.handler({}, k.tctx(replyEvent) as any));
+    assert.match(r, /已收下：小狗歪头/);
+    lib = await k.library();
+    assert.equal(lib.length, 3);
 
-    // 关掉 autoStealPrivate：私聊不收，群聊照收
-    await k.configure({ autoStealPrivate: false });
-    await k.plugin().hooks.onChatMessage!(privEvent(write('p2.png', 62)));
-    assert.equal((await k.library()).length, 1, 'autoStealPrivate 关掉后私聊不收');
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'g1.png', path: write('g1.png', 63) }]));
-    assert.equal((await k.library()).length, 2, '群聊不受影响');
+    // 没图明说
+    r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [], { text: '只有字没有图' })) as any));
+    assert.match(r, /没有图片/);
 
-    // 私聊与群聊的每日额度各算各的（换个新私聊：30959 那个今天已用掉 1 张，额度要跨配置保留）
-    await k.configure({ autoSteal: true, autoStealPrivate: true, stealDailyCap: 1 });
-    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'g2.png', path: write('g2.png', 64) }]));
-    assert.equal((await k.library()).length, 2, '群聊额度用完');
-    await k.plugin().hooks.onChatMessage!(eventOf({ chatId: '30960' }, [{ name: 'p3.png', path: write('p3.png', 65) }], {
-      type: 'private', chatId: '30960',
-    }));
-    assert.equal((await k.library()).length, 3, '另一个私聊的额度独立，仍可收');
+    // 工具面写明「明确要求才收」
+    assert.match(steal.description, /明确要求/);
   } finally {
     await k.cleanup();
   }
 });
 
-test('send_sticker：按描述匹配、冷却、空库不注入提示', async () => {
+test('send_sticker：按描述/标签/时机匹配、冷却、空库不注入提示', async () => {
   const k = await boot();
   try {
     await k.configure({ sendCooldownSec: 60 });
@@ -192,48 +182,47 @@ test('send_sticker：按描述匹配、冷却、空库不注入提示', async ()
     } as any);
     assert.ok(!(empty.systemSections ?? []).some((s: any) => s.name === 'sticker'), '空库不注入清单');
 
+    k.mockEngine.script.push(tagStep('狂笑滚地', ['笑'], '笑到不行的时候'));
     const up1 = await k.restJson('POST', '/upload', { name: '狂笑.png' }, png(11));
+    k.mockEngine.script.push(tagStep('大哭', ['哭', '委屈'], '被说哭的时候'));
     const up2 = await k.restJson('POST', '/upload', { name: '大哭.png' }, png(12));
     assert.equal(up1.ok, true);
     assert.equal(up2.ok, true);
 
-    // 有库：清单进 systemSections，带描述与分寸
+    // 有库：清单进 systemSections，带描述/标签/时机与分寸
     const injected = await k.plugin().hooks.beforeLLM!({
       chat: k.chat, event: eventOf(k.chat, []), system: '', messages: [], tools: [sendTool], systemSections: [],
     } as any);
     const sec = (injected.systemSections ?? []).find((s: any) => s.name === 'sticker');
     assert.ok(sec, '有图时要注入表情包节');
-    assert.match(sec.text, /狂笑/);
-    assert.match(sec.text, /看情况发/);
+    assert.match(sec.text, /狂笑滚地/);
+    assert.match(sec.text, /用在笑到不行的时候/);
+    assert.match(sec.text, /明确让你收图/);
     assert.match(sec.text, /冷却/);
 
+    // 时机词也能挑中：query「被说哭」→ 大哭那张
     const outs: any[] = [];
     const off = k.kernel.bus.on(busEvents.chatOut, (e: any) => outs.push(e));
     try {
-      const r1 = asText(await sendTool.handler({ query: '笑' }, k.tctx(eventOf(k.chat, [])) as any));
-      assert.match(r1, /已发了一张「狂笑」/);
+      const r1 = asText(await sendTool.handler({ query: '被说哭' }, k.tctx(eventOf(k.chat, [])) as any));
+      assert.match(r1, /已发了一张「大哭」/);
       assert.equal(outs.length, 1);
-      const seg = outs[0].segments[0];
-      assert.equal(seg.type, 'image');
-      assert.deepEqual(readFileSync(String(seg.data.file)), png(11), '挑中的应是「狂笑」那张');
+      assert.deepEqual(readFileSync(String(outs[0].segments[0].data.file)), png(12), '按时机挑中的应是「大哭」');
       let lib = await k.library();
-      assert.equal(lib.find((s: any) => s.id === up1.id).count, 1);
-      assert.ok(lib.find((s: any) => s.id === up1.id).lastUsed > 0);
+      assert.equal(lib.find((s: any) => s.id === up2.id).count, 1);
 
       // 冷却中：不发、不计数、给模型一句中文提示
-      const r2 = asText(await sendTool.handler({ query: '哭' }, k.tctx(eventOf(k.chat, [])) as any));
+      const r2 = asText(await sendTool.handler({ query: '笑' }, k.tctx(eventOf(k.chat, [])) as any));
       assert.match(r2, /冷却/);
       assert.equal(outs.length, 1, '冷却中不许再发');
-      assert.equal((await k.library()).find((s: any) => s.id === up2.id).count, 0, '冷却中不改计数');
 
       // 关掉冷却（重载 = 新实例）：第二张能发
       await k.configure({ sendCooldownSec: 0 });
       const sendTool2 = k.toolOf('send_sticker');
-      const r3 = asText(await sendTool2.handler({ query: '哭' }, k.tctx(eventOf(k.chat, [])) as any));
-      assert.match(r3, /已发了一张「大哭」/);
+      const r3 = asText(await sendTool2.handler({ query: '笑' }, k.tctx(eventOf(k.chat, [])) as any));
+      assert.match(r3, /已发了一张「狂笑滚地」/);
       assert.equal(outs.length, 2);
-      assert.deepEqual(readFileSync(String(outs[1].segments[0].data.file)), png(12));
-      assert.equal((await k.library()).find((s: any) => s.id === up2.id).count, 1);
+      assert.deepEqual(readFileSync(String(outs[1].segments[0].data.file)), png(11));
 
       // 无命中：明说没有，不硬发
       const r4 = asText(await sendTool2.handler({ query: '完全对不上的东西' }, k.tctx(eventOf(k.chat, [])) as any));
@@ -247,75 +236,32 @@ test('send_sticker：按描述匹配、冷却、空库不注入提示', async ()
   }
 });
 
-test('steal_sticker：消息内的图与引用消息里的图都能收，没图明说', async () => {
-  const k = await boot();
-  try {
-    const dir = join(k.dataDir, 'src');
-    mkdirSync(dir, { recursive: true });
-    const a = join(dir, 'a.png');
-    writeFileSync(a, png(41));
-    const steal = k.toolOf('steal_sticker');
-
-    let r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [{ name: 'a.png', path: a }], { text: '笑死 这个好' })) as any));
-    assert.match(r, /已收下小明的图（笑死 这个好）/);
-    let lib = await k.library();
-    assert.equal(lib.length, 1);
-    assert.equal(lib[0].desc, '笑死 这个好');
-
-    r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [{ name: 'a2.png', path: a }])) as any));
-    assert.match(r, /已经在库里/);
-    assert.equal((await k.library()).length, 1);
-
-    // 引用消息：replyTo.files 只有沙箱相对路径，靠 fs.sandbox 解析
-    const inbox = join(k.kernel.sandbox.root(k.chat), 'inbox');
-    mkdirSync(inbox, { recursive: true });
-    writeFileSync(join(inbox, 'reply.png'), png(42));
-    const replyEvent = eventOf(k.chat, [], {
-      files: undefined,
-      text: '看这个',
-      replyTo: { userId: '20002', nickname: '小红', text: '[图片]', files: [{ name: 'reply.png', rel: 'inbox/reply.png' }] },
-      segments: [{ type: 'reply', data: { id: 'm1' } }],
-    });
-    r = asText(await steal.handler({}, k.tctx(replyEvent) as any));
-    assert.match(r, /已收下小红/);
-    lib = await k.library();
-    assert.equal(lib.length, 2);
-    assert.equal(lib.find((s: any) => s.source?.nickname === '小红').desc, '看这个');
-
-    r = asText(await steal.handler({}, k.tctx(eventOf(k.chat, [], { text: '只有字没有图' })) as any));
-    assert.match(r, /没有图片/);
-  } finally {
-    await k.cleanup();
-  }
-});
-
-test('REST：列表/改描述/上传/取图/删除/库容', async () => {
+test('REST：列表/改三项/上传/取图/删除/库容/补打标签', async () => {
   const k = await boot();
   try {
     const bytes = png(21);
+    // 打标失败路径（队列空）：上传返回仍 ok，desc 用文件名
     const up = await k.restJson('POST', '/upload', { name: '开心_猫.png' }, bytes);
     assert.equal(up.ok, true, JSON.stringify(up));
     assert.match(up.id, /^[0-9a-f]{16}$/);
+    assert.equal(up.sticker.desc, '开心 猫');
+    assert.deepEqual(up.sticker.tags, []);
 
-    // 同一张图再传：id 相同，不新增
+    // 同一张图再传：id 相同，不新增（也不消耗一次打标）
     const dup = await k.restJson('POST', '/upload', { name: '换个名字.png' }, bytes);
     assert.equal(dup.id, up.id);
     assert.equal(dup.duplicate, true);
 
     let lib = await k.library();
     assert.equal(lib.length, 1);
-    assert.equal(lib[0].desc, '开心 猫');
-    assert.deepEqual(lib[0].tags, []);
-    assert.equal(lib[0].count, 0);
-    assert.equal(lib[0].lastUsed, 0);
-    assert.ok(lib[0].addedAt > 0);
 
-    // 改描述与标签（标签也接受逗号字符串）
-    const upd = await k.restJson('POST', '/desc', {}, { id: up.id, desc: '开心猫猫', tags: '开心, 猫' });
+    // 改描述/标签/时机（标签也接受逗号字符串）
+    const upd = await k.restJson('POST', '/desc', {}, { id: up.id, desc: '开心猫猫', tags: '开心, 猫', timing: '被夸的时候' });
     assert.equal(upd.ok, true);
     lib = await k.library();
     assert.equal(lib[0].desc, '开心猫猫');
     assert.deepEqual(lib[0].tags, ['开心', '猫']);
+    assert.equal(lib[0].timing, '被夸的时候');
 
     // 取图：类型、缓存头、字节
     const img = await k.rest('GET', '/image', { id: up.id });
@@ -332,26 +278,28 @@ test('REST：列表/改描述/上传/取图/删除/库容', async () => {
     assert.equal((await k.rest('POST', '/upload', { name: 'x.txt' }, Buffer.from('not an image'))).status, 415);
     assert.equal((await k.rest('POST', '/upload', { name: 'big.png' }, Buffer.concat([png(22), Buffer.alloc(4 * 1024 * 1024)]))).status, 413);
 
-    // 真实 HTTP 的 JSON 分支也能用：{"data":"<base64>"}；desc/tags 可点名（回填脚本走的就是这条）
-    const b64 = await k.restJson('POST', '/upload', { name: 'base64.png' }, { data: png(23).toString('base64') });
-    assert.equal(b64.ok, true);
-    assert.equal((await k.library()).length, 2);
-    const withDesc = await k.restJson('POST', '/upload', {}, {
-      data: png(26).toString('base64'), desc: '猫咪捂脸', tags: '猫, 搞笑',
+    // JSON 分支点名 desc/tags/timing：模型不覆盖点名字段（队列里塞一个不同的答复验证）
+    const named = await k.restJson('POST', '/upload', {}, {
+      data: png(23).toString('base64'), desc: '手点的描述', tags: ['手点'], timing: '手点的时机',
     });
-    assert.equal(withDesc.ok, true);
-    let lib2 = await k.library();
-    const wd = lib2.find((s: any) => s.id === withDesc.id);
-    assert.equal(wd.desc, '猫咪捂脸');
-    assert.deepEqual(wd.tags, ['猫', '搞笑']);
-    assert.equal(lib2.length, 3);
+    assert.equal(named.ok, true);
+    lib = await k.library();
+    const namedItem = lib.find((s: any) => s.id === named.id);
+    assert.equal(namedItem.desc, '手点的描述');
+    assert.deepEqual(namedItem.tags, ['手点']);
+    assert.equal(namedItem.timing, '手点的时机');
+
+    // 补打标签：库里两张三项都齐全（一张手改过、一张 JSON 点名过），整批补不应动任何一张
+    const retag = await k.restJson('POST', '/retag', {}, {});
+    assert.equal(retag.ok, true);
+    assert.equal(retag.tagged, 0, '三项齐全时补打标签不应动任何一张');
 
     // 删除：记录与文件一起走
     assert.equal((await k.restJson('POST', '/delete', {}, { id: up.id })).ok, true);
     assert.equal((await k.rest('GET', '/image', { id: up.id })).status, 404);
     const files = existsSync(join(k.dataDir, 'stickers')) ? readdirSync(join(k.dataDir, 'stickers')) : [];
     assert.equal(files.some((f) => f.startsWith(up.id)), false, '删除要连文件一起删');
-    assert.equal((await k.library()).length, 2);
+    assert.equal((await k.library()).length, 1);
 
     // 库容：maxLibrary=1 时再传就 409（重载后端点仍然可用）
     await k.configure({ maxLibrary: 1 });
@@ -365,9 +313,52 @@ test('REST：列表/改描述/上传/取图/删除/库容', async () => {
   }
 });
 
+test('/retag：缺标的整批补，点名的强制重打；模型打标关着就 409', async () => {
+  const k = await boot();
+  try {
+    // 两张不打标（队列空）：desc 落文件名兜底，tags/timing 全空
+    const u1 = await k.restJson('POST', '/upload', { name: '一.png' }, png(61));
+    const u2 = await k.restJson('POST', '/upload', { name: '二.png' }, png(62));
+    assert.equal((await k.library()).every((s: any) => !s.tags.length), true);
+
+    k.mockEngine.script.push(tagStep('第一张', ['一'], '第一次'));
+    k.mockEngine.script.push(tagStep('第二张', ['二'], '第二次'));
+    const r1 = await k.restJson('POST', '/retag', {}, {});
+    assert.equal(r1.ok, true);
+    assert.equal(r1.tagged, 2);
+    let lib = await k.library();
+    // 整批补是填空：desc 不覆盖（还是文件名兜底），tags/timing 补上
+    assert.equal(lib.find((s: any) => s.id === u1.id).timing, '第一次');
+    assert.deepEqual(lib.find((s: any) => s.id === u2.id).tags, ['二']);
+
+    // 再跑一遍：全都齐了，不动
+    const r2 = await k.restJson('POST', '/retag', {}, {});
+    assert.equal(r2.tagged, 0);
+
+    // 点名强制重打（覆盖已有）
+    k.mockEngine.script.push(tagStep('重写描述', ['新的'], '新的时机'));
+    const r3 = await k.restJson('POST', '/retag', {}, { id: u1.id });
+    assert.equal(r3.ok, true);
+    assert.equal(r3.tagged, 1);
+    lib = await k.library();
+    const item = lib.find((s: any) => s.id === u1.id);
+    assert.equal(item.desc, '重写描述');
+    assert.deepEqual(item.tags, ['新的']);
+    assert.equal(item.timing, '新的时机');
+
+    // 关掉自动打标签：409
+    await k.configure({ modelTagging: false });
+    const off = await k.rest('POST', '/retag', {}, {});
+    assert.equal(off.status, 409);
+  } finally {
+    await k.cleanup();
+  }
+});
+
 test('reload 后库与图片仍在（数据在 plugin_kv 与 data/stickers，不在进程内存）', async () => {
   const k = await boot();
   try {
+    k.mockEngine.script.push(tagStep('存住', ['持久'], '任何时候'));
     const up = await k.restJson('POST', '/upload', { name: '存住.png' }, png(31));
     await k.kernel.container.reload('sticker');
 
@@ -375,6 +366,7 @@ test('reload 后库与图片仍在（数据在 plugin_kv 与 data/stickers，不
     assert.equal(lib.length, 1);
     assert.equal(lib[0].id, up.id);
     assert.equal(lib[0].desc, '存住');
+    assert.equal(lib[0].timing, '任何时候');
 
     const img = await k.rest('GET', '/image', { id: up.id });
     assert.equal(img.status, 200);
@@ -383,6 +375,9 @@ test('reload 后库与图片仍在（数据在 plugin_kv 与 data/stickers，不
     k.toolOf('send_sticker');
     const keys = k.kernel.db.all<{ key: string }>("SELECT key FROM plugin_kv WHERE plugin_id='sticker'").map((r) => r.key);
     assert.ok(keys.includes('v2:library'));
+    assert.ok(keys.every((x) => x.startsWith('v2:')), `出现了不带 v2: 前缀的键：${keys.join(',')}`);
+    // 自动收图的每日计数键不该再出现
+    assert.ok(keys.every((x) => !x.startsWith('v2:daily:')), '每日收图计数已随自动收图一起删除');
   } finally {
     await k.cleanup();
   }

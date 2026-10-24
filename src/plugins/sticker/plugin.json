@@ -1,8 +1,8 @@
 {
   "id": "sticker",
   "name": "表情包",
-  "version": "0.2.1",
-  "description": "bot 的表情包库：模型看情况发表情，也能把群里/私聊发的图收进库里；桌面端「表情包」页可上传、改描述与标签。",
+  "version": "0.3.0",
+  "description": "bot 的表情包库：只在用户明确要求时收录，收录时模型看图写描述/标签/使用时机；模型按标签挑图发；桌面端「表情包」页可管理。",
   "author": {
     "name": "parallel"
   },
@@ -18,25 +18,15 @@
   ],
   "defaultGroupState": "on",
   "userConfig": {
-    "autoSteal": {
-      "type": "boolean",
-      "default": false,
-      "description": "自动把消息里的图片收进表情包库（关着也能用 steal_sticker 手动收）"
-    },
-    "autoStealPrivate": {
+    "modelTagging": {
       "type": "boolean",
       "default": true,
-      "description": "自动收图开着时，私聊里发的图也收（把图直接发给 bot 就是要它收）；关掉则只收群聊"
-    },
-    "stealDailyCap": {
-      "type": "number",
-      "default": 50,
-      "description": "每个会话（群/私聊各算各的）每天自动收图的上限（0 = 不自动收）"
+      "description": "收录时让模型看一遍图，自动写描述、标签与使用时机（关掉就只留手填）"
     },
     "sendCooldownSec": {
       "type": "number",
       "default": 60,
-      "description": "send_sticker 的冷却秒数（同一个群两次发图的最小间隔，0 = 不冷却）"
+      "description": "send_sticker 的冷却秒数（同一个会话两次发图的最小间隔，0 = 不冷却）"
     },
     "promptListMax": {
       "type": "number",

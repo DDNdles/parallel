@@ -46,7 +46,7 @@ for (const n of names) {
   const resp = await fetch(`${base}/api/plugin/sticker/upload?name=${encodeURIComponent(n)}`, {
     method: 'POST',
     headers: { 'x-auth-token': uiToken, 'content-type': 'application/json' },
-    body: JSON.stringify({ data: buf.toString('base64'), desc: '来自君にも嘘をつこう的图', tags: [] }),
+    body: JSON.stringify({ data: buf.toString('base64') }),   // 不点名描述：让模型看图打标（v0.3 起）
   });
   const r = await resp.json().catch(() => ({ ok: false, error: `HTTP ${resp.status}` }));
   if (r.ok && r.duplicate) dup++;

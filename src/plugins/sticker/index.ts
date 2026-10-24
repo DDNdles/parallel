@@ -7,37 +7,41 @@ import type {
 } from '../../kernel/types.ts';
 
 // ============================================================
-// sticker —— bot 的表情包库（2026-10-24 重写）
+// sticker —— bot 的表情包库（2026-10-24 v0.3：收录=明确要求 + 模型看图打标）
 //
 //  - 全 bot 一份库：图片平铺在 <data>/stickers/，索引与计数进 plugin_kv；
 //    旧版按 <chatKey>/ 存的图不迁移、不删除、不读取（那边是 v1，键与目录都换了位置）；
 //  - id = 图片内容的 sha256 前 16 位：同一张图换个文件名再发也不会收重；
 //  - 键全部带 v2: 前缀，防与旧版撞名；
-//  - 工具只走 chat 面：send_sticker 按描述/标签挑一张发，steal_sticker 把这条消息里的图收下；
-//  - 自动收图默认关（autoSteal）：开了群聊与私聊都收（私聊有单独开关 autoStealPrivate）、
-//    跳过 bot 自己、每个会话每天有硬上限；
-//  - 桌面端「表情包」页走本插件的 REST 端点（列表/看图/改描述/删除/上传）。
+//  - **只收用户明确要求收录的图**（2026-10-24 定）：自动收图整档删除——
+//    什么时候收由用户说（"收下这个/存进表情包"），模型调 steal_sticker；桌面端上传同理；
+//  - 收录时让模型**看一遍图**，写 desc（画面内容）、tags（检索词）、timing（什么场合发），
+//    不记来源（谁发的无关紧要，检索也不靠它）；模型打标可关（modelTagging）；
+//  - 工具只走 chat 面：send_sticker 按 desc/tags/timing 挑一张发；
+//  - 桌面端「表情包」页走本插件的 REST 端点（列表/看图/改三项/删除/上传/补打标签）。
 // ============================================================
 
 const LIB_KEY = 'v2:library';
-// 4MB：QQ 表情动图常见 3MB+（今天真机就有 3.4MB 的 GIF 被 2MB 上限拦掉），收到库里是要长期存的，再大就没边了
+// 4MB：QQ 表情动图常见 3MB+（真机就有 3.4MB 的 GIF），收到库里是要长期存的，再大就没边了
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_DESC = 80;
+const MAX_TIMING = 48;
 const MAX_TAGS = 8;
 const TAG_MAX = 12;
-
-interface StickerSource { userId: string; nickname: string }
 
 interface Sticker {
   id: string;
   /** 图片文件名（平铺在 storeDir 下，不含目录） */
   file: string;
+  /** 画面内容（模型看图写的；也可桌面端手改） */
   desc: string;
+  /** 检索词 */
   tags: string[];
+  /** 什么场合/接什么话时发它（模型看图写的） */
+  timing: string;
   count: number;
   lastUsed: number;
   addedAt: number;
-  source?: StickerSource;
 }
 
 interface ImageKind { mime: string; ext: string }
@@ -45,6 +49,9 @@ interface ImageKind { mime: string; ext: string }
 type AddResult =
   | { ok: true; id: string; sticker: Sticker; duplicate: boolean }
   | { ok: false; error: string; status: number };
+
+/** 模型打标的结果：字段可缺，缺什么补什么 */
+interface TagResult { desc?: string; tags?: string[]; timing?: string }
 
 /** 只看文件头：插件没有 mime 探测依赖，收到什么字节就按魔数认 */
 function sniffImage(buf: Buffer): ImageKind | undefined {
@@ -116,7 +123,7 @@ function commonLen(a: string, b: string): number {
   return best;
 }
 
-/** 关键词打分：描述 > 标签 > 片段重合；id 可直接点名 */
+/** 关键词打分：描述 > 标签 > 使用时机 > 片段重合；id 可直接点名 */
 function scoreOf(s: Sticker, q: string): number {
   const query = q.toLowerCase();
   if (!query) return 0;
@@ -142,6 +149,14 @@ function scoreOf(s: Sticker, q: string): number {
       if (common >= 1) score += Math.min(common, 4) * 2;
     }
   }
+  const timing = s.timing.toLowerCase();
+  if (timing) {
+    if (timing.includes(query)) score += 8;
+    else {
+      const common = commonLen(query, timing);
+      if (common >= 2) score += Math.min(common, 4) * 2;
+    }
+  }
   return score;
 }
 
@@ -163,12 +178,6 @@ function pickSticker(list: Sticker[], query: string): Sticker | undefined {
     }
   }
   return best;
-}
-
-function today(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** 请求体里的图片字节：原始 Buffer/Uint8Array 优先，也接受 JSON 里的 base64（真实 HTTP 的 JSON 分支） */
@@ -228,12 +237,10 @@ export function setup(ctx: PluginContext): void {
         file: basename(r.file),
         desc: cleanText(r.desc, MAX_DESC),
         tags: cleanTags(r.tags),
+        timing: cleanText(r.timing, MAX_TIMING),
         count: Number.isFinite(r.count) ? Math.max(0, Math.trunc(Number(r.count))) : 0,
         lastUsed: Number(r.lastUsed) || 0,
         addedAt: Number(r.addedAt) || 0,
-        ...(r.source && typeof r.source === 'object'
-          ? { source: { userId: String(r.source.userId ?? ''), nickname: String(r.source.nickname ?? '') } }
-          : {}),
       });
     }
     return out;
@@ -245,13 +252,13 @@ export function setup(ctx: PluginContext): void {
 
   function viewOf(s: Sticker): Record<string, unknown> {
     return {
-      id: s.id, desc: s.desc, tags: s.tags, count: s.count,
-      lastUsed: s.lastUsed, addedAt: s.addedAt, source: s.source,
+      id: s.id, desc: s.desc, tags: s.tags, timing: s.timing, count: s.count,
+      lastUsed: s.lastUsed, addedAt: s.addedAt,
     };
   }
 
-  /** 收一张图：内容 hash 去重、只认图片、单张 2MB、库满拒收 */
-  function addBytes(buf: Buffer, meta: { desc?: string; tags?: string[]; source?: StickerSource }): AddResult {
+  /** 收一张图：内容 hash 去重、只认图片、单张 4MB、库满拒收 */
+  function addBytes(buf: Buffer, meta: { desc?: string; tags?: string[]; timing?: string }): AddResult {
     if (!buf.length) return { ok: false, error: '没有收到图片数据', status: 400 };
     if (buf.length > MAX_IMAGE_BYTES) {
       return { ok: false, error: `图片超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB（${Math.round(buf.length / 1024)}KB），不收`, status: 413 };
@@ -275,17 +282,17 @@ export function setup(ctx: PluginContext): void {
       id, file,
       desc: cleanText(meta.desc, MAX_DESC),
       tags: cleanTags(meta.tags),
+      timing: cleanText(meta.timing, MAX_TIMING),
       count: 0,
       lastUsed: 0,
       addedAt: Date.now(),
-      ...(meta.source ? { source: { ...meta.source } } : {}),
     };
     list.push(sticker);
     saveLibrary(list);
     return { ok: true, id, sticker, duplicate: false };
   }
 
-  function addFromPath(abs: string, meta: { desc?: string; tags?: string[]; source?: StickerSource }): AddResult {
+  function addFromPath(abs: string, meta: { desc?: string; tags?: string[]; timing?: string }): AddResult {
     try {
       const st = statSync(abs);
       if (!st.isFile()) return { ok: false, error: '不是文件', status: 400 };
@@ -298,61 +305,102 @@ export function setup(ctx: PluginContext): void {
     }
   }
 
+  // ---------- 模型看图打标（收录的灵魂；失败不拦收录，只是没有标签） ----------
+
+  const TAG_SYSTEM = [
+    '你在给一个 QQ 群聊 bot 的表情包库打标签。看用户发来的表情包图，只输出一个 JSON 对象，不要输出任何别的话。',
+    '格式：{"desc":"画面内容，12字以内","tags":["检索词","2到4个","中文单词或短语"],"timing":"什么场合或接什么话时发它最合适，一句话，20字以内"}',
+    'tags 要写"别人想发这张图时会搜的词"（情绪、角色、动作），不要写"表情包""图片"这种废词。',
+  ].join('\n');
+
+  /** 让模型看一张已入库的图，写 desc/tags/timing。模型不可用/答非所问就返回 null，不影响收录。 */
+  async function tagSticker(abs: string): Promise<TagResult | null> {
+    try {
+      const resp = await ctx.llm.chat({
+        model: '',
+        messages: [
+          { role: 'system', content: TAG_SYSTEM },
+          { role: 'user', content: '给这张表情包打标签。' },
+        ],
+        attachments: [{ kind: 'image', path: abs }],
+        stream: false,
+        maxTokens: 300,
+      });
+      const m = String(resp.content ?? '').match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      const raw = JSON.parse(m[0]) as Record<string, unknown>;
+      const out: TagResult = {};
+      if (typeof raw.desc === 'string' && raw.desc.trim()) out.desc = cleanText(raw.desc, MAX_DESC);
+      if (raw.tags !== undefined) {
+        const tags = cleanTags(raw.tags);
+        if (tags.length) out.tags = tags;
+      }
+      if (typeof raw.timing === 'string' && raw.timing.trim()) out.timing = cleanText(raw.timing, MAX_TIMING);
+      return Object.keys(out).length ? out : null;
+    } catch (e) {
+      ctx.log.warn(`表情包打标失败（不影响收录）: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** 把模型给的标签写进记录：默认只填空的（桌面端手改过的优先），点名重打时才覆盖 */
+  function applyTags(id: string, tag: TagResult, overwrite = false): void {
+    const list = loadLibrary();
+    const item = list.find((s) => s.id === id);
+    if (!item) return;
+    if (tag.desc && (overwrite || !item.desc)) item.desc = tag.desc;
+    if (tag.tags?.length && (overwrite || !item.tags.length)) item.tags = tag.tags;
+    if (tag.timing && (overwrite || !item.timing)) item.timing = tag.timing;
+    saveLibrary(list);
+  }
+
+  /** 新收录的一张：过一遍模型打标（可关；失败跳过）。desc 先空着——模型的描述优先于文件名/消息文字这类弱提示。 */
+  async function tagIfNeeded(sticker: Sticker): Promise<void> {
+    if (!cfgBool('modelTagging', true)) return;
+    const abs = join(storeDir, sticker.file);
+    if (!existsSync(abs)) return;
+    const tag = await tagSticker(abs);
+    if (tag) applyTags(sticker.id, tag);
+  }
+
+  /** 打标后兜底：模型没给描述时才用文件名/消息文字 */
+  function fillDesc(id: string, fallback: string): void {
+    if (!fallback) return;
+    const list = loadLibrary();
+    const item = list.find((s) => s.id === id);
+    if (item && !item.desc) { item.desc = fallback; saveLibrary(list); }
+  }
+
   // ---------- 收图来源 ----------
 
   const chatKeyOf = (chat: ChatRef): string => `${chat.type}_${chat.chatId}`;
 
   /** 这条消息里可收的图：消息内 files、引用消息的文件、段里带本地路径的图（远端 URL 不在这里下） */
-  function imagePathsOf(event: ChatEvent, chat: ChatRef): { path: string; name: string; source: StickerSource }[] {
-    const out: { path: string; name: string; source: StickerSource }[] = [];
-    const self: StickerSource = { userId: event.userId, nickname: event.nickname };
-    const push = (path: string, name: string, source: StickerSource): void => {
-      if (path && !out.some((x) => x.path === path)) out.push({ path, name, source });
+  function imagePathsOf(event: ChatEvent, chat: ChatRef): { path: string; name: string }[] {
+    const out: { path: string; name: string }[] = [];
+    const push = (path: string, name: string): void => {
+      if (path && !out.some((x) => x.path === path)) out.push({ path, name });
     };
     for (const f of event.files ?? []) {
       const path = f.sandboxPath || (f.rel ? join(ctx.sandbox.root(chat), f.rel) : '');
-      push(path, f.name, self);
+      push(path, f.name);
     }
     for (const f of event.replyTo?.files ?? []) {
       if (!f.rel) continue;
       // 引用快照只带沙箱相对路径；fs.sandbox 权限就是为这一处要的
-      const source = { userId: event.replyTo?.userId ?? '', nickname: event.replyTo?.nickname ?? '' };
-      try { push(join(ctx.sandbox.root(chat), f.rel), f.name, source); } catch { /* 沙箱不可用就跳过 */ }
+      try { push(join(ctx.sandbox.root(chat), f.rel), f.name); } catch { /* 沙箱不可用就跳过 */ }
     }
     for (const seg of event.segments ?? []) {
       if (seg.type !== 'image') continue;
       const f = String(seg.data?.file ?? seg.data?.path ?? '');
-      if (f && !/^https?:/i.test(f) && existsSync(f)) push(f, basename(f), self);
+      if (f && !/^https?:/i.test(f) && existsSync(f)) push(f, basename(f));
     }
     return out;
   }
 
-  /** 描述优先用这条消息的文字（常是对图的吐槽），没有就按来源昵称 */
-  function descFor(event: ChatEvent, source: StickerSource): string {
-    const text = cleanText(String(event.text ?? '').replace(/\[[^\]]*\]/g, ' '), 40);
-    return text || `来自${source.nickname || source.userId || '群友'}的图`;
-  }
-
-  /** bot 自己的消息不自动收：协议端回包的 self_id 与登录号都对一遍 */
-  function isSelfEvent(event: ChatEvent): boolean {
-    const raw = (event.raw ?? {}) as Record<string, unknown>;
-    const ui = ((ctx.config as Record<string, unknown>).ui ?? {}) as { lastLogin?: { qq?: string } };
-    const ids = [String(raw.self_id ?? ''), String(ui.lastLogin?.qq ?? '')].filter(Boolean);
-    return ids.includes(String(event.userId));
-  }
-
-  // ---------- 每日自动收图计数（每个会话一个：群与私聊各算各的，跨天自动归零） ----------
-
-  const dailyKeyOf = (chatKey: string): string => `v2:daily:${chatKey}`;
-
-  function dailyUsed(chatKey: string): { day: string; n: number } {
-    const v = ctx.state.get<{ day?: string; n?: number }>(dailyKeyOf(chatKey), {});
-    const n = typeof v?.n === 'number' && v.n > 0 ? Math.trunc(v.n) : 0;
-    return { day: v?.day === today() ? v.day : today(), n: v?.day === today() ? n : 0 };
-  }
-
-  function setDaily(chatKey: string, used: { day: string; n: number }): void {
-    ctx.state.set(dailyKeyOf(chatKey), used);
+  /** 模型没打上标时的兜底描述：这条消息的文字（常是对图的吐槽），没有就空着 */
+  function descFallback(event: ChatEvent): string {
+    return cleanText(String(event.text ?? '').replace(/\[[^\]]*\]/g, ' '), 40);
   }
 
   // ---------- 发送冷却（进程内存；重启只是少一层护栏，不影响正确性） ----------
@@ -363,11 +411,11 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'send_sticker',
-    description: '从表情包库里挑一张最合适的图发出去。query 填描述或标签里的词（如「笑」「无语」「猫」）；是接话的一部分，不是每句都要配图。',
+    description: '从表情包库里挑一张最合适的图发出去。query 填描述/标签/时机里的词（如「笑」「猫」「被夸的时候」）；是接话的一部分，不是每句都要配图。',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '想发的表情：描述或标签关键词，也可以填清单里的 id' },
+        query: { type: 'string', description: '想发的表情：描述、标签或使用时机的关键词，也可以填清单里的 id' },
       },
       required: ['query'],
     },
@@ -375,12 +423,12 @@ export function setup(ctx: PluginContext): void {
     promptSnippet: '从表情包库发一张图（接话用，别刷屏）',
     promptGuidelines: [
       '看情况发：气氛到位、图对得上才发一张；别每句都配图，别连着发同一类。',
-      'query 用描述或标签里的词；库里没有对得上的就正常说话，不要硬发。',
+      'query 用描述/标签/时机里的词；库里没有对得上的就正常说话，不要硬发。',
       '发送冷却由程序管；被拒（冷却中/没匹配）就照常接话，不要向对方解释工具调用。',
     ],
     handler: async (args, tctx) => {
       const query = cleanText(args.query, 60);
-      if (!query) return '（query 是空的；想发图就把描述或标签里的词填进来，不想发就正常说话。）';
+      if (!query) return '（query 是空的；想发图就把描述/标签/时机里的词填进来，不想发就正常说话。）';
 
       const cooldown = cfgNum('sendCooldownSec', 60, 0, 3600);
       const key = chatKeyOf(tctx.chat);
@@ -415,66 +463,46 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'steal_sticker',
-    description: '把这条消息里的图片（含被引用消息里的图）收进表情包库。对方发了图、或说「收下这个表情」时用。',
+    description: '把这条消息（或被引用消息）里的图片收进表情包库，收录时会自动看图写描述、标签与使用时机。只在用户明确要求收录时用（“收下这个”“存成表情”“收录一下”）。',
     parameters: { type: 'object', properties: {} },
     surface: 'chat',
-    promptSnippet: '收下消息里的图进表情包库',
+    promptSnippet: '收下消息里的图进表情包库（用户明确要求才用）',
     promptGuidelines: [
-      '只在对方发了图、或明确让你收下时用；消息里没有图就直说没有，不要编。',
-      '收下的图默认用消息原文当描述；不合适就提醒主人到桌面端改描述与标签，别自己乱猜内容。',
+      '只在用户明确让你收的时候用：「收下这个」「存进表情包」「收录」这类话；用户没开口，发再多图也不要自作主张收。',
+      '消息里没有图就直说没有；想收之前那条就引用它再试。',
+      '收下后把系统给的描述/标签/时机简短复述一句，让用户知道收成了什么。',
     ],
-    handler: (_args, tctx) => {
+    handler: async (_args, tctx) => {
       const images = imagePathsOf(tctx.event, tctx.chat);
       if (!images.length) return '（这条消息里没有图片可收。让对方再发一张，或者引用那张图再试。）';
 
-      const nick = tctx.event.nickname || tctx.event.userId || '对方';
+      const fallback = descFallback(tctx.event);
       const notes: string[] = [];
       let added = 0;
       for (const img of images) {
-        const source = img.source;
-        const from = source.nickname || source.userId || nick;
-        const r = addFromPath(img.path, { desc: descFor(tctx.event, source), source });
+        const r = addFromPath(img.path, { desc: '' });
         if (!r.ok) {
           notes.push(`没收成：${r.error}`);
-        } else if (r.duplicate) {
-          notes.push('这张图已经在库里了');
-        } else {
-          added += 1;
-          notes.push(`已收下${from}的图（${r.sticker.desc}）`);
+          continue;
         }
+        if (r.duplicate) {
+          notes.push('这张图已经在库里了');
+          continue;
+        }
+        added += 1;
+        await tagIfNeeded(r.sticker);
+        fillDesc(r.id, fallback);
+        const s = loadLibrary().find((x) => x.id === r.id)!;
+        const tag = s.tags.length ? `［${s.tags.join('/')}］` : '';
+        const timing = s.timing ? `（用在${s.timing}）` : '';
+        notes.push(`已收下：${s.desc || '（没写描述）'}${tag}${timing}`);
       }
       if (added) notes.push(`库里现在有 ${loadLibrary().length} 张。`);
       return notes.join('\n');
     },
   });
 
-  // ---------- 钩子 ----------
-
-  ctx.hooks.onChatMessage = (event: ChatEvent): void => {
-    if (!cfgBool('autoSteal', false)) return;
-    // 私聊也收：把图直接发给 bot 本身就带「给它收」的意思（2026-10-24 主人私聊甩了 29 张表情
-    // 一张没进库，就是这条 group-only 的老规则拦的）。不想要这层可用 autoStealPrivate 单独关掉。
-    if (event.type !== 'group' && !cfgBool('autoStealPrivate', true)) return;
-    if (isSelfEvent(event)) return;
-
-    const cap = cfgNum('stealDailyCap', 50, 0, 1000);
-    if (cap <= 0) return;
-
-    const chat: ChatRef = { platform: event.platform, type: event.type, chatId: event.chatId };
-    const used = dailyUsed(chatKeyOf(chat));
-    if (used.n >= cap) return;
-
-    let n = used.n;
-    for (const img of imagePathsOf(event, chat)) {
-      if (n >= cap) break;
-      const r = addFromPath(img.path, { desc: descFor(event, img.source), source: img.source });
-      // 重复（同一张图再发一次）不占每日额度
-      if (r.ok && !r.duplicate) n += 1;
-    }
-    if (n !== used.n) setDaily(chatKeyOf(chat), { day: used.day, n });
-  };
-
-  // 库清单注入 chat 轮的提示词：给模型「有什么图」的地图，分寸另说一句。
+  // 库清单注入 chat 轮的提示词：给模型「有什么图、什么时候用」的地图，分寸另说一句。
   // 空库、或这一轮根本没有 send_sticker（比如 work 轮/插件被停用）都不注入。
   ctx.hooks.beforeLLM = (req: LLMRequestContext): LLMRequestContext => {
     if (!req.tools?.some((t) => t.name === 'send_sticker')) return req;
@@ -488,7 +516,8 @@ export function setup(ctx: PluginContext): void {
       .slice(0, max);
     const lines = shown.map((s) => {
       const tags = s.tags.length ? `［${s.tags.join('/')}］` : '';
-      return `- ${s.id}｜${s.desc || '（没写描述）'}${tags}`;
+      const timing = s.timing ? `（用在${s.timing}）` : '';
+      return `- ${s.id}｜${s.desc || '（没写描述）'}${tags}${timing}`;
     });
     const sections = (req.systemSections ??= []);
     sections.push({
@@ -496,9 +525,10 @@ export function setup(ctx: PluginContext): void {
       name: 'sticker',
       title: 'sticker',
       text: [
-        '表情包库（要发图时调用 send_sticker，query 填描述或标签里的词）：',
+        '表情包库（要发图时调用 send_sticker，query 填描述/标签/时机里的词）：',
         ...lines,
         list.length > shown.length ? `（共 ${list.length} 张，这里只列常用的 ${shown.length} 张）` : '',
+        '用户明确让你收图时调 steal_sticker（“收下这个”“存成表情包”）；用户没开口就不要收。',
         '分寸：看情况发——气氛合适、图对得上才发一张，别刷屏、别每句都配图；冷却时间由程序管，被拒就照常接话，不要向对方解释这个工具。',
       ].filter(Boolean).join('\n'),
     });
@@ -554,7 +584,7 @@ export function setup(ctx: PluginContext): void {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const id = String(body.id ?? '').trim();
     if (!id) return fail(400, '缺少 id');
-    if (!('desc' in body) && !('tags' in body)) return fail(400, '没有要改的内容（desc/tags）');
+    if (!('desc' in body) && !('tags' in body) && !('timing' in body)) return fail(400, '没有要改的内容（desc/tags/timing）');
     const list = loadLibrary();
     const item = list.find((s) => s.id === id);
     if (!item) return fail(404, '没有这张表情');
@@ -565,6 +595,10 @@ export function setup(ctx: PluginContext): void {
     if ('tags' in body) {
       if (!Array.isArray(body.tags) && typeof body.tags !== 'string') return fail(400, 'tags 需要是数组或逗号分隔的字符串');
       item.tags = cleanTags(body.tags);
+    }
+    if ('timing' in body) {
+      if (typeof body.timing !== 'string') return fail(400, 'timing 需要是字符串');
+      item.timing = cleanText(body.timing, MAX_TIMING);
     }
     saveLibrary(list);
     return json({ ok: true, sticker: viewOf(item) });
@@ -583,23 +617,52 @@ export function setup(ctx: PluginContext): void {
     return json({ ok: true, id });
   }));
 
-  ctx.http.on('POST', '/upload', serve((req) => {
+  ctx.http.on('POST', '/upload', serve(async (req) => {
     const name = cleanText(req.query.name, 80);
     const buf = bytesOf(req.body);
     if (!buf || !buf.length) {
       return fail(400, '没收到图片字节：请用原始字节 POST（content-type 非 JSON），或传 {"data":"<base64>"}');
     }
-    // JSON 分支可以点名描述与标签（脚本回填用）；没给就照旧拿文件名当描述——上传「狂笑.png」就能用「狂笑」匹配到
-    let desc = name ? cleanText(basename(name).replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' '), MAX_DESC) : '';
+    // JSON 分支可以点名 desc/tags/timing（脚本回填用）；点名的字段模型不覆盖。
+    // 文件名只当兜底描述：模型打标成功时用模型写的画面内容，比「狂笑.png」这种提示可靠。
+    const nameDesc = name ? cleanText(basename(name).replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' '), MAX_DESC) : '';
+    let desc = '';
     let tags: string[] = [];
+    let timing = '';
     if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) && !(req.body instanceof Uint8Array)) {
       const o = req.body as Record<string, unknown>;
       if (typeof o.desc === 'string') desc = cleanText(o.desc, MAX_DESC);
       if (o.tags !== undefined) tags = cleanTags(o.tags);
+      if (typeof o.timing === 'string') timing = cleanText(o.timing, MAX_TIMING);
     }
-    const r = addBytes(buf, { desc, tags });
+    const r = addBytes(buf, { desc, tags, timing });
     if (!r.ok) return fail(r.status, r.error);
-    return json({ ok: true, id: r.id, ...(r.duplicate ? { duplicate: true } : {}) });
+    if (!r.duplicate) {
+      await tagIfNeeded(r.sticker);
+      fillDesc(r.id, nameDesc);
+    }
+    const tagged = loadLibrary().find((s) => s.id === r.id);
+    return json({ ok: true, id: r.id, sticker: viewOf(tagged ?? r.sticker), ...(r.duplicate ? { duplicate: true } : {}) });
+  }));
+
+  /** 补打标签：带 id 重打那一张；不带 id 把库里缺 tags 或 timing 的都补一遍 */
+  ctx.http.on('POST', '/retag', serve(async (req) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const id = String(body.id ?? '').trim();
+    const list = loadLibrary();
+    if (!cfgBool('modelTagging', true)) return fail(409, '自动打标签关着（设置 → 表情包 → 自动打标签）');
+    const targets = id
+      ? list.filter((s) => s.id === id)
+      : list.filter((s) => !s.tags.length || !s.timing);
+    if (id && !targets.length) return fail(404, '没有这张表情');
+    let tagged = 0;
+    for (const s of targets) {
+      const abs = join(storeDir, basename(s.file));
+      if (!existsSync(abs)) continue;
+      const tag = await tagSticker(abs);
+      if (tag) { applyTags(s.id, tag, !!id); tagged += 1; }
+    }
+    return json({ ok: true, tagged, total: targets.length });
   }));
 
   ctx.log.info(`表情包库就绪：${loadLibrary().length} 张（${storeDir}）`);
