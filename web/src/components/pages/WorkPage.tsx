@@ -16,7 +16,7 @@ import { fileIcon } from '@/lib/fileIcon';
 import { ctxBadge } from '@/lib/entries';
 import { Switch } from '@/components/Modal';
 import {
-  Act, CtxRing, SecHead, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf, thinkSummary,
+  Act, CtxRing, SecHead, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf,
   type ActRow, type LoopEvent, type Metrics, type WorkRun,
 } from '@/components/workActivity';
 
@@ -380,11 +380,10 @@ function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
             <Fragment key={ri}>
               {rd.acts.map((a, ai) => {
                 const key = `${ri}-${ai}`;
-                const row = a.kind === 'think' ? { ...a, subject: '', sub: thinkSummary(a.body) } : a;
-                const isThink = a.kind === 'think';
+                // 只有 live 运行给入场 key：新行淡入一次，历史回放不重播（ZCode 同法）
                 return (
-                  <Act key={key} row={row} text={isThink} opened={!!expanded[key] || !!a.streaming}
-                    onToggle={() => onToggle(key)} thinkSummary={isThink} />
+                  <Act key={key} row={a} opened={!!expanded[key]} onToggle={() => onToggle(key)}
+                    enter={running ? `${run.id}:${key}` : undefined} />
                 );
               })}
             </Fragment>

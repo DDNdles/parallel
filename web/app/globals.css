@@ -912,7 +912,9 @@ tr:hover td { background: var(--row-hover); }
 .wd-act { margin-top: 1px; }
 .wd-act-h { display: flex; align-items: center; gap: 7px; padding: 8px 0; cursor: pointer; font-size: 13px; }
 .wd-act-h.plain { cursor: default; }
-.wd-act-h:hover .lbl { color: var(--text); }
+/* 悬停整行提亮（ZCode ToolSummaryRow 把 transition-colors 挂在 trigger 上）；
+   运行中那行的动作词由扫光接管，悬停不改它（后面的 shimmer 规则同优先级、位置更后，会覆盖） */
+.wd-act-h:hover .lbl, .wd-act-h:hover .nm, .wd-act-h:hover .sb { color: var(--text); }
 /* 行首图标：必须显式给宽高——全局 .ic 是 18×18 的盒子且 .ic svg{width:100%}，会把 size 属性顶掉 */
 .wd-act-h .ic, .wd-act-h .bdg { display: inline-flex; flex: none; color: var(--faint); }
 .wd-act-h .ic { width: 15px; height: 15px; }
@@ -944,25 +946,42 @@ tr:hover td { background: var(--row-hover); }
 .wd-fold { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .28s var(--ease-out); }
 .wd-fold.open { grid-template-rows: 1fr; transition-duration: .25s; }
 .wd-fold-inner { overflow: hidden; min-height: 0; }
-/* 运行中的转圈：一段 270° 圆弧匀速转（ZCode 的 loader 语义；reduced-motion 由全局规则兜底） */
+/* 运行中的转圈：一段 270° 圆弧匀速转。活动行的图标已经不再用它
+   （ZCode 的取舍：流式期工具行多，旋转图标长期占渲染资源，运行态由动作词扫光表达）；
+   标题栏 / 左栏 / 头部的 spinner 仍然在用。 */
 .wd-spin { display: inline-flex; color: var(--text); animation: wd-spin 1s linear infinite; }
 @keyframes wd-spin { to { transform: rotate(360deg); } }
-/* 思考行收起态的摘要：ZCode 的扫光字（运行中才扫，跑完就静止成普通灰字） */
-.wd-act.running .lbl,
-.wd-act.running .sb { color: var(--dim); }
-/* 运行中的动作词（「浏览器」「终端」…）：白色扫光；结果回来 running 消失，自动恢复普通灰 */
+/* 运行中的动作词：ZCode animated-gradient-text 同款曲线——满色底、一道约 20% 暗带扫过，
+   300% 渐变宽、4s；gradient-flow 那三段（回扫后在 0% 处停住）也照搬。
+   词在整段动画里始终可读（对比旧的「亮带+发光」），完成 running 消失即回到普通灰。 */
 .wd-act.running .lbl {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--text) 45%, transparent) 0%, color-mix(in srgb, var(--text) 45%, transparent) 30%, var(--text) 50%, color-mix(in srgb, var(--text) 45%, transparent) 70%, color-mix(in srgb, var(--text) 45%, transparent) 100%);
-  background-size: 200% 100%; background-clip: text; -webkit-background-clip: text;
+  background: linear-gradient(90deg, var(--text) 0%, var(--text) 34%,
+    color-mix(in srgb, var(--text) 22%, transparent) 50%, var(--text) 66%, var(--text) 100%);
+  background-size: 300% 100%; background-clip: text; -webkit-background-clip: text;
   color: transparent; -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--text) 55%, transparent));
-  animation: wd-shimmer 1.6s linear infinite;
+  will-change: background-position;
+  animation: wd-shimmer 4s linear infinite;
 }
-/* 扫光只属于动作词（「思考」「终端」这种）；后面的摘要保持普通灰字，不跟着扫 */
-.wd-act .sb.wd-think-sum { color: var(--faint); }
-.wd-act.running .sb.wd-think-sum { color: var(--dim); }
-@keyframes wd-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0% 0; } }
-.wd-chev { display: inline-flex; color: var(--faint); transform: rotate(-90deg); transition: transform var(--dur-fast) var(--ease-out); }
+@keyframes wd-shimmer { 0% { background-position: 100% 0; } 50% { background-position: 0% 0; } 100% { background-position: 0% 0; } }
+/* 思考行流式期的滚动摘要（ZCode ReasoningTrigger）：单行、跟最新一行；超宽时两端渐隐。
+   ZCode 只在溢出时挂 mask（data-mask="both" 由组件按 scrollWidth>clientWidth 切换） */
+.wd-roll { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; display: block; color: var(--dim); }
+.wd-roll[data-mask="both"] {
+  mask-image: linear-gradient(to right, transparent 0, black 16px, black calc(100% - 16px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, transparent 0, black 16px, black calc(100% - 16px), transparent 100%); }
+/* 换行滚入：新行从下方 0.8em 浮起（ZCode QueuedSummaryContent 的 300ms 滚动；key 变化即重挂重播） */
+.wd-roll-line { display: inline-block; min-width: max-content; animation: wd-roll-in .3s cubic-bezier(.4, 0, .2, 1) both; }
+@keyframes wd-roll-in { from { transform: translateY(.8em); opacity: 0; } to { transform: none; opacity: 1; } }
+/* 「正在思考 · 最新行」之间那个点（ZCode 的 · 分隔符），不参与收缩 */
+.wd-act-h .sb.sb-dot { flex: none; }
+/* 新行入场：淡入一次（ZCode zcode-stream-text-in 900ms）；只在 live 运行中、按 runId 播一次 */
+.wd-enter { animation: wd-fade-in .9s cubic-bezier(.16, 1, .3, 1) both; will-change: opacity; }
+@keyframes wd-fade-in { from { opacity: 0; } to { opacity: 1; } }
+/* 展开箭头：悬停行才浮现（ZCode 静息 opacity 0），展开后常亮并转到朝下；无正文的行不渲染它 */
+.wd-chev { display: inline-flex; flex: none; color: var(--faint); opacity: 0;
+  transform: rotate(-90deg);
+  transition: transform var(--dur-fast) var(--ease-out), opacity var(--dur-fast) var(--ease-out); }
+.wd-act-h:hover .wd-chev, .wd-act.open .wd-chev { opacity: 1; }
 /* 图标本体朝下，所以静息转 -90° 读作 ">"，展开回正读作 "v" */
 .wd-act.open .wd-chev { transform: rotate(0deg); }
 /* 执行失败仍留卡片；收敛回答去掉标签与卡片，直接贴在面板背景上 */

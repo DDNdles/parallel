@@ -6,7 +6,7 @@
  * 动作图标 + 能力词 + 主体 + 灰色次级 + 行增减，正文点开才以整幅卡片出现。
  * 这里只保留 parallel 内核事件已有的字段，不引入 ZCode 的协议类型。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon } from '@/components/Icon';
 import { fileIcon } from '@/lib/fileIcon';
 import { toolAction, splitMcp, argPath, ctxBadge, type ToolMeta } from '@/lib/entries';
@@ -236,13 +236,50 @@ export function metricsOf(events: LoopEvent[], model: string | undefined, ctxByM
 export const fmtMs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
 export const fmtClock = (ts: number) => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 
-/** 思考行的收起态摘要：取第一段有内容的行（ZCode 在流式时显示最后一行；我们拿到的是整段） */
+/** 思考行的收起态摘要：取第一段有内容的行 */
 export function thinkSummary(text: string): string {
   for (const line of String(text ?? '').split('\n')) {
     const t = line.trim();
     if (t) return t.length > 70 ? `${t.slice(0, 70)}…` : t;
   }
   return '';
+}
+
+/** 流式摘要取最后一行非空行（ZCode resolveReasoningStreamingSummary：滚动时永远跟最新的字） */
+export function lastLine(text: string): string {
+  const lines = String(text ?? '').replace(/\r\n?/gu, '\n').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (t) return t;
+  }
+  return '';
+}
+
+/**
+ * 思考行流式期的滚动摘要（ZCode QueuedSummaryContent 的轻量版）：
+ * 最后一行换行时旧行滚出、新行从下方滚入；超宽时把视口推到末尾并两端渐隐。
+ */
+function RollLine({ text }: { text: string }) {
+  const [snap, setSnap] = useState(() => ({ text: lastLine(text), k: 0 }));
+  const hostRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(false);
+  useEffect(() => {
+    const l = lastLine(text);
+    if (!l) return;
+    setSnap((p) => (p.text === l ? p : { text: l, k: p.k + 1 }));
+  }, [text]);
+  useEffect(() => {
+    const el = hostRef.current;
+    if (!el) return;
+    // 最新 token 会被右侧裁掉，普通 ellipsis 固定显示旧前缀——直接推到末尾
+    el.scrollLeft = el.scrollWidth;
+    setOverflow(el.scrollWidth > el.clientWidth + 1);
+  }, [snap]);
+  return (
+    <span ref={hostRef} className="wd-roll" data-mask={overflow ? 'both' : 'none'}>
+      <span key={snap.k} className="wd-roll-line">{snap.text}</span>
+    </span>
+  );
 }
 
 /** 上下文占比圆环周长（直径 15px 与标题同高，r=6），用 stroke-dasharray 换算百分比 */
@@ -347,9 +384,22 @@ export function WorkPulse() {
   );
 }
 
-/** ZCode 形态的动作行：动作图标 (+文件徽章) + 动作词 + 主体 + 灰色次级 + 行增减，正文点开才出现 */
-export function Act({ row, opened, onToggle, text, thinkSummary: isThink }: {
-  row: ActRow; opened: boolean; onToggle: () => void; text?: boolean; thinkSummary?: boolean;
+/**
+ * 行入场的「已播过」名册（ZCode ToolCallBlocks 同一手法）：按稳定 key 记一次，
+ * 切换任务 / 列表重挂不重播。超过上限按最旧删，历史行反正不再入场。
+ */
+const ENTER_MAX = 800;
+const playedEnter = new Map<string, number>();
+
+/**
+ * ZCode 形态的动作行：动作图标 + 动作词（运行中换时态措辞并扫光）+ 主体 + 灰色次级 + 行增减，
+ * 正文点开才出现。图标在运行中保持静态——旋转 loader 会长期占渲染资源，
+ * 运行态由动作词表达（对齐 ZCode ToolLayout / reasoning 的取舍）。
+ */
+export function Act({ row, opened, onToggle, enter }: {
+  row: ActRow; opened: boolean; onToggle: () => void;
+  /** 行入场 key（只在 live 运行中给）：首次出现淡入一次 */
+  enter?: string;
 }) {
   const m = ACT[row.kind];
   const has = !!row.body;
@@ -358,26 +408,49 @@ export function Act({ row, opened, onToggle, text, thinkSummary: isThink }: {
   // 正文首次打开后才挂载，收起时留在 0 高度里等着，才能把收起也做成滑动
   const [everOpen, setEverOpen] = useState(opened);
   useEffect(() => { if (opened) setEverOpen(true); }, [opened]);
+  // 入场只在本行挂载那一刻判定一次；标记放 effect 里延迟执行，避免开发态双挂载把动画误吞（ZCode 同法）
+  const [playEnter] = useState(() => !!enter && !playedEnter.has(enter));
+  useEffect(() => {
+    if (!playEnter || !enter) return;
+    const t = setTimeout(() => {
+      playedEnter.set(enter, Date.now());
+      if (playedEnter.size > ENTER_MAX) {
+        for (const k of [...playedEnter.entries()].sort((a, b) => a[1] - b[1])
+          .slice(0, playedEnter.size - ENTER_MAX).map(([k]) => k)) playedEnter.delete(k);
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, [playEnter, enter]);
+  const enterCls = playEnter ? ' wd-enter' : '';
   // 模型正文：不挂在「思考」行里，直接按普通正文铺开，没有动作头也没有折叠
   if (row.kind === 'text') {
     return (
-      <div className="wd-text">
+      <div className={'wd-text' + enterCls}>
         {row.body}
         {row.streaming && <span className="caret-slot wd-caret"><Icon name="brand" size={13} /></span>}
       </div>
     );
   }
+  // 动作词的时态（ZCode）：execute 跑起来说「正在执行」、思考链说「正在思考」，跑完回到能力词
+  const lbl = row.kind === 'think'
+    ? (row.running || row.streaming ? '正在思考' : '思考')
+    : row.kind === 'run' && row.running ? '正在执行' : m.label;
   const toggle = has ? () => { setEverOpen(true); onToggle(); } : undefined;
+  // 收起态的摘要（ZCode ReasoningTrigger）：流式中滚动跟显示最后一行，静止后显示首行摘要；展开就不重复
+  const thinkCol = row.kind === 'think';
+  const rolling = thinkCol && row.streaming && !opened;
+  const sub = opened ? '' : thinkCol ? (rolling ? '' : thinkSummary(row.body)) : row.sub;
   return (
-    <div className={'wd-act' + (opened && has ? ' open' : '') + (row.running ? ' running' : '')}>
+    <div className={'wd-act' + (opened && has ? ' open' : '') + (row.running ? ' running' : '') + enterCls}>
       <div className={'wd-act-h' + (has ? '' : ' plain')} onClick={toggle}>
-        <span className="ic">{row.running
-          ? <span className="wd-spin"><Icon name="spinner" size={15} /></span>
-          : <Icon name={m.icon} size={15} />}</span>
-        <span className="lbl">{m.label}</span>
+        <span className="ic"><Icon name={m.icon} size={15} /></span>
+        <span className="lbl">{lbl}</span>
         {row.path && <span className="bdg"><Icon name={fileIcon(row.path)} size={14} /></span>}
         {row.subject && <span className="nm">{row.subject}</span>}
-        {row.sub && <span className={'sb' + (isThink ? ' wd-think-sum' : '')}>{row.sub}</span>}
+        {rolling && <span className="sb sb-dot">·</span>}
+        {rolling
+          ? <RollLine text={row.body} />
+          : sub && <span className="sb">{sub}</span>}
         {added !== undefined && <span className="add">+{added}</span>}
         {removed !== undefined && <span className="del">-{removed}</span>}
         {has && <span className="wd-chev"><Icon name="chevron" size={12} /></span>}
@@ -386,7 +459,7 @@ export function Act({ row, opened, onToggle, text, thinkSummary: isThink }: {
         <div className={'wd-fold' + (opened ? ' open' : '')}>
           <div className="wd-fold-inner">
             {opened || everOpen
-              ? (text ? <div className="wd-act-t">{row.body}</div> : <pre className="wd-act-b mono">{row.body}</pre>)
+              ? (thinkCol ? <div className="wd-act-t">{row.body}</div> : <pre className="wd-act-b mono">{row.body}</pre>)
               : null}
           </div>
         </div>

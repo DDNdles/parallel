@@ -13,7 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { get, onEvent } from '@/lib/api';
 import { Icon } from '@/components/Icon';
 import {
-  Act, CtxRing, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf, thinkSummary,
+  Act, CtxRing, WorkPulse, cacheRate, fmtMs, loopActs, metricsOf,
   type WorkRun,
 } from '@/components/workActivity';
 
@@ -281,17 +281,13 @@ export default function WorkDrawer({ chatKey, open, onClose, ctxByModel, narrow 
                 <div className="wd-task-t">{run.task}</div>
               </div>
 
-              {acts.map((a, i) => {
-                const key = `w${i}`;
-                // 思考行收起时把首行当摘要挂在行首（ZCode 的思考链：一行摘要，点开看全文）
-                const row = a.kind === 'think'
-                  ? { ...a, subject: '', sub: thinkSummary(a.body) }
-                  : a;
-                // 摘要那格单独挂类名：只有思考行有扫光，其他行的次级文字保持静态
-                const isThink = a.kind === 'think';
-                return <Act key={i} row={row} text={isThink} opened={!!expanded[key] || !!a.streaming}
-                  onToggle={() => setExpanded((p) => ({ ...p, [key]: !p[key] }))} thinkSummary={isThink} />;
-              })}
+              {acts.map((a, i) => (
+                // ZCode 配方：思考行收起态滚动显示最新一行，正文点开才展开；
+                // 只有 live 运行给入场 key，新行淡入一次（同工作页）
+                <Act key={i} row={a} opened={!!expanded[`w${i}`]}
+                  onToggle={() => setExpanded((p) => ({ ...p, [`w${i}`]: !p[`w${i}`] }))}
+                  enter={running ? `${run.id}:w${i}` : undefined} />
+              ))}
 
               {run.error && <div className="wd-final err"><div className="lbl">执行失败</div><div>{run.error}</div></div>}
               {final && <div className="wd-answer">{final}</div>}
