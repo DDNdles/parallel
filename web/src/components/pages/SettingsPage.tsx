@@ -734,7 +734,7 @@ export default function SettingsPage() {
             return (
               <>
                 <div className="mset-field">
-                  <label className="mset-flabel">SESSDATA<Hint text="b 站网页 cookie 里复制，登录态" /></label>
+                  <label className="mset-flabel">SESSDATA<Hint text="浏览器登录 b 站后：F12 →「应用程序」→ Cookie → www.bilibili.com，找到 SESSDATA 复制它的值。选填，不填只是拿不到 AI 字幕" /></label>
                   <div className="mset-keywrap">
                     <BrandInput type={showBili ? 'text' : 'password'} value={val} spellCheck={false}
                       autoComplete="new-password"
