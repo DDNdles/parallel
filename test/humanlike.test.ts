@@ -395,7 +395,8 @@ test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自�
   triggers.length = 0;
 
   // 一条没人理的普通消息：积压 1 条，门槛 2 ⇒ 先沉默（空窗补偿按 30s 下限算，不在测试里等）
-  svc.ingest(ev('有人吗'), { isCommand: false });
+  //（文本必须不是问句：2026-10-24 起末条问句会把门槛打对折，那是 B3 的设计行为）
+  svc.ingest(ev('风好大'), { isCommand: false });
   await wait(40);
   assert.equal(triggers.length, 0, '刚说完就回那是问答机器人，不是群友');
   svc.dispose();

@@ -17,7 +17,12 @@ import type { Bus } from '../bus.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { SessionLog } from '../sessionlog.ts';
 import { faceTokensToSegments } from '../util/qqface.ts';
-import { backoffBypassed, idleBackoffSeconds, idleCompensation, talkValueFor } from './frequency.ts';
+import {
+  CIRCADIAN, LIVELINESS, SIGNAL,
+  adaptiveThreshold, backoffBypassed, circadianThresholdMultiplier, idleBackoffSeconds,
+  idleCompensation, idleEquivalentCap, looksLikeFlood, looksLikeQuestion,
+  softThresholdProbability, talkValueFor,
+} from './frequency.ts';
 import {
   activeAntiRepeat,
   detectRepetition,
@@ -72,11 +77,16 @@ interface ChatState {
   schedule: SchedulePlan;
   /** 上一次主动开口的时间（HDSI 用最小间隔挡频繁主动） */
   lastProactiveAt: number;
+  /** C4 昼夜直方图：24 小时桶，随入站累加并按 14 天半衰遗忘；样本不足时因子回中性 */
+  hourly: number[];
+  hourlyTouchedAt: number;
 }
 
 /** 相邻入站间隔的统计窗口（MaiBot 30 分钟）与连发抖动阈值（<5s 不计入平均） */
 const INTERVAL_WINDOW_MS = 30 * 60_000;
 const INTERVAL_BURST_MS = 5_000;
+/** 间隔 ≥10 分钟算沉默不算节奏：沉默由空窗补偿折算，记进样本只会把折算的除数拉爆（沉默越久越不想说，方向反了） */
+const SILENCE_GAP_SECONDS = 600;
 /** 空窗补偿的平均间隔下限：低活跃群里别把沉默折算得太快（MaiBot 30s） */
 const IDLE_COMPENSATION_MIN_AVERAGE_INTERVAL_SECONDS = 30;
 
@@ -152,6 +162,7 @@ export class HumanlikeService {
         rhythmSigs: [], rhythmExhausted: 0,
         selfTexts: [], inboundTexts: [], antiRepeat: [],
         schedule: emptyPlan(), lastProactiveAt: 0,
+        hourly: new Array<number>(24).fill(0), hourlyTouchedAt: 0,
       };
       this.states.set(k, s);
     }
@@ -345,19 +356,52 @@ export class HumanlikeService {
     }
 
     const pending = st.buffer.length;
-    const idleSeconds = st.lastInboundAt ? Math.max(0, (now - st.lastInboundAt) / 1000) : 0;
     const avgInterval = this.averageInterval(st);
     const frequency = talkValueFor(timing, chat);
     const freq = Math.min(1, Math.max(0, Number(frequency) || 0));
     // talkValue=0 = 这个会话现在不说话（@/提及仍由上面的硬规则直通）
     const silentByFrequency = freq <= 0;
     /** 攒够多少条才进一轮：只看积压条数，talkValue 的数值不参与折算 */
-    const threshold = Math.max(1, Math.round(Number(timing.pendingThreshold) || 1));
+    const configuredThreshold = Math.max(1, Math.round(Number(timing.pendingThreshold) || 1));
+
+    // ---- C1 自适应门槛：快群（avg 被 30s 下限钳住）恰为配置值，慢群按同一把 avg 反比放宽 ----
+    // ---- C4 昼夜因子：本群历史上冷清的小时更矜持（样本不足回中性 1） ----
+    // ---- B3 便宜信号：末条是问句打折、窗口内同质短消息爆发加倍 ----
+    const mods: string[] = [];
+    let effThreshold = adaptiveThreshold(configuredThreshold, avgInterval, st.intervals.length);
+    if (effThreshold !== configuredThreshold) {
+      mods.push(`自适应${configuredThreshold}→${effThreshold}`);
+    }
+    const circMult = circadianThresholdMultiplier(st.hourly, new Date(now).getHours());
+    if (circMult > 1.01) mods.push(`昼夜×${circMult.toFixed(2)}`);
+    let signalMult = circMult;
+    if (looksLikeQuestion(carrier.text ?? '')) {
+      mods.push(`问句×${SIGNAL.QUESTION_FACTOR}`);
+      signalMult *= SIGNAL.QUESTION_FACTOR;
+    }
+    if (looksLikeFlood(st.buffer, now)) {
+      mods.push(`刷屏×${SIGNAL.FLOOD_FACTOR}`);
+      signalMult *= SIGNAL.FLOOD_FACTOR;
+    }
+    effThreshold = Math.max(1, Math.min(24, Math.round(effThreshold * signalMult)));
+
+    // ---- B2 退避语义修正：近 5 分钟真人消息 ≥3 条 = 群重新热闹，清退避（热闹就别装矜持） ----
+    const rc = this.recentCounts(st, now);
+    if (rc.total - rc.self >= LIVELINESS.MIN_INBOUND) {
+      st.consecutiveNoAction = 0;
+      st.backoffUntil = 0;
+    }
+
+    // ---- B1 空窗补偿换锚：沉默从 bot 上次开口算起，不再被 buffer TTL 连坐 ----
+    //（没开过口时退回旧口径 now-lastInboundAt；开口后 idle 归零，天然形成短期高参与窗口 = C3）
+    const idleBase = st.lastSpokeAt || st.lastInboundAt;
+    const idleSeconds = idleBase ? Math.max(0, (now - idleBase) / 1000) : 0;
     const comp = idleCompensation({
       pendingCount: pending,
-      triggerThreshold: threshold,
+      triggerThreshold: effThreshold,
       idleSeconds,
       averageIntervalSeconds: avgInterval,
+      maxEquivalent: idleEquivalentCap(effThreshold),
     });
 
     // 空闲退避：连续不理人就指数放慢；群里重新热闹（积压够多）直接绕过
@@ -371,14 +415,23 @@ export class HumanlikeService {
 
     let reason: TriggerBatch['reason'] | null = null;
     let detail = '';
-    if (!silentByFrequency && pending >= threshold) {
+    const modSuffix = mods.length ? `（${mods.join('，')}）` : '';
+    if (!silentByFrequency && pending >= effThreshold) {
       reason = 'frequency';
-      detail = `pending=${pending} >= ${threshold}`;
+      detail = `pending=${pending} >= ${effThreshold}${modSuffix}`;
     } else if (!silentByFrequency && comp.reached) {
       reason = 'idle';
-      detail = comp.detail;
+      detail = `${comp.detail}${modSuffix}`;
     } else {
-      detail = silentByFrequency ? 'talkValue=0，静默' : comp.detail;
+      // ---- C2 软阈值：等效条数已过 85% 门槛时按超出比例概率开口（消除「差一条」悬崖） ----
+      const p = silentByFrequency ? 0 : softThresholdProbability(comp.equivalent, effThreshold);
+      const rng = this.opts.random ?? Math.random;
+      if (p > 0 && (p >= 1 || rng() < p)) {
+        reason = 'frequency';
+        detail = `软阈值 等效=${comp.equivalent.toFixed(2)}/${effThreshold} 概率=${p.toFixed(2)}${modSuffix}`;
+      } else {
+        detail = silentByFrequency ? 'talkValue=0，静默' : comp.detail + (p > 0 ? ` 软阈值未命中(p=${p.toFixed(2)})` : '') + modSuffix;
+      }
     }
 
     if (reason) {
@@ -680,8 +733,10 @@ export class HumanlikeService {
   private recordInbound(st: ChatState, now: number): void {
     if (st.lastInboundAt) {
       const gap = (now - st.lastInboundAt) / 1000;
-      // 连发抖动 <5s 不代表真实发言节奏，跳过以免拉低平均间隔（MaiBot 口径）
-      if (gap * 1000 >= INTERVAL_BURST_MS) st.intervals.push({ at: now, gap });
+      // 连发抖动 <5s 不代表真实发言节奏；≥10min 是沉默不是节奏——两头都不进样本
+      if (gap * 1000 >= INTERVAL_BURST_MS && gap <= SILENCE_GAP_SECONDS) {
+        st.intervals.push({ at: now, gap });
+      }
       const cut = now - INTERVAL_WINDOW_MS;
       while (st.intervals.length && st.intervals[0].at < cut) st.intervals.shift();
       if (st.intervals.length > 200) st.intervals.splice(0, st.intervals.length - 200);
@@ -689,6 +744,13 @@ export class HumanlikeService {
     st.lastInboundAt = now;
     st.recent.push({ at: now, self: false });
     this.trimRecent(st, now);
+    // C4 昼夜直方图：先按距上次更新的时长做半衰遗忘（长眠的旧分布慢慢让位），再记入当前小时
+    const decay = st.hourlyTouchedAt
+      ? 0.5 ** Math.max(0, (now - st.hourlyTouchedAt) / CIRCADIAN.HALF_LIFE_MS)
+      : 1;
+    for (let h = 0; h < 24; h++) st.hourly[h] *= decay;
+    st.hourly[new Date(now).getHours()] += 1;
+    st.hourlyTouchedAt = now;
   }
 
   /** 重复惩罚的入站对照：记录群里最近在聊什么（命令与空文本不算） */
@@ -721,8 +783,12 @@ export class HumanlikeService {
     if (!st.intervals.length) {
       return st.lastInboundAt ? IDLE_COMPENSATION_MIN_AVERAGE_INTERVAL_SECONDS : null;
     }
-    const sum = st.intervals.reduce((a, b) => a + b.gap, 0);
-    return Math.max(IDLE_COMPENSATION_MIN_AVERAGE_INTERVAL_SECONDS, sum / st.intervals.length);
+    // 2026-10-24 起用中位数而非均值：长沉默本身会产生一个超大的间隔样本，
+    // 均值被它拉爆后空窗折算（沉默÷avg）反而变弱——沉默越久越不想说话，方向反了。
+    // 人类发言间隔是重尾分布，分位数才是稳健统计（lognormal 文献口径）。
+    const gaps = st.intervals.map((i) => i.gap).sort((a, b) => a - b);
+    const mid = gaps[Math.floor(gaps.length / 2)] ?? gaps[0] ?? 0;
+    return Math.max(IDLE_COMPENSATION_MIN_AVERAGE_INTERVAL_SECONDS, mid);
   }
 
   private mentioned(event: ChatEvent): boolean {
