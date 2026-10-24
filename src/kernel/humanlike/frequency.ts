@@ -119,15 +119,17 @@ export function circadianThresholdMultiplier(hourBuckets: number[] | null, hour:
   return 1 + (1 - r) * CIRCADIAN.MAX_EXTRA;
 }
 
-/** B1：折算帽。门槛 10 → 帽 6；自适应放低到 5 → 帽 3（单条消息 + 帽 < 门槛，死群不会变成每条必回） */
-export const IDLE_CAP_RATIO = 0.6;
+/** B1：折算帽。门槛 10 → 帽 4；自适应放低到 5 → 帽 2。
+ *  2026-10-24 晚从 0.6 收紧到 0.4：线上实测 0.6 让 bot 刚说完话 3-4 条就再插一嘴，观感太密。 */
+export const IDLE_CAP_RATIO = 0.4;
 
 export function idleEquivalentCap(threshold: number): number {
   return Math.min(Math.max(0, threshold - 1), Math.ceil(threshold * IDLE_CAP_RATIO));
 }
 
-/** C2：等效条数 ∈ [85% 门槛, 门槛) 时按超出比例给开口概率；门槛 <3 没有软区 */
-export const SOFT = { START_RATIO: 0.85 } as const;
+/** C2：等效条数 ∈ [95% 门槛, 门槛) 时按超出比例给开口概率；门槛 <3 没有软区。
+ *  2026-10-24 晚从 0.85 收紧到 0.95：0.85 时 9/10 就有 1/3 概率提前开口（线上真发生），观感偏密。 */
+export const SOFT = { START_RATIO: 0.95 } as const;
 
 export function softThresholdProbability(equivalent: number, threshold: number): number {
   if (threshold < 3 || equivalent < threshold * SOFT.START_RATIO) return 0;

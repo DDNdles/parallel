@@ -54,16 +54,16 @@ test('C4 昼夜因子：样本不足中性；活跃小时 1.0、最冷小时 1+M
   assert.ok(noon > 1 && noon < 1 + CIRCADIAN.MAX_EXTRA, `中间档介于两者之间（实际 ${noon.toFixed(2)}）`);
 });
 
-test('B1 折算帽：min(阈值-1, ceil(0.6×阈值))，慢群门槛低时帽也低', () => {
-  assert.equal(idleEquivalentCap(10), 6);
-  assert.equal(idleEquivalentCap(5), 3);
+test('B1 折算帽：min(阈值-1, ceil(0.4×阈值))，慢群门槛低时帽也低', () => {
+  assert.equal(idleEquivalentCap(10), 4);
+  assert.equal(idleEquivalentCap(5), 2);
   assert.equal(idleEquivalentCap(3), 2);
   assert.equal(idleEquivalentCap(2), 1, '阈值 2 时帽 1：单条消息 + 帽 < 阈值，纯折算永远不够');
 });
 
-test('C2 软阈值：85% 门槛以下 0、门槛处 1、之间线性', () => {
-  assert.equal(softThresholdProbability(7, 10), 0, '7/10 < 8.5 → 0');
-  assert.ok(Math.abs(softThresholdProbability(9.25, 10) - 0.5) < 1e-9, '中点 0.5');
+test('C2 软阈值：95% 门槛以下 0、门槛处 1、之间线性', () => {
+  assert.equal(softThresholdProbability(9, 10), 0, '9/10 < 9.5 → 0（10-24 收紧后 9 条不再提前开）');
+  assert.ok(Math.abs(softThresholdProbability(9.75, 10) - 0.5) < 1e-9, '中点 0.5');
   assert.equal(softThresholdProbability(10, 10), 1);
   assert.equal(softThresholdProbability(2, 2), 0, '门槛 <3 没有软区');
 });
@@ -149,15 +149,18 @@ async function primeSlowPace(h: ReturnType<typeof makeService>, n = 6) {
   }
 }
 
-test('B1 全链路：bot 上次开口后沉默 20 分钟，两条新消息即开口（旧口径要攒满 10 条）', async () => {
+test('B1 全链路：bot 上次开口后沉默 20 分钟，第三条新消息开口（旧口径要攒满 10 条）', async () => {
   const h = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 10 } });
-  await primeSlowPace(h);                        // avg=60s（中位数）、样本 6 → 自适应 10→5，帽 3
+  await primeSlowPace(h);                        // avg=60s（中位数）、样本 6 → 自适应 10→5，帽 2
   h.svc.noteSpoke(chat);                         // bot 开口：idle 锚点归零，沉默间隙不进节奏样本
   h.tick(20 * 60_000);                           // 沉默 20 分钟（<30min 样本窗，60s 样本仍有效）
   await feed(h, ev('第一句'));
   h.tick(40_000);
   await feed(h, ev('第二句'));
-  assert.equal(h.triggers.length, 1, `1+帽3=4<5 不开；2+帽3=5 ≥5 开（实际 ${h.triggers.length}）`);
+  assert.equal(h.triggers.length, 0, '1+帽2=3、2+帽2=4 都 <5：说完话后别太快再插嘴（10-24 收紧）');
+  h.tick(40_000);
+  await feed(h, ev('第三句'));
+  assert.equal(h.triggers.length, 1, '3+帽2=5 ≥5 开口');
   assert.equal(h.triggers[0]?.reason, 'idle');
   h.svc.dispose();
 });
@@ -227,22 +230,23 @@ test('B3：末条问句把门槛打对折并在 gate 日志留痕；刷屏把门
   h2.svc.dispose();
 });
 
-test('C2：等效条数过 85% 门槛按概率开口——rng 必中即开、必不中静默且日志带概率', async () => {
+test('C2：等效条数过 95% 门槛按概率开口——rng 必中即开、必不中静默', async () => {
   const off = { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 };
   const mk = (random: () => number) => makeService(
-    { timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 10 }, backoff: off },
+    { timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 5 }, backoff: off },
     random,
   );
-  // 门槛 10、无样本（连发不计）→ effThr=10、软区 [8.5,10)；第 9 条时 eq≈9 → p≈0.33
+  // 门槛 5、软区 [4.75, 5)：noteSpoke 后停 26s 再来 4 条（间隔 1s，无节奏样本）
+  // → idle≈29s/30s≈0.97（帽 2）→ 等效 4.97 → p≈0.87：rng0 必中、rng1 必不中
   for (const [name, random, expectFire] of [['必中(rng0)', rng0, 1], ['必不中(rng1)', rng1, 0]] as const) {
     const h = mk(random);
-    for (let i = 0; i < 9; i++) {
-      // 文本要 >10 字：否则 5 条多人短消息会先撞上 B3 的刷屏加倍
+    h.svc.noteSpoke(chat);
+    h.tick(26_000);
+    for (let i = 0; i < 4; i++) {
       await feed(h, ev(`铺垫用的较长消息内容第${i}句，请忽略`, { userId: `u${i % 3}` }));
       h.tick(1_000);
     }
-    assert.equal(h.triggers.length, expectFire, `软阈值（等效≈9/10，p≈0.33）：${name} → ${expectFire ? '开口' : '静默'}`);
-    //（静默原因日志有 10s 限流，概率行为本身已由 fire/no-fire 证明）
+    assert.equal(h.triggers.length, expectFire, `软阈值（等效≈4.97/5，p≈0.87）：${name} → ${expectFire ? '开口' : '静默'}`);
     h.svc.dispose();
   }
 });
