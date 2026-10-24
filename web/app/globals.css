@@ -1124,7 +1124,9 @@ tr:hover td { background: var(--row-hover); }
   background: var(--menu-bg-solid); border: 1px solid var(--border-strong); border-radius: 10px;
   box-shadow: var(--shadow-float);
   font-size: 12px; font-weight: 400; line-height: 1.6; color: var(--text); text-align: left;
-  white-space: normal;
+  white-space: pre-line; /* 支持 
+ 分行的长说明（如 SESSDATA 获取步骤）；单行提示无 
+ 不受影响 */
   opacity: 0; visibility: hidden; pointer-events: none;
   transition: opacity .14s var(--ease-out), visibility 0s .14s; }
 .mset-hint:hover .mset-hint-pop, .mset-hint:focus-visible .mset-hint-pop {
