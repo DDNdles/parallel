@@ -484,7 +484,7 @@ export default function SettingsPage() {
                 </div>
                 {timingScope === 'group' ? (<>
                   <Num label="触发所需积压条数"
-                    hint="攒够这么多条消息才进模型；群里安静时靠空窗补偿补一次"
+                    hint="快群攒够这么多条开口；慢群按节奏自动放宽（最低 5）。问句减半、刷屏加倍、深夜更矜持；攒到八成五起按概率提前开口"
                     value={h.timing.pendingThreshold}
                     onChange={(v) => patchTiming({ pendingThreshold: v })} />
                   <Num label="群聊频率（0-1）"
@@ -573,13 +573,13 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ merge: { ...h.merge, fireDelayMaxMs: v } })} />
                 <Num label="主动发言所需静默时长（秒）" value={h.proactive.idleSeconds}
                   onChange={(v) => patchH({ proactive: { ...h.proactive, idleSeconds: v } })} />
-                <Num label="退避起点（轮）" hint="退避：连续多轮评估未发言后，下次评估前的等待逐轮翻倍" value={h.backoff.startCount}
+                <Num label="退避起点（轮）" hint="连续多轮评估未发言后，等待逐轮翻倍；群热闹起来（近 5 分钟 ≥3 条真人消息）会清零" value={h.backoff.startCount}
                   onChange={(v) => patchH({ backoff: { ...h.backoff, startCount: v } })} />
                 <Num label="退避基准（秒）" value={h.backoff.baseSeconds}
                   onChange={(v) => patchH({ backoff: { ...h.backoff, baseSeconds: v } })} />
                 <Num label="退避上限（秒）" value={h.backoff.capSeconds}
                   onChange={(v) => patchH({ backoff: { ...h.backoff, capSeconds: v } })} />
-                <Num label="绕过退避的积压条数" value={h.backoff.bypassPendingCount}
+                <Num label="绕过退避的积压条数" hint="积压到这么多条直接跳过退避开口评估" value={h.backoff.bypassPendingCount}
                   onChange={(v) => patchH({ backoff: { ...h.backoff, bypassPendingCount: v } })} />
               </div>
 
