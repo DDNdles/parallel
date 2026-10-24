@@ -135,8 +135,10 @@ async function unpackBin(zip: string, want: string, target: string): Promise<voi
 
 function findDeep(root: string, name: string, depth: number): string {
   if (depth < 0) return '';
+  // readdirSync 默认 withFileTypes:false（这里要的就是 string[]）；显式传那个选项会命中
+  // 返回 string[] | Buffer[] 的重载，把 entries 的类型搅宽
   let entries: string[] = [];
-  try { entries = readdirSync(root, { withFileTypes: false }); } catch { return ''; }
+  try { entries = readdirSync(root); } catch { return ''; }
   for (const n of entries) {
     const p = join(root, n);
     if (n === name) return p;

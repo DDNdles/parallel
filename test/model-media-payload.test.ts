@@ -6,7 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
+import type { KernelConfig } from '../src/kernel/config.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
+
+/** DEFAULT_CONFIG 整树 as const → 全 readonly 且字面量类型；测试要直接改配置，
+ *  取同一对象的可变视图（去掉 readonly 并把字面量放宽到基础类型；纯类型层，运行时还是那份 config） */
+type Widen<T> = T extends string ? string : T extends number ? number : T extends boolean ? boolean : T;
+type Mutable<T> = { -readonly [K in keyof T]: Widen<Mutable<T[K]>> };
 
 /**
  * 「模型到底收没收到这份媒体」不看代码猜，只看内核真发出去的请求报文。
@@ -137,21 +143,22 @@ before(async () => {
 
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-media-payload-'));
   kernel = new Kernel({ dataDir, noApi: true });
-  kernel.config.config.risk.replyRatePerMin = 10_000;
+  const cfg = kernel.config.config as Mutable<KernelConfig>;
+  cfg.risk.replyRatePerMin = 10_000;
   kernel.chat.setRatePerMin(10_000);
-  const hlOut = kernel.config.config.humanlike.outgoing;
+  const hlOut = cfg.humanlike.outgoing;
   hlOut.typingBaseDelaySeconds = 0;
   hlOut.typingMaxDelaySeconds = 0;
   hlOut.typingJitterRatio = 0;
-  kernel.config.config.onebot.port = 31000 + (process.pid % 2000);
-  kernel.config.config.masterIds = [String(MASTER)];
-  (kernel.config.config.providers as Record<string, unknown>).stub = {
+  cfg.onebot.port = 31000 + (process.pid % 2000);
+  cfg.masterIds = [String(MASTER)];
+  (cfg.providers as Record<string, unknown>).stub = {
     label: 'Stub', model: 'stub-model', enabled: true, baseUrl: `http://127.0.0.1:${port}/v1`,
     protocol: 'openai-compatible', custom: true,
     models: [{ id: 'stub-model', contextWindow: 65536, enabled: true, inputTypes: ['text', 'image', 'audio', 'video'] }],
   };
-  kernel.config.config.llm.activeProvider = 'stub';
-  kernel.config.config.llm.chatChain = [{ provider: 'stub', model: 'stub-model' }];
+  cfg.llm.activeProvider = 'stub';
+  cfg.llm.chatChain = [{ provider: 'stub', model: 'stub-model' }];
   kernel.config.setProviderKey('stub', 'stub-not-a-real-key');
   kernel.config.saveConfig();
   kernel.llm.syncCustomProviders();
@@ -174,7 +181,7 @@ after(async () => {
   try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* Temp 目录系统会回收 */ }
 });
 
-const send = (messageId: number, extraSegments: any[], group: string = GROUP) => mock.sendGroupMessage({
+const send = (messageId: number, extraSegments: any[], group: string | number = GROUP) => mock.sendGroupMessage({
   groupId: Number(group), userId: MEMBER, text: '', atMe: true, nickname: '小明', messageId, extraSegments,
 });
 
@@ -373,7 +380,7 @@ test('超出 historyLimit 的旧消息不进请求体：它带的图也不出现
   const G = freshGroup();
   const chat = chatOf(G);
   const savedLimit = kernel.config.config.storage.historyLimit;
-  kernel.config.config.storage.historyLimit = 2;
+  (kernel.config.config.storage as { historyLimit: number }).historyLimit = 2;
   kernel.history.setLimit(2);
   try {
     kernel.history.pushUser(chat, '这是很久以前那张图', [
@@ -390,7 +397,7 @@ test('超出 historyLimit 的旧消息不进请求体：它带的图也不出现
       .flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
     assert.equal(has(allBlocks, 'image_url').length, 0, '那条带的图也不许进请求体');
   } finally {
-    kernel.config.config.storage.historyLimit = savedLimit;
+    (kernel.config.config.storage as { historyLimit: number }).historyLimit = savedLimit;
     kernel.history.setLimit(savedLimit);
   }
 });

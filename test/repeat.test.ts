@@ -30,7 +30,7 @@ function watcher(cfgOver: Partial<RepeatCfg> = {}, random: () => number = rngMin
   const sent: { chatId: string; text: string }[] = [];
   const w = new RepeatWatcher({
     config: () => cfg as RepeatConfig,
-    send: async (chat, text) => sent.push({ chatId: chat.chatId, text }),
+    send: async (chat, text) => { sent.push({ chatId: chat.chatId, text }); },
     onSent: (chat, text) => sent.push({ chatId: `on_${chat.chatId}`, text }),
     selfId: () => '10000',
     random,

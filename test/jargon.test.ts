@@ -20,9 +20,9 @@ import type { ChatEvent } from '../src/kernel/types.ts';
 
 function groupEvent(text: string): ChatEvent {
   return {
-    platform: 'qq', type: 'group', chatId: '910', userId: 'u1', nickname: '小明',
+    id: `jargon-${Math.random()}`, platform: 'qq', type: 'group', chatId: '910', userId: 'u1', nickname: '小明', senderRole: 'member',
     text, segments: [], files: [], isAtMe: false, isReplyToMe: false, raw: {}, ts: Date.now(),
-  } as ChatEvent;
+  };
 }
 
 interface Harness { j: JargonService; db: Db; seen: { term: string; contexts: string[] }[]; dir: string; tryRm: () => void }

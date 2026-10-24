@@ -669,12 +669,14 @@ export interface GatedSandbox {
   /** 当前会话沙箱根目录 */
   root(chat: ChatRef): string;
   list(chat: ChatRef, relPath?: string): SandboxEntry[];
+  /** 递归收集文件清单（带上限截断标记）；sandbox 插件的 grep/glob 工具在用 */
+  walkFiles(chat: ChatRef, relPath?: string, opts?: { maxFiles?: number; maxDepth?: number }): { files: SandboxEntry[]; truncated: boolean };
   read(chat: ChatRef, relPath: string): string;
   write(chat: ChatRef, relPath: string, content: string | Buffer, opts?: { work?: boolean }): SandboxWriteResult;
   delete(chat: ChatRef, relPath: string): void;
-  run(chat: ChatRef, opts: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }): SandboxRunResult;
+  run(chat: ChatRef, opts: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }): Promise<SandboxRunResult>;
   /** work 模式扩展：bash + work 档配额（工具层负责 minRole 门槛） */
-  runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): SandboxRunResult;
+  runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): Promise<SandboxRunResult>;
   stats(): SandboxStat[];
   clear(chat: ChatRef): void;
 }
@@ -800,9 +802,10 @@ export interface GatedWork {
   list(limit?: number): unknown[];
   /**
    * 该会话最近一次成功交付的产物（chat 侧 deliver_file 用）。
-   * 只回最近一次成功且不在等回答的运行；没有则 undefined。
+   * 只回最近一次有产物且不在等回答的运行；没有则 undefined。
+   * `ok`：那次运行是否完整跑完（失败/中断的活也可能已产出文件，deliver_file 据此加说明）。
    */
-  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string } | undefined;
+  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string; ok: boolean } | undefined;
 }
 
 export interface SandboxEntry {

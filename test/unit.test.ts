@@ -17,7 +17,7 @@ test('splitSegments: 长文本按上限切分', () => {
   const long = 'a'.repeat(4000);
   const parts = splitSegments([{ type: 'text', data: { text: long } }], 1800);
   assert.equal(parts.length, 3);
-  assert.equal(parts.reduce((s, p) => s + p[0].data.text.length, 0), 4000);
+  assert.equal(parts.reduce((s, p) => s + (p[0].data as { text: string }).text.length, 0), 4000);
 });
 
 test('splitSegments: 短文本单条、非文本段独立成条', () => {

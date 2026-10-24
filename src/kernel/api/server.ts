@@ -361,7 +361,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
     // ================= RPC（UI 用） =================
     if (area === 'api' && a === 'rpc' && b === 'commands_visible') {
-      const chat = { platform: 'ui', type: body.chatType === 'private' ? 'private' : 'group', chatId: String(body.chatId ?? '') };
+      const chat: ChatRef = { platform: 'ui', type: body.chatType === 'private' ? 'private' : 'group', chatId: String(body.chatId ?? '') };
       return send(kernel.container.commandsForChat(chat, body.role ?? 'owner').map((cm) => ({
         name: cm.def.name, pluginId: cm.pluginId, description: cm.def.description, enabled: cm.enabled, minRole: cm.def.minRole,
       })));
@@ -724,8 +724,9 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         if (typeof body.label === 'string' && body.label.trim()) pc.label = body.label.trim().slice(0, 40);
         if (typeof body.protocol === 'string' && PROVIDER_PROTOCOLS.includes(body.protocol)) pc.protocol = body.protocol;
         if (Array.isArray(body.models)) {
-          pc.models = sanitizeModels(body.models);
-          const usable = pc.models.filter((m) => m.enabled !== false).map((m) => m.id);
+          const models: ProviderModelCfg[] = sanitizeModels(body.models);
+          pc.models = models;
+          const usable = models.filter((m) => m.enabled !== false).map((m) => m.id);
           if (pc.model && !usable.includes(pc.model)) pc.model = usable[0] ?? pc.model;
         }
         if (typeof body.model === 'string' && body.model) pc.model = body.model.trim().slice(0, 120);

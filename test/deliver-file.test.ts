@@ -43,6 +43,8 @@ async function boot(group: string) {
   const files: string[] = [];
   kernel.chat.attachAdapter({
     send: async () => 'mid',
+    sendForward: async () => undefined,
+    sendPoke: async () => {},
     sendFile: async (_c, abs) => { files.push(abs); return 'fid'; },
     connected: () => true,
     status: () => ({ connected: true }),

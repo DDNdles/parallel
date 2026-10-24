@@ -72,7 +72,7 @@ test('频率：群聊/私聊各自的 talkValue', () => {
 
 test('回复时机全局一套：改群聊参数同样作用于别的群，没有按会话的覆盖', async () => {
   const { svc, triggers } = makeService({
-    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
   });
   svc.ingest(ev('普通消息'), { isCommand: false });
@@ -226,7 +226,7 @@ function makeService(over: Partial<HumanlikeConfig> = {}, opts: { realClock?: bo
     config: () => cfg,
     selfNickname: () => '麦麦',
     trigger: (b) => triggers.push({ events: b.events, reason: b.reason }),
-    sessionLog: { append: (_c, _t, e) => logs.push(e) } as never,
+    sessionLog: { append: (_c: string, _t: string, e: { type: string; text?: string }) => { logs.push(e); } } as never,
     bus, errors, now,
     // 起跳随机延时用固定 0（= 取下限）：测试要确定性，抖动幅度由用例显式配置
     random: rng0,
@@ -304,7 +304,7 @@ test('服务：私聊连发几句合成一个批次，且不做开口打分', as
 
 test('服务：私聊关掉合批时仍逐条直通（与旧行为一致）', () => {
   const { svc } = makeService({
-    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
   });
   assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'pass');
   svc.dispose();
@@ -327,7 +327,7 @@ test('拟人化没有总开关：配置形状里就不该有 enabled（她不是
 
 test('服务：攒够 pendingThreshold 条后由定时器触发，而不是逐条触发', async () => {
   const { svc, triggers, cfg } = makeService({
-    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 3 },
   });
   svc.ingest(ev('一'), { isCommand: false });
@@ -369,20 +369,20 @@ test('服务：@ 直通不受合批与起跳延时影响（同步放行）', asy
 
 test('服务：frequency 模式攒不够就沉默，并把连续不说计数 +1（旧频率模式口径）', async () => {
   const { svc, triggers, logs } = makeService({
-    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
   });
   svc.ingest(ev('随便说说'), { isCommand: false });
   await wait(30);
   assert.equal(triggers.length, 0, '普通发言不该开口');
-  assert.ok(svc.snapshot(chat).consecutiveNoAction >= 1, '门控评估没说，退避计数增加');
+  assert.ok((svc.snapshot(chat).consecutiveNoAction as number) >= 1, '门控评估没说，退避计数增加');
   assert.ok(logs.some((l) => l.type === 'gate' && /不说/.test(l.text ?? '')), JSON.stringify(logs));
   svc.dispose();
 });
 
 test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自我唤醒）', async () => {
   const { svc, triggers } = makeService({
-    merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000 },
+    merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
     backoff: { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 },
   }, { realClock: true });
@@ -403,7 +403,7 @@ test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自�
 
 test('服务：pending=0 时不会纯靠沉默自我唤醒（主动发言默认关）', async () => {
   const { svc, triggers } = makeService({
-    merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000 },
+    merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
   }, { realClock: true });
   svc.ingest(ev('a', { isAtMe: true }), { isCommand: false });
@@ -469,7 +469,7 @@ test('服务：关掉分条就整段一条发出去（分条是纯程序开关�
 
 test('服务：缓冲里的老消息会被 TTL 清掉（不复述几分钟前的话）', async () => {
   const { svc, triggers, tick, now } = makeService({
-    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 1000 },
+    merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 1000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
     backoff: { baseSeconds: 0, capSeconds: 0, startCount: 1, bypassPendingCount: 0 },
   });
@@ -655,6 +655,8 @@ function makeChat(opts: { ratePerMin: number }) {
   let n = 0;
   const adapter: TransportAdapter = {
     send: async (_chat, segments) => { sent.push(segments.filter((s) => s.type === 'text').map((s) => String(s.data.text)).join('')); return `m${++n}`; },
+    sendForward: async () => 'f',
+    sendPoke: async () => {},
     sendFile: async () => 'f',
     connected: () => true,
     status: () => ({}),
@@ -818,7 +820,7 @@ test('重复惩罚：提醒 5 分钟一次；连续重写失败 3 次后不再�
 
 test('服务：仅 @ 后才回复——普通群消息连门槛都不看，@ 仍直通并把积压一起带上', async () => {
   const { svc, triggers } = makeService({
-    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000 },
+    merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
   });
   svc.ingest(ev('普通消息'), { isCommand: false });

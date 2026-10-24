@@ -205,7 +205,9 @@ export function touchAntiRepeat(
   now: number,
   cfg: RepetitionConfig,
 ): AntiRepeatEntry[] {
-  const by = new Map(state.map((e) => [e.phrase, { ...e }] as const));
+  // 拷贝旧条目再改（不污染入参 state）；不能给这里的元组加 as const——那会把拷贝也变成深度 readonly，
+  // 下面 old.untilAt / old.selfMsgs / old.inMsgs 的就地更新就写不进去了
+  const by = new Map<string, AntiRepeatEntry>(state.map((e) => [e.phrase, { ...e }]));
   const cooldown = Math.max(1, Math.round(cfg.cooldownMinutes)) * 60_000;
   for (const hit of hits) {
     const old = by.get(hit.phrase);

@@ -496,7 +496,8 @@ export class OneBot11Adapter implements TransportAdapter {
     return await this.call('upload_private_file', { user_id: chat.chatId, file: uri, name });
   }
 
-  private connected(): boolean {
+  /** TransportAdapter 契约要求公开（kernel/UI 据此判断协议端是否在线） */
+  connected(): boolean {
     return !!this.client && this.client.readyState === 1;
   }
 

@@ -579,14 +579,16 @@ export class PluginContainer {
       log,
       bus: {
         emit: (e, ...a) => bus.emit(e, ...a),
+        // 返回退订函数（Bus 契约如此）；插件不用它也没关系——卸载时 disposers 照样统一清理
         on: (e, h) => {
           const off = bus.on(e, h);
           lp.disposers.push(off);
-          return;
+          return off;
         },
         once: (e, h) => {
           const off = bus.once(e, h);
           lp.disposers.push(off);
+          return off;
         },
       },
       config: config.config as unknown as Record<string, unknown>,

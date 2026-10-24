@@ -7,6 +7,7 @@ import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
 import { attachmentsOf } from '../src/kernel/pipeline.ts';
+import type { KernelConfig } from '../src/kernel/config.ts';
 import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
 import {
@@ -14,6 +15,16 @@ import {
   forwardTotal, renderForward,
 } from '../src/kernel/util/forward.ts';
 import type { ChatEvent, ForwardRecord } from '../src/kernel/types.ts';
+
+/** DEFAULT_CONFIG 以 as const 声明（深只读 + 字面量类型）；测试要在启动前就地改配置，
+ *  这里取它的「可写、字面量放宽」视图 —— 只影响类型层，不引入任何运行时行为。 */
+type Writable<T> =
+  T extends string ? string
+  : T extends number ? number
+  : T extends boolean ? boolean
+  : T extends readonly (infer U)[] ? Writable<U>[]
+  : T extends object ? { -readonly [K in keyof T]: Writable<T[K]> }
+  : T;
 
 /**
  * 群友发来的「聊天记录」合集（QQ 的合并转发）。
@@ -79,21 +90,22 @@ before(async () => {
   await new Promise<void>((r) => imgServer.listen(IMG_PORT, '127.0.0.1', r));
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-forward-'));
   kernel = new Kernel({ dataDir, noApi: true });
-  kernel.config.config.risk.replyRatePerMin = 10_000;
+  const cfg = kernel.config.config as Writable<KernelConfig>;
+  cfg.risk.replyRatePerMin = 10_000;
   kernel.chat.setRatePerMin(10_000);
-  const hlOut = kernel.config.config.humanlike.outgoing;
+  const hlOut = cfg.humanlike.outgoing;
   hlOut.typingBaseDelaySeconds = 0;
   hlOut.typingMaxDelaySeconds = 0;
   hlOut.typingJitterRatio = 0;
-  kernel.config.config.onebot.port = ONEBOT_PORT;
-  kernel.config.config.masterIds = [String(MASTER)];
-  (kernel.config.config.providers as Record<string, unknown>).mock = {
+  cfg.onebot.port = ONEBOT_PORT;
+  cfg.masterIds = [String(MASTER)];
+  (cfg.providers as Record<string, unknown>).mock = {
     label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
     models: [{ id: 'mock-1', enabled: true }],
   };
-  kernel.config.config.llm.activeProvider = 'mock';
-  kernel.config.config.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
-  kernel.config.config.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.activeProvider = 'mock';
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
   mockProvider = (kernel.llm as unknown as { providers: Map<string, MockEngine> }).providers.get('mock')!;
   await kernel.boot();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
@@ -218,7 +230,7 @@ test('聊天记录：按 resId 现取节点，正文与昵称都落进会话日�
   assert.deepEqual(fwd.nodes.map((n) => `${n.nickname}：${n.text}`), ['小明：明天交作业', '小红：收到']);
   assert.equal(fwd.nodes[0].ts, 1_760_000_000_000, '节点时间要换成毫秒（协议端给的是秒）');
   // 段里的占位留着：模型那边另有展开正文，界面拿它当"这条是聊天记录"的兜底字样
-  assert.ok((entryOf(90001)?.text ?? '').includes('[聊天记录]'), entryOf(90001)?.text);
+  assert.ok((entryOf(90001)?.text ?? '').includes('[聊天记录]'), entryOf(90001)?.text ?? '');
 });
 
 test('模型看到的是展开后的正文，不是一个占位符', async () => {
@@ -457,15 +469,16 @@ test('顶层图片仍走适配器落盘（这条以前没有任何用例覆盖�
   await until(() => !!entryOf(90015), 8000, '图片消息落账');
   const e = entryOf(90015)!;
   assert.equal(e.text, '[图片]看这张');
-  const files = (e.data?.files ?? []) as { name: string; rel: string; size: number }[];
-  assert.equal(files.length, 1, JSON.stringify(e.data?.files));
+  const data = (e.data ?? {}) as { files?: unknown[] };   // data 在类型上是 unknown，按实际形状取
+  const files = (data.files ?? []) as { name: string; rel: string; size: number }[];
+  assert.equal(files.length, 1, JSON.stringify(data.files));
   assert.equal(files[0].name, 'top.png');
   assert.ok(files[0].size > 0);
   const root = kernel.sandbox.root({ platform: 'qq', type: 'group', chatId: String(GROUP) });
   assert.ok(existsSync(join(root, files[0].rel)), `图片要真落进 inbox：${files[0].rel}`);
   // 落账的附件只留 name/rel/size：那份带 rkey 的临时 URL 不该躺在会话日志里。
   // （段里那个 url 是补链接时就写回去的，属既有行为，要清另说。）
-  assert.ok(!JSON.stringify(e.data?.files).includes('127.0.0.1'), JSON.stringify(e.data?.files));
+  assert.ok(!JSON.stringify(data.files).includes('127.0.0.1'), JSON.stringify(data.files));
 });
 
 test('语音容器：浏览器能解的原样存，silk 先转 wav（转不动就按原样存别丢文件）', async () => {
@@ -475,7 +488,8 @@ test('语音容器：浏览器能解的原样存，silk 先转 wav（转不动�
     extraSegments: [{ type: 'record', data: { file: 'a.mp3' } }],
   });
   await until(() => !!entryOf(90016), 8000, 'mp3 语音落账');
-  assert.equal(((entryOf(90016)!.data?.files ?? []) as { name: string }[])[0].name, 'a.mp3', 'mp3 浏览器能解，不该被改名');
+  const files16 = (((entryOf(90016)!.data ?? {}) as { files?: unknown[] }).files ?? []) as { name: string }[];
+  assert.equal(files16[0].name, 'a.mp3', 'mp3 浏览器能解，不该被改名');
   // silk 转不动时按原样存那条：由顶层语音用例（假服务器给的是 PNG 字节，ffmpeg 必然失败）钉住
 });
 
@@ -489,8 +503,9 @@ test('顶层语音/视频消息也落盘：以前只有 [语音] 三个字，等
   const e = entryOf(90014)!;
   // 段序是 [record, text]（MockOneBot 把 extraSegments 放在文本段之前），所以占位在前
   assert.equal(e.text, '[语音]听这段');
-  const files = (e.data?.files ?? []) as { name: string; rel: string }[];
-  assert.equal(files.length, 1, JSON.stringify(e.data?.files));
+  const data = (e.data ?? {}) as { files?: unknown[] };   // data 在类型上是 unknown，按实际形状取
+  const files = (data.files ?? []) as { name: string; rel: string }[];
+  assert.equal(files.length, 1, JSON.stringify(data.files));
   assert.equal(files[0].name, 'top.silk');
   const root = kernel.sandbox.root({ platform: 'qq', type: 'group', chatId: String(GROUP) });
   assert.ok(existsSync(join(root, files[0].rel)), `语音要真落进 inbox：${files[0].rel}`);

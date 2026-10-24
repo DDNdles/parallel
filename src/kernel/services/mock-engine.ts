@@ -171,8 +171,11 @@ export class MockEngine {
 
     // 先把这一步的结果算出来（同步逻辑），再按事件顺序推出去
     const step = this.script.shift();
-    let content: (TextContent | ToolCall)[] = [];
-    let stopReason: AssistantMessage['stopReason'] = 'stop';
+    // 本地 content 允许 thinking 块（MockScriptStep.thinking → pi-ai 的 ThinkingContent，emit 里走 thinking_* 事件）
+    let content: (TextContent | ThinkingContent | ToolCall)[] = [];
+    // 按全集初始化（不让 'stop' 字面量收窄）：done 事件的 reason 映射按 pi-ai 的 StopReason 全集写
+    // （含 length 等防御分支），mock 实际只会产生 stop/toolUse 两种
+    let stopReason: AssistantMessage['stopReason'] = 'stop' as AssistantMessage['stopReason'];
     let text = '';
     let usage: AssistantMessage['usage'] | undefined;
 

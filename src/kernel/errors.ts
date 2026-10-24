@@ -3,7 +3,7 @@ import { Bus, busEvents } from './bus.ts';
 import { newId, nowMs } from './util/misc.ts';
 
 export type ErrorLevel = 'info' | 'warn' | 'error';
-export type ErrorCategory = 'adapter' | 'provider' | 'plugin' | 'sandbox' | 'storage' | 'kernel' | 'command' | 'media';
+export type ErrorCategory = 'adapter' | 'provider' | 'plugin' | 'sandbox' | 'storage' | 'kernel' | 'command' | 'media' | 'work';
 
 export interface ErrorRecord {
   id: string;
@@ -49,7 +49,8 @@ export class ErrorCenter {
     level: ErrorLevel,
     category: ErrorCategory,
     message: string,
-    opts: { pluginId?: string; chatId?: string; stack?: string; notifyOwner?: boolean } = {},
+    // providerId：调用方（LlmService）附带的定位线索——目前只作诊断信息收下、不进 ErrorRecord（保持既有行为）
+    opts: { pluginId?: string; chatId?: string; providerId?: string; stack?: string; notifyOwner?: boolean } = {},
   ): ErrorRecord {
     const dedupeKey = `${category}|${opts.pluginId ?? ''}|${message.slice(0, 120)}`;
     let rec = this.records.get(dedupeKey);

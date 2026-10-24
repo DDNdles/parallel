@@ -159,10 +159,26 @@ test('额度：API 失败不计数、满 3 张拒绝；PNG 真落盘；参考图
   }
 });
 
+test('JPEG：返回字节是 JPEG 时按 .jpg 落盘，不冒充 PNG', async () => {
+  // 真机踩过的坑：flash-image 系模型回 JPEG，一律存 .png 会让扩展名与字节不符
+  const JPEG = Buffer.from('ffd8ffe000104a46494600010000000100', 'hex');
+  const k = await boot('key-test');
+  const mock = mockGemini([geminiOk(JPEG.toString('base64'))]);
+  try {
+    const out = await k.call('画一只猫', { role: 'owner' });
+    assert.match(out, /已生成 imagegen\/.+\.jpg/, out);
+    const rel = out.match(/imagegen\/[^\s（]+\.jpg/)![0];
+    const abs = join(k.kernel.sandbox.root(k.privilegedChat), rel);
+    assert.deepEqual(readFileSync(abs), JPEG, 'JPEG 内容要原样落进沙箱');
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
 test('主人与管理员默认不限张数', async () => {
   const k = await boot('key-test');
-  const mock = mockGemini(Array.from({ length: 8 }, () => geminiOk()));
-  try {
+  const mock = mockGemini(Array.from({ length: 8 }, () => geminiOk()));  try {
     for (let i = 0; i < 4; i++) assert.match(await k.call(`主人第 ${i} 张`, { role: 'owner' }), /已生成/);
     for (let i = 0; i < 4; i++) assert.match(await k.call(`管理员第 ${i} 张`, { role: 'admin' }), /已生成/);
     assert.equal(mock.calls.length, 8);
@@ -280,7 +296,7 @@ test('work 面工具 + beforeLLM 只追加；未配 Key 时结构化拒绝且不
       system: 'base', messages: [], tools: [],
       systemSections: [{ order: 1, text: '别的插件先注入的节' }],
     };
-    const out = hooks.beforeLLM!(req);
+    const out = await hooks.beforeLLM!(req);
     assert.equal(out.systemSections![0].text, '别的插件先注入的节', '原有节必须保留');
     const sec = out.systemSections!.find((s) => s.title === 'imagegen');
     assert.ok(sec, 'beforeLLM 要追加生图说明节');

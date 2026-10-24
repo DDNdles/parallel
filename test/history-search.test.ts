@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
+import type { KernelConfig } from '../src/kernel/config.ts';
+
+/** DEFAULT_CONFIG 整树 as const → 全 readonly；测试直接改配置时取同一对象的可变视图（纯类型层） */
+type Widen<T> = T extends string ? string : T extends number ? number : T extends boolean ? boolean : T;
+type Mutable<T> = { -readonly [K in keyof T]: Widen<Mutable<T[K]>> };
 
 /**
  * search_history 工具：她"翻旧账"的通道。
@@ -21,8 +26,9 @@ let dataDir: string;
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-histsearch-'));
   kernel = new Kernel({ dataDir, noApi: true });
-  kernel.config.config.onebot.port = 30000 + (process.pid % 20000);
-  kernel.config.config.masterIds = [String(MASTER)];
+  const cfg = kernel.config.config as Mutable<KernelConfig>;
+  cfg.onebot.port = 30000 + (process.pid % 20000);
+  cfg.masterIds = [String(MASTER)];
   await kernel.boot();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
 });
@@ -119,6 +125,6 @@ test('一轮之内翻旧账有预算：查满就劝它照字面回答，别再�
   assert.match(outs[3], /别再查/);
   assert.match(outs[5], /别再查/, '两个工具共用一份预算');
   // 换一轮（另一个事件 id）就该重新给预算
-  const ctx4 = { ...ctx3, event: { ...ctx3.event, id: 'turn-quota-2' } } as never;
+  const ctx4 = { ...(ctx3 as object), event: { ...((ctx3 as { event: object }).event), id: 'turn-quota-2' } } as never;
   assert.ok(!/别再查/.test(String(hist.handler({ query: '新话题' }, ctx4))), '预算按轮算，不按群累计');
 });

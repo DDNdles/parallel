@@ -48,7 +48,7 @@ async function boot() {
 test('poke：昵称解析成最近说话人，发出 send_poke 并落 poke 日志', async () => {
   const g = await boot();
   try {
-    g.mock.sendGroupMessage({ groupId: Number(g.group), userId: '20001', text: '在吗', nickname: '小明' });
+    g.mock.sendGroupMessage({ groupId: Number(g.group), userId: 20001, text: '在吗', nickname: '小明' });
     await until(() => g.kernel.sessionLog.tail(g.group, 'group').some((e) => e.type === 'message_in' && e.nickname === '小明'),
       5000, '入站消息');
 

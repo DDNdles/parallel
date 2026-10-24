@@ -108,7 +108,8 @@ export interface PiChatOptions {
   providerId: string;
   protocol: PiProtocol;
   baseUrl: string;
-  apiKey: string;
+  /** 真正发请求的路径（chatViaPiAi）必填；只造 Model 元数据的路径（piModelFor）用不到，可为空 */
+  apiKey?: string;
   /** 模型元数据（连 pi-ai 的 Model 需要 contextWindow / maxTokens / 是否支持图片 / 是否推理模型） */
   model: { id: string; contextWindow?: number; maxTokens?: number; image?: boolean; reasoning?: boolean };
   req: LLMChatRequest;

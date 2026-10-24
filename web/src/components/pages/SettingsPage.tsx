@@ -792,6 +792,12 @@ export default function SettingsPage() {
                   <BrandInput value={String(gc.model ?? '')} spellCheck={false}
                     onChange={(e) => setPlugVal('imagegen', { model: e.target.value })} />
                 </div>
+                <div className="mset-field">
+                  <label className="mset-flabel">接口地址</label>
+                  <BrandInput value={String(gc.baseUrl ?? '')} spellCheck={false}
+                    placeholder="留空 = 官方地址"
+                    onChange={(e) => setPlugVal('imagegen', { baseUrl: e.target.value })} />
+                </div>
                 <div className="set-grid">
                   <Num label="每人每周张数" value={Number(gc.weeklyQuota ?? 0)}
                     onChange={(v) => setPlugVal('imagegen', { weeklyQuota: v })} />

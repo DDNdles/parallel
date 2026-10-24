@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Bus } from '../src/kernel/bus.ts';
-import { ConfigStore } from '../src/kernel/config.ts';
+import { ConfigStore, type ModelRef } from '../src/kernel/config.ts';
 import { Db } from '../src/kernel/db.ts';
 import { ErrorCenter } from '../src/kernel/errors.ts';
 import { LlmService } from '../src/kernel/services/llm.ts';
@@ -70,7 +70,7 @@ before(async () => {
   };
   config.setProviderKey('pi-test', 'sk-pi-test');
   llm.syncCustomProviders();
-  config.config.llm.chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
+  (config.config.llm as { chatChain: ModelRef[] }).chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
 });
 
 after(() => {
@@ -158,10 +158,10 @@ test('换了供应商照样走 pi-ai（没有第二条引擎可切）', async ()
   };
   config.setProviderKey('native-test', 'sk-native');
   llm.syncCustomProviders();   // 新加的供应商要过这一步才会注册进实例表
-  config.config.llm.chatChain = [{ provider: 'native-test', model: 'native-model' }];
+  (config.config.llm as { chatChain: ModelRef[] }).chatChain = [{ provider: 'native-test', model: 'native-model' }];
   const resp = await llm.chat({ model: '', messages: [{ role: 'user', content: 'hi' }] } as any, {});
   assert.equal(resp.content, '你好');
-  config.config.llm.chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
+  (config.config.llm as { chatChain: ModelRef[] }).chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
 });
 
 test('直接调桥接层：未装 pi-ai 时给的是「去装依赖」的明确错误，不静默降级', async () => {
@@ -192,7 +192,7 @@ test('音频/视频：在 onPayload 上补进请求体的最后一条 user 消�
   };
   config.setProviderKey('av', 'k');
   llm.syncCustomProviders();
-  config.config.llm.chatChain = [{ provider: 'av', model: 'av-model' }];
+  (config.config.llm as { chatChain: ModelRef[] }).chatChain = [{ provider: 'av', model: 'av-model' }];
 
   await llm.chat({
     model: '',
@@ -215,7 +215,7 @@ test('音频/视频：在 onPayload 上补进请求体的最后一条 user 消�
   assert.equal(video.video_url.url, 'https://x/v.mp4');
   assert.equal(blocks[0].type, 'text', '原有文本块要保留在最前');
 
-  config.config.llm.chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
+  (config.config.llm as { chatChain: ModelRef[] }).chatChain = [{ provider: 'pi-test', model: 'pi-model' }];
 });
 
 test('prepareMedia：Anthropic 没有音频/视频块 → 明确列入 skipped，不静默丢', async () => {

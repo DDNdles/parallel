@@ -5,9 +5,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
+import type { KernelConfig } from '../src/kernel/config.ts';
 import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
 import { SandboxError } from '../src/kernel/services/sandbox.ts';
+
+/** DEFAULT_CONFIG 以 as const 声明（深只读 + 字面量类型）；测试要在启动前后就地改配置，
+ *  这里取它的「可写、字面量放宽」视图 —— 只影响类型层，不引入任何运行时行为。 */
+type Writable<T> =
+  T extends string ? string
+  : T extends number ? number
+  : T extends boolean ? boolean
+  : T extends readonly (infer U)[] ? Writable<U>[]
+  : T extends object ? { -readonly [K in keyof T]: Writable<T[K]> }
+  : T;
+
+/** 落账条目的引用快照挂在 data.replyTo（SessionLogEntry.data 类型上是 unknown，按实际形状取） */
+type QuoteData = { messageId?: string; replyTo?: { nickname?: string; text?: string; files?: unknown[] } };
+const quoteData = (e?: { data?: unknown }): QuoteData | undefined => e?.data as QuoteData | undefined;
 
 /**
  * 端到端：真实内核 + 模拟协议端（MockOneBot），不插真 QQ 号验证主流程。
@@ -16,6 +31,8 @@ let kernel: Kernel;
 let dataDir: string;
 let mock: MockOneBot;
 let mockProvider: MockEngine;
+/** kernel.config.config 的可写视图（同一对象）：测试要就地改的配置都走它 */
+let cfg: Writable<KernelConfig>;
 
 const GROUP = 123;
 const MEMBER = 10001;
@@ -57,34 +74,35 @@ const ONEBOT_PORT = 30000 + (process.pid % 20000); // 随机端口避免并发�
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-e2e-'));
   kernel = new Kernel({ dataDir, noApi: true });
+  cfg = kernel.config.config as Writable<KernelConfig>;
   // 加速：限速放开 + 主人配置
   // 限速按条计费（一轮回复拆成几条就吃几个令牌），默认值 12 条/分钟是这个文件里几十条断言的量级 ——
   // 不放开的话跑到后半程桶就空了，消息被静默丢弃，后面几条用例会莫名其妙地超时。
   // 两处都要写：写 config 是为了扛住中途 saveConfig 触发的 configChanged 热更新。
-  kernel.config.config.risk.replyRatePerMin = 10_000;
+  cfg.risk.replyRatePerMin = 10_000;
   kernel.chat.setRatePerMin(10_000);
   // 拟人层在测试里要确定性：把打字延迟压到 HDSI 的下限（公式不可关闭，最低 250ms/条），
   // 基础延迟与上限归零、抖动归零。拆分开关保持打开 —— 但只有模型写了分隔标记才会分多条。
-  const hlOut = kernel.config.config.humanlike.outgoing;
+  const hlOut = cfg.humanlike.outgoing;
   hlOut.typingBaseDelaySeconds = 0;
   hlOut.typingMaxDelaySeconds = 0;
   hlOut.typingJitterRatio = 0;
   // 重复消息去重默认 2 分钟：本文件的用例普遍在同一个群反复用「在吗」触发，这里整体关掉，
   // 只让专门测去重的那一条自己打开。
   kernel.pipeline.duplicateWindowMs = 0;
-  kernel.config.config.onebot.port = ONEBOT_PORT;
+  cfg.onebot.port = ONEBOT_PORT;
   // 协议端托管只在带桌面端的内核里跑（见 kernel.boot 的 noApi 判断）：测试内核用 MockOneBot
   // 顶替，真托管会在临时目录下载 89MB 发行包，抢磁盘/网络并在首个 agent loop 窗口里制造偶发超时（历史 flake 根因）。
-  kernel.config.config.masterIds = [String(MASTER)];
+  cfg.masterIds = [String(MASTER)];
   // 预置里没有 Mock 供应商了（模型页不再列测试用项）：测试自己挂一个脚本供应商
-  (kernel.config.config.providers as Record<string, unknown>).mock = {
+  (cfg.providers as Record<string, unknown>).mock = {
     label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
     models: [{ id: 'mock-1', enabled: true }],
   };
-  kernel.config.config.llm.activeProvider = 'mock';
+  cfg.llm.activeProvider = 'mock';
   // 两条链各自独立、不再互相跟随（work 链空 = /work 没有模型），测试显式配满两条
-  kernel.config.config.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
-  kernel.config.config.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
   mockProvider = (kernel.llm as unknown as { providers: Map<string, MockEngine> }).providers.get('mock')!;
   await kernel.boot();
   mock = new MockOneBot(`ws://127.0.0.1:${ONEBOT_PORT}/onebot`, kernel.config.secrets.onebotAccessToken);
@@ -161,7 +179,7 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
   await quiesce();
   const tail = kernel.sessionLog.tail(String(GROUP), 'group', 50);
   assert.ok(tail.some((e) => e.type === 'tool_call' && e.text === 'recall_facts'));
-  assert.ok(tail.some((e) => e.type === 'tool_result' && String(e.data?.result ?? '').includes('记忆')));
+  assert.ok(tail.some((e) => e.type === 'tool_result' && String((e.data as { result?: unknown } | undefined)?.result ?? '').includes('记忆')));
 });
 
 // ============================================================
@@ -315,7 +333,7 @@ test('演化层：remember_setting 写得进、一轮只收一条，work 面严�
   assert.ok(list[0].at > 0, '带写入时间（桌面端人格页按它排序）');
   // 两条回执都真的回给了模型（会话语义：写入回执 + 超预算的拒绝理由）
   const results = kernel.sessionLog.tail(String(GROUP), 'group', 80)
-    .filter((e) => e.type === 'tool_result').map((e) => String(e.data?.result ?? ''));
+    .filter((e) => e.type === 'tool_result').map((e) => String((e.data as { result?: unknown } | undefined)?.result ?? ''));
   assert.ok(results.some((r) => r.includes('已写入')), `该有一条写入回执: ${JSON.stringify(results)}`);
   assert.ok(results.some((r) => r.includes('已经写过一条')), `该有一条超预算回执: ${JSON.stringify(results)}`);
   mock.actions.length = 0;
@@ -550,7 +568,7 @@ test('隐藏会话：bot 收不到任何东西（消息不落账，也不回复/
     const scriptLen = mockProvider.script.length;
     mockProvider.script.push({ content: '（这句不该出现在任何地方）' });
     const mark = mock.actions.length;
-    mock.sendGroupMessage({ groupId: HIDE_GROUP, userId: MASTER, text: '/work 算点什么', nickname: '主人' });
+    mock.sendGroupMessage({ groupId: Number(HIDE_GROUP), userId: MASTER, text: '/work 算点什么', nickname: '主人' });
     // 隐藏即"收不到"：会话流里既没有入站也没有出站
     await new Promise((r) => setTimeout(r, 900));
     const tail = kernel.sessionLog.tail(HIDE_GROUP, 'group', 50);
@@ -576,9 +594,9 @@ test('引用一条消息：内核按消息号查回原文，落进条目的 repl
   await new Promise((r) => setTimeout(r, 500));
   const tail = kernel.sessionLog.tail(G, 'group', 20);
   const quoted = tail.find((e) => e.text?.includes('那我请'));
-  assert.equal(quoted?.data?.messageId, '55002', '入站条目要记下协议端消息号（下次被引用才查得到）');
-  assert.ok(String(quoted?.data?.replyTo?.text ?? '').includes('两顿 20'), 'replyTo 要带上被引用那条的原文');
-  assert.equal(quoted?.data?.replyTo?.nickname, '小明');
+  assert.equal(quoteData(quoted)?.messageId, '55002', '入站条目要记下协议端消息号（下次被引用才查得到）');
+  assert.ok(String(quoteData(quoted)?.replyTo?.text ?? '').includes('两顿 20'), 'replyTo 要带上被引用那条的原文');
+  assert.equal(quoteData(quoted)?.replyTo?.nickname, '小明');
 
   // 被引用的是一张图：快照必须连附件一起抄过来，否则桌面端引用块里只能看到"[图片]"三个字
   kernel.sessionLog.append(G, 'group', {
@@ -589,7 +607,7 @@ test('引用一条消息：内核按消息号查回原文，落进条目的 repl
     extraSegments: [{ type: 'reply', data: { id: '55100' } }] });
   await new Promise((r) => setTimeout(r, 500));
   const imgQuote = kernel.sessionLog.tail(G, 'group', 20).find((e) => e.text?.includes('这张好看'));
-  assert.deepEqual(imgQuote?.data?.replyTo?.files, [{ name: 'a.jpg', rel: 'inbox/a.jpg' }], '引用图片消息要把 rel 带上');
+  assert.deepEqual(quoteData(imgQuote)?.replyTo?.files, [{ name: 'a.jpg', rel: 'inbox/a.jpg' }], '引用图片消息要把 rel 带上');
 
   // 老条目只存过文件名（10-10 之前的形状）：快照要补出 inbox/ 前缀，桌面端才取到图
   kernel.sessionLog.append(G, 'group', {
@@ -600,7 +618,7 @@ test('引用一条消息：内核按消息号查回原文，落进条目的 repl
     extraSegments: [{ type: 'reply', data: { id: '55102' } }] });
   await new Promise((r) => setTimeout(r, 500));
   const legacyQuote = kernel.sessionLog.tail(G, 'group', 20).find((e) => e.text?.includes('上面那张'));
-  assert.deepEqual(legacyQuote?.data?.replyTo?.files, [{ name: 'b.png', rel: 'inbox/b.png' }]);
+  assert.deepEqual(quoteData(legacyQuote)?.replyTo?.files, [{ name: 'b.png', rel: 'inbox/b.png' }]);
 });
 
 test('私聊全收并回复', async () => {
@@ -1158,7 +1176,7 @@ test('拟人化：主动发言轮里模型回 SKIP 就保持沉默', async () =>
   await quiesce();
   const PRO_GROUP = 4570;
   kernel.container.setGroupState('chat', String(PRO_GROUP), true, String(MASTER));
-  const hl = kernel.config.config.humanlike;
+  const hl = cfg.humanlike;
   const savedProactive = hl.proactive.enable;
   const savedAgency = hl.agency.enable;
   hl.proactive.enable = true;                 // 主动发言默认关，这里临开
@@ -1186,7 +1204,7 @@ test('拟人化：主动发言轮真说话时不往历史塞假用户消息', as
   await quiesce();
   const PRO_GROUP = 4571;
   kernel.container.setGroupState('chat', String(PRO_GROUP), true, String(MASTER));
-  const hl = kernel.config.config.humanlike;
+  const hl = cfg.humanlike;
   const savedProactive = hl.proactive.enable;
   const savedAgency = hl.agency.enable;
   hl.proactive.enable = true;
@@ -1250,7 +1268,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
   await quiesce();
   const G = 4580;
   kernel.container.setGroupState('chat', String(G), true, String(MASTER));
-  const hl = kernel.config.config.humanlike;
+  const hl = cfg.humanlike;
   const savedOut = { ...hl.outgoing };
   const savedIt = { ...hl.interrupt };
   const savedMention = hl.timing.mentionedBotReply;
@@ -1281,7 +1299,7 @@ test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发�
     assert.equal(String(assistants[0].content), '第一句', '被砍掉的气泡一个字都不该进历史');
 
     // 会话流里留一条 gate 说明为什么话说一半（桌面端据此排障）
-    const gates = kernel.sessionLog.tail(G, 'group', 60)
+    const gates = kernel.sessionLog.tail(String(G), 'group', 60)
       .filter((e) => (e.data as any)?.decision === 'interrupted');
     assert.ok(gates.length >= 1, '被打断要在会话日志里留 gate');
   } finally {
@@ -1295,7 +1313,7 @@ test('拟人化：同一句隔开 2 秒以上又说一遍，不再另起一轮�
   await quiesce();
   const G = 4581;
   kernel.container.setGroupState('chat', String(G), true, String(MASTER));
-  const hl = kernel.config.config.humanlike;
+  const hl = cfg.humanlike;
   const savedIt = { ...hl.interrupt };
   hl.interrupt.enable = false;              // 这条测的是重复消息，别让打断掺进来
   kernel.pipeline.duplicateWindowMs = 120_000;
@@ -1316,7 +1334,7 @@ test('拟人化：同一句隔开 2 秒以上又说一遍，不再另起一轮�
     await new Promise((r) => setTimeout(r, 1500));
 
     assert.equal(mockProvider.calls.length, firstCalls, '同样的话不该再叫一次模型');
-    const gate = kernel.sessionLog.tail(G, 'group', 60)
+    const gate = kernel.sessionLog.tail(String(G), 'group', 60)
       .find((e) => (e.data as any)?.decision === 'duplicate_ignored');
     assert.ok(gate, '要在会话日志里留一条 duplicate_ignored');
   } finally {

@@ -93,7 +93,7 @@ test('depsReady：只看必备项', () => {  const mk = (over: Partial<DepItem> 
 test('API：/api/setup/deps 免 token、不碰协议端；install 在 noApi 内核里必须拒绝', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-setup-api-'));
   const kernel = new Kernel({ dataDir, noApi: true });
-  const ob = kernel.config.config.onebot as unknown as Record<string, Record<string, unknown>>;
+  const ob = kernel.config.config.onebot as unknown as Record<string, unknown>;
   ob.port = 30000 + (process.pid % 20000);
   kernel.config.config.ui.port = 42000 + (process.pid % 6000);
   await kernel.boot();

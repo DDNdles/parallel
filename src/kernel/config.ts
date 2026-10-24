@@ -291,7 +291,10 @@ export const DEFAULT_CONFIG = {
     // 上下文时间窗（分钟）：agentTurn 按 now-contextMinutes 过滤历史快照；条数上限 storage.historyLimit 同时生效
     contextMinutes: 10,
   },
-} as const;
+  // 注意这里**不能**加 `as const`：KernelConfig 是运行时会被反复写的生活文档
+  // （桌面端改设置、迁移函数改旧键、适配器记 lastLogin…），as const 会让整个类型深度
+  // readonly、与真实用法矛盾。字面量字段需要窄类型的地方各自用 `as 'xx' | 'yy'` 注明。
+};
 
 export type KernelConfig = typeof DEFAULT_CONFIG;
 

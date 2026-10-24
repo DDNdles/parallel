@@ -63,7 +63,7 @@ test('authState：控制台没起来时只报本地那一半，且绝不回 toke
     assert.equal(st.reachable, false, '连不上控制台要如实标出来，别把"没起来"说成"没授权"');
     assert.equal(st.hasToken, true);
     assert.equal(st.validation, '');
-    assert.equal(st.supported, undefined);
+    assert.equal((st as { supported?: unknown }).supported, undefined);
     assert.match(st.pageUrl, /^https:\/\/auth\.luckylillia\.com$/, '默认 cf 接入点的申请页');
     assert.equal(st.mirrorUrl, 'https://llbot.wumiao.wang', '国内镜像一并给出');
     assert.equal(st.qqGroup, '545402644');
@@ -118,9 +118,9 @@ test('authState：控制台报的校验态原样透出，鉴权走 X-Webui-Token
 test('API：/api/setup/auth 免 token 可读可写，响应与日志都不带 token 本体，且不拉起协议端', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-auth-api-'));
   const kernel = new Kernel({ dataDir, noApi: true });
-  const ob = kernel.config.config.onebot as unknown as Record<string, Record<string, unknown>>;
+  const ob = kernel.config.config.onebot as unknown as Record<string, unknown>;
   ob.port = 31000 + (process.pid % 19000);
-  kernel.config.config.ui.port = 43000 + (process.pid % 5000);
+  (kernel.config.config.ui as { port: number }).port = 43000 + (process.pid % 5000);
   await kernel.boot();
   const server = await startApiServer(kernel);
   const base = `http://127.0.0.1:${kernel.config.config.ui.port}`;

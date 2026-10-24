@@ -54,7 +54,7 @@ test('反向 WS 客户端写成官方 schema，并保留用户已有的其它网
   const once = mergeNapcatNetworkConfig(user, client);
   const net = ANY(once.network);
   assert.equal(once.someOther, 1);
-  assert.equal(ANY(net.httpServers[0]).name, 'web');
+  assert.equal(ANY(ANY(net.httpServers)[0]).name, 'web');
   assert.deepEqual(clients(once).map((c) => c.name), ['别的', 'parallel']);
   // 幂等：被改坏的条目会被拉回内核期望值，且不会多出第二条
   const broken = mergeNapcatNetworkConfig(user, { ...client, url: 'ws://旧地址' });
@@ -73,7 +73,7 @@ test('无头内核不托管；切成 NapCat 后 LLBot 也不会被拉起', async
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-flavor-'));
   const kernel = new Kernel({ dataDir, noApi: true });
   ANY(ANY(kernel.config.config.onebot)).port = 30000 + (process.pid % 20000);
-  kernel.config.config.onebot.flavor = 'napcat';
+  ANY(kernel.config.config.onebot).flavor = 'napcat';
   await kernel.boot();
   try {
     assert.equal(kernel.protocolEnd().id, 'napcat');
@@ -81,7 +81,7 @@ test('无头内核不托管；切成 NapCat 后 LLBot 也不会被拉起', async
     assert.equal(kernel.napcat.running(), false);
     assert.equal(ANY(kernel.napcat.status()).managed, undefined, '状态里不再有托管字段');
     assert.match(String(ANY(kernel.napcat.status()).webuiUrl), /^http:\/\/127\.0\.0\.1:6099\/webui\?token=[0-9a-f]{12}$/);
-    kernel.config.config.onebot.flavor = 'llbot';
+    ANY(kernel.config.config.onebot).flavor = 'llbot';
     assert.equal(kernel.protocolEnd().id, 'llbot');
   } finally {
     await kernel.shutdown();
@@ -117,7 +117,7 @@ test('登录判定看协议端自报的在线，不看反向 WS：QQ 退了 WS �
   const kernel = new Kernel({ dataDir, noApi: true });
   const onebot = ANY(kernel.config.config.onebot);
   onebot.port = 30000 + (process.pid % 20000);
-  kernel.config.config.ui.port = 41000 + (process.pid % 8000);
+  ANY(kernel.config.config.ui).port = 41000 + (process.pid % 8000);
   await kernel.boot();
   const server = await startApiServer(kernel);
   const base = `http://127.0.0.1:${kernel.config.config.ui.port}`;
@@ -147,7 +147,7 @@ test('API：换端入口已删（flavor 只认 config.json 手改）；检测逐
   const kernel = new Kernel({ dataDir, noApi: true });
   const onebot = ANY(kernel.config.config.onebot);
   onebot.port = 30000 + (process.pid % 20000);
-  kernel.config.config.ui.port = 41000 + (process.pid % 8000);
+  ANY(kernel.config.config.ui).port = 41000 + (process.pid % 8000);
   await kernel.boot();
   const server = await startApiServer(kernel);
   const base = `http://127.0.0.1:${kernel.config.config.ui.port}`;
@@ -166,7 +166,7 @@ test('API：换端入口已删（flavor 只认 config.json 手改）；检测逐
     assert.equal(ANY(ANY(JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf-8'))).onebot).flavor, 'llbot', 'config API 不落盘换端');
 
     // 与手改 config.json 等价：flavor 被改后（启动读取或手改内存），状态如实反映当前协议端
-    kernel.config.config.onebot.flavor = 'napcat';
+    ANY(kernel.config.config.onebot).flavor = 'napcat';
     assert.equal((await get('/api/login/status')).protocol, 'napcat');
     assert.equal(kernel.llbot.running(), false);
     assert.equal(kernel.napcat.running(), false);

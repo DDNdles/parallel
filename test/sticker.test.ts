@@ -352,7 +352,7 @@ test('真实 HTTP：原始字节上传可用（桌面端 postRaw 那条路）', 
     const resp = await fetch(base + '/api/plugin/sticker/upload?name=' + encodeURIComponent('直传.png'), {
       method: 'POST',
       headers: { 'x-auth-token': token, 'content-type': 'image/png' },
-      body: png(51),
+      body: new Uint8Array(png(51)),
     });
     assert.equal(resp.status, 200);
     const data = (await resp.json()) as any;

@@ -60,13 +60,13 @@ test('引用 bot 的出站消息：出站落账带 messageId，入站回查成 r
     assert.equal((out.data as { messageId?: string }).messageId, '424242', '出站条目必须存协议端消息号');
 
     mock.sendGroupMessage({
-      groupId: Number(groupId), userId: '10001', text: '这个',
+      groupId: Number(groupId), userId: 10001, text: '这个',
       // reply 段在正文之前，和真实协议端一致
       extraSegments: [{ type: 'reply', data: { id: '424242' } }],
     });
 
     const inbound = await until(
-      () => kernel.sessionLog.tail(groupId, 'group').find((e) => e.type === 'message_in' && e.text.includes('424242')),
+      () => kernel.sessionLog.tail(groupId, 'group').find((e) => e.type === 'message_in' && (e.text ?? '').includes('424242')),
       5000, '入站落账',
     );
     const quote = (inbound.data as { replyTo?: { userId?: string; nickname?: string; text?: string } }).replyTo;

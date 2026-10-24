@@ -8,7 +8,7 @@ import { newId } from '../../kernel/util/misc.ts';
 //
 //  - 文生图：prompt → gemini-3-pro-image:generateContent
 //  - 参考图：把会话沙箱里的本地图片读成 base64，放进 inline_data
-//  - 产物：PNG 写进当前会话沙箱 imagegen/，模型随后用 send_file 发出
+//  - 产物：写进当前会话沙箱 imagegen/，扩展名按返回字节的真实格式（PNG/JPEG/WebP）
 //  - 额度：普通成员每个自然周（周一起算）N 张；主人/管理员默认不限
 //  - 失败不计数：先占额度，API/写盘失败再退回去
 //  - REST：/api/plugin/imagegen/{gallery,image,usage,generate}（桌面端「生图」页）
@@ -35,6 +35,8 @@ export interface GalleryImage {
   userId: string;
   chatId: string;
   ts: number;
+  /** 落盘时嗅探出的真实格式（Gemini 可能回 JPEG/WebP 而不是 PNG）；旧记录缺失时回退嗅探 */
+  mime?: string;
   /**
    * 内部定位信息：REST /image 要按「当时那个会话的沙箱」把文件读出来。
    * /gallery 不返回这一项（对外字段与接口约定一致）。
@@ -79,8 +81,8 @@ function sniffImageMime(buf: Buffer): string | undefined {
   return undefined;
 }
 
-/** 落盘文件名：只留最后一段、去掉非法字符，统一按 PNG 存 */
-function safeFilename(raw: string, id: string): string {
+/** 落盘文件名：只留最后一段、去掉非法字符，扩展名跟真实格式走（Gemini 可能回 JPEG/WebP） */
+function safeFilename(raw: string, id: string, mime: string): string {
   const last = String(raw ?? '').replace(/\\/g, '/').split('/').pop() ?? '';
   let name = last
     .replace(/[\\/:*?"<>|\x00-\x1f\s]+/g, '_')
@@ -89,7 +91,8 @@ function safeFilename(raw: string, id: string): string {
     .slice(0, 80)
     .trim();
   if (!name) name = id;
-  return `${name}.png`;
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'png';
+  return `${name}.${ext}`;
 }
 
 /** Gemini 的 HTTP 错误 → 一句能给普通用户看的中文（不泄露内部路径/代码） */
@@ -122,6 +125,8 @@ export function setup(ctx: PluginContext): void {
       apiKey: String(ctx.userConfig.apiKey ?? '').trim(),
       // 允许用户把模型写成 models/gemini-...（照抄文档时很常见），拼 URL 前去掉前缀
       model: String(ctx.userConfig.model ?? '').trim().replace(/^models\//, '') || 'gemini-3-pro-image',
+      // 留空走官方地址；直连不通的环境（典型：国内）可填本地网关/代理，如 http://127.0.0.1:8045
+      baseUrl: String(ctx.userConfig.baseUrl ?? '').trim().replace(/\/+$/, '') || 'https://generativelanguage.googleapis.com',
       weeklyQuota: Number.isFinite(quota) && quota >= 0 ? Math.floor(quota) : 3,
       ownerUnlimited: ctx.userConfig.ownerUnlimited !== false,
     };
@@ -216,13 +221,14 @@ export function setup(ctx: PluginContext): void {
   async function callGemini(input: {
     apiKey: string;
     model: string;
+    baseUrl: string;
     prompt: string;
     refs: { mime: string; data: string }[];
   }): Promise<{ ok: true; data: Buffer } | { ok: false; error: string }> {
     const parts: Record<string, unknown>[] = [{ text: input.prompt }];
     for (const r of input.refs) parts.push({ inline_data: { mime_type: r.mime, data: r.data } });
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(input.model)}:generateContent`;
+    const url = `${input.baseUrl}/v1beta/models/${encodeURIComponent(input.model)}:generateContent`;
     let resp: Response;
     try {
       resp = await fetch(url, {
@@ -291,7 +297,7 @@ export function setup(ctx: PluginContext): void {
       return { ok: false, code: 'input', error: `生图失败：画面描述太长了（上限 ${PROMPT_MAX_CHARS} 字），精简一点再试。` };
     }
 
-    const { apiKey, model, weeklyQuota, ownerUnlimited } = cfg();
+    const { apiKey, model, baseUrl, weeklyQuota, ownerUnlimited } = cfg();
     if (!apiKey) {
       return { ok: false, code: 'config', error: '生图失败：还没配置 Gemini API Key，请主人在桌面端「插件 → 生图」里填一个。' };
     }
@@ -319,14 +325,16 @@ export function setup(ctx: PluginContext): void {
     // 占位发生在 await 之前，同一用户的并发调用不会都判定为"还有额度"。
     if (limited) bumpUsage(week, opts.userId, 1);
 
-    const api = await callGemini({ apiKey, model, prompt, refs });
+    const api = await callGemini({ apiKey, model, baseUrl, prompt, refs });
     if (!api.ok) {
       if (limited) bumpUsage(week, opts.userId, -1);
       return { ok: false, code: 'api', error: api.error };
     }
 
     const id = newId('img_');
-    const relPath = `imagegen/${safeFilename(opts.filename ?? '', id)}`;
+    // 按返回字节的真实格式定扩展名（模型可能回 JPEG/WebP，写错扩展名 QQ 端会显示异常）；认不出的按 PNG 兜底
+    const mime = sniffImageMime(api.data) ?? 'image/png';
+    const relPath = `imagegen/${safeFilename(opts.filename ?? '', id, mime)}`;
     let written: { relPath: string; size: number };
     try {
       written = ctx.sandbox.write(opts.chat, relPath, api.data);
@@ -344,6 +352,7 @@ export function setup(ctx: PluginContext): void {
       chatId: opts.chat.chatId,
       ts: Date.now(),
       chatRef: opts.chat,
+      mime,
     });
     return { ok: true, id, path: written.relPath, size: written.size };
   }
@@ -352,7 +361,7 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'generate_image',
-    description: '画一张图（文生图；给了 refs 就用会话沙箱里的图片当参考）。产出 PNG，落在当前会话沙箱的 imagegen/ 目录，返回路径与大小。',
+    description: '画一张图（文生图；给了 refs 就用会话沙箱里的图片当参考）。产物落在当前会话沙箱的 imagegen/ 目录（PNG/JPEG 跟随模型返回格式），返回路径与大小。',
     promptSnippet: '用 Gemini 画图（文生图 / 参考图），产物落会话沙箱 imagegen/',
     promptGuidelines: [
       '用户要图（画一张、生成图片、按描述作图、照这张图改）时直接用 generate_image 画，画完把返回的路径用 send_file 发给对方，不要只报路径。',
@@ -369,7 +378,7 @@ export function setup(ctx: PluginContext): void {
           items: { type: 'string' },
           description: '参考图：会话沙箱内的相对路径，最多 4 张（可选）',
         },
-        filename: { type: 'string', description: '可选文件名（落在 imagegen/ 下，统一补 .png）' },
+        filename: { type: 'string', description: '可选文件名（落在 imagegen/ 下，按实际格式补扩展名）' },
       },
       required: ['prompt'],
     },
@@ -432,7 +441,8 @@ export function setup(ctx: PluginContext): void {
     try {
       const abs = insideSandbox(rec.chatRef ?? desktopChat(), rec.file);
       const buf = readFileSync(abs);
-      return { headers: { 'content-type': 'image/png' }, body: buf };
+      // 旧记录没存 mime：现场嗅探，别把 JPEG 当 PNG 发；认不出就按二进制流给
+      return { headers: { 'content-type': rec.mime ?? sniffImageMime(buf) ?? 'application/octet-stream' }, body: buf };
     } catch (e) {
       return { status: 404, body: { ok: false, error: `图片读不到：${(e as Error).message}` } };
     }

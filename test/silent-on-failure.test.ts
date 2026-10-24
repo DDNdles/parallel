@@ -5,8 +5,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Kernel } from '../src/kernel/kernel.ts';
+import type { KernelConfig } from '../src/kernel/config.ts';
 import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 import { MockOneBot } from './helpers/mock-onebot.ts';
+
+/** DEFAULT_CONFIG 以 as const 声明（深只读 + 字面量类型）；测试要在启动前后就地改配置，
+ *  这里取它的「可写、字面量放宽」视图 —— 只影响类型层，不引入任何运行时行为。 */
+type Writable<T> =
+  T extends string ? string
+  : T extends number ? number
+  : T extends boolean ? boolean
+  : T extends readonly (infer U)[] ? Writable<U>[]
+  : T extends object ? { -readonly [K in keyof T]: Writable<T[K]> }
+  : T;
+type WritableConfig = Writable<KernelConfig>;
 
 /**
  * 模型失败 = 彻底沉默（用户定稿）：没接模型 / 额度耗尽 / 模型吐空内容时，
@@ -17,6 +29,7 @@ let kernel: Kernel;
 let dataDir: string;
 let mock: MockOneBot;
 let mockProvider: MockEngine;
+let cfg: WritableConfig;
 
 const GROUP = 321;
 const MEMBER = 10002;
@@ -46,21 +59,22 @@ const ONEBOT_PORT = 30000 + (process.pid % 20000); // 随机端口，与其他�
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'parallel-silent-'));
   kernel = new Kernel({ dataDir, noApi: true });
-  kernel.config.config.risk.replyRatePerMin = 10_000;
+  cfg = kernel.config.config as WritableConfig;
+  cfg.risk.replyRatePerMin = 10_000;
   kernel.chat.setRatePerMin(10_000);
   // 打字延迟压到 HDSI 下限（公式不可关闭），本用例只关心"发不发"，不关心节奏
-  const hlOut = kernel.config.config.humanlike.outgoing;
+  const hlOut = cfg.humanlike.outgoing;
   hlOut.typingBaseDelaySeconds = 0;
   hlOut.typingMaxDelaySeconds = 0;
   hlOut.typingJitterRatio = 0;
-  kernel.config.config.onebot.port = ONEBOT_PORT;
-  kernel.config.config.masterIds = [String(MASTER)];
-  (kernel.config.config.providers as Record<string, unknown>).mock = {
+  cfg.onebot.port = ONEBOT_PORT;
+  cfg.masterIds = [String(MASTER)];
+  (cfg.providers as Record<string, unknown>).mock = {
     label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
     models: [{ id: 'mock-1', enabled: true }],
   };
-  kernel.config.config.llm.activeProvider = 'mock';
-  kernel.config.config.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.activeProvider = 'mock';
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
   mockProvider = (kernel.llm as unknown as { providers: Map<string, MockEngine> }).providers.get('mock')!;
   await kernel.boot();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
@@ -82,7 +96,7 @@ after(async () => {
 });
 
 test('没接模型（链空）：群消息得到完全沉默', async () => {
-  const llm = kernel.config.config.llm;
+  const llm = cfg.llm;
   llm.chatChain = [];
   llm.activeProvider = ''; // chainConfig 对空链会回退 activeProvider，两处都清掉才是真"没接模型"
   mock.actions.length = 0;

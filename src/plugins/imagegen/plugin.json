@@ -31,6 +31,11 @@
       "default": "gemini-3-pro-image",
       "description": "生图模型名（默认 gemini-3-pro-image，可改成别的 Gemini 生图模型）"
     },
+    "baseUrl": {
+      "type": "string",
+      "default": "",
+      "description": "Gemini 接口地址（留空 = 官方 generativelanguage.googleapis.com；走本地网关或代理时填，如 http://127.0.0.1:8045）"
+    },
     "weeklyQuota": {
       "type": "number",
       "default": 3,

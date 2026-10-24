@@ -7,11 +7,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Bus, busEvents } from '../src/kernel/bus.ts';
-import { ConfigStore } from '../src/kernel/config.ts';
+import { ConfigStore, type KernelConfig } from '../src/kernel/config.ts';
 import { Db } from '../src/kernel/db.ts';
 import { ErrorCenter } from '../src/kernel/errors.ts';
 import { LlmService, isHardUnavailable, isProviderWideFailure } from '../src/kernel/services/llm.ts';
 import type { LLMChatRequest } from '../src/kernel/types.ts';
+
+/** DEFAULT_CONFIG 以 as const 声明（深只读 + 字面量类型）；测试要反复改链与阈值，
+ *  这里取它的「可写、字面量放宽」视图 —— 只影响类型层，不引入任何运行时行为。 */
+type Writable<T> =
+  T extends string ? string
+  : T extends number ? number
+  : T extends boolean ? boolean
+  : T extends readonly (infer U)[] ? Writable<U>[]
+  : T extends object ? { -readonly [K in keyof T]: Writable<T[K]> }
+  : T;
 
 /**
  * 模型优先级链与掉线降级（本地假服务器，不打真实 API）：
@@ -32,6 +42,8 @@ let baseUrl = '';
 let dataDir = '';
 let bus: Bus;
 let config: ConfigStore;
+/** config.config 的可写视图（同一对象）：链/阈值/思考强度的就地读写都走它 */
+let cfg: Writable<KernelConfig>;
 let errors: ErrorCenter;
 let llm: LlmService;
 
@@ -77,6 +89,7 @@ before(async () => {
   bus = new Bus();
   errors = new ErrorCenter(bus, { dataDir });
   config = new ConfigStore(dataDir, bus, errors);
+  cfg = config.config as Writable<KernelConfig>;
   llm = new LlmService(config, errors, new Db(dataDir), bus);
 
   const providers = config.config.providers as Record<string, any>;
@@ -98,8 +111,8 @@ before(async () => {
   // 思考等级由每个模型自己声明；good 只开 low/high 两档
   providers.good.models[0].reasoningLevels = ['low', 'high'];
   llm.syncCustomProviders();
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 1;
 });
 
 after(() => {
@@ -136,8 +149,8 @@ test('错误分类：连不上/鉴权/缺模型算硬故障，429/500 仍按软�
 test('硬不可用（连不上）不等阈值：立刻挪位置、冷却，下一次不再先白试', async () => {
   reset();
   errors.clear();
-  config.config.llm.failoverThreshold = 5;
-  config.config.llm.chatChain = [{ provider: 'dead', model: 'dead-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 5;
+  cfg.llm.chatChain = [{ provider: 'dead', model: 'dead-1' }, { provider: 'good', model: 'good-1' }];
 
   const resp = await llm.chat(req(), {});
   assert.equal(resp.content, '好');
@@ -156,15 +169,15 @@ test('硬不可用（连不上）不等阈值：立刻挪位置、冷却，下�
   assert.ok(recs.every((e) => e.level === 'warn'), '已经有人接上就不算 error');
   assert.match(recs[0].message, /已自动切换模型/);
 
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 1;
   llm.resetFailover();
 });
 
 test('同一家 provider 的 transport 故障只算一次：后续同家条目这轮直接跳过', async () => {
   reset();
-  config.config.llm.failoverThreshold = 5;
-  config.config.llm.chatChain = [
+  cfg.llm.failoverThreshold = 5;
+  cfg.llm.chatChain = [
     { provider: 'dead', model: 'dead-1' },
     { provider: 'dead', model: 'dead-2' },
     { provider: 'good', model: 'good-1' },
@@ -176,16 +189,16 @@ test('同一家 provider 的 transport 故障只算一次：后续同家条目�
   assert.equal(view[0].fails, 1, '第一条记一次失败');
   assert.equal(view[1].fails, 0, '同家的第二条没有再白发一次请求');
   assert.equal(view[2].state, 'current', '指针落在真正接上的那条上');
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 1;
   llm.resetFailover();
 });
 
 test('work 链走 chainStreamFn 时同样会降级（派活实际走的就是这条路径）', async () => {
   reset();
   errors.clear();
-  config.config.llm.failoverThreshold = 5;
-  config.config.llm.workChain = [{ provider: 'dead', model: 'dead-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 5;
+  cfg.llm.workChain = [{ provider: 'dead', model: 'dead-1' }, { provider: 'good', model: 'good-1' }];
   const fn = llm.chainStreamFn('work');
   const stream = await fn({} as any, { messages: [{ role: 'user', content: [{ type: 'text', text: '在吗' }], timestamp: Date.now() }] } as any, {});
   let done: any = null;
@@ -199,14 +212,14 @@ test('work 链走 chainStreamFn 时同样会降级（派活实际走的就是这
   assert.equal(llm.servingLabel('work'), 'good:good-1');
   const recs = errors.list({ category: 'provider' });
   assert.ok(recs.every((e) => e.level === 'warn'), '中途接上只留 warn');
-  config.config.llm.workChain = [];
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.workChain = [];
+  cfg.llm.failoverThreshold = 1;
   llm.resetFailover();
 });
 
 test('阈值 2：只掉一次不挪位置，连续两次才切下一个', async () => {
   reset();
-  config.config.llm.failoverThreshold = 2;
+  cfg.llm.failoverThreshold = 2;
   await llm.chat(req(), {});
   assert.equal(llm.chainsView().chat[0].state, 'current', '第一条仍是当前位置（只失败了 1 次）');
   assert.equal(llm.chainsView().chat[0].fails, 1);
@@ -216,12 +229,12 @@ test('阈值 2：只掉一次不挪位置，连续两次才切下一个', async 
   assert.equal(llm.chainsView().chat[1].state, 'current', '连续两次掉线后位置挪到第二条');
   assert.equal(llm.chainsView().chat[0].fails, 2);
   assert.equal(hits[0], 'bad-1', '每次调用仍从当前位置往后依次试');
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.failoverThreshold = 1;
 });
 
 test('降级切换向桌面端发 model.failover 事件', async () => {
   reset();
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.failoverThreshold = 1;
   const got: any[] = [];
   const off = bus.on(busEvents.modelFailover, (d: unknown) => got.push(d));
   await llm.chat(req(), {});
@@ -234,21 +247,21 @@ test('降级切换向桌面端发 model.failover 事件', async () => {
 
 test('成功之后清零该条的失败计数', async () => {
   reset();
-  config.config.llm.failoverThreshold = 3;
+  cfg.llm.failoverThreshold = 3;
   await llm.chat(req(), {});                       // bad 失败 1 次
   assert.equal(llm.chainsView().chat[0].fails, 1);
   llm.resetFailover();
-  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }, { provider: 'bad', model: 'bad-1' }];
+  cfg.llm.chatChain = [{ provider: 'good', model: 'good-1' }, { provider: 'bad', model: 'bad-1' }];
   await llm.chat(req(), {});                       // good 直接成功
   assert.equal(llm.chainsView().chat[0].fails, 0);
   assert.equal(llm.chainsView().chat[0].state, 'current');
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
-  config.config.llm.failoverThreshold = 1;
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.failoverThreshold = 1;
 });
 
 test('已经流式吐过字就不再换模型（否则用户看到两份回答）', async () => {
   reset();
-  config.config.llm.chatChain = [{ provider: 'flaky', model: 'flaky-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.chatChain = [{ provider: 'flaky', model: 'flaky-1' }, { provider: 'good', model: 'good-1' }];
   let text = '';
   await assert.rejects(
     () => llm.chat(req(), { onDelta: (d) => { text += d.text ?? ''; } }),
@@ -257,7 +270,7 @@ test('已经流式吐过字就不再换模型（否则用户看到两份回答�
   );
   assert.equal(text, '半', '半个回答已经推给桌面端了');
   assert.equal(hits.length, 1, '只打了第一条，没有顺延');
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
 });
 
 test('用户打断（abort）不计掉线、不降级', async () => {
@@ -280,40 +293,40 @@ test('配置级不可用（未启用）也走降级', async () => {
 
 test('整条链都不可用时抛最后一条的错误，并记进报错中心', async () => {
   reset();
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }];
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }];
   // pi-ai 的错误文案：<状态码> "<对端 body>"（自研实现以前是 'HTTP 500 …'）
   await assert.rejects(() => llm.chat(req(), {}), /500/);
   assert.equal(hits.length, 1, '单条链没有可顺延的对象');
   assert.ok(errors.list().some((e) => e.category === 'provider' && /bad: /.test(e.message)));
-  config.config.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
+  cfg.llm.chatChain = [{ provider: 'bad', model: 'bad-1' }, { provider: 'good', model: 'good-1' }];
 });
 
 test('work 链独立：空 = 没有可用模型（不跟随 chat）；配了就用自己', () => {
-  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
-  config.config.llm.workChain = [];
+  cfg.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
+  cfg.llm.workChain = [];
   assert.equal(llm.servingLabel('work'), '—', '工作链没配就是没配，不再借聊天链');
   assert.deepEqual(llm.chainsView().work, [], '左栏不该凭空长出条目');
-  config.config.llm.workChain = [{ provider: 'good', model: 'good-1' }];
+  cfg.llm.workChain = [{ provider: 'good', model: 'good-1' }];
   assert.equal(llm.servingLabel('work'), 'good:good-1');
-  config.config.llm.workChain = [];
-  config.config.llm.chatChain = [];
+  cfg.llm.workChain = [];
+  cfg.llm.chatChain = [];
 });
 
 test('链为空时按 activeProvider 兜底（手改 config.json 仍然生效）', () => {
-  const saved = config.config.llm.chatChain;
-  config.config.llm.chatChain = [];
-  config.config.llm.activeProvider = 'good';
+  const saved = cfg.llm.chatChain;
+  cfg.llm.chatChain = [];
+  cfg.llm.activeProvider = 'good';
   assert.deepEqual(llm.chainConfig('chat'), [{ provider: 'good', model: 'good-1' }]);
   assert.deepEqual(llm.chainsView().chat, [], '左栏只画配置里真写过的条目，兜底那条不占位');
   assert.equal(llm.activeProviderId(), 'good');
   assert.equal(llm.isActiveUsable().ok, true);
-  config.config.llm.chatChain = saved;
+  cfg.llm.chatChain = saved;
 });
 
 test('思考强度：每个模型单独设置，只认该模型声明的档位', async () => {
   reset();
-  config.config.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
-  config.config.llm.modelReasoning = { 'good|good-1': 'high' };
+  cfg.llm.chatChain = [{ provider: 'good', model: 'good-1' }];
+  cfg.llm.modelReasoning = { 'good|good-1': 'high' };
   assert.deepEqual(llm.reasoningLevelsFor('good', 'good-1'), ['low', 'high']);
   assert.equal(llm.reasoningFor('good', 'good-1'), 'high');
 
@@ -321,10 +334,10 @@ test('思考强度：每个模型单独设置，只认该模型声明的档位',
   assert.equal(String(bodies[bodies.length - 1]?.reasoning_effort ?? ''), 'high',
     `模型的思考强度要进请求体：${JSON.stringify(bodies[bodies.length - 1])}`);
 
-  config.config.llm.modelReasoning['good|good-1'] = 'not-a-level';
+  cfg.llm.modelReasoning['good|good-1'] = 'not-a-level';
   assert.equal(llm.reasoningFor('good', 'good-1'), '', '非法值按默认处理');
 
-  config.config.llm.modelReasoning['bad|bad-1'] = 'high';
+  cfg.llm.modelReasoning['bad|bad-1'] = 'high';
   assert.equal(llm.reasoningFor('bad', 'bad-1'), '', '没声明等级模型不生效');
-  config.config.llm.modelReasoning = {};
+  cfg.llm.modelReasoning = {};
 });
