@@ -11,7 +11,7 @@ import { busEvents } from '../src/kernel/bus.ts';
 // ============================================================
 // 表情包插件（2026-10-24 重写）
 //
-//  1. onChatMessage 自动收图：内容去重、每群每日上限、跳过 bot 自己；
+//  1. onChatMessage 自动收图：内容去重、每会话（群/私聊）每日上限、跳过 bot 自己、私聊开关；
 //  2. send_sticker：按描述/标签挑图、发出去、计数、冷却；空库不注入提示；
 //  3. steal_sticker：消息内与引用消息里的图都能收，没图明说；
 //  4. REST：列表/改描述/上传（原始字节或 base64）/取图/删除/库容；
@@ -136,6 +136,45 @@ test('onChatMessage：自动收图去重、每日上限、跳过 bot 自己', as
     const keys = k.kernel.db.all<{ key: string }>("SELECT key FROM plugin_kv WHERE plugin_id='sticker'").map((r) => r.key);
     assert.ok(keys.includes('v2:library'));
     assert.ok(keys.every((x) => x.startsWith('v2:')), `出现了不带 v2: 前缀的键：${keys.join(',')}`);
+  } finally {
+    await k.cleanup();
+  }
+});
+
+test('自动收图：私聊默认也收，autoStealPrivate 关掉就回到只收群', async () => {
+  const k = await boot();
+  try {
+    // 2026-10-24 真机坑：主人在私聊连甩 29 张表情一张没进库——老规则把私聊整段跳过
+    await k.configure({ autoSteal: true, stealDailyCap: 10 });
+    const dir = join(k.dataDir, 'src');
+    mkdirSync(dir, { recursive: true });
+    const write = (name: string, seed: number) => {
+      const p = join(dir, name);
+      writeFileSync(p, png(seed));
+      return p;
+    };
+
+    const privEvent = (path: string) => eventOf({ chatId: '30959' }, [{ name: 'p.png', path }], {
+      type: 'private', chatId: '30959',
+    });
+    await k.plugin().hooks.onChatMessage!(privEvent(write('p1.png', 61)));
+    assert.equal((await k.library()).length, 1, '私聊的图默认也要自动收');
+
+    // 关掉 autoStealPrivate：私聊不收，群聊照收
+    await k.configure({ autoStealPrivate: false });
+    await k.plugin().hooks.onChatMessage!(privEvent(write('p2.png', 62)));
+    assert.equal((await k.library()).length, 1, 'autoStealPrivate 关掉后私聊不收');
+    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'g1.png', path: write('g1.png', 63) }]));
+    assert.equal((await k.library()).length, 2, '群聊不受影响');
+
+    // 私聊与群聊的每日额度各算各的（换个新私聊：30959 那个今天已用掉 1 张，额度要跨配置保留）
+    await k.configure({ autoSteal: true, autoStealPrivate: true, stealDailyCap: 1 });
+    await k.plugin().hooks.onChatMessage!(eventOf(k.chat, [{ name: 'g2.png', path: write('g2.png', 64) }]));
+    assert.equal((await k.library()).length, 2, '群聊额度用完');
+    await k.plugin().hooks.onChatMessage!(eventOf({ chatId: '30960' }, [{ name: 'p3.png', path: write('p3.png', 65) }], {
+      type: 'private', chatId: '30960',
+    }));
+    assert.equal((await k.library()).length, 3, '另一个私聊的额度独立，仍可收');
   } finally {
     await k.cleanup();
   }
@@ -289,21 +328,30 @@ test('REST：列表/改描述/上传/取图/删除/库容', async () => {
     assert.equal(missing.status, 404);
     assert.equal(JSON.parse(String(missing.body)).ok, false);
 
-    // 非图片 / 超 2MB：都拒收
+    // 非图片 / 超 4MB：都拒收
     assert.equal((await k.rest('POST', '/upload', { name: 'x.txt' }, Buffer.from('not an image'))).status, 415);
-    assert.equal((await k.rest('POST', '/upload', { name: 'big.png' }, Buffer.concat([png(22), Buffer.alloc(2 * 1024 * 1024)]))).status, 413);
+    assert.equal((await k.rest('POST', '/upload', { name: 'big.png' }, Buffer.concat([png(22), Buffer.alloc(4 * 1024 * 1024)]))).status, 413);
 
-    // 真实 HTTP 的 JSON 分支也能用：{"data":"<base64>"}
+    // 真实 HTTP 的 JSON 分支也能用：{"data":"<base64>"}；desc/tags 可点名（回填脚本走的就是这条）
     const b64 = await k.restJson('POST', '/upload', { name: 'base64.png' }, { data: png(23).toString('base64') });
     assert.equal(b64.ok, true);
     assert.equal((await k.library()).length, 2);
+    const withDesc = await k.restJson('POST', '/upload', {}, {
+      data: png(26).toString('base64'), desc: '猫咪捂脸', tags: '猫, 搞笑',
+    });
+    assert.equal(withDesc.ok, true);
+    let lib2 = await k.library();
+    const wd = lib2.find((s: any) => s.id === withDesc.id);
+    assert.equal(wd.desc, '猫咪捂脸');
+    assert.deepEqual(wd.tags, ['猫', '搞笑']);
+    assert.equal(lib2.length, 3);
 
     // 删除：记录与文件一起走
     assert.equal((await k.restJson('POST', '/delete', {}, { id: up.id })).ok, true);
     assert.equal((await k.rest('GET', '/image', { id: up.id })).status, 404);
     const files = existsSync(join(k.dataDir, 'stickers')) ? readdirSync(join(k.dataDir, 'stickers')) : [];
     assert.equal(files.some((f) => f.startsWith(up.id)), false, '删除要连文件一起删');
-    assert.equal((await k.library()).length, 1);
+    assert.equal((await k.library()).length, 2);
 
     // 库容：maxLibrary=1 时再传就 409（重载后端点仍然可用）
     await k.configure({ maxLibrary: 1 });

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtempSync, readFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8,6 +9,17 @@ import { Kernel } from '../src/kernel/kernel.ts';
 import { startApiServer } from '../src/kernel/api/server.ts';
 import { depsReady, probeDeps, invalidateDepCache, type DepItem } from '../src/kernel/services/deps.ts';
 import { DEP_FETCHES, startDepFetch } from '../src/kernel/services/downloads.ts';
+
+/**
+ * 现挑没人听的端口。旧写法用 pid 推端口（30000+pid%20000 / 42000+pid%6000），
+ * 有些 pid 两个算式会撞同一个号：OneBot 先绑、API 再绑就 EADDRINUSE；
+ * 而 startApiServer 原本在 try 之外，一抛错 kernel.shutdown() 永远执行不到，
+ * 内核句柄泄漏把整个测试进程挂死（2026-10-24 真机复现过两次）。
+ */
+const freePort = () => new Promise<number>((res) => {
+  const s = createServer();
+  s.listen(0, '127.0.0.1', () => { const p = (s.address() as { port: number }).port; s.close(() => res(p)); });
+});
 
 /**
  * 初始环境检查页的后端契约：
@@ -94,12 +106,13 @@ test('API：/api/setup/deps 免 token、不碰协议端；install 在 noApi 内�
   const dataDir = mkdtempSync(join(tmpdir(), 'parallel-setup-api-'));
   const kernel = new Kernel({ dataDir, noApi: true });
   const ob = kernel.config.config.onebot as unknown as Record<string, unknown>;
-  ob.port = 30000 + (process.pid % 20000);
-  kernel.config.config.ui.port = 42000 + (process.pid % 6000);
+  ob.port = await freePort();
+  kernel.config.config.ui.port = await freePort();
   await kernel.boot();
-  const server = await startApiServer(kernel);
+  let server: Awaited<ReturnType<typeof startApiServer>> | null = null;
   const base = `http://127.0.0.1:${kernel.config.config.ui.port}`;
   try {
+    server = await startApiServer(kernel);
     // 不带 token 也要能读：这页排在拿到 token 之前
     const r = await fetch(`${base}/api/setup/deps`);
     assert.equal(r.status, 200);
@@ -124,7 +137,7 @@ test('API：/api/setup/deps 免 token、不碰协议端；install 在 noApi 内�
     assert.ok(Number(((await done.json()) as { setupDoneAt: number }).setupDoneAt) > 0);
     assert.ok(Number(JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf-8')).ui.setupDoneAt) > 0, '必须落盘');
   } finally {
-    server.close();
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
     await kernel.shutdown();
   }
 });

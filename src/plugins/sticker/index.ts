@@ -14,12 +14,14 @@ import type {
 //  - id = 图片内容的 sha256 前 16 位：同一张图换个文件名再发也不会收重；
 //  - 键全部带 v2: 前缀，防与旧版撞名；
 //  - 工具只走 chat 面：send_sticker 按描述/标签挑一张发，steal_sticker 把这条消息里的图收下；
-//  - 自动收图默认关（autoSteal）：开了也只收群聊、跳过 bot 自己、每群每天有硬上限；
+//  - 自动收图默认关（autoSteal）：开了群聊与私聊都收（私聊有单独开关 autoStealPrivate）、
+//    跳过 bot 自己、每个会话每天有硬上限；
 //  - 桌面端「表情包」页走本插件的 REST 端点（列表/看图/改描述/删除/上传）。
 // ============================================================
 
 const LIB_KEY = 'v2:library';
-const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+// 4MB：QQ 表情动图常见 3MB+（今天真机就有 3.4MB 的 GIF 被 2MB 上限拦掉），收到库里是要长期存的，再大就没边了
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_DESC = 80;
 const MAX_TAGS = 8;
 const TAG_MAX = 12;
@@ -252,7 +254,7 @@ export function setup(ctx: PluginContext): void {
   function addBytes(buf: Buffer, meta: { desc?: string; tags?: string[]; source?: StickerSource }): AddResult {
     if (!buf.length) return { ok: false, error: '没有收到图片数据', status: 400 };
     if (buf.length > MAX_IMAGE_BYTES) {
-      return { ok: false, error: `图片超过 2MB（${Math.round(buf.length / 1024)}KB），不收`, status: 413 };
+      return { ok: false, error: `图片超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB（${Math.round(buf.length / 1024)}KB），不收`, status: 413 };
     }
     const kind = sniffImage(buf);
     if (!kind) return { ok: false, error: '只收图片（png/jpg/gif/webp/bmp）', status: 415 };
@@ -288,7 +290,7 @@ export function setup(ctx: PluginContext): void {
       const st = statSync(abs);
       if (!st.isFile()) return { ok: false, error: '不是文件', status: 400 };
       if (st.size > MAX_IMAGE_BYTES) {
-        return { ok: false, error: `超过 2MB（${Math.round(st.size / 1024)}KB），不收`, status: 413 };
+        return { ok: false, error: `超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB（${Math.round(st.size / 1024)}KB），不收`, status: 413 };
       }
       return addBytes(readFileSync(abs), meta);
     } catch {
@@ -339,7 +341,7 @@ export function setup(ctx: PluginContext): void {
     return ids.includes(String(event.userId));
   }
 
-  // ---------- 每日自动收图计数（每群一个，跨天自动归零） ----------
+  // ---------- 每日自动收图计数（每个会话一个：群与私聊各算各的，跨天自动归零） ----------
 
   const dailyKeyOf = (chatKey: string): string => `v2:daily:${chatKey}`;
 
@@ -450,8 +452,9 @@ export function setup(ctx: PluginContext): void {
 
   ctx.hooks.onChatMessage = (event: ChatEvent): void => {
     if (!cfgBool('autoSteal', false)) return;
-    // 只收群里的图：私聊图片不替用户做主
-    if (event.type !== 'group') return;
+    // 私聊也收：把图直接发给 bot 本身就带「给它收」的意思（2026-10-24 主人私聊甩了 29 张表情
+    // 一张没进库，就是这条 group-only 的老规则拦的）。不想要这层可用 autoStealPrivate 单独关掉。
+    if (event.type !== 'group' && !cfgBool('autoStealPrivate', true)) return;
     if (isSelfEvent(event)) return;
 
     const cap = cfgNum('stealDailyCap', 50, 0, 1000);
@@ -586,9 +589,15 @@ export function setup(ctx: PluginContext): void {
     if (!buf || !buf.length) {
       return fail(400, '没收到图片字节：请用原始字节 POST（content-type 非 JSON），或传 {"data":"<base64>"}');
     }
-    // 文件名当初始描述：上传「狂笑.png」就能用「狂笑」匹配到
-    const desc = name ? cleanText(basename(name).replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' '), MAX_DESC) : '';
-    const r = addBytes(buf, { desc });
+    // JSON 分支可以点名描述与标签（脚本回填用）；没给就照旧拿文件名当描述——上传「狂笑.png」就能用「狂笑」匹配到
+    let desc = name ? cleanText(basename(name).replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' '), MAX_DESC) : '';
+    let tags: string[] = [];
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) && !(req.body instanceof Uint8Array)) {
+      const o = req.body as Record<string, unknown>;
+      if (typeof o.desc === 'string') desc = cleanText(o.desc, MAX_DESC);
+      if (o.tags !== undefined) tags = cleanTags(o.tags);
+    }
+    const r = addBytes(buf, { desc, tags });
     if (!r.ok) return fail(r.status, r.error);
     return json({ ok: true, id: r.id, ...(r.duplicate ? { duplicate: true } : {}) });
   }));

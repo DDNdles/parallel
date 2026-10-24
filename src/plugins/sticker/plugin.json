@@ -1,8 +1,8 @@
 {
   "id": "sticker",
   "name": "表情包",
-  "version": "0.2.0",
-  "description": "bot 的表情包库：模型看情况发表情，也能把群里/消息里的图收进库里；桌面端「表情包」页可上传、改描述与标签。",
+  "version": "0.2.1",
+  "description": "bot 的表情包库：模型看情况发表情，也能把群里/私聊发的图收进库里；桌面端「表情包」页可上传、改描述与标签。",
   "author": {
     "name": "parallel"
   },
@@ -21,12 +21,17 @@
     "autoSteal": {
       "type": "boolean",
       "default": false,
-      "description": "自动把群里发的图片收进表情包库（关着也能用 steal_sticker 手动收）"
+      "description": "自动把消息里的图片收进表情包库（关着也能用 steal_sticker 手动收）"
+    },
+    "autoStealPrivate": {
+      "type": "boolean",
+      "default": true,
+      "description": "自动收图开着时，私聊里发的图也收（把图直接发给 bot 就是要它收）；关掉则只收群聊"
     },
     "stealDailyCap": {
       "type": "number",
       "default": 50,
-      "description": "每个群每天自动收图的上限（0 = 不自动收）"
+      "description": "每个会话（群/私聊各算各的）每天自动收图的上限（0 = 不自动收）"
     },
     "sendCooldownSec": {
       "type": "number",

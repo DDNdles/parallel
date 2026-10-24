@@ -705,18 +705,24 @@ export default function SettingsPage() {
 
           {sec === 'sticker' && (!plug || !pv ? <div className="mset-empty">读取中…</div> : !plug.sticker ? <div className="mset-empty">插件未启用，可在插件页开启。</div> : (() => {
             const sc = pv.sticker;
-            const on = sc.autoSteal !== false;
+            const on = sc.autoSteal === true;
+            const priv = sc.autoStealPrivate !== false;
             return (
               <>
                 <div className="mset-models">
                   <div className="mset-mrow">
-                    <span className="plg-v">自动收图<Hint text="群聊图片自动存进表情库" /></span>
+                    <span className="plg-v">自动收图<Hint text="消息里的图片自动存进表情库" /></span>
                     <span className="mset-macts"><Switch on={on}
                       onChange={() => setPlugVal('sticker', { autoSteal: !on }, 0)} /></span>
                   </div>
+                  <div className="mset-mrow">
+                    <span className="plg-v">私聊也收<Hint text="私聊里发给 bot 的图也自动收；关掉只收群聊" /></span>
+                    <span className="mset-macts"><Switch on={on && priv}
+                      onChange={() => setPlugVal('sticker', { autoStealPrivate: !priv }, 0)} /></span>
+                  </div>
                 </div>
                 <div className="set-grid" style={{ marginTop: 14 }}>
-                  <Num label="每日收图上限" hint="0 = 不自动收" value={Number(sc.stealDailyCap ?? 0)}
+                  <Num label="每日收图上限" hint="每个会话各算各的，0 = 不自动收" value={Number(sc.stealDailyCap ?? 0)}
                     onChange={(v) => setPlugVal('sticker', { stealDailyCap: v })} />
                   <Num label="发表情冷却（秒）" value={Number(sc.sendCooldownSec ?? 0)}
                     onChange={(v) => setPlugVal('sticker', { sendCooldownSec: v })} />
