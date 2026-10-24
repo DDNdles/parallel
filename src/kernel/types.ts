@@ -744,6 +744,8 @@ export interface GatedHistory {
 export interface WorkDispatchInput {
   chat: ChatRef;
   task: string;
+  /** 给进度条/列表看的单行短标（task 是多行原话正文时必填；缺省用 task 全文） */
+  label?: string;
   userId: string;
   nickname?: string;
   role: string;

@@ -80,8 +80,8 @@ export default function StickersPage({ cmd }: { cmd?: PageCmd }) {
     } catch (e) { setErr(`补标签失败：${(e as Error).message}`); }
     finally { setRetagging(false); }
   };
+  /** 删除不做确认（2026-10-24 用户定的：直接删） */
   const remove = async (s: Sticker) => {
-    if (!confirm(`删除表情包「${s.desc || s.id}」？`)) return;
     try {
       await post('/api/plugin/sticker/delete', { id: s.id });
       setErr('');

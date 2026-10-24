@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
-import { pickWorkRequester } from '../src/plugins/work/index.ts';
+import { pickWorkRequester, verbatimTaskOf, stripRelayNoise } from '../src/plugins/work/index.ts';
 
 // ============================================================
 // chat 面的 work 工具（2026-10-21，取代 /work 命令）
@@ -304,6 +304,75 @@ test('work_dispatch 归属：合批轮里按 requester / 原话找正主，不�
   assert.equal(pickWorkRequester({}, tctx, '整理成一份完整的 IEEE 论文文档').userId, '10001');
   // 与整批都不沾边 → 退回 carrier（旧行为），不乱改
   assert.equal(pickWorkRequester({}, tctx, 'zzz').userId, '10002');
+});
+
+test('一字不差传话：verbatimTaskOf 任务正文=发起人原话，chat 转述一个字不进；@/回复标记剥掉', () => {
+  const ev = (userId: string, nickname: string, text: string, segs: any[] = []) => ({
+    id: 'e' + Math.random().toString(36).slice(2), platform: 'qq', type: 'group' as const, chatId: '9501',
+    userId, nickname, senderRole: 'member' as const, segments: segs, text,
+    isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: 'member' as any,
+  });
+  const ask = ev('30003', '小明', '@3893163081 帮我画一张豆包和奶龙对打的图，豆包要占上风', [{ type: 'image', data: {} }]);
+  const mine2 = ev('30003', '小明', '就要之前说的那种风格');
+  const chatter = ev('10002', 'Lawrence', '哈哈这个梗好笑');
+  const tctx = { event: chatter, batch: [ask, mine2, chatter] };
+
+  // chat 的转述只当探针：在发起人的两条里挑重合最高那条（原话），转述本身不进任务
+  const v = verbatimTaskOf('生成一张豆包与奶龙战斗、豆包占上风的趣味插画', tctx, { userId: '30003', nickname: '小明' });
+  assert.ok(v.task.startsWith('用户原话（一字未改）：'));
+  assert.ok(v.task.includes('帮我画一张豆包和奶龙对打的图，豆包要占上风'), '原话一字不差');
+  assert.ok(!v.task.includes('趣味插画'), 'chat 的转述一个字不许进');
+  assert.ok(!v.task.includes('@3893163081'), '@ 是唤醒标记不是用户的话');
+  assert.ok(v.task.includes('——发起人：小明'));
+  assert.ok(v.task.includes('带了 1 张图'), '带的图要在任务里注明');
+  assert.ok(v.task.includes('Lawrence：哈哈这个梗好笑'), '同轮上下文按原文附上');
+  assert.equal(v.label, '帮我画一张豆包和奶龙对打的图，豆包要占上风', '短标=去@后的原话');
+
+  // 发起人只有一条：直接用它，不附「同轮对话」节（没有别的实质消息）
+  const solo = verbatimTaskOf('画图', { event: ask, batch: [ask] }, { userId: '30003', nickname: '小明' });
+  assert.ok(solo.task.includes('豆包要占上风'));
+  assert.ok(!solo.task.includes('同轮对话'));
+
+  // 发起人本轮没说话（只发了图/全是空）：空 task，调用方退回转述并注明
+  assert.equal(verbatimTaskOf('x', { event: chatter, batch: [chatter] }, { userId: '30003' }).task, '');
+
+  assert.equal(stripRelayNoise(' [回复:123] @3893163081 画一张 @all 的图 [图片] '), '画一张 @all 的图 [图片]');
+});
+
+test('work_dispatch 端到端：派出去的是用户原话（程序代传），列表短标=原话单行', async () => {
+  const g = await boot('9406');
+  g.mock.script.length = 0;
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const ev = (userId: string, nickname: string, text: string) => ({
+      id: 'e' + Math.random().toString(36).slice(2), platform: 'qq', type: 'group' as const, chatId: g.chat.chatId,
+      userId, nickname, senderRole: 'member' as const, segments: [], text,
+      isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: 'member' as any,
+    });
+    const ask = ev('30003', '小明', '帮我画一张豆包和奶龙对打的图，豆包要占上风');
+    ask.role = 'admin';   // 派活按提需求者的角色判：小明得是管理员这件活才派得出去
+    const chatter = ev('10002', 'Lawrence', '哈哈这个梗好笑');
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '画好了' } }] });
+    g.mock.script.push({ content: '好了' });
+    await dispatch.handler(
+      { task: '生成一张豆包与奶龙战斗、豆包占上风的趣味插画', requester: '小明' },
+      { event: chatter, batch: [ask, chatter], chat: g.chat, role: 'owner' as const } as any,
+    );
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+    const run = await until(() => g.kernel.workRunner.list(10, g.chatKey)[0], 8000, '任务开跑');
+    // 列表/进度条上的 task 是短标（原话单行），不是 chat 的转述
+    assert.equal(run.task, '帮我画一张豆包和奶龙对打的图，豆包要占上风');
+    // work 真正收到的任务正文（首轮请求里）是原话块，chat 的措辞不许出现
+    const call = await until(
+      () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('用户原话（一字未改）')),
+      8000, 'work 首轮请求',
+    );
+    const body = String(call.usersJoined);
+    assert.ok(body.includes('豆包要占上风'), '原话进任务正文');
+    assert.ok(!body.includes('趣味插画'), 'chat 转述不许进任务正文');
+  } finally {
+    await g.cleanup();
+  }
 });
 
 test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状态）', async () => {

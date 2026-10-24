@@ -954,7 +954,7 @@ function makeGatedWork(
       const chatKey = `${chat.type}_${chat.chatId}`;
       const pending = deps.work.takePending(chatKey, input.userId);
       const task = pending ? composeContinueTask(pending, input.task) : input.task;
-      const label = pending ? `${pending.label}（续）` : input.task;
+      const label = pending ? `${pending.label}（续）` : (input.label?.trim() || input.task);
       void deps.work.run({
         chat,
         task,

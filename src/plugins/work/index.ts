@@ -82,22 +82,13 @@ export function pickWorkRequester(
     if (who) return who;
   }
   // 字符二元组：task 通常是在重述某人的原话，重合最高的那条才是正主（并列取更晚的）
-  const grams = (s: string): Set<string> => {
-    const out = new Set<string>();
-    const t = s.replace(/\s+/g, '');
-    for (let i = 0; i + 1 < t.length; i++) {
-      const g = t.slice(i, i + 2);
-      if (/[\p{L}\p{N}]/u.test(g[0]) && /[\p{L}\p{N}]/u.test(g[1])) out.add(g);
-    }
-    return out;
-  };
-  const taskGrams = grams(task);
+  const taskGrams = bigramSet(task);
   let best: { e: ChatEvent; score: number } | undefined;
   if (taskGrams.size) {
     for (const e of batch) {
       if (!String(e.text ?? '').trim()) continue;
       let score = 0;
-      for (const g of grams(String(e.text))) if (taskGrams.has(g)) score++;
+      for (const g of bigramSet(String(e.text))) if (taskGrams.has(g)) score++;
       if (!best || score >= best.score) best = { e, score };
     }
   }
@@ -109,6 +100,59 @@ export function pickWorkRequester(
     };
   }
   return { userId: tctx.event.userId, nickname: tctx.event.nickname, role: tctx.event.role };
+}
+
+/** 字符二元组集合（中文不分词的相似度探针） */
+function bigramSet(s: string): Set<string> {
+  const out = new Set<string>();
+  const t = s.replace(/\s+/g, '');
+  for (let i = 0; i + 1 < t.length; i++) {
+    const g = t.slice(i, i + 2);
+    if (/[\p{L}\p{N}]/u.test(g[0]) && /[\p{L}\p{N}]/u.test(g[1])) out.add(g);
+  }
+  return out;
+}
+
+/** 原话里去掉唤醒标记（@号码、[回复:id]）——它们不是用户说的话；[图片]/[表情] 占位保留（是信息） */
+export function stripRelayNoise(t: string): string {
+  return t.replace(/ ?@\d+/g, '').replace(/\[回复:[^\]]*\]/g, '').trim();
+}
+
+/**
+ * 一字不差传话（2026-10-24 用户定调：chat 不许转述用户的意思）：
+ * 任务正文 = 发起人原话原文（程序从本轮消息里代传），chat 模型写的 task 只当相似度探针，
+ * 用来在发起人的几条消息里挑出提需求的那条——挑完就丢，一个字都不进任务。
+ * 同轮其他人的话按原样附在后面当上下文（也是原文，不算转述）。
+ * 返回 task=完整任务正文，label=给进度条看的单行短标。找不到可用原话返回空 task（调用方退回转述并注明）。
+ */
+export function verbatimTaskOf(
+  probe: string,
+  tctx: Pick<ToolContext, 'event' | 'batch'>,
+  who: { userId: string; nickname?: string },
+): { task: string; label: string } {
+  const batch = tctx.batch?.length ? tctx.batch : [tctx.event];
+  const mine = batch.filter((e) => e.userId === who.userId && String(e.text ?? '').trim());
+  if (!mine.length) return { task: '', label: '' };
+  const probeGrams = bigramSet(probe);
+  let chosen = mine[0];
+  let bestScore = -1;
+  for (const e of mine) {
+    let score = 0;
+    for (const g of bigramSet(String(e.text))) if (probeGrams.has(g)) score++;
+    if (score >= bestScore) { bestScore = score; chosen = e; }
+  }
+  const original = stripRelayNoise(String(chosen.text ?? ''));
+  if (!original) return { task: '', label: '' };
+  const label = original.replace(/\s+/g, ' ').slice(0, 48);
+  const lines = ['用户原话（一字未改）：', original, '', `——发起人：${who.nickname || who.userId}`];
+  const imgs = (chosen.segments ?? []).filter((s) => s.type === 'image').length;
+  if (imgs) lines.push(`（这条消息带了 ${imgs} 张图，已存在会话沙箱 inbox/ 里，需要就直接取用。）`);
+  const others = batch.filter((e) => e !== chosen && String(e.text ?? '').trim());
+  if (others.length) {
+    lines.push('', '同轮对话原文（上下文，同样一字未改）：');
+    for (const e of others) lines.push(`${e.nickname || e.userId}：${stripRelayNoise(String(e.text ?? ''))}`);
+  }
+  return { task: lines.join('\n'), label };
 }
 
 export function setup(ctx: PluginContext): void {
@@ -225,12 +269,12 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'work_dispatch',
-    description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。',
+    description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。派出去的是**用户原话**（程序原样代传，不经你转述）。',
     // 不设 minRole：普通群友的 chat 也要"知道有这个能力、然后拒绝"，而不是工具凭空消失
     surface: 'chat',
-    promptSnippet: '把需要实际动手的活派给工作子代理',
+    promptSnippet: '把需要实际动手的活派给工作子代理（任务按用户原话代传）',
     promptGuidelines: [
-      '派活的 task 要自带前因后果：做什么、输入在哪、要交回什么——工作子代理看不到你们的聊天。',
+      'task 只填你对这件活的一句话理解——它只用来对准用户哪句话是需求，真正派出去的是**用户原话**，由程序原样代传。你不负责转述，更不要替用户补充或收窄细节（尤其是画图的画面描述）。',
       '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
       '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
@@ -238,16 +282,16 @@ export function setup(ctx: PluginContext): void {
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '要它做的事：目标、输入、要交回什么' },
+        task: { type: 'string', description: '你对这件活的一句话理解（程序拿它对准用户原话，不会作为任务正文派出）' },
         requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
       },
       required: ['task'],
     },
     handler: (args, tctx) => {
-      const task = String(args.task ?? '').trim();
-      if (!task) return '（任务为空，没有派出去。先问清对方要做什么。）';
+      const modelTask = String(args.task ?? '').trim();
+      if (!modelTask) return '（任务为空，没有派出去。先问清对方要做什么。）';
       // 归属：合批轮里 carrier 只是最后说话的人，按 requester / 原话重合度找真正提需求的人
-      const who = pickWorkRequester(args, tctx, task);
+      const who = pickWorkRequester(args, tctx, modelTask);
       const role = String(who.role ?? tctx.role);
       if (!canWork(role)) {
         return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
@@ -255,6 +299,12 @@ export function setup(ctx: PluginContext): void {
       if (ctx.work.modelLabel() === '—') {
         return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
       }
+      // 一字不差传话：任务正文=用户原话（程序代传）；本轮找不到原话（比如发起人只发了图）才退回 chat 的理解，并注明是转述
+      const verbatim = verbatimTaskOf(modelTask, tctx, who);
+      const task = verbatim.task
+        || `${modelTask}\n\n（注：本轮没找到发起人的文字原话，以上是聊天侧的理解，仅此情况允许转述。）`;
+      // 短标只用于进度条/列表：有原话用原话单行；退回转述时保留全文（老口径：任务全文不截断）
+      const label = verbatim.label || modelTask;
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
       const userId = who.userId || tctx.event.userId;
@@ -269,7 +319,7 @@ export function setup(ctx: PluginContext): void {
         started = true;
         off?.();
         if (timer) clearTimeout(timer);
-        const r = ctx.work.dispatch({ chat, task, userId, nickname, role });
+        const r = ctx.work.dispatch({ chat, task, label, userId, nickname, role });
         if (!r.ok) ctx.log.warn(`派活没有开跑：${r.reason ?? '未知原因'}`);
       };
       off = ctx.bus.on(busEvents.agentEnd, (p: { chatKey?: string }) => {

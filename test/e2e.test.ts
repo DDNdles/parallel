@@ -782,7 +782,8 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   assert.ok(kinds.includes('tool') && kinds.includes('toolResult'), '要有工具调用与返回事件');
   assert.ok(kinds.includes('final'), '要有收敛回答事件');
   assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'work_finish');
-  assert.equal(runs[0].task, '算一下 2**10', '展示的是工具给的任务，不是用户原话');
+  // 2026-10-24 起一字不差传话：进度条/列表展示的是**用户原话**（程序代传），不是 chat 模型写的 task
+  assert.equal(runs[0].task, '帮我算一下 2 的 10 次方', '展示的必须是用户原话，不是工具转述的 task');
   assert.ok(runs[0].usage, '要带本次任务的 token 账');
   assert.ok(runs[0].usage.cacheHit > 0 && runs[0].usage.cacheMiss > 0, '缓存命中/未命中要有数');
   assert.ok(runs[0].usage.prompt >= runs[0].usage.cacheHit, '提示词 token 不该少于命中数');
@@ -860,12 +861,14 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   const task2 = mockProvider.calls.slice(calls2).map((c) => c.lastUser ?? '').find((t) => t.includes('接着上次'));
   assert.ok(task2, '第二轮的 work 请求要带上"接着上次"的任务描述');
   assert.ok(task2!.includes('你上次停下来问发起者的：用哪份文件？'), task2);
-  assert.ok(task2!.includes('发起者这次说的是：用 inbox/a.csv 那份'), task2);
+  // 一字不差传话后，发起者的回答也按原话块代传（不再是裸转述）
+  assert.ok(task2!.includes('发起者这次说的是：用户原话（一字未改）：'), task2);
+  assert.ok(task2!.includes('用 inbox/a.csv 那份'), task2);
 
   const run2 = kernel.workRunner.list(5, chatKey)[0];
   assert.equal(run2.awaiting, undefined, '这一轮是正常交付，不该再挂着"等回答"');
   assert.equal(run2.summary, '整理完了，产出 report.md');
-  assert.equal(run2.task, '整理一下那份报表（续）', '列表里显示短标题，不是拼接文本');
+  assert.equal(run2.task, '帮我整理一下那份报表（续）', '列表里显示短标题（用户原话+续），不是拼接文本');
   assert.equal(kernel.workRunner.livePending(chatKey, String(MASTER)), undefined, '回答后现场要消费掉');
 
   // 待答复已被消费：再派一件新活不该再粘上那段历史

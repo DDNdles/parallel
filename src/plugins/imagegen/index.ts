@@ -376,6 +376,7 @@ export function setup(ctx: PluginContext): void {
     promptSnippet: '用 Gemini 画图（文生图 / 参考图），产物落会话沙箱 imagegen/',
     promptGuidelines: [
       '用户要图（画一张、生成图片、按描述作图、照这张图改）时直接用 generate_image 画，画完把返回的路径用 send_file 发给对方，不要只报路径。',
+      '任务正文里有「用户原话」时，prompt 必须原样粘贴那段原话，一字不改（"画一张"这类词保留也无妨）——不改写、不扩写、不加风格词；原话信息不够就 work_ask 问，不要自己脑补画面。',
       '参考图只能给会话沙箱内的相对路径（如 inbox/xxx.png），最多 4 张；图不在沙箱里就先让用户发过来。',
       '生图失败时如实说明原因，不要说已经画好；额度用完就告诉对方下周再来。',
     ],
@@ -383,7 +384,7 @@ export function setup(ctx: PluginContext): void {
     parameters: {
       type: 'object',
       properties: {
-        prompt: { type: 'string', description: '画面描述：主体、场景、风格、构图，越具体越好（中文即可）' },
+        prompt: { type: 'string', description: '画面描述。任务里带「用户原话」时直接用原话原文（一字不改）；没有原话才自己写：主体、场景、风格、构图，写具体（中文即可）' },
         refs: {
           type: 'array',
           items: { type: 'string' },
@@ -418,6 +419,7 @@ export function setup(ctx: PluginContext): void {
     const lines = [
       '# 生图',
       '- 对方要图（画一张、生成图片、按描述作图、照这张图改）时，让 work 去做：work 有 generate_image 工具，支持文生图，也支持拿会话沙箱里的图片当参考。',
+      '- 派活走 work_dispatch，画面描述会按**用户原话**一字不差代传：不要替对方改写、翻译或润色他要的画面，他说什么就是什么。',
       `- 普通成员每个自然周（周一起算）最多 ${weeklyQuota} 张；主人与管理员${ownerUnlimited ? '不限张数' : '同样按这个额度算'}。额度用完就如实告诉对方下周再来，不要用文字假装已经画好。`,
     ];
     if (!apiKey) lines.push('- 这台 bot 目前还没配置 Gemini API Key，画不了图；对方要图时直说现在生不了。');
