@@ -128,6 +128,9 @@ async function main(): Promise<void> {
     expect('run_js', js.text, /42/);
     const bash = await call('run_bash', { command: 'echo smoke-bash' });
     expect('run_bash', bash.text, 'smoke-bash');
+    // work 容器联网 + 镜像里的 node（2026-10-24 起）：一条命令同时验两样
+    const net = await call('run_bash', { command: 'node --version && curl -fsS -m 10 https://example.com -o /dev/null && echo NET-OK' });
+    expect('run_bash', net.text, /NET-OK/);
     // shell 顺手写文件：执行前后快照要比出 +N -M（工作页逐行显示）
     const bashWrite = await call('run_bash', { command: "printf 'alpha\\nbeta\\n' > smoke/from-bash.txt" });
     expect('run_bash', bashWrite.text, '文件改动');
@@ -201,11 +204,10 @@ async function main(): Promise<void> {
     const facts = await call('recall_facts', { query: '喜欢' });
     expect('recall_facts', facts.text, /没有相关记忆|找到的记忆/);
 
-    // 8) 发文件（假协议端应记录一次 upload_group_file）
-    const sent = await call('send_file', { path: 'smoke/hello.txt' });
-    expect('send_file', sent.text, '已发送');
-    const upload = await mock.waitForAction('upload_group_file', 5000).catch(() => null);
-    add('-- 协议端收文件', upload ? 'PASS' : 'FAIL', 0, upload ? `upload_group_file → ${JSON.stringify(upload.params).slice(0, 80)}` : '没收到 upload_group_file');
+    // 8) 发文件：send_file 已随 2026-10-23 的交付链路改版删除（产物由内核打包 zip 发「工作交付」），
+    //    这里只验证它确实不在 work 面上
+    add('-- send_file 已删', registered.has('send_file') ? 'FAIL' : 'PASS', 0,
+      registered.has('send_file') ? 'send_file 还在 work 面上' : '已随交付改版删除');
 
     // 9) 子代理委派（mock 模型：子代理一轮就 work_finish）
     const mockEngine = (kernel.llm as any).providers.get('mock');

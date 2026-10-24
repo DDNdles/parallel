@@ -151,7 +151,8 @@ export function buildWorkSections(input: WorkPromptInput): { system: string; sec
       text: [
         `# 环境`,
         `- 会话沙箱：${input.sandboxRoot}（可读写；这是唯一可写的地方，路径越界会被内核拒绝）。`,
-        `- 计算沙箱**没有外网**：联网一律走工具，不要在脚本里直接请求网络。`,
+        `- 计算容器**有外网**：脚本里可直接联网（requests/urllib/curl，缺库就 pip install，node 也可用）；`,
+        `  要渲染网页或带登录态的操作仍用 browser_*，那才是浏览器。`,
         `- 脚本 / shell / 浏览器都在 **Linux 容器**里跑：容器内会话目录是 \`/ws\`（= 上面那个沙箱根），`,
         `  python_session、run_python_work、run_bash 里的相对路径都相对 \`/ws\`。`,
         `- **不要在脚本里写宿主机的 Windows 路径**（C:\\...）：容器里不存在它，按它写文件会造出一个名字很怪的空文件。`,

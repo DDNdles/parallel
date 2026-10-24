@@ -8,11 +8,12 @@ import { nowMs } from '../util/misc.ts';
 /**
  * 会话容器管理器：为每个会话维持两类常驻容器。
  *
- *  compute：--network none 的 Python 会话容器（常驻 ipykernel，变量跨调用保留）
+ *  compute：Python 会话容器（常驻 ipykernel，变量跨调用保留）；联网可配
  *  browser：有网的浏览器容器（常驻 Chromium，登录态/页面跨调用保留）
  *
  * 关键设计：控制通道走 `docker exec` + 容器内 loopback 桥，而不是端口映射 ——
- * 这样 compute 容器可以保持 --network none（没有任何出网路径），且在
+ * 桥只监听 loopback、不映射端口，容器是否出网由启动参数单独决定（work 容器
+ * 2026-10-24 起联网，sandbox.workNetwork 可关回 --network none），且在
  * Windows/Docker Desktop 上也能工作（无需宿主直连容器网络）。
  *
  * 生命周期：按需拉起；空闲超时回收；超过 maxPerHost 时按 LRU 回收。
@@ -115,7 +116,8 @@ export class SessionContainers {
       '--cpus', kind === 'browser' ? '2' : '1',
       '--memory', kind === 'browser' ? '1g' : '512m',
     ];
-    if (kind === 'compute') args.push('--network', 'none');
+    // compute 是 work 专用容器：默认联网（workNetworkOn），关了才 --network none
+    if (kind === 'compute' && this.sandboxCfg.workNetwork === false) args.push('--network', 'none');
     args.push(image);
     const r = spawnSync(bin, args, 60_000, this.dockerEnv());
     if (!r.ok) throw new Error(`启动 ${kind} 容器失败：${r.stderr || r.stdout}`.slice(0, 400));

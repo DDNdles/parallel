@@ -235,13 +235,17 @@ export const DEFAULT_CONFIG = {
     forgetScope: 'admin_only' as 'self_and_admin' | 'admin_only',
   },
   sandbox: {
-    runtime: 'auto',                      // 执行运行时：'docker'=容器强隔离（断网+文件隔离）| 'subprocess'=本机子进程 | 'auto'=docker 可用则用之，否则回落 subprocess
+    runtime: 'auto',                      // 执行运行时：'docker'=容器强隔离（chat 断网+文件隔离）| 'subprocess'=本机子进程 | 'auto'=docker 可用则用之，否则回落 subprocess
+    // work 容器联网（2026-10-24 用户定）：一次性 python/js/bash 与常驻 compute 容器
+    // 可直接出网（requests/pip/npm）；chat 档不受它影响，始终 --network none。
+    workNetwork: true,
     dockerImagePython: 'python:3.12-slim',
-    // work 档的一次性 Python 换成带库镜像（numpy/pandas/matplotlib/PIL/opencv…）：
+    // work 档的一次性 Python 换成带库镜像（numpy/pandas/matplotlib/PIL/opencv/node…）：
     // 实测 slim 镜像里模型 import PIL/numpy 全部失败，便转去宿主机命令绕路——那也是隔离漏口。
     dockerImagePythonWork: 'parallel-sandbox-python:latest',
     dockerImageNode: 'node:24-slim',
-    dockerImageNodeWork: 'node:24-slim',
+    // work 档 JS 与 bash/python 同镜像：镜像里预装了 node，还能带上 python 库
+    dockerImageNodeWork: 'parallel-sandbox-python:latest',
     // work 的 bash 与一次性 Python 同镜像：debian:12-slim 里连 python3 都没有（实测）
     dockerImageBash: 'parallel-sandbox-python:latest',
     ttlHours: 24,                         // chat 临时文件 TTL（最后一次访问起算）

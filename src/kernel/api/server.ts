@@ -1039,6 +1039,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         for (const k of ['ttlHours', 'inboxTtlHours', 'maxFileBytes', 'maxSessionBytes', 'execTimeoutPythonMs', 'execTimeoutJsMs', 'maxRunsPerMin']) {
           if (typeof body[k] === 'number') s[k] = body[k];
         }
+        // work 容器联网开关（chat 档不在此列：它永远断网）
+        if (typeof body.workNetwork === 'boolean') s.workNetwork = body.workNetwork;
         kernel.config.saveConfig();
         return send({ ok: true });
       }

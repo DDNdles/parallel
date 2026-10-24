@@ -27,7 +27,7 @@ import { existsSync } from 'node:fs';
 // 工具面分层（防线）：
 //  ① 内核：`surface:'work'`（chat 轮看不见）+ 白名单（agent 定义）+ minRole:'admin'
 //  ② 规则：工具自带的 guidelines 进 work system，chat system 完全不含这些工具
-//  ③ 执行层：容器隔离（compute 断网 / browser 有网）+ 配额
+//  ③ 执行层：容器隔离（compute 联网可配 / browser 有网；chat 档始终断网）+ 配额
 // ============================================================
 
 /** 本插件全部工具都只在 work 面可见 */
@@ -586,10 +586,10 @@ export function setup(ctx: PluginContext): void {
   if (has('container') && typeof se?.runPython === 'function') {
     ctx.llm.registerTool({
       name: 'python_session',
-      description: '在常驻 Python 会话中执行代码：变量、导入、已加载的数据在多次调用之间保留。适合数据分析、迭代计算、画图（matplotlib）。沙箱无外网。',
+      description: '在常驻 Python 会话中执行代码：变量、导入、已加载的数据在多次调用之间保留。适合数据分析、迭代计算、画图（matplotlib）。容器可联网。',
       minRole: 'admin',
       surface: WORK,
-      promptSnippet: '在常驻 Python 会话里执行代码，变量跨调用保留（沙箱无外网）',
+      promptSnippet: '在常驻 Python 会话里执行代码，变量跨调用保留（容器可联网）',
       promptGuidelines: [
         '需要跨步骤保留变量、导入或已加载数据时用 python_session；一次性脚本用 run_python_work。',
         '在 python_session 里画图（matplotlib）后，要用 sandbox_write 把图片存进沙箱，并在交付的 artifacts 里登记。',
@@ -685,15 +685,15 @@ export function setup(ctx: PluginContext): void {
     }
   }
 
-  // 一次性执行（容器沙箱：python/js/bash 断网；全部在容器里跑）
+  // 一次性执行（容器沙箱：python/js/bash 默认联网可配；全部在容器里跑）
   //
   // 没有 run_powershell：Linux 容器里的 pwsh 只是个空壳（没有 python/git/curl），
   // 计算与文本处理用 run_bash / run_python_work 就够了。之前按"镜像在本地才暴露"
   // 做过条件注册，2026-10-22 用户定：Linux 不需要 pwsh，工具与镜像一起删掉。
   if (has('sandbox.exec') && typeof sb.runAny === 'function') {
     const runTools: [string, 'bash' | 'python', string, string, string][] = [
-      ['run_bash', 'bash', '运行 Bash 命令（Docker 容器：断网、只挂会话沙箱、跑完销毁；与 python_session 同一镜像，带 python3 与常用库）。适合 grep/sed/awk 文本处理。', 'command', '跑 Bash（Docker 容器，断网、跑完销毁）'],
-      ['run_python_work', 'python', '一次性运行 Python（Docker 容器内；每次全新解释器，变量不保留；需要跨调用保留请用 python_session）。', 'code', '一次性跑 Python（变量不保留）'],
+      ['run_bash', 'bash', '运行 Bash 命令（Docker 容器：可联网、只挂会话沙箱、跑完销毁；与 python_session 同一镜像，带 python3/node 与常用库）。适合 grep/sed/awk 文本处理。', 'command', '跑 Bash（Docker 容器，可联网、跑完销毁）'],
+      ['run_python_work', 'python', '一次性运行 Python（Docker 容器内、可联网；每次全新解释器，变量不保留；需要跨调用保留请用 python_session）。', 'code', '一次性跑 Python（可联网，变量不保留）'],
     ];
     for (const [name, language, description, argName, snippet] of runTools) {
       ctx.llm.registerTool({

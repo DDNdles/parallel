@@ -68,8 +68,9 @@ const CONTAINER_HARDEN = [
  * 轻沙箱（非隔离档，红线见 README）：
  * - 每个会话一个沙箱根目录，LLM 文件工具只能触达当前会话目录（防路径穿越）
  * - 临时性：TTL 自动清理；单文件/单会话配额
- * - 受限执行：优先 Docker 容器强隔离（--network none 断网 + 只挂载会话目录），
- *   不可用时回落 python -I / node 本机隔离子进程；超时 kill、输出截断、并发与频率配额
+ * - 受限执行：优先 Docker 容器强隔离（chat 档 --network none 断网；work 档联网，
+ *   sandbox.workNetwork 可关）+ 只挂载会话目录；不可用时回落 python -I / node
+ *   本机隔离子进程；超时 kill、输出截断、并发与频率配额
  */
 export class SandboxService {
   readonly rootDir: string;
@@ -435,6 +436,11 @@ export class SandboxService {
     return changes.sort((a, b) => a.path.localeCompare(b.path));
   }
 
+  /** work 容器是否联网（sandbox.workNetwork，默认开；chat 档不受它影响，始终断网） */
+  private workNetworkOn(): boolean {
+    return (this.config.config.sandbox as { workNetwork?: boolean }).workNetwork !== false;
+  }
+
   /** work 档的执行必须走容器：不可用就抛（隔离没生效时宁可做不了，也不悄悄降级到宿主） */
   private requireDocker(what: string): 'docker' {
     if (this.dockerOk === null) this.dockerOk = this.probeDocker();
@@ -485,11 +491,12 @@ export class SandboxService {
 
   /**
    * Docker 容器执行（强隔离档）：
-   * --network none 物理断网；只挂载会话沙箱目录（读写）；--rm 跑完即销毁；无 GPU/无特权。
-   * 代码经 stdin 传入，避免命令行长度与转义问题。
+   * chat 档 --network none 物理断网；work 档联网（workNetworkOn，默认开），
+   * 模型可在脚本里直接 requests/pip。只挂载会话沙箱目录（读写）；--rm 跑完即销毁；
+   * 无 GPU/无特权。代码经 stdin 传入，避免命令行长度与转义问题。
    *
    * work 档默认换用 `parallel-sandbox-python` 镜像（Dockerfile 里预装了 numpy/pandas/
-   * matplotlib/PIL/opencv 等）：实测 work 模型在一次性 python 里 import PIL/numpy 全失败，
+   * matplotlib/PIL/opencv/node 等）：实测 work 模型在一次性 python 里 import PIL/numpy 全失败，
    * 只能改用宿主机命令绕路——工具面"看起来齐全、实际不可用"同样是隔离失效的一种。
    */
   private execDocker(chat: ChatRef, language: 'python' | 'javascript', code: string, timeoutMs: number, work = false): Promise<SandboxRunResult> {
@@ -499,11 +506,13 @@ export class SandboxService {
     };
     const image = language === 'python'
       ? (work ? (cfg.dockerImagePythonWork || 'parallel-sandbox-python:latest') : (cfg.dockerImagePython || 'python:3.12-slim'))
-      : (work ? (cfg.dockerImageNodeWork || 'node:24-slim') : (cfg.dockerImageNode || 'node:24-slim'));
+      : (work ? (cfg.dockerImageNodeWork || 'parallel-sandbox-python:latest') : (cfg.dockerImageNode || 'node:24-slim'));
     // Windows 路径转 Docker 挂载格式：C:\...\dir -> //c/.../dir（Docker Desktop 接受）；先 resolve 保证带盘符
     const hostDir = resolve(this.root(chat)).replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
     const args = [
-      'run', '--rm', '-i', '--network', 'none',   // -i：保持容器 stdin 开启以接收代码
+      'run', '--rm', '-i',   // -i：保持容器 stdin 开启以接收代码
+      // chat 档断网；work 档按 sandbox.workNetwork（默认联网，2026-10-24 用户定）
+      ...(work && this.workNetworkOn() ? [] : ['--network', 'none']),
       ...CONTAINER_HARDEN,
       '-v', `${hostDir}:/ws`,
       '-w', '/ws',
@@ -557,14 +566,14 @@ export class SandboxService {
 
   /**
    * bash 的 Docker 执行：work 模式专用。与代码沙箱同等的强隔离：
-   * --network none 断网、只挂会话目录、--rm 销毁、限额。
-   * 用**计算镜像**而不是 debian-slim：模型会在这里 import numpy/PIL，
+   * 联网（可配）、只挂会话目录、--rm 销毁、限额。
+   * 用**计算镜像**而不是 debian-slim：模型会在这里 import numpy/PIL、调 node，
    * 而 debian:12-slim 里连 python3 都没有（实测 `python3: command not found`）。
    */
   private execDockerShell(chat: ChatRef, code: string, timeoutMs: number): Promise<SandboxRunResult> {
     const cfg = this.config.config.sandbox as { dockerImageBash?: string };
     const hostDir = resolve(this.root(chat)).replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
-    const args = ['run', '--rm', '-i', '--network', 'none', ...CONTAINER_HARDEN, '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
+    const args = ['run', '--rm', '-i', ...(this.workNetworkOn() ? [] : ['--network', 'none']), ...CONTAINER_HARDEN, '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
     args.push(cfg.dockerImageBash || 'parallel-sandbox-python:latest', 'bash', '-c', code);
     return new Promise((resolveP) => {
       const startTs = Date.now();

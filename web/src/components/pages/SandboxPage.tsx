@@ -31,6 +31,7 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
   const [limits, setLimits] = useState(false);
   const [timeoutMs, setTimeoutMs] = useState(15000);   // 脚本默认超时（原「沙箱」插件的可配置项）
   const [sbGlobal, setSbGlobal] = useState(true);      // 沙箱能力的全局默认
+  const [workNet, setWorkNet] = useState(true);        // work 容器联网（chat 沙箱始终断网）
   const [entries, setEntries] = useState<Entry[]>([]);
   /** 折叠起来的日期文件夹（键 = YYYY-MM-DD）；默认全展开，只在本次浏览里记 */
   const [closed, setClosed] = useState<Set<string>>(new Set());
@@ -43,10 +44,11 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
 
   const reload = useCallback(() => {
     get('/api/sandbox')
-      .then((d: { stats?: Stat[]; config?: Record<string, number> }) => {
+      .then((d: { stats?: Stat[]; config?: Record<string, unknown> }) => {
         const s = d.stats ?? [];
         setStats(s);
-        setCfg(d.config ?? {});
+        setCfg((d.config ?? {}) as Record<string, number>);
+        setWorkNet((d.config as { workNetwork?: boolean } | undefined)?.workNetwork !== false);
         setSel((v) => (v && s.some((x) => x.chat === v) ? v : s[0]?.chat ?? ''));
       })
       .catch(() => {});
@@ -191,6 +193,12 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
             </Field>
           </div>
           <div className="mset-mrow" style={{ border: '1px solid var(--border)', borderRadius: 11, marginTop: 4 }}>
+            <span className="plg-v">work 容器联网</span>
+            <span className="mset-macts">
+              <Switch on={workNet} title="work 的执行容器可出网（requests/pip/npm）；聊天沙箱不受影响，始终断网" onChange={() => setWorkNet((v) => !v)} />
+            </span>
+          </div>
+          <div className="mset-mrow" style={{ border: '1px solid var(--border)', borderRadius: 11, marginTop: 4 }}>
             <span className="plg-v">沙箱工具（新群默认开启）</span>
             <span className="mset-macts">
               <Switch on={sbGlobal} title="按群开关在「插件」页的开关矩阵里设置" onChange={() => setSbGlobal((v) => !v)} />
@@ -199,14 +207,14 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
           <div className="mset-mfoot">
             <button className="btn primary" onClick={async () => {
               try {
-                await post('/api/sandbox/config', cfg);
+                await post('/api/sandbox/config', { ...cfg, workNetwork: workNet });
                 await post('/api/plugins/sandbox/config', { values: { defaultTimeoutMs: timeoutMs } });
                 await post('/api/plugins/sandbox/global-default', { enabled: sbGlobal });
                 setLimitsErr('');
                 setLimits(false);
               } catch (e) { setLimitsErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
             }}>保存</button>
-            <span className="plg-hint">沙箱无网络、无凭据，路径穿越由内核拦截</span>
+            <span className="plg-hint">聊天沙箱无网络；work 容器联网可开关；无凭据，路径穿越由内核拦截</span>
           </div>
           {limitsErr && <div className="mset-err">{limitsErr}</div>}
         </Modal>
