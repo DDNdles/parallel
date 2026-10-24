@@ -46,10 +46,10 @@ export const PAGES: { id: string; name: string; nav: string; icon: string }[] = 
   { id: 'errors', name: '报错', nav: '报错', icon: 'errors' },
   { id: 'work', name: '工作', nav: '工作', icon: 'work' },
   { id: 'sandbox', name: '沙箱', nav: '沙箱', icon: 'file' },
-  { id: 'settings', name: '设置', nav: '设置', icon: 'settings' },
   { id: 'stickers', name: '表情包', nav: '表情包', icon: 'sticker' },
   { id: 'bilibili', name: 'b站搜索', nav: 'b站搜索', icon: 'bilibili' },
   { id: 'imagegen', name: '生图', nav: '生图', icon: 'image' },
+  { id: 'settings', name: '设置', nav: '设置', icon: 'settings' },
 ];
 const ALL_PAGES = PAGES;
 
