@@ -245,6 +245,25 @@ function ev(text: string, over: Partial<ChatEvent> = {}): ChatEvent {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+test('出站塑形：单条上限逐条套用，整段回复不被 maxMessageCharacters 腰斩（稍等本 回归）', async () => {
+  // 线上参数复刻：回复总长 100、单条安全垫 24、软切 10。2026-10-24 修的顺序 bug：
+  // 之前 24 套在整段上，"…稍等本鱼哦"被硬切成"稍等本"发出去
+  const { svc } = makeService({
+    outgoing: {
+      ...DEFAULT_OUTGOING,
+      splitReplyMessages: true, replyMaxCharacters: 100,
+      bubbleSoftMaxCharacters: 10, maxMessageCharacters: 24,
+    },
+  });
+  const plans = await svc.compose(chat, '好嘞主人！这就去安排画一张豆包大战奶龙，稍等本鱼哦');
+  const texts = plans.map((p) => String((p.segments[0] as { data: { text?: string } })?.data?.text ?? ''));
+  const joined = texts.join('');
+  assert.ok(joined.includes('稍等本鱼哦'), `结尾要完整（实际：${joined}）`);
+  assert.ok(!/(^|[^鱼])本$/.test(texts[texts.length - 1] ?? ''), `不能出现「稍等本」式残泡（实际：${JSON.stringify(texts)}）`);
+  for (const t of texts) assert.ok(t.length <= 24, `单条不超安全垫：${t}`);
+  svc.dispose();
+});
+
 test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消息被接管', async () => {
   const { svc } = makeService();
   const plain = svc.ingest(ev('早上好'), { isCommand: false });

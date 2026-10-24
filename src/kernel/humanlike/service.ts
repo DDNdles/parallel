@@ -34,7 +34,7 @@ import {
   touchAntiRepeat,
   type AntiRepeatEntry,
 } from './repetition.ts';
-import { MAX_BUBBLES, isSilentScene, normalizeVisibleContent, splitIntoBubbles, trimAtSentence, typingDelayMs } from './delivery.ts';
+import { MAX_BUBBLES, clip, isSilentScene, normalizeVisibleContent, splitIntoBubbles, trimAtSentence, typingDelayMs } from './delivery.ts';
 import { detectCollapse, rhythmNudge, rhythmSignature } from './rhythm.ts';
 import { deriveWindow, evaluateAgency, nextRecheckAt, type ProactiveContactCandidate } from './agency.ts';
 import { currentActivity, emptyPlan, prunePlan, schedulePrompt, type SchedulePlan } from './schedule.ts';
@@ -708,10 +708,15 @@ export class HumanlikeService {
    */
   private collectBubbles(text: string, cfg: HumanlikeConfig): string[] {
     const out = cfg.outgoing;
-    const t = trimAtSentence(normalizeVisibleContent(text, out.maxMessageCharacters), out.replyMaxCharacters);
+    // 顺序（2026-10-24 修）：剥标记 → 句边截断到「回复总长上限」→ 分条 → **逐条**套单条上限。
+    // 之前把 maxMessageCharacters（单条平台安全垫，线上 24）套在整段回复上，
+    // 24 字之后被硬切，"稍等本鱼哦"只剩"稍等本"这类半截话就是这么来的。
+    const stripped = normalizeVisibleContent(text, Number.MAX_SAFE_INTEGER);
+    const t = trimAtSentence(stripped, out.replyMaxCharacters);
     if (!t) return [];
-    if (out.splitReplyMessages === false) return [t];
-    return splitIntoBubbles(t, MAX_BUBBLES, out.bubbleSoftMaxCharacters);
+    if (out.splitReplyMessages === false) return [clip(t, out.maxMessageCharacters)];
+    return splitIntoBubbles(t, MAX_BUBBLES, out.bubbleSoftMaxCharacters)
+      .map((b) => (b.length > out.maxMessageCharacters ? clip(b, out.maxMessageCharacters) : b));
   }
 
   /** 气泡 → 带打字停顿的发送计划：第一条不等，之后每条按自己的字数算「正在输入」要多久。
