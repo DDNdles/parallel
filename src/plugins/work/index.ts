@@ -177,7 +177,7 @@ export function setup(ctx: PluginContext): void {
       if (o.type === 'stream') parts.push(o.text ?? '');
       else if (o.type === 'error') parts.push(`错误 ${o.name}: ${o.text ?? ''}`);
       // 只有 matplotlib 之类主动显示出来的图才有 image；回给模型看一眼（收图模型），否则它只能读数字
-      else if (o.image) { image = o.image; parts.push('[图表已生成（随本条结果附上）；要发给用户就 sandbox_write 落盘后 send_file]'); }
+      else if (o.image) { image = o.image; parts.push('[图表已生成（随本条结果附上）；要交给用户就 sandbox_write 落盘后登记进 work_finish 的 artifacts]'); }
       else if (o.text) parts.push(String(o.text));
     }
     return { text: parts.join('\n').trim() || '（无输出）', image };
@@ -189,8 +189,8 @@ export function setup(ctx: PluginContext): void {
   //    否则普通群友那边模型根本不知道有这回事，也就没法"被人格化地拒绝"）；
   //  - work_status：只回**调用者自己**的活；
   //  - deliver_file：work 做出来的文件最终由 chat 用自己的人设发出去。
-  //    work 面不需要它（那边有 send_file），所以严格只在 chat 面可见。
-  //    它只认**本会话沙箱内、且确实由某次 work 交付登记过**的文件，
+  //    work 面不需要它（收尾时内核把 artifacts 打包成合集发「工作交付」），
+  //    所以严格只在 chat 面可见。它只认**本会话沙箱内、且确实由某次 work 交付登记过**的文件，
   //    不是让 chat 拿到任意文件的读取/写入口。
   const canWork = (role: string): boolean => role === 'owner' || role === 'admin';
   const chatKeyOf = (chat: ChatRef): string => `${chat.type}_${chat.chatId}`;
@@ -203,7 +203,7 @@ export function setup(ctx: PluginContext): void {
       python_session: '常驻 Python', run_python_work: 'Python', run_bash: '命令行',
       sandbox_read: '读文件', sandbox_write: '写文件', sandbox_edit: '改文件', sandbox_grep: '检索文件',
       sandbox_glob: '找文件', web_search: '联网搜索', web_fetch: '读网页', todo: '任务清单',
-      send_file: '发文件', delegate: '子代理', work_finish: '收尾', work_ask: '提问',
+      delegate: '子代理', work_finish: '收尾', work_ask: '提问',
       skill: '技能', skill_file: '读技能文件', skill_install: '装配技能',
     } as Record<string, string>)[n] || '工具';
   };
@@ -606,7 +606,7 @@ export function setup(ctx: PluginContext): void {
         try {
           const r = await se.runPython(chatRefOf(tctx), String(args.code ?? ''), Number(args.timeout_ms) || 60_000, false);
           const f = formatSession(r);
-          // 图表别只留在模型眼里：落进沙箱它才发得出去（send_file 只认沙箱内文件）
+          // 图表别只留在模型眼里：落进沙箱才能随交付合集发出去（artifacts 只认沙箱内文件）
           if (f.image) {
             try {
               const rel = `charts/chart-${Date.now()}.png`;
@@ -672,7 +672,7 @@ export function setup(ctx: PluginContext): void {
             // 截图回给模型：不收图的模型那边由 agent loop 统一拦掉并留一条 warn
             if (r.image && action === 'screenshot') {
               return {
-                content: `${r.text || '（已截图）'}\n（截图已附在本条结果里，用于你看渲染效果；要发给用户就 sandbox_write 落盘后 send_file）`,
+                content: `${r.text || '（已截图）'}\n（截图已附在本条结果里，用于你看渲染效果；要随交付交给用户就 sandbox_write 落盘，并登记进 work_finish 的 artifacts）`,
                 images: [{ data: String(r.image), mimeType: 'image/png' }],
               };
             }
@@ -841,7 +841,7 @@ export function formatWorkResult(r: any): string {  if (!r) return '（工作子
     r.summary,
   ];
   if (r.artifacts?.length) {
-    parts.push('', `产物（在会话沙箱内，可用 send_file 发送）：`, ...r.artifacts.map((a: string) => `- ${a}`));
+    parts.push('', `产物（在会话沙箱内，已登记进交付清单）：`, ...r.artifacts.map((a: string) => `- ${a}`));
   }
   return parts.join('\n').trim();
 }
