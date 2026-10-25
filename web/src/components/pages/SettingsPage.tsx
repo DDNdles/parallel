@@ -529,7 +529,7 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
-                <BubbleWeights h={h} patchH={patchH} />
+                <BubbleSlider h={h} patchH={patchH} />
                 <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
                 {h.outgoing.typingEnabled === true && (<>
@@ -826,50 +826,100 @@ export default function SettingsPage() {
   );
 }
 
-/** 气泡数概率编辑器（2026-10-25）：每档一个权重，抽签按权重归一化；空数组 = 自动三角分布。
- *  显示的百分比是「当前输入」的归一化（不含近形降权——那是运行时的反定型叠加）。
- *  autoWeights 与内核 delivery.autoBubbleWeights 保持同一公式。 */
-function BubbleWeights({ h, patchH }: {
+/** 气泡数概率滑轨（2026-10-25）：一条轨道切 N 段（每段=一种气泡数），段间的圆点
+ *  可拖动——拖动改变相邻两段的边界，段宽即该档概率。空 bubbleWeights = 自动三角分布
+ *  （仅显示，拖动即进入自定义）；「恢复自动」清回空数组。autoWeights 与内核
+ *  delivery.autoBubbleWeights 保持同一公式；近形降权是运行时叠加，不计入显示。 */
+function BubbleSlider({ h, patchH }: {
   h: Humanlike;
   patchH: (p: Partial<Humanlike>, immediate?: boolean) => void;
 }) {
   const max = Math.max(1, Math.round(h.outgoing.maxBubbles ?? 6));
   const expected = Math.max(1, Math.min(Math.round(h.outgoing.expectedBubbles ?? 3), max));
-  const auto = (i: number): number => Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45);
   const custom = h.outgoing.bubbleWeights ?? [];
   const isAuto = !custom.some((w) => w > 0);
-  const shown = Array.from({ length: max }, (_v, i) => {
+  const weights = Array.from({ length: max }, (_v, i) => {
     const w = custom[i];
-    return typeof w === 'number' && w >= 0 ? w : auto(i);
+    return typeof w === 'number' && w > 0 ? w : Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45);
   });
-  const total = shown.reduce((a, b) => a + b, 0) || 1;
-  const setW = (i: number, v: number) => {
-    const next = Array.from({ length: max }, (_x, j) => (j === i ? Math.max(0, Math.min(100, v)) : (custom[j] ?? auto(j))));
-    patchH({ outgoing: { ...h.outgoing, bubbleWeights: next } });
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  const widths = weights.map((w) => (w / total) * 100);
+
+  const [drag, setDrag] = useState<{ idx: number; pos: number } | null>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+  // bounds[i] = 第 i 段左边界（0..100），长 max+1；拖动中的把手 idx 用 drag.pos 覆盖
+  const bounds: number[] = [0];
+  for (let i = 0; i < max; i++) {
+    const left = bounds[i];
+    const w = i === drag?.idx ? drag.pos - left : widths[i];
+    bounds.push(Math.min(100, Math.max(left, left + Math.max(1, w))));
+  }
+  bounds[bounds.length - 1] = 100;
+
+  const commit = (b: number[]) => {
+    const w = b.slice(1).map((v, i) => Math.max(0, Math.round(v - b[i])));
+    patchH({ outgoing: { ...h.outgoing, bubbleWeights: w.some((x) => x > 0) ? w : [] } }, true);
   };
+  const startDrag = (idx: number) => (e: React.PointerEvent) => {
+    e.preventDefault();
+    // 捕获失败（个别触屏驱动/合成事件）不致命：move/up 仍沿祖先冒泡到轨道
+    try { (e.target as HTMLElement).setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    setDrag({ idx, pos: bounds[idx] });
+  };
+  const moveDrag = (e: React.PointerEvent) => {
+    if (!drag) return;
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const raw = ((e.clientX - rect.left) / rect.width) * 100;
+    const lo = bounds[drag.idx - 1] + 2;
+    const hi = (drag.idx + 2 <= max ? bounds[drag.idx + 2] : 100) - 2;
+    setDrag({ idx: drag.idx, pos: Math.min(hi, Math.max(lo, raw)) });
+  };
+  const endDrag = () => {
+    if (!drag) return;
+    commit(bounds);
+    setDrag(null);
+  };
+
   return (
     <div style={{ gridColumn: '1 / -1' }}>
       <div className="mset-sec-h" style={{ marginTop: 10 }}>
-        <span>气泡数概率{isAuto && <span className="plg-hint">（自动分布，改任意一项即自定义）</span>}</span>
+        <span>气泡数概率{isAuto && <span className="plg-hint">（自动分布，拖动圆点即自定义）</span>}</span>
         {!isAuto && (
           <button className="mset-add" onClick={() => patchH({ outgoing: { ...h.outgoing, bubbleWeights: [] } }, true)}>恢复自动</button>
         )}
       </div>
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, marginTop: 8 }}>
-        {shown.map((w, i) => {
-          const pct = Math.round((w / total) * 100);
+      <div
+        ref={trackRef}
+        style={{ position: 'relative', height: 34, borderRadius: 8, marginTop: 10, background: 'var(--bg-hover)', overflow: 'hidden', touchAction: 'none' }}
+        onPointerMove={moveDrag}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        {Array.from({ length: max }, (_v, i) => {
+          const w = bounds[i + 1] - bounds[i];
           return (
-            <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-              <span className="plg-hint">{pct}%</span>
-              <div style={{ width: '100%', height: 6, borderRadius: 3, background: 'var(--bg-hover)' }}>
-                <div style={{ width: `${Math.max(2, pct)}%`, height: '100%', borderRadius: 3, background: 'var(--fg)' }} />
-              </div>
-              <BrandInput type="number" decimal value={Math.round(w * 100) / 100} spellCheck={false}
-                onChange={(e) => setW(i, Number(e.target.value))} />
-              <span className="plg-hint">{i + 1} 条</span>
+            <div key={i} title={`${i + 1} 条 · ${Math.round(w)}%`} style={{
+              position: 'absolute', left: `${bounds[i]}%`, width: `${w}%`, top: 0, bottom: 0,
+              background: i % 2 ? 'var(--bg-active)' : 'transparent',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 1,
+              borderLeft: i ? '1px solid var(--border)' : undefined,
+              overflow: 'hidden',
+            }}>
+              {w >= 9 && <span style={{ fontSize: 11, fontWeight: 600 }}>{Math.round(w)}%</span>}
+              {w >= 9 && <span className="plg-hint">{i + 1} 条</span>}
             </div>
           );
         })}
+        {Array.from({ length: max - 1 }, (_v, i) => i + 1).map((idx) => (
+          <div key={idx} onPointerDown={startDrag(idx)} title="拖动调整边界"
+            style={{
+              position: 'absolute', left: `${bounds[idx]}%`, top: '50%', transform: 'translate(-50%, -50%)',
+              width: 14, height: 14, borderRadius: '50%', background: 'var(--fg)', cursor: 'grab',
+              boxShadow: '0 0 0 2px var(--bg)', zIndex: 2,
+              opacity: drag?.idx === idx ? 1 : 0.85,
+            }} />
+        ))}
       </div>
     </div>
   );
