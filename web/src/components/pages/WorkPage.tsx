@@ -24,7 +24,7 @@ interface WorkApi {
   runs: WorkRun[];
   models: { chat: string; work: string };
   containers: { kind: string; chat: string; id: string; idleMs: number }[];
-  images: { python: boolean; browser: boolean };
+  images: { python: boolean; browser: boolean; build?: { python?: 'building' | 'failed'; browser?: 'building' | 'failed' } };
   docker: boolean;
 }
 
@@ -428,8 +428,16 @@ function EnvDetail({ data, onReload }: { data: WorkApi | null; onReload: () => v
 
       <div className="mset-meta">
         <span className={'tag' + (data && !data.docker ? ' err' : '')}>Docker {data?.docker ? '就绪' : '不可用'}</span>
-        <span className={'tag' + (data && !data.images?.python ? ' err' : '')}>Python{data?.images?.python ? '可用' : '不可用'}</span>
-        <span className={'tag' + (data && !data.images?.browser ? ' err' : '')}>浏览器{data?.images?.browser ? '可用' : '不可用'}</span>
+        <span className={'tag' + (data && !data.images?.python && data.images?.build?.python !== 'building' ? ' err' : '')}>
+          {data?.images?.build?.python === 'building' ? 'Python 镜像构建中…'
+            : data?.images?.build?.python === 'failed' ? 'Python 镜像构建失败'
+              : `Python${data?.images?.python ? '可用' : '未构建'}`}
+        </span>
+        <span className={'tag' + (data && !data.images?.browser && data.images?.build?.browser !== 'building' ? ' err' : '')}>
+          {data?.images?.build?.browser === 'building' ? '浏览器镜像构建中…'
+            : data?.images?.build?.browser === 'failed' ? '浏览器镜像构建失败'
+              : `浏览器${data?.images?.browser ? '可用' : '未构建'}`}
+        </span>
       </div>
 
       <div className="mset-sec-h"><span>模型链</span></div>

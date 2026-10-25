@@ -86,6 +86,9 @@ const PACKAGE_CACHE_MOUNTS = [
 export class SandboxService {
   readonly rootDir: string;
   private execCounter = new SlidingWindowCounter();
+  /** kernel 接线：work 执行发现镜像缺失时通知 SessionContainers 开始自动构建 */
+  onMissingImage?: (image: string) => void;
+  private imageCheckCache = new Map<string, { ok: boolean; at: number }>();
   private runningCount = new Map<string, number>();
   private dockerOk: boolean | null = null;   // null=未探测；探测结果缓存
   private dockerWarned = false;
@@ -393,6 +396,7 @@ export class SandboxService {
         // 作为 work 工具的落地就是隔离漏口（容器不可用 → 报错，不回落）。
         const runtime = opts.work ? this.requireDocker('shell 执行') : this.resolveRuntime();
         if (runtime === 'docker') {
+          if (opts.work) this.requireWorkImage((this.config.config.sandbox as { dockerImageBash?: string }).dockerImageBash || 'parallel-sandbox-python:latest');
           return attach(await this.execDockerShell(chat, opts.code, timeoutMs));
         }
         return attach(await this.execSubprocessShell(chat, opts.code, timeoutMs));
@@ -400,6 +404,9 @@ export class SandboxService {
       // python/javascript：work 档同样强制容器（见方法注释）；chat 档维持 auto 回落
       const runtime = opts.work ? this.requireDocker('脚本执行') : this.resolveRuntime();
       if (runtime === 'docker') {
+        if (opts.work) this.requireWorkImage(opts.language === 'python'
+          ? (cfg as { dockerImagePythonWork?: string }).dockerImagePythonWork || 'parallel-sandbox-python:latest'
+          : (cfg as { dockerImageNodeWork?: string }).dockerImageNodeWork || 'parallel-sandbox-python:latest');
         return attach(await this.execDocker(chat, opts.language, opts.code, timeoutMs, !!opts.work));
       }
       return attach(await this.execSubprocess(chat, opts.language, opts.code, cwd, timeoutMs));
@@ -445,6 +452,24 @@ export class SandboxService {
       changes.push({ path, added: 0, removed: text ? text.split('\n').length : 0 });
     }
     return changes.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * work 档执行前确认镜像在本地（60s 缓存）：不在就触发自动构建并明确报错——
+   * 首次使用的用户在这里得到「正在构建」而不是 docker run 的找不到镜像原文。
+   */
+  private requireWorkImage(image: string): void {
+    const hit = this.imageCheckCache.get(image);
+    if (hit && nowMs() - hit.at < 60_000) { if (hit.ok) return; }
+    let ok = false;
+    for (const bin of dockerBinCandidates()) {
+      try { execFileSync(bin, ['image', 'inspect', image], { timeout: 10_000, windowsHide: true, stdio: 'pipe' }); ok = true; break; } catch { /* 下一个候选 */ }
+    }
+    this.imageCheckCache.set(image, { ok, at: nowMs() });
+    if (!ok) {
+      this.onMissingImage?.(image);
+      throw new SandboxError(`沙箱镜像 ${image} 还没构建，内核已开始自动构建（首次要拉基础镜像，约几分钟）。构建完成后再试一次。`);
+    }
   }
 
   /** work 容器是否联网（sandbox.workNetwork，默认开；chat 档不受它影响，始终断网） */

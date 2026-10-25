@@ -1,5 +1,6 @@
 import { spawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { join, resolve, relative, isAbsolute } from 'node:path';
+import { existsSync } from 'node:fs';
 import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ChatRef } from '../types.ts';
@@ -23,6 +24,9 @@ export class SessionContainers {
   private browse = new Map<string, { id: string; lastUse: number }>();
   private dockerBin = 'docker';
   private dockerReady: boolean | null = null;
+  /** 自动构建现场（方案1，2026-10-25）：镜像缺失时后台 docker build；failed 后 10 分钟冷却防轮询风暴 */
+  private builds = new Map<'compute' | 'browser', { status: 'building' | 'failed'; startedAt: number; log: string }>();
+  private static BUILD_RETRY_MS = 10 * 60_000;
 
   constructor(
     private dataDir: string,
@@ -74,7 +78,10 @@ export class SessionContainers {
   /** 镜像是否已在本地（docker image inspect 现场探测；60s 缓存，桌面端 8s 轮询别每次都打 docker） */
   private imageCache = new Map<string, { ok: boolean; at: number }>();
 
-  imagesAvailable(): { python: boolean; browser: boolean } {
+  imagesAvailable(): {
+    python: boolean; browser: boolean;
+    build?: { python?: 'building' | 'failed'; browser?: 'building' | 'failed' };
+  } {
     const bin = this.ensureDocker();
     if (!bin) return { python: false, browser: false };
     const probe = (kind: 'compute' | 'browser'): boolean => {
@@ -83,9 +90,58 @@ export class SessionContainers {
       if (hit && nowMs() - hit.at < 60_000) return hit.ok;
       const ok = spawnSync(bin, ['image', 'inspect', image], 15_000, this.dockerEnv()).ok;
       this.imageCache.set(image, { ok, at: nowMs() });
+      if (!ok) this.maybeAutoBuild(kind, bin);
       return ok;
     };
-    return { python: probe('compute'), browser: probe('browser') };
+    const build: { python?: 'building' | 'failed'; browser?: 'building' | 'failed' } = {};
+    const pc = this.builds.get('compute');
+    if (pc) build.python = pc.status;
+    const pb = this.builds.get('browser');
+    if (pb) build.browser = pb.status;
+    return { python: probe('compute'), browser: probe('browser'), build: Object.keys(build).length ? build : undefined };
+  }
+
+  /**
+   * 镜像缺失时的自动构建（2026-10-25 分发方案1）：docker/ 目录随发布包走，
+   * 新用户不用手工 build——首次探测不到就后台构建，工作页显示「构建中」，
+   * 完成后镜像可用；失败进报错中心并冷却 10 分钟（轮询不会反复重试）。
+   */
+  maybeAutoBuild(kind: 'compute' | 'browser', bin?: string): void {
+    const prev = this.builds.get(kind);
+    if (prev?.status === 'building') return;
+    if (prev?.status === 'failed' && nowMs() - prev.startedAt < SessionContainers.BUILD_RETRY_MS) return;
+    const docker = bin ?? this.ensureDocker();
+    if (!docker) return;
+    const dir = join(process.cwd(), 'docker', kind === 'compute' ? 'sandbox-python' : 'sandbox-browser');
+    if (!existsSync(join(dir, 'Dockerfile'))) return;   // 发布环境没有 docker/ 目录：静默跳过
+    const image = this.imageOf(kind);
+    this.builds.set(kind, { status: 'building', startedAt: nowMs(), log: '' });
+    this.errors.record('info' as any, 'sandbox', `沙箱镜像 ${image} 不在本地，开始自动构建（${dir}；首次要拉基础镜像，可能几分钟）`);
+    const child = spawn(docker, ['build', '-t', image, dir], { windowsHide: true, env: this.dockerEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    let tail = '';
+    const onChunk = (c: Buffer) => { tail = (tail + c.toString('utf-8')).slice(-6000); };
+    child.stdout!.on('data', onChunk);
+    child.stderr!.on('data', onChunk);
+    child.on('error', (e) => {
+      this.builds.set(kind, { status: 'failed', startedAt: nowMs(), log: tail || e.message });
+      this.errors.record('warn', 'sandbox', `沙箱镜像 ${image} 自动构建启动失败: ${e.message}`);
+    });
+    child.on('close', (code) => {
+      if (code === 0) {
+        this.builds.delete(kind);
+        this.imageCache.set(image, { ok: true, at: nowMs() });
+        this.errors.record('info' as any, 'sandbox', `沙箱镜像 ${image} 自动构建完成`);
+      } else {
+        this.builds.set(kind, { status: 'failed', startedAt: nowMs(), log: tail });
+        this.errors.record('warn', 'sandbox', `沙箱镜像 ${image} 自动构建失败（exit=${code}）：…${tail.slice(-400)}`);
+      }
+    });
+  }
+
+  /** 按镜像名请求构建（SandboxService 执行前发现镜像缺失时回调进来） */
+  requestBuildForImage(image: string): void {
+    const kind: 'compute' | 'browser' = image.includes('browser') ? 'browser' : 'compute';
+    this.maybeAutoBuild(kind);
   }
 
   /** 容器/挂载的唯一键：work 轮按发起人再分一层（与 SandboxService.chatKey 同口径） */

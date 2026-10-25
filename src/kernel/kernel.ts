@@ -123,6 +123,7 @@ export class Kernel {
     this.memory = new MemoryService(this.db, this.bus, this.errors);
     this.sandbox = new SandboxService(this.dataDir, this.db, this.config, this.errors);
     this.session = new SessionContainers(this.dataDir, this.config, this.errors);
+    this.sandbox.onMissingImage = (image) => this.session.requestBuildForImage(image);
     this.chat = new ChatService(this.bus, {
       ratePerMin: this.config.config.risk.replyRatePerMin,
       sandboxRoot: (c) => this.sandbox.root(c),
@@ -319,6 +320,11 @@ export class Kernel {
       ? '⚠ 尚未配置主人 QQ（config.masterIds），报错通知等主人专属能力将不可用。'
       : '';
     if (masterHint) this.log.warn(masterHint);
+    // 分发方案1：启动后探测一次沙箱镜像，缺就后台自动构建（工作页会显示「构建中」）
+    const buildProbe = setTimeout(() => {
+      try { this.session.imagesAvailable(); } catch { /* 探测失败不影响启动 */ }
+    }, 5_000);
+    buildProbe.unref();
   }
 
   /** kernel.rpc：插件经事件总线向内核请求能力（桌面端 commands_visible 走 HTTP 直调，不在此处） */
