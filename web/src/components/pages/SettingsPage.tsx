@@ -525,7 +525,7 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
                 <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
-                <Num label="预期气泡数" hint="每轮抽签定一个目标条数：提示词照它说，程序分条也照它收（超出的合并回去）；模型明确换行或内容放不下时仍可突破" value={h.outgoing.expectedBubbles ?? 3}
+                <Num label="预期气泡数（提示推荐）" hint="写进提示词的推荐条数，模型尽量照着来；必要时可突破" value={h.outgoing.expectedBubbles ?? 3}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />

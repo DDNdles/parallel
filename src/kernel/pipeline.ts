@@ -759,8 +759,6 @@ export class Pipeline {
     const isReport = !!opts?.report;
     /** 这一轮由 @ 触发：@ 必回，插话打断对它直接失效（生成期与气泡期都不打断） */
     const forcedAt = (opts?.batch?.length ? opts.batch : [event]).some((e) => e.isAtMe);
-    /** 本轮抽签的目标气泡数：440 提示词与出站分条（sendScene）两处同用，汇报轮没有 */
-    let targetBubbles: number | undefined;
 
     // 检查本群是否有任何生效中的插件能提供工具/人格；全关时按配置提示管理员
     // 汇报轮的产物由系统合并成聊天记录，不再给模型 deliver_file（避免它又单独发一遍文件）
@@ -861,19 +859,16 @@ export class Pipeline {
       // 短句、镜像长度、不写动作描写，总长上限写进词里。剧本体（HDSI 的 <say> 小说格式）已删，
       // 模型说什么就发什么，分条与截断由程序侧兜底（humanlike/delivery.ts）。
       // 汇报轮不加：那轮要的是把工作结果讲清楚，不是聊天。
-      // 抽签目标条数在这一轮要**两处同用**：写进 440 提示词 + 传给出站分条（sendScene），
-      // 提示说发 X 条、程序就照 X 收，两边各抽各的就不叫约束了。
       if (!isReport) {
         const out = this.humanlike.config.outgoing;
-        targetBubbles = pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
-          recentShapes: this.humanlike.recentBubbleShapes(chat),
-          weights: out.bubbleWeights,
-        });
         systemSections.push({
           order: 440, title: 'chat-style',
           text: chatOutputStyleText({
             maxChars: out.replyMaxCharacters,
-            targetBubbles,
+            targetBubbles: pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
+              recentShapes: this.humanlike.recentBubbleShapes(chat),
+              weights: out.bubbleWeights,
+            }),
             maxBubbles: out.maxBubbles,
           }),
         });
@@ -1052,7 +1047,7 @@ export class Pipeline {
       const quoteTarget = canQuoteTurn(event, opts) ? this.quoteTargetOf(event) : undefined;
       await this.sendScene(chat, finalReply, quoteTarget, opts?.mention,
         opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname, sandboxKey: opts.report.result.sandboxKey } : undefined,
-        !forcedAt, targetBubbles);
+        !forcedAt);
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
@@ -1168,8 +1163,6 @@ export class Pipeline {
     forward?: { artifacts: string[]; userId: string; nickname?: string; sandboxKey?: string },
     /** 这轮的气泡是否允许被插话砍掉；@ 轮与汇报轮传 false */
     interruptible = true,
-    /** 当轮抽签的目标气泡数：与 440 提示词同一个值，出站分条照着收敛（不传=只兜硬上限） */
-    targetBubbles?: number,
   ): Promise<void> {
     if (forward) {
       // 一条聊天记录：汇报正文整段进首节点（不按聊天气泡切/50 字截断），产物文件各占一个节点
@@ -1197,7 +1190,7 @@ export class Pipeline {
         this.errors.record('warn', 'work', `聊天记录发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
       }
     }
-    const { plans } = await this.humanlike.composeScene(raw, targetBubbles);
+    const { plans } = await this.humanlike.composeScene(raw);
     if (!plans.length) {
       this.humanlike.noteSilent(chat);
       return;

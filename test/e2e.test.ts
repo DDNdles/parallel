@@ -927,36 +927,6 @@ test('拟人化：分条是纯程序 —— 句末标点/换行/旧分隔标记�
   assert.equal(one.length, 1, `逗号不断句，实际 ${one.length} 条: ${JSON.stringify(one)}`);
 });
 
-test('拟人化：目标气泡数是程序约束 —— 抽签钉在 3 条，模型回 5 句只发 3 条且内容不丢', async () => {
-  await quiesce();
-  kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));
-  mock.actions.length = 0;
-  // 概率全押 3 条那档 → pickBubbleTarget 每轮必抽 3（近形降权乘的系数不改变"其他档为 0"）
-  const out = cfg.humanlike.outgoing as typeof cfg.humanlike.outgoing & { bubbleWeights?: number[] };
-  const saved = { expected: out.expectedBubbles, max: out.maxBubbles, weights: out.bubbleWeights };
-  out.expectedBubbles = 3;
-  out.maxBubbles = 6;
-  out.bubbleWeights = [0, 0, 100, 0, 0, 0];
-  try {
-    mockProvider.script.push({ content: '呜。没有啦。哼，不理你了。再说也没用。就这样吧。' });
-    mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '在吗', atMe: true, nickname: '小明' });
-    await mock.waitForReply(GROUP, 8000);
-    await quiesce();
-    const sent = mock.actions.filter((a) => a.action === 'send_group_msg' && String(a.params.group_id) === String(GROUP));
-    const texts = sent.map((a) => (a.params.message ?? []).filter((s: any) => s.type === 'text').map((s: any) => String(s.data?.text ?? '')).join(''));
-    assert.equal(texts.length, 3, `5 句要并成目标 3 条: ${JSON.stringify(texts)}`);
-    assert.equal(
-      texts.join('').replace(/[。，]/g, ''),
-      '呜没有啦哼不理你了再说也没用就这样吧',
-      `合并只动分组不动内容: ${JSON.stringify(texts)}`,
-    );
-  } finally {
-    out.expectedBubbles = saved.expected;
-    out.maxBubbles = saved.max;
-    out.bubbleWeights = saved.weights;
-  }
-});
-
 test('拟人化：触发消息被后来的消息刷远时，回复自动挂引用（v1 程序锚定）', async () => {
   await quiesce();
   kernel.container.setGroupState('chat', String(GROUP), true, String(MASTER));

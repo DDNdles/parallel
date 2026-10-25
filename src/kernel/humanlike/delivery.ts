@@ -6,8 +6,7 @@
  * 模型不再为格式多写一个字；"说几条、多长"由下面三步保证：
  *   1. `normalizeVisibleContent` 剥掉媒体占位符与模型手滑输出的标签；
  *   2. `trimAtSentence` 句边截断兜底：回复超长时保留到最后一个句末标点，不把半句话拍出去；
- *   3. `splitIntoBubbles` 按换行与句末标点切成气泡：条数超出**当轮抽签的目标**时均衡合并到目标
- *      （模型明确换行 / 内容多到并不进去时自动放行），硬上限 maxBubbles 兜底；
+ *   3. `splitIntoBubbles` 按换行与句末标点切成气泡（最多 6 条，超出时均衡合并），
  *      `maxMessageCharacters` 作为**单条**平台安全垫在分条后逐条应用（别套在整段上）；
  *      `typingDelayMs` 算第二条及后续气泡的「正在输入」等待 —— 基础延迟 + 字数/速度，
  *      乘抖动，下限 250ms。首条不等（用户已经等过模型了）。
@@ -306,24 +305,14 @@ function mergeToCap(parts: string[], maxBubbles: number): string[] {
 
 /**
  * 按换行与句末标点把一段话切成气泡（最贴近真人"一句一条"的打字节奏）。
- *  - 换行是最强的分条意图：模型写了多少行，目标条数就抬到多少（仍受 maxBubbles 封顶）；
+ *  - 换行是最强的分条意图：模型自己换的行不合并；
  *  - 句末标点后切；连续标点（？！？…）并作同一个句尾；引号/右括号跟着前一句走；
  *  - 单句超过 softMax（默认 24 字）时，再在逗号/顿号/冒号处补切；
- *  - 条数超过 `targetBubbles`（当轮提示里规定的那条数）时做**均衡连续分组**合并到目标——
- *    2026-10-25 起目标条数不只是提示词：程序也照着收。两个自动放行的口子让它不是硬约束：
- *      · 模型明确换行分条 → 目标抬到行数（它是有意要多条）；
- *      · 并到目标会出超过 HARD_BUBBLE_CHARS 的长条（内容真的多）→ 回落 maxBubbles 硬上限。
- *    内容一个字不丢 —— 约束的是"几条"，不是"说不说"。
- *  - 清洗（剥句尾句号/切点逗号）放在**合并之后**：合并组内要靠原句标点喘气，
- *    "呜。没有啦"并成一条时不能变成"呜没有啦"。
+ *  - 超过 maxBubbles 时做**均衡连续分组**，保持 MAX_BUBBLES 上限、不把尾巴全粘最后一条。
  */
-export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES, softMax = 24, targetBubbles?: number): string[] {
-  const cap = Math.max(1, Math.floor(maxBubbles));
+export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES, softMax = 24): string[] {
   const out: string[] = [];
-  let lineCount = 0;
   for (const line of String(text ?? '').split(/\r?\n+/)) {
-    if (!line.trim()) continue;
-    lineCount++;
     let buf = '';
     for (let i = 0; i < line.length; i++) {
       buf += line[i];
@@ -337,17 +326,11 @@ export function splitIntoBubbles(text: string, maxBubbles = MAX_BUBBLES, softMax
     }
     if (buf.trim()) out.push(buf.trim());
   }
-  const pieces = out.flatMap((b) => splitLongBubble(b, softMax));
-  let target = targetBubbles == null ? cap : Math.min(cap, Math.max(1, Math.round(targetBubbles)));
-  target = Math.max(target, Math.min(lineCount, cap));
-  let groups = pieces;
-  if (groups.length > target) {
-    const merged = mergeToCap(groups, target);
-    const longest = merged.reduce((m, g) => Math.max(m, [...g].length), 0);
-    // 内容真多：并到目标条数会出超长条 → 放弃收敛，回落到硬上限的均衡分组
-    groups = longest > HARD_BUBBLE_CHARS ? mergeToCap(groups, cap) : merged;
-  }
-  return groups.map(cleanBubble).filter(Boolean);
+  const pieces = out
+    .flatMap((b) => splitLongBubble(b, softMax))
+    .map(cleanBubble)
+    .filter(Boolean);
+  return mergeToCap(pieces, maxBubbles);
 }
 
 /**
