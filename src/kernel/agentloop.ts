@@ -363,13 +363,20 @@ export class AgentLoop {
       // pi-ai 的工具参数是 TypeBox schema；parallel 存的就是 JSON Schema，原样包一层即可
       parameters: pie.Type.Unsafe(def.parameters),
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-        const tctx: ToolContext = {
-          event: ctx.event, chat: ctx.chat, role: ctx.event.role ?? 'member',
-          batch: ctx.batch, speakers: ctx.speakers,
-          historyWindowStartTs: ctx.historyWindowStartTs,
-          work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
-          vision,
-        };
+          const tctx: ToolContext = {
+            event: ctx.event, chat: ctx.chat, role: ctx.event.role ?? 'member',
+            batch: ctx.batch, speakers: ctx.speakers,
+            historyWindowStartTs: ctx.historyWindowStartTs,
+            work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
+            vision,
+            // 窗口消息快照（user/assistant）：work_dispatch 核对 chat 侧选录的原文片段用，
+            // 只读投影——工具拿不到也改不了这份上下文本身
+            contextMessages: ctx.messages
+              ? ctx.messages
+                  .filter((m) => m.role === 'user' || m.role === 'assistant')
+                  .map((m) => ({ role: m.role as 'user' | 'assistant', content: String(m.content ?? ''), ts: m.ts }))
+              : undefined,
+          };
         try {
           const r = await def.handler(params ?? {}, tctx);
           const text = typeof r === 'string' ? r : r.content;

@@ -155,6 +155,54 @@ export function verbatimTaskOf(
   return { task: lines.join('\n'), label };
 }
 
+/**
+ * 聊天上下文选录（2026-10-25 用户定）：chat 模型只能给「原文片段」，内核在它眼前的
+ * 窗口消息里逐一核对——对得上的把**整条原文**带给 work；对不上的（转述/改写/编造）
+ * 一律丢弃。chat 模型选得了内容，改不了内容。
+ * 最后一条 user 消息（本轮合批）不参与核对：它已经一字未改地附在任务正文里了。
+ */
+export function selectChatContext(
+  quotes: string[],
+  msgs: { role: 'user' | 'assistant'; content: string; ts?: number }[] | undefined,
+  opts: { maxQuotes?: number; maxMsgs?: number; maxChars?: number } = {},
+): { section: string; matched: number; dropped: number } {
+  const maxQuotes = opts.maxQuotes ?? 8;
+  const maxMsgs = opts.maxMsgs ?? 12;
+  const maxChars = opts.maxChars ?? 6000;
+  if (!quotes.length || !msgs?.length) return { section: '', matched: 0, dropped: 0 };
+  let lastUser = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === 'user') { lastUser = i; break; }
+  const candidates = msgs.filter((_m, i) => i !== lastUser);
+  const norm = (s: string) => String(s ?? '').replace(/\s+/g, '').toLowerCase();
+  const hits: typeof candidates = [];
+  let dropped = 0;
+  for (const q of quotes.slice(0, maxQuotes)) {
+    const nq = norm(q);
+    if (nq.length < 6) { dropped++; continue; }   // 太短的片段会乱命中（「好的」谁都说过）
+    const hit = candidates.find((m) => norm(m.content).includes(nq));
+    if (hit) { if (!hits.includes(hit)) hits.push(hit); } else dropped++;
+  }
+  if (!hits.length) return { section: '', matched: 0, dropped };
+  const lines: string[] = [];
+  let chars = 0;
+  for (let i = 0; i < hits.length && i < maxMsgs; i++) {
+    const m = hits[i];
+    const d = m.ts && Number.isFinite(m.ts) ? new Date(m.ts) : undefined;
+    const hhmm = d && !Number.isNaN(d.getTime())
+      ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} ` : '';
+    // user 消息的 content 本身就带「昵称：」前缀（进模型前由内核拼好）——整行原样带过去
+    const body = `${hhmm}${m.role === 'assistant' ? 'bot：' : ''}${m.content}`;
+    if (chars + body.length > maxChars) { lines.push(`（还有 ${hits.length - i} 条没带上：超出字数上限）`); break; }
+    lines.push(body);
+    chars += body.length;
+  }
+  if (hits.length > maxMsgs) lines.push(`（还有 ${hits.length - maxMsgs} 条没带上：超出条数上限）`);
+  const section = lines.length
+    ? `\n\n聊天上下文（chat 侧选录的原文，程序逐字核对过，一字未改）：\n${lines.join('\n')}`
+    : '';
+  return { section, matched: hits.length, dropped };
+}
+
 export function setup(ctx: PluginContext): void {
   const sb = ctx.sandbox as any;
   const se = ctx.session as any;
@@ -272,10 +320,11 @@ export function setup(ctx: PluginContext): void {
     description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。派出去的是**用户原话**（程序原样代传，不经你转述）。',
     // 不设 minRole：普通群友的 chat 也要"知道有这个能力、然后拒绝"，而不是工具凭空消失
     surface: 'chat',
-    promptSnippet: '把需要实际动手的活派给工作子代理（任务按用户原话代传）',
+    promptSnippet: '把需要实际动手的活派给工作子代理（任务按用户原话代传，可附聊天原文上下文）',
     promptGuidelines: [
       'task 只填你对这件活的一句话理解——它只用来对准用户哪句话是需求，真正派出去的是**用户原话**，由程序原样代传。你不负责转述，更不要替用户补充或收窄细节（尤其是画图的画面描述）。',
       '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
+      '这件活要靠更早的聊天内容（之前提过的要求/偏好/来龙去脉）时，用 context_quotes 带上：每段从你看到的消息里**一字不差地引用**原文片段，程序核对后把整条原话附给 work。只能选、不能改——转述或改写的片段会被丢弃。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
       '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
     ],
@@ -284,6 +333,10 @@ export function setup(ctx: PluginContext): void {
       properties: {
         task: { type: 'string', description: '你对这件活的一句话理解（程序拿它对准用户原话，不会作为任务正文派出）' },
         requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
+        context_quotes: {
+          type: 'array', maxItems: 8, items: { type: 'string' },
+          description: '这件活相关的更早聊天记录：每段从你看到的消息里一字不差地引用原文片段（程序逐字核对，改写/转述的会被丢弃）。只挑真正相关的，没有就不填。',
+        },
       },
       required: ['task'],
     },
@@ -301,8 +354,14 @@ export function setup(ctx: PluginContext): void {
       }
       // 一字不差传话：任务正文=用户原话（程序代传）；本轮找不到原话（比如发起人只发了图）才退回 chat 的理解，并注明是转述
       const verbatim = verbatimTaskOf(modelTask, tctx, who);
-      const task = verbatim.task
+      let task = verbatim.task
         || `${modelTask}\n\n（注：本轮没找到发起人的文字原话，以上是聊天侧的理解，仅此情况允许转述。）`;
+      // 相关聊天上下文：chat 模型只给原文片段，内核逐字核对后整条附上（它选得了、改不了）
+      const quotes = Array.isArray(args.context_quotes)
+        ? (args.context_quotes as unknown[]).map((q) => String(q ?? '')).filter(Boolean)
+        : [];
+      const picked = selectChatContext(quotes, tctx.contextMessages);
+      if (picked.section) task += picked.section;
       // 短标只用于进度条/列表：有原话用原话单行；退回转述时保留全文（老口径：任务全文不截断）
       const label = verbatim.label || modelTask;
       const chat = tctx.chat;
@@ -327,7 +386,10 @@ export function setup(ctx: PluginContext): void {
       });
       timer = setTimeout(start, 5000);
       timer.unref?.();
-      return `（已接下这件活，马上交给工作子代理去做。这一轮只用一句自然的话应下，不要说你已经做完了；做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
+      const ctxNote = picked.matched
+        ? `；附带的聊天上下文 ${picked.matched} 条已核对原文带上${picked.dropped ? `，另有 ${picked.dropped} 段没对上原文被丢弃（要带就一字不差地引用原话）` : ''}`
+        : (picked.dropped ? `；你选的 ${picked.dropped} 段上下文都没对上聊天原文，一个字都没带过去（要带就一字不差地引用原话，不能转述）` : '');
+      return `（已接下这件活，马上交给工作子代理去做${ctxNote}。这一轮只用一句自然的话应下，不要说你已经做完了；做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
     },
   });
 

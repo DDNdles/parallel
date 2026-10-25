@@ -148,6 +148,10 @@ export interface ToolContext {
   speakers?: { userId: string; nickname: string; role: Role; ts: number }[];
   /** 上下文窗口起点：search_history 用它把"模型眼前就有的那几条"排除掉（同 LLMRequestContext） */
   historyWindowStartTs?: number;
+  /** 模型当前上下文窗口的消息快照（user/assistant，只读；最后一条 user 是本轮合批）。
+   *  work_dispatch 用它核对 chat 侧选录的「原文片段」——chat 模型只能选、不能改：
+   *  对不上的片段（转述/改写/编造）由内核丢弃，带给 work 的上下文保证一字未改。 */
+  contextMessages?: { role: 'user' | 'assistant'; content: string; ts?: number }[];
   /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
   work?: { depth: number; runId?: string; agent?: string };
   /** 本轮链首模型是否收图片（模型页「输入类型」勾了 image）。工具据此决定要不要把图片塞回模型 */

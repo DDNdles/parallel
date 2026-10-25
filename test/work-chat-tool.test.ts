@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
-import { pickWorkRequester, verbatimTaskOf, stripRelayNoise } from '../src/plugins/work/index.ts';
+import { pickWorkRequester, verbatimTaskOf, stripRelayNoise, selectChatContext } from '../src/plugins/work/index.ts';
 
 // ============================================================
 // chat 面的 work 工具（2026-10-21，取代 /work 命令）
@@ -414,6 +414,83 @@ test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状
     assert.match(text, /\[~\] 写正文/, text);
     assert.match(text, /\[ \] 打包交付/, text);
     await a;
+  } finally {
+    await g.cleanup();
+  }
+});
+
+// ============================================================
+// 聊天上下文选录（2026-10-25 用户定）：chat 模型只能给原文片段，内核逐字核对——
+// 对得上的整条原文带给 work；转述/改写/编造的一律丢弃。chat 选得了、改不了。
+// ============================================================
+
+test('selectChatContext：原文片段核对通过带整条、转述与编造丢弃、本轮合批不重复带', () => {
+  const T = Date.now();
+  const msgs = [
+    { role: 'user' as const, content: '张三：那个蓝色要用在海报标题上，别的不要动', ts: T - 3_600_000 },
+    { role: 'user' as const, content: '李四：logo 记得放右下角', ts: T - 1_800_000 },
+    { role: 'assistant' as const, content: '好的，颜色和位置我都记下了', ts: T - 1_700_000 },
+    { role: 'user' as const, content: '王五：就按刚才说的做吧', ts: T },   // 最后一条 user=本轮合批
+  ];
+  const r = selectChatContext(
+    ['那个蓝色要用在海报标题上', 'logo记得放左下角', '就按刚才说的做吧'],
+    msgs,
+  );
+  assert.equal(r.matched, 1, '只有一字不差的片段该命中');
+  assert.equal(r.dropped, 2, '改写的和本轮合批里的都该丢');
+  assert.match(r.section, /聊天上下文（chat 侧选录的原文/);
+  assert.match(r.section, /张三：那个蓝色要用在海报标题上，别的不要动/);
+  assert.ok(!r.section.includes('logo'), '改写过的李四那条不能进');
+  assert.ok(!r.section.includes('王五'), '本轮合批的消息不该重复带');
+});
+
+test('selectChatContext：bot 自己的话也带（标注 bot），同一条被多段引用只带一次，空白差异不影响核对', () => {
+  const T = Date.now();
+  const msgs = [
+    { role: 'user' as const, content: '张三：上次说的字体是思源黑体', ts: T - 900_000 },
+    { role: 'assistant' as const, content: '记下了，海报正文用思源黑体，标题另说', ts: T - 800_000 },
+    { role: 'user' as const, content: '王五：那开始吧', ts: T },   // 最后一条 user=本轮合批
+  ];
+  const r = selectChatContext(['字体是思源黑体', '字体 是  思源黑体', '海报正文用思源黑体'], msgs);
+  assert.equal(r.matched, 2, '两段引用命中同一条消息只算一条，另一段命中 bot 的回复');
+  assert.equal(r.dropped, 0);
+  assert.match(r.section, /bot：记下了，海报正文用思源黑体/);
+  assert.match(r.section, /张三：上次说的字体是思源黑体/);
+});
+
+test('work_dispatch：context_quotes 核对后进任务正文，改写的被丢且在回执里如实报告', async () => {
+  const g = await boot('9405');
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const T = Date.now();
+    const done = new Promise<any>((resolve) => {
+      const off = g.kernel.bus.on('work.done' as any, (d: any) => {
+        if (d.chatKey === g.chatKey && d.trigger === 'chat') { off(); resolve(d); }
+      });
+    });
+    g.kernel.sandbox.write({ ...g.chat, scope: 'u10001' }, 'out.md', '# hi\n');
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '做完了', artifacts: ['out.md'] } }] });
+    g.mock.script.push({ content: '做好了。' });
+    const ret = String(await dispatch.handler(
+      { task: '做张海报', context_quotes: ['标题用思源黑体', 'logo记得放右下角'] },
+      {
+        ...g.tctx('10001', 'owner'),
+        contextMessages: [
+          { role: 'user' as const, content: '张三：标题用思源黑体，别用别的', ts: T - 900_000 },
+          { role: 'user' as const, content: '李四：logo 放右下角', ts: T - 600_000 },
+        ],
+      } as any,
+    ));
+    assert.match(ret, /上下文 1 条已核对原文带上/, `回执要说明核对结果：${ret}`);
+    assert.match(ret, /1 段没对上原文被丢弃/, `改写的要在回执里点名：${ret}`);
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+    const d = await done;
+    // list() 里的 task 是短标；全文落 work_runs 表（resume 与桌面端详情都读它）
+    const row = (g.kernel as any).db.get('SELECT task FROM work_runs WHERE id=?', d.id) as { task: string };
+    assert.match(row.task, /聊天上下文（chat 侧选录的原文，程序逐字核对过，一字未改）/);
+    assert.match(row.task, /张三：标题用思源黑体，别用别的/);
+    assert.ok(!row.task.includes('logo 放右下角'), '改写过的原文片段不能进任务');
+    assert.ok(!row.task.includes('李四：'), '被丢弃片段所在消息不能整条混进来');
   } finally {
     await g.cleanup();
   }
