@@ -14,7 +14,7 @@ import type { MockEngine } from '../src/kernel/services/mock-engine.ts';
 //
 //  1. steal_sticker：消息内与引用消息里的图都能收；模型打标写入 desc/tags/timing；
 //     打标失败不拦收录（描述退回消息文字）；不记来源；
-//  2. send_sticker：按描述/标签/时机挑图、发出去、计数、冷却；空库不注入提示；
+//  2. send_sticker：按描述/标签/时机挑图、发出去、计数；空库不注入提示；
 //  3. REST：列表/改三项/上传（原始字节或 base64，可点名字段）/取图/删除/库容/补打标签；
 //  4. reload 后数据仍在（plugin_kv 与 data/stickers 都不是进程内存）；
 //  5. 真实 HTTP 的原始字节上传（前端 postRaw 走的就是这条）。
@@ -170,10 +170,11 @@ test('steal_sticker：模型看图打标（desc/tags/timing），失败退回消
   }
 });
 
-test('send_sticker：按描述/标签/时机匹配、冷却、空库不注入提示', async () => {
+test('send_sticker：按描述/标签/时机匹配、连发不拦、空库不注入提示', async () => {
   const k = await boot();
   try {
-    await k.configure({ sendCooldownSec: 60 });
+    // 2026-10-25 用户定：发送冷却已删——偷了就能立即发，频率靠提示词分寸
+    await k.configure({});
     const sendTool = k.toolOf('send_sticker');
 
     // 空库：beforeLLM 不注入清单节
@@ -198,7 +199,7 @@ test('send_sticker：按描述/标签/时机匹配、冷却、空库不注入提
     assert.match(sec.text, /狂笑滚地/);
     assert.match(sec.text, /用在笑到不行的时候/);
     assert.match(sec.text, /明确让你收图/);
-    assert.match(sec.text, /冷却/);
+    assert.ok(!/冷却/.test(sec.text), '冷却文案已删');
 
     // 时机词也能挑中：query「被说哭」→ 大哭那张
     const outs: any[] = [];
@@ -211,21 +212,14 @@ test('send_sticker：按描述/标签/时机匹配、冷却、空库不注入提
       let lib = await k.library();
       assert.equal(lib.find((s: any) => s.id === up2.id).count, 1);
 
-      // 冷却中：不发、不计数、给模型一句中文提示
+      // 连发不拦（2026-10-25 用户定：偷了就能立即发，没有发送冷却）
       const r2 = asText(await sendTool.handler({ query: '笑' }, k.tctx(eventOf(k.chat, [])) as any));
-      assert.match(r2, /冷却/);
-      assert.equal(outs.length, 1, '冷却中不许再发');
-
-      // 关掉冷却（重载 = 新实例）：第二张能发
-      await k.configure({ sendCooldownSec: 0 });
-      const sendTool2 = k.toolOf('send_sticker');
-      const r3 = asText(await sendTool2.handler({ query: '笑' }, k.tctx(eventOf(k.chat, [])) as any));
-      assert.match(r3, /已发了一张「狂笑滚地」/);
+      assert.match(r2, /已发了一张「狂笑滚地」/);
       assert.equal(outs.length, 2);
       assert.deepEqual(readFileSync(String(outs[1].segments[0].data.file)), png(11));
 
       // 无命中：明说没有，不硬发
-      const r4 = asText(await sendTool2.handler({ query: '完全对不上的东西' }, k.tctx(eventOf(k.chat, [])) as any));
+      const r4 = asText(await sendTool.handler({ query: '完全对不上的东西' }, k.tctx(eventOf(k.chat, [])) as any));
       assert.match(r4, /没有和/);
       assert.equal(outs.length, 2);
     } finally {

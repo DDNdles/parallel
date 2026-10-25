@@ -716,8 +716,6 @@ export default function SettingsPage() {
                   </div>
                 </div>
                 <div className="set-grid" style={{ marginTop: 14 }}>
-                  <Num label="发表情冷却（秒）" value={Number(sc.sendCooldownSec ?? 0)}
-                    onChange={(v) => setPlugVal('sticker', { sendCooldownSec: v })} />
                   <Num label="列表最多列几张" value={Number(sc.promptListMax ?? 0)}
                     onChange={(v) => setPlugVal('sticker', { promptListMax: v })} />
                   <Num label="表情库上限" hint="满了拒收新图" value={Number(sc.maxLibrary ?? 0)}

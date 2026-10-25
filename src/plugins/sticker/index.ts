@@ -373,7 +373,6 @@ export function setup(ctx: PluginContext): void {
 
   // ---------- 收图来源 ----------
 
-  const chatKeyOf = (chat: ChatRef): string => `${chat.type}_${chat.chatId}`;
 
   /** 这条消息里可收的图：消息内 files、引用消息的文件、段里带本地路径的图（远端 URL 不在这里下） */
   function imagePathsOf(event: ChatEvent, chat: ChatRef): { path: string; name: string }[] {
@@ -403,10 +402,6 @@ export function setup(ctx: PluginContext): void {
     return cleanText(String(event.text ?? '').replace(/\[[^\]]*\]/g, ' '), 40);
   }
 
-  // ---------- 发送冷却（进程内存；重启只是少一层护栏，不影响正确性） ----------
-
-  const lastSent = new Map<string, number>();
-
   // ---------- LLM 工具 ----------
 
   ctx.llm.registerTool({
@@ -424,20 +419,11 @@ export function setup(ctx: PluginContext): void {
     promptGuidelines: [
       '看情况发：气氛到位、图对得上才发一张；别每句都配图，别连着发同一类。',
       'query 用描述/标签/时机里的词；库里没有对得上的就正常说话，不要硬发。',
-      '发送冷却由程序管；被拒（冷却中/没匹配）就照常接话，不要向对方解释工具调用。',
+      '库里没有对得上的（被拒）就照常接话，不要向对方解释工具调用。',
     ],
     handler: async (args, tctx) => {
       const query = cleanText(args.query, 60);
       if (!query) return '（query 是空的；想发图就把描述/标签/时机里的词填进来，不想发就正常说话。）';
-
-      const cooldown = cfgNum('sendCooldownSec', 60, 0, 3600);
-      const key = chatKeyOf(tctx.chat);
-      const now = Date.now();
-      const last = lastSent.get(key) ?? 0;
-      if (cooldown > 0 && last && now - last < cooldown * 1000) {
-        const wait = Math.ceil((cooldown * 1000 - (now - last)) / 1000);
-        return `（刚发过表情，冷却还剩 ${wait} 秒；这次别发，正常接话。）`;
-      }
 
       const list = loadLibrary();
       if (!list.length) return '（表情包库还是空的；这次别发图，用文字接话。）';
@@ -456,7 +442,6 @@ export function setup(ctx: PluginContext): void {
       item.count += 1;
       item.lastUsed = Date.now();
       saveLibrary(list);
-      if (cooldown > 0) lastSent.set(key, Date.now());
       return `（已发了一张「${item.desc || item.tags[0] || item.id}」的表情。这一轮不用再发，正常把话说完。）`;
     },
   });
@@ -529,7 +514,7 @@ export function setup(ctx: PluginContext): void {
         ...lines,
         list.length > shown.length ? `（共 ${list.length} 张，这里只列常用的 ${shown.length} 张）` : '',
         '用户明确让你收图时调 steal_sticker（“收下这个”“存成表情包”）；用户没开口就不要收。',
-        '分寸：看情况发——气氛合适、图对得上才发一张，别刷屏、别每句都配图；冷却时间由程序管，被拒就照常接话，不要向对方解释这个工具。',
+        '分寸：看情况发——气氛合适、图对得上才发一张，别刷屏、别每句都配图；库里没有对得上的就照常接话，不要向对方解释这个工具。',
       ].filter(Boolean).join('\n'),
     });
     return req;
