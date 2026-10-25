@@ -529,7 +529,7 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
-                <BubbleBars h={h} patchH={patchH} />
+                <BubbleSlider h={h} patchH={patchH} />
                 <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
                 {h.outgoing.typingEnabled === true && (<>
@@ -826,12 +826,12 @@ export default function SettingsPage() {
   );
 }
 
-/** 气泡数概率柱（2026-10-25 重做）：每根柱=一种气泡条数，柱高=该档抽取权重（0..100），
- *  拖动或直接点柱身设定高度，拖到底 = 停用该档——与内核 pickBubbleTarget 逐档取权同口径，
- *  柱间互不牵连（旧版拖边界会同时改两档概率）。bubbleWeights 全空 = 内核自动三角分布
- *  （峰值=预期气泡数），此处按同一公式预览；动柱即写入自定义，「恢复自动」清回空数组。
- *  百分比是归一化后的实际抽取概率；近形降权为运行时叠加，不计入显示。 */
-function BubbleBars({ h, patchH }: {
+/** 气泡数概率条（2026-10-25 第二版）：一条横向轨道按概率切成 N 段（每段=一种气泡条数），
+ *  **段本身可拖动**——左右拖改变这一档的占比，其余段按比例让位（旧版拖边界一次牵动两档，
+ *  被否）。拖没（占比 0）= 停用该档，下方数字标签仍可抓住拖回来。数据仍是 bubbleWeights
+ *  权重数组（内核 pickBubbleTarget 逐档取权），段宽 = 权重/总和 的归一化占比。
+ *  空 bubbleWeights = 自动三角分布（峰值=预期气泡数）预览，动一段即写入自定义。 */
+function BubbleSlider({ h, patchH }: {
   h: Humanlike;
   patchH: (p: Partial<Humanlike>, immediate?: boolean) => void;
 }) {
@@ -839,33 +839,38 @@ function BubbleBars({ h, patchH }: {
   const expected = Math.max(1, Math.min(max, Math.round(h.outgoing.expectedBubbles ?? 3)));
   const custom = h.outgoing.bubbleWeights ?? [];
   const isAuto = !custom.some((w) => Number.isFinite(w) && w > 0);
-  // 自动三角分布（同 delivery.autoBubbleWeights）按峰值归一到 0..100，作为预览与首次拖动的种子
-  const raw = Array.from({ length: max }, (_v, i) => Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45));
-  const seed = raw.map((w) => Math.max(1, Math.round((w / Math.max(...raw)) * 100)));
-  const base = Array.from({ length: max }, (_v, i) => {
-    if (isAuto) return seed[i];
-    const w = custom[i];
-    return Number.isFinite(w) ? Math.min(100, Math.max(0, Math.round(w as number))) : 0;
-  });
+  // 自动三角分布（同 delivery.autoBubbleWeights）作预览与首次拖动的种子；自定义直接用存储权重
+  const base = isAuto
+    ? Array.from({ length: max }, (_v, i) => Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45))
+    : Array.from({ length: max }, (_v, i) => {
+      const w = custom[i];
+      return Number.isFinite(w) ? Math.max(0, Math.min(100, w as number)) : 0;
+    });
+  const sum = base.reduce((a, b) => a + b, 0) || 1;
+  const shares = base.map((w) => (w / sum) * 100);
 
-  const [drag, setDrag] = useState<{ idx: number; bottom: number; height: number; next: number[] } | null>(null);
-  const shown = drag ? drag.next : base;
-  const total = shown.reduce((a, b) => a + b, 0);
+  const [drag, setDrag] = useState<{ idx: number; startX: number; trackW: number; start: number[]; next: number[] } | null>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const shown = drag ? drag.next : shares;
 
-  const commit = (w: number[]) => {
-    const clean = w.slice(0, max).map((x) => Math.max(0, Math.min(100, Math.round(x))));
+  const commit = (s: number[]) => {
+    const clean = s.slice(0, max).map((x) => Math.max(0, Math.min(100, Math.round(x))));
     // 全 0 = 等于没配：清回空数组走自动分布（内核同口径）
     patchH({ outgoing: { ...h.outgoing, bubbleWeights: clean.some((x) => x > 0) ? clean : [] } }, true);
   };
 
-  // 指针监听挂 window：拖出轨道不丢事件（旧版 setPointerCapture 在合成事件下会抛错）
+  // 指针监听挂 window：拖出轨道不丢事件（不用 setPointerCapture，合成事件下会抛错）
   useEffect(() => {
     if (!drag) return;
     const move = (e: PointerEvent) => {
-      const w = Math.max(0, Math.min(100, Math.round(((drag.bottom - e.clientY) / drag.height) * 100)));
-      if (w === drag.next[drag.idx]) return;
-      const next = drag.next.slice();
-      next[drag.idx] = w;
+      const dShare = ((e.clientX - drag.startX) / drag.trackW) * 100;
+      const target = Math.max(0, Math.min(100, drag.start[drag.idx] + dShare));
+      const rest = 100 - target;
+      const oSum = drag.start.reduce((a, b, i) => (i === drag.idx ? a : a + b), 0);
+      const next = drag.start.map((s, i) => {
+        if (i === drag.idx) return target;
+        return oSum > 0 ? (s * rest) / oSum : rest / Math.max(1, max - 1);
+      });
       setDrag({ ...drag, next });
     };
     const up = () => { commit(drag.next); setDrag(null); };
@@ -880,43 +885,42 @@ function BubbleBars({ h, patchH }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drag]);
 
-  const start = (i: number) => (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
+  const start = (i: number) => (e: React.PointerEvent) => {
+    if (e.button !== 0 || max === 1) return;
     e.preventDefault();
-    const r = e.currentTarget.getBoundingClientRect();
-    const w = Math.max(0, Math.min(100, Math.round(((r.bottom - e.clientY) / r.height) * 100)));
-    const next = base.slice();
-    next[i] = w;
-    setDrag({ idx: i, bottom: r.bottom, height: r.height, next });
+    const r = trackRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setDrag({ idx: i, startX: e.clientX, trackW: r.width, start: shares.slice(), next: shares.slice() });
   };
 
   return (
     <div className="mset-field" style={{ gridColumn: '1 / -1', marginBottom: 0 }}>
       <div style={{ display: 'flex', alignItems: 'center' }}>
         <label className="mset-flabel" style={{ marginBottom: 0 }}>气泡数概率
-          <Hint text="每根柱=一种气泡条数，柱高=抽中权重；拖动或点柱身直接设定，拖到底=停用该档" />
+          <Hint text={'一条轨道切 N 段，每段=一种气泡条数，段宽=该档抽取概率。\n拖动任意一段改变它的概率，其余段按比例让位；拖没=停用该档（拖下方数字可恢复）'} />
         </label>
         {!isAuto && <button className="mset-add" onClick={() => commit([])}>恢复自动</button>}
       </div>
-      <div className={`bb-row${isAuto ? ' bb-auto' : ''}${drag ? ' bb-drag' : ''}`}>
-        {shown.map((w, i) => {
-          const pct = total > 0 ? Math.round((w / total) * 100) : 0;
-          return (
-            <div key={i} className="bb-col">
-              <div className="bb-track" onPointerDown={start(i)}
-                title={`${i + 1} 条 · ${pct}%${!isAuto && w === 0 ? '（已停用）' : ''}——拖动或点击设定高度`}>
-                <div className="bb-fill" style={{ height: `${w}%` }} />
-              </div>
-              <span className={`bb-num${i + 1 === expected ? ' bb-peak' : ''}`}>{i + 1}</span>
-              <span className="bb-pct">{pct}%</span>
-            </div>
-          );
-        })}
+      <div ref={trackRef} className={`bbs-track${isAuto ? ' bbs-auto' : ''}${drag ? ' bbs-drag' : ''}`}>
+        {shown.map((s, i) => (
+          <div key={i} className={`bbs-seg${drag?.idx === i ? ' bbs-on' : ''}`}
+            style={{ flexGrow: Math.max(s, 0.0001), flexBasis: 0 }}
+            onPointerDown={start(i)}
+            title={`${i + 1} 条 · ${Math.round(s)}%${!isAuto && s < 0.5 ? '（已停用）' : ''}`}>
+            {s >= 10 && <span className="bbs-t">{i + 1} 条 · {Math.round(s)}%</span>}
+          </div>
+        ))}
+      </div>
+      <div className="bbs-labels">
+        {shown.map((s, i) => (
+          <span key={i} className={`bbs-lb${i + 1 === expected ? ' bbs-peak' : ''}`}
+            style={{ flexGrow: Math.max(s, 0.0001), flexBasis: 0 }} onPointerDown={start(i)}>{i + 1}</span>
+        ))}
       </div>
       <div className="plg-hint" style={{ marginTop: 8 }}>
         {isAuto
-          ? '自动分布：峰值=预期气泡数，拖动任一柱即进入自定义'
-          : `自定义 ${shown.filter((x) => x > 0).length}/${max} 档参与抽取，每轮按百分比抽签`}
+          ? '自动分布：峰值=预期气泡数，拖动任意一段即进入自定义'
+          : `自定义 ${shown.filter((x) => x >= 0.5).length}/${max} 档参与抽取，每轮按段宽抽签`}
       </div>
     </div>
   );

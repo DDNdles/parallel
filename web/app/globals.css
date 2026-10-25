@@ -1171,25 +1171,27 @@ tr:hover td { background: var(--row-hover); }
 .mset-mrow:last-child { border-bottom: 0; }
 .mset-mrow:hover { background: var(--row-hover); }
 
-/* 气泡数概率柱（设置页·拟人化·发送方式）：每根柱=一种条数，柱高=权重；
-   黑白灰随主题自动反转（亮突出的用 --bg-active/--dim 两档实心），列多时百分比让位 */
-.bb-row { display: flex; gap: 8px; margin-top: 10px; align-items: flex-end; }
-.bb-col { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 5px; }
-.bb-track { position: relative; width: 100%; height: 92px; border-radius: 7px; background: var(--sel);
-  cursor: ns-resize; touch-action: none; user-select: none;
-  transition: background var(--dur-fast) var(--ease-out); }
-.bb-track:hover { background: var(--bg-hover); }
-.bb-fill { position: absolute; left: 0; right: 0; bottom: 0; border-radius: 5px 5px 0 0;
-  background: var(--dim); transition: height var(--dur-base) var(--ease-out), background var(--dur-fast) var(--ease-out); }
-.bb-auto .bb-fill { background: var(--bg-active); } /* 自动分布只是预览，压暗一档 */
-.bb-auto .bb-track:hover .bb-fill { background: var(--dim); }
-.bb-drag .bb-fill, .bb-drag .bb-track { transition: none; } /* 拖动跟手，不要缓动 */
-.bb-drag { cursor: ns-resize; }
-.bb-num { font-family: var(--mono); font-size: 11px; color: var(--dim); }
-.bb-peak { color: var(--text); font-weight: 600; }
-.bb-pct { font-family: var(--mono); font-size: 10.5px; color: var(--faint); white-space: nowrap; }
-.bb-row:has(.bb-col:nth-child(11)) .bb-pct { display: none; }
-.bb-col:has(.bb-track:hover) .bb-num { color: var(--text); }
+/* 气泡数概率条（设置页·拟人化·发送方式）：横向轨道按概率切段，段=一种条数、段宽=占比；
+   段本身可拖动（拖它=只改它，其余按比例让位），黑白灰两档实心随主题自动反转 */
+.bbs-track { display: flex; gap: 3px; height: 40px; margin-top: 10px; padding: 3px;
+  border-radius: 11px; background: var(--sel); touch-action: none; }
+.bbs-seg { position: relative; min-width: 0; border-radius: 8px; background: var(--bg-hover);
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+  cursor: ew-resize; user-select: none;
+  transition: background var(--dur-fast) var(--ease-out), flex-grow var(--dur-base) var(--ease-out); }
+.bbs-seg:hover, .bbs-seg.bbs-on { background: var(--bg-active); }
+.bbs-auto .bbs-seg { background: var(--seg-bg); }
+.bbs-auto .bbs-seg:hover, .bbs-auto .bbs-seg.bbs-on { background: var(--bg-hover); }
+.bbs-drag .bbs-seg { transition: none; } /* 拖动跟手，段宽变化不要缓动 */
+.bbs-t { font-family: var(--mono); font-size: 11px; color: var(--text); white-space: nowrap; pointer-events: none; }
+.bbs-auto .bbs-t { color: var(--dim); }
+/* 数字标签行与段同宽对齐（flexGrow 一致），停用段塌成 0 时标签仍可抓住拖回来 */
+.bbs-labels { display: flex; gap: 3px; margin-top: 6px; }
+.bbs-lb { flex-basis: 0; min-width: 16px; text-align: center; font-family: var(--mono); font-size: 11px;
+  color: var(--dim); cursor: ew-resize; user-select: none;
+  transition: color var(--dur-fast) var(--ease-out); }
+.bbs-lb:hover { color: var(--text); }
+.bbs-peak { color: var(--text); font-weight: 600; }
 .mset-mrow.off .mset-mname { color: var(--faint); text-decoration: line-through; }
 .mset-mname { border: 0; background: transparent; font-family: var(--mono); font-size: 12.5px; color: var(--text);
   max-width: 42%; padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; text-align: left; }
