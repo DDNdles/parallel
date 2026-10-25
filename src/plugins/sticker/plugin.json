@@ -23,11 +23,6 @@
       "default": true,
       "description": "收录时让模型看一遍图，自动写描述、标签与使用时机（关掉就只留手填）"
     },
-    "sendCooldownSec": {
-      "type": "number",
-      "default": 60,
-      "description": "send_sticker 的冷却秒数（同一个会话两次发图的最小间隔，0 = 不冷却）"
-    },
     "promptListMax": {
       "type": "number",
       "default": 40,
