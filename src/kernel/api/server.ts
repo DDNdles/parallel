@@ -1349,6 +1349,15 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     e = applyNum(t, outgoing, 'bubbleSoftMaxCharacters', 10, 80, '单条气泡目标字数'); if (e) return e;
     e = applyNum(t, outgoing, 'expectedBubbles', 1, 10, '预期气泡数'); if (e) return e;
     e = applyNum(t, outgoing, 'maxBubbles', 1, 20, '最大气泡数'); if (e) return e;
+    if ('bubbleWeights' in outgoing) {
+      const bw = outgoing.bubbleWeights;
+      if (bw !== null && !Array.isArray(bw)) return '气泡数概率需要是数组';
+      const arr = Array.isArray(bw) ? bw : [];
+      if (arr.length > 20) return '气泡数概率最多 20 档';
+      const cleaned = arr.map((w) => (typeof w === 'number' && Number.isFinite(w) ? Math.max(0, Math.min(100, w)) : 0));
+      // 全 0 / 空 = 回自动分布：直接清空，配置里不留垃圾
+      outgoing.bubbleWeights = cleaned.some((w) => w > 0) ? cleaned : [];
+    }
     e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
     e = applyNum(t, outgoing, 'typingCharactersPerSecond', 1, 100, '打字速度'); if (e) return e;
     e = applyNum(t, outgoing, 'typingMaxDelaySeconds', 0, 120, '单条最长打字等待'); if (e) return e;

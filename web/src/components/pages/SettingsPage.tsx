@@ -15,7 +15,7 @@ interface Humanlike {
   /** 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限 */
   outgoing: {
     splitReplyMessages: boolean; replyMaxCharacters: number; maxReplyTokens: number;
-    bubbleSoftMaxCharacters: number; expectedBubbles?: number; maxBubbles?: number;
+    bubbleSoftMaxCharacters: number; expectedBubbles?: number; maxBubbles?: number; bubbleWeights?: number[];
     typingEnabled?: boolean;
     typingBaseDelaySeconds: number; typingCharactersPerSecond: number;
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
@@ -529,6 +529,7 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
+                <BubbleWeights h={h} patchH={patchH} />
                 <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
                 {h.outgoing.typingEnabled === true && (<>
@@ -820,6 +821,55 @@ export default function SettingsPage() {
             );
           })())}
         </section>
+      </div>
+    </div>
+  );
+}
+
+/** 气泡数概率编辑器（2026-10-25）：每档一个权重，抽签按权重归一化；空数组 = 自动三角分布。
+ *  显示的百分比是「当前输入」的归一化（不含近形降权——那是运行时的反定型叠加）。
+ *  autoWeights 与内核 delivery.autoBubbleWeights 保持同一公式。 */
+function BubbleWeights({ h, patchH }: {
+  h: Humanlike;
+  patchH: (p: Partial<Humanlike>, immediate?: boolean) => void;
+}) {
+  const max = Math.max(1, Math.round(h.outgoing.maxBubbles ?? 6));
+  const expected = Math.max(1, Math.min(Math.round(h.outgoing.expectedBubbles ?? 3), max));
+  const auto = (i: number): number => Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45);
+  const custom = h.outgoing.bubbleWeights ?? [];
+  const isAuto = !custom.some((w) => w > 0);
+  const shown = Array.from({ length: max }, (_v, i) => {
+    const w = custom[i];
+    return typeof w === 'number' && w >= 0 ? w : auto(i);
+  });
+  const total = shown.reduce((a, b) => a + b, 0) || 1;
+  const setW = (i: number, v: number) => {
+    const next = Array.from({ length: max }, (_x, j) => (j === i ? Math.max(0, Math.min(100, v)) : (custom[j] ?? auto(j))));
+    patchH({ outgoing: { ...h.outgoing, bubbleWeights: next } });
+  };
+  return (
+    <div style={{ gridColumn: '1 / -1' }}>
+      <div className="mset-sec-h" style={{ marginTop: 10 }}>
+        <span>气泡数概率{isAuto && <span className="plg-hint">（自动分布，改任意一项即自定义）</span>}</span>
+        {!isAuto && (
+          <button className="mset-add" onClick={() => patchH({ outgoing: { ...h.outgoing, bubbleWeights: [] } }, true)}>恢复自动</button>
+        )}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, marginTop: 8 }}>
+        {shown.map((w, i) => {
+          const pct = Math.round((w / total) * 100);
+          return (
+            <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+              <span className="plg-hint">{pct}%</span>
+              <div style={{ width: '100%', height: 6, borderRadius: 3, background: 'var(--bg-hover)' }}>
+                <div style={{ width: `${Math.max(2, pct)}%`, height: '100%', borderRadius: 3, background: 'var(--fg)' }} />
+              </div>
+              <BrandInput type="number" decimal value={Math.round(w * 100) / 100} spellCheck={false}
+                onChange={(e) => setW(i, Number(e.target.value))} />
+              <span className="plg-hint">{i + 1} 条</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

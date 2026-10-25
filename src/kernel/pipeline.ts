@@ -867,6 +867,7 @@ export class Pipeline {
             maxChars: out.replyMaxCharacters,
             targetBubbles: pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
               recentShapes: this.humanlike.recentBubbleShapes(chat),
+              weights: out.bubbleWeights,
             }),
             maxBubbles: out.maxBubbles,
           }),

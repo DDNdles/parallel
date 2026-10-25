@@ -25,6 +25,8 @@ export interface OutgoingConfig {
   expectedBubbles?: number;
   /** 最大气泡数：程序分条硬上限（超出合并） */
   maxBubbles?: number;
+  /** 气泡数概率的自定义权重（索引对 1..N 条；空 = 自动三角分布；某档 0 = 禁用该条数） */
+  bubbleWeights?: number[];
   /** 是否模拟「正在输入」的停顿（默认关：气泡之间立即发） */
   typingEnabled: boolean;
   /** 发送第二条及后续分段消息前的基础打字等待秒数 */
@@ -46,6 +48,7 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   bubbleSoftMaxCharacters: 24,
   expectedBubbles: 3,
   maxBubbles: 6,
+  bubbleWeights: [],
   typingEnabled: false,
   typingBaseDelaySeconds: 1,
   typingCharactersPerSecond: 8,
@@ -74,25 +77,44 @@ const SOFT_BREAKS = new Set([...'，,、：:']);
 const HARD_BUBBLE_CHARS = 40;
 
 /**
+ * 自动分布：以 expected 为峰的三角权重向两边线性衰减，远处留 ~15% 地板——
+ * 偶尔抽到 1 条或接近上限，形状才活得起来。设置页「气泡数概率」没自定义时用它。
+ */
+export function autoBubbleWeights(expected: number, maxBubbles: number): number[] {
+  const max = Math.max(1, Math.round(maxBubbles));
+  const peak = Math.min(max, Math.max(1, Math.round(expected)));
+  const out: number[] = [];
+  for (let i = 1; i <= max; i++) out.push(Math.max(0.15, 1 - Math.abs(i - peak) * 0.45));
+  return out;
+}
+
+/**
  * 每轮随机抽一个「目标气泡数」（2026-10-25）：写进当轮提示规定模型说几条，
  * 必要情况允许它突破（程序只兜 maxBubbles 的合并）。固定推荐值会让输出形状定型，
  * 每轮抽签 + 最近形状降权（与 rhythm 反定型同路数）才是活的节奏。
  *
- * 分布：以 expected 为峰的三角权重向两边线性衰减，但远处保留 ~15% 地板——
- * 偶尔抽到 1 条或接近上限，形状才活得起来。最近几轮出现过的粗结构再打折
- * （连着两轮都用同一个数就太刻意）。
+ * 分布权重：opts.weights（设置页「气泡数概率」，按索引对 1..N 条）非空时优先——
+ * 缺档/非法回落地板 0.15，全 0 视为没配走自动分布；否则用 autoBubbleWeights。
+ * 最近几轮出现过的粗结构再打折（连着两轮都用同一个数就太刻意）。
  */
 export function pickBubbleTarget(
   expected: number,
   maxBubbles: number,
-  opts: { recentShapes?: number[]; rand?: () => number } = {},
+  opts: { recentShapes?: number[]; rand?: () => number; weights?: number[] } = {},
 ): number {
   const max = Math.max(1, Math.round(maxBubbles));
   const peak = Math.min(max, Math.max(1, Math.round(expected)));
+  // 自定义权重（设置页「气泡数概率」）：有任一档 >0 就用自定义——填 0 = 该条数禁用、
+  // 数组比上限短 = 缺档不抽；全是 0 / 没配 = 走自动分布
+  const raw = (opts.weights ?? []).map((w) => (Number.isFinite(w) ? Math.max(0, Math.min(100, w as number)) : NaN));
+  const customOk = raw.slice(0, max).some((w) => Number.isFinite(w) && w > 0);
+  const base: number[] = customOk
+    ? Array.from({ length: max }, (_v, i) => (Number.isFinite(raw[i]) ? (raw[i] as number) : 0))
+    : autoBubbleWeights(peak, max);
   const recent = (opts.recentShapes ?? []).slice(-3);
   const weights: number[] = [];
   for (let i = 1; i <= max; i++) {
-    let w = Math.max(0.15, 1 - Math.abs(i - peak) * 0.45);
+    let w = base[i - 1];
     // 与最近一轮相同的形状降权；最近两轮连续同构的再砍一刀（1 条连发 / 3+ 连发都太刻意）
     for (let k = 0; k < recent.length; k++) {
       const shape = recent[recent.length - 1 - k];
@@ -102,6 +124,7 @@ export function pickBubbleTarget(
     weights.push(w);
   }
   const total = weights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return peak;
   let roll = (opts.rand ?? Math.random)() * total;
   for (let i = 0; i < weights.length; i++) {
     roll -= weights[i];

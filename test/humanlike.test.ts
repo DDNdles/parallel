@@ -898,3 +898,28 @@ test('pickBubbleTarget：范围夹紧、众数落在预期附近、最近同形�
   const base = counts.get(3) ?? 0;
   assert.ok(repeat < base, `近形应降权：避重后抽 3 = ${repeat}，基线 ${base}`);
 });
+
+test('pickBubbleTarget 自定义权重：按权重归一化、0=禁用、缺档不抽、全 0 回自动', () => {
+  // 确定性：权重 [1,0,0,0,0,0]（只许 1 条）无论 rand 都返回 1
+  for (const r of [0.01, 0.5, 0.99]) {
+    assert.equal(pickBubbleTarget(3, 6, { weights: [1, 0, 0, 0, 0, 0], rand: () => r }), 1, '被禁用的条数绝不抽出');
+  }
+  // [0,0,5,0,0,0] 只抽 3
+  for (const r of [0.01, 0.5, 0.99]) {
+    assert.equal(pickBubbleTarget(3, 6, { weights: [0, 0, 5, 0, 0, 0], rand: () => r }), 3);
+  }
+  // 缺档不抽：[1,1] 只会出 1/2
+  for (let i = 0; i < 200; i++) {
+    const v = pickBubbleTarget(3, 6, { weights: [1, 1] });
+    assert.ok(v === 1 || v === 2, `缺档应不抽：${v}`);
+  }
+  // 全 0 = 回自动分布（峰值在 expected）
+  const autoCounts = new Map<number, number>();
+  for (let i = 0; i < 800; i++) {
+    const v = pickBubbleTarget(3, 6, { weights: [0, 0, 0, 0, 0, 0] });
+    autoCounts.set(v, (autoCounts.get(v) ?? 0) + 1);
+  }
+  assert.ok((autoCounts.get(3) ?? 0) > 200, `全 0 应回自动分布，峰在 3：${JSON.stringify([...autoCounts])}`);
+  // 负数/超 100 夹紧 [0,100]
+  assert.equal(pickBubbleTarget(3, 2, { weights: [-5, 999], rand: () => 0.99 }), 2);
+});
