@@ -172,6 +172,9 @@ export class Db {
     addWorkCol('events', 'TEXT');
     addWorkCol('usage', 'TEXT');
     addWorkCol('nickname', 'TEXT');
+    // 2026-10-25 任务隔离改版：沙箱不再挂群聊，任务沙箱键（private_u{userId}__t{taskId}）落这列；
+    // 老行为 NULL，回退按 chat_key+user_id 拼旧式 key
+    addWorkCol('sandbox_key', 'TEXT');
     this.repairFts();
     this.migrateUsageModel();
   }

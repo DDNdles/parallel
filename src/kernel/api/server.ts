@@ -8,7 +8,7 @@ import type { Kernel } from '../kernel.ts';
 import { REASONING_LEVELS, type ModelRef, type ProviderModelCfg } from '../config.ts';
 import { newId, nowMs } from '../util/misc.ts';
 import { usageReport } from '../services/usage.ts';
-import { collectRecentArtifacts, workScopeOf } from '../services/work.ts';
+import { collectRecentArtifacts, workScopeOf, sandboxRefOfKey } from '../services/work.ts';
 import { isDeliverableArtifact } from '../services/artifacts.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
 import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
@@ -905,7 +905,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           : (cfg.extraAdminIds ?? []).includes(userId) ? 'admin' : 'member';
         if (role === 'member') return send({ error: '只有管理员能继续工作' }, 403);
         const r = await kernel.container.resumeWork({
-          chatKey, task, userId,
+          chatKey, task, userId, runId: row?.id,
           nickname: body.nickname ?? row?.nickname ?? undefined,
           role: role as Role,
           trigger: 'chat',
@@ -924,17 +924,17 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         const runId = String(body.runId ?? '').trim();
         if (!runId) return send({ error: 'runId 不能为空' }, 400);
         const row = kernel.db.get<{
-          id: string; chat_key: string; task: string; user_id: string; nickname?: string;
+          id: string; chat_key: string; sandbox_key: string | null; task: string; user_id: string; nickname?: string;
           ts: number; duration_ms: number; artifacts: string | null; ok: number; error: string | null;
-        }>('SELECT id, chat_key, task, user_id, nickname, ts, duration_ms, artifacts, ok, error FROM work_runs WHERE id=?', runId);
+        }>('SELECT id, chat_key, sandbox_key, task, user_id, nickname, ts, duration_ms, artifacts, ok, error FROM work_runs WHERE id=?', runId);
         if (!row) return send({ error: `没有运行 ${runId}` }, 404);
         const m = String(row.chat_key ?? '').match(/^(group|private)_(.+)$/);
         if (!m) return send({ error: '这次运行没有可投递的会话' }, 400);
         const userId = String(row.user_id ?? '').trim();
         if (!userId) return send({ error: '这次运行没有发起人，无法定位沙箱' }, 400);
-        const chat: ChatRef = {
-          platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2], scope: workScopeOf(userId),
-        };
+        // 2026-10-25 任务隔离：优先用运行自己的任务沙箱；老行（无 sandbox_key）回退旧式按人沙箱
+        const chat: ChatRef = sandboxRefOfKey(String(row.sandbox_key ?? ''))
+          ?? { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2], scope: workScopeOf(userId) };
         let known: string[] = [];
         try {
           const parsed = JSON.parse(row.artifacts ?? '[]');

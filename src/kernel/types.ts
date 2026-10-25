@@ -277,6 +277,11 @@ export interface PluginHooks {
 }
 
 export interface LLMRequestContext {
+  /**
+   * work 轮的入账会话（2026-10-25 任务隔离）：sessionLog/用量/错误上报按它记；
+   * `chat` 是任务沙箱 ref（工具的文件/容器操作都落在它上面）。chat 轮不传（= chat 本身）。
+   */
+  reportChat?: ChatRef;
   chat: ChatRef;
   event: ChatEvent;
   system: string;
@@ -753,6 +758,12 @@ export interface WorkDispatchInput {
   userId: string;
   nickname?: string;
   role: string;
+  /**
+   * 续接旧任务（2026-10-25 用户定：新旧任务由 chat 模型判断）：任务号（work_status 列出的
+   * runId）或 'latest'（该用户最近一个任务）。带它 = 沿用旧任务的沙箱与上下文；
+   * 缺省 = 全新任务（新沙箱，看不到旧任务文件）。
+   */
+  continueRun?: string;
 }
 
 export interface WorkDispatchResult {
@@ -788,6 +799,8 @@ export interface WorkLiveStatus {
     durationMs: number; finishedAt: number; summary: string;
     artifacts: string[]; error?: string;
   };
+  /** 该发起人最近的任务（跨会话；chat 模型据此判断「接着旧任务」还是开新任务） */
+  recent?: { id: string; task: string; ok: boolean; phase: string; at: number; runId?: string }[];
 }
 
 export interface GatedWork {
@@ -802,8 +815,8 @@ export interface GatedWork {
    * 上一次停下来提问的现场还没过期时，这次的话就是那个问题的回答（自动拼成续接任务）。
    */
   dispatch(input: WorkDispatchInput): WorkDispatchResult;
-  /** 该会话里这位发起人自己的活（只按 userId 过滤，看不到别人的） */
-  status(chatKey: string, userId: string): WorkLiveStatus;
+  /** 这位发起人自己的活（按 userId 跨会话过滤；2026-10-25 任务隔离改版后群聊不再是一层边界） */
+  status(userId: string): WorkLiveStatus;
   /** 最近任务（桌面端「工作」页） */
   list(limit?: number): unknown[];
   /**
@@ -811,7 +824,7 @@ export interface GatedWork {
    * 只回最近一次有产物且不在等回答的运行；没有则 undefined。
    * `ok`：那次运行是否完整跑完（失败/中断的活也可能已产出文件，deliver_file 据此加说明）。
    */
-  latestArtifacts(chatKey: string, userId?: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string; ok: boolean } | undefined;
+  latestArtifacts(userId: string): { runId: string; task: string; artifacts: string[]; at: number; userId: string; ok: boolean; sandboxKey?: string } | undefined;
 }
 
 export interface SandboxEntry {

@@ -7,7 +7,7 @@ import type { LlmService } from './services/llm.ts';
 import type { MemoryService } from './services/memory.ts';
 import type { SessionLog } from './sessionlog.ts';
 import type { WorkRunner, WorkRunResult } from './services/work.ts';
-import { workScopeOf } from './services/work.ts';
+import { workScopeOf, sandboxRefOfKey } from './services/work.ts';
 import type { ConfigStore } from './config.ts';
 import type { ErrorCenter } from './errors.ts';
 import type { Bus } from './bus.ts';
@@ -879,7 +879,7 @@ export class Pipeline {
       }
       // 有一件活停在这位管理员这里（work 停下来提问了）：让她知道，并在对方回答时用 work_dispatch 接回去。
       // 只说给管理员听：这问题只有他能定，普通成员看到也只是噪声。
-      const pendingAsk = isReport ? undefined : this.workRunner.livePending(chatKey, event.userId);
+      const pendingAsk = isReport ? undefined : this.workRunner.livePending(event.userId);
       if (pendingAsk && roleAtLeastRole(role, 'admin')) {
         systemSections.push({
           order: 500,
@@ -896,7 +896,7 @@ export class Pipeline {
       // chat 模型看不到那次任务的上下文，得靠这一节知道有东西可发、叫什么名字。
       // 产物落在**发起人自己的** work 沙箱里，所以按当前说话人取（每个人只看见自己那份）。
       if (!isReport && roleAtLeastRole(role, 'admin')) {
-        const last = this.workRunner.latestArtifacts(chatKey, event.userId);
+        const last = this.workRunner.latestArtifacts(event.userId);
         if (last?.artifacts.length) {
           systemSections.push({
             order: 505,
@@ -1039,7 +1039,7 @@ export class Pipeline {
 
       const quoteTarget = canQuoteTurn(event, opts) ? this.quoteTargetOf(event) : undefined;
       await this.sendScene(chat, finalReply, quoteTarget, opts?.mention,
-        opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname } : undefined,
+        opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname, sandboxKey: opts.report.result.sandboxKey } : undefined,
         !forcedAt);
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
@@ -1153,7 +1153,7 @@ export class Pipeline {
     /** 汇报轮 @ 发起人：程序带上 at 段（不靠模型在正文里写 @号码） */
     mention?: { userId: string; nickname?: string },
     /** 汇报轮：正文 + 产物合并成一条聊天记录；普通轮不传 */
-    forward?: { artifacts: string[]; userId: string; nickname?: string },
+    forward?: { artifacts: string[]; userId: string; nickname?: string; sandboxKey?: string },
     /** 这轮的气泡是否允许被插话砍掉；@ 轮与汇报轮传 false */
     interruptible = true,
   ): Promise<void> {
@@ -1162,12 +1162,16 @@ export class Pipeline {
       const text = this.humanlike.reportText(raw);
       if (!text && !forward.artifacts.length) { this.humanlike.noteSilent(chat); return; }
       try {
-        await this.chat.sendForward({ ...chat, scope: workScopeOf(forward.userId) }, {
+        // 2026-10-25 任务隔离：发送目标还是聊天本身；产物从任务沙箱读（老运行回退旧式按人沙箱）
+        const sandboxChat = (forward.sandboxKey ? sandboxRefOfKey(forward.sandboxKey) : undefined)
+          ?? { ...chat, scope: workScopeOf(forward.userId) };
+        await this.chat.sendForward(chat, {
           text,
           artifacts: forward.artifacts,
           mention: mention ? { userId: mention.userId } : undefined,
           selfId: this.selfId(),
           selfNickname: this.selfNickname(),
+          sandboxChat,
         });
         this.humanlike.noteSpoke(chat, 1, text ? [text] : []);
         if (text) this.history.pushAssistant(chat, text);

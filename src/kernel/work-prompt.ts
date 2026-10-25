@@ -159,8 +159,9 @@ export function buildWorkSections(input: WorkPromptInput): { system: string; sec
         `  要打开自己写的网页用 browser_open + \`file:///ws/文件名\`，不要用宿主路径的 file:// URL。`,
         `- 宿主机桌面与它上面装的程序（本机 Chrome/Edge 等）在沙箱里看不到、也不该去调用；`,
         `  需要渲染网页就用 browser_*，不要试图启动本机浏览器。`,
-        `- 这个沙箱是本会话里**发起人自己的**一份（同一群其他人看不到它的内容）；`,
-        `  群聊里收到的文件已放在 \`inbox/\`，用相对路径读即可。`,
+        `- 这个沙箱是**本任务独立**的一份（发起人任务空间里的一次任务）：别的任务的文件看不到、`,
+        `  也不该去找；如果是续接任务（任务里写了「接着上次」），上次的文件就在同一份沙箱里。`,
+        `  群聊里收到的文件已镜像到 \`inbox/\`，用相对路径读即可。`,
         `- 产物留在会话沙箱内，按下面的格式登记；**不要在过程中自己发文件**（不要 send_file）：`,
         `  内核会把所有产物打包成一个合集，连结论一起发给用户。`,
       ].join('\n'),
@@ -241,6 +242,8 @@ export interface PendingAsk {
   question: string;
   notes?: string;
   at: number;
+  /** 提问所在任务的沙箱键：回答接回去时沿用同一份任务沙箱（2026-10-25 任务隔离） */
+  sandboxKey?: string;
   /** 谁问的（回答要同一个人来给） */
   userId: string;
 }
@@ -262,6 +265,23 @@ export function composeContinueTask(pending: { task: string; question: string; n
     '沙箱里上次的东西还在，先看一眼接着干，别从零重来；「发起者这次说的是」就是他对那个问题的回答——',
     '如果读起来是另一件事，就按新任务做，上面几行只当背景。',
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * 通用续接拼装（2026-10-25 任务隔离：用户明确要「接着旧任务」时）。
+ * 与 composeContinueTask（回答上次提问）不同：这是用户主动点名继续的旧任务。
+ */
+export function composeTaskResume(prev: { task: string; label?: string }, next: string): string {
+  return [
+    '【接着上次的任务继续做】',
+    '——上次交给你的任务（原文）——',
+    prev.task,
+    '——用户这次的指示——',
+    next,
+    '',
+    '这是同一个任务的延续：沿用同一份沙箱，上次的文件都还在，先看一眼接着干，别从零重来；',
+    '「用户这次的指示」若读起来是另一件事，就按新任务做，上面几行只当背景。',
+  ].join('\n');
 }
 
 export interface WorkHandoff {

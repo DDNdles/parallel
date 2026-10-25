@@ -1,6 +1,6 @@
 import type { PluginContext, LLMRequestContext, ChatRef, ChatEvent, Role, ToolContext, WorkLiveStatus } from '../../kernel/types.ts';
 import { renderAsk, renderHandoff } from '../../kernel/work-prompt.ts';
-import { workScopeOf } from '../../kernel/services/work.ts';
+import { workScopeOf, sandboxRefOfKey } from '../../kernel/services/work.ts';
 import { busEvents } from '../../kernel/bus.ts';
 import { resolve as resolvePath } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -301,6 +301,15 @@ export function setup(ctx: PluginContext): void {
     if (st.pending) {
       lines.push(`有一件活停着等他回答：${st.pending.question}${st.pending.notes ? `（已经做到：${st.pending.notes}）` : ''}`);
     }
+    // 最近任务（跨会话）：判断「接着旧任务」还是开新任务的依据（2026-10-25 任务隔离）
+    if (st.recent?.length) {
+      lines.push('他最近的任务（含其他群/私聊里的；用户要继续时把任务号填进 work_dispatch 的 continue_run）：');
+      for (const r of st.recent.slice(0, 5)) {
+        const state = r.phase === 'running' ? '在跑' : r.phase === 'await' ? '等他回答' : r.ok ? '已完成' : '没跑完';
+        const agoMin = Math.max(0, Math.round((Date.now() - r.at) / 60_000));
+        lines.push(`- [${r.id}]「${r.task}」${state}（${agoMin < 1 ? '刚刚' : `${agoMin} 分钟前`}）`);
+      }
+    }
     if (!st.active.length && st.last) {
       const l = st.last;
       const state = l.awaiting ? '停下来等回答' : l.ok ? '已完成' : '失败了';
@@ -324,6 +333,7 @@ export function setup(ctx: PluginContext): void {
     promptGuidelines: [
       'task 只填你对这件活的一句话理解——它只用来对准用户哪句话是需求，真正派出去的是**用户原话**，由程序原样代传。你不负责转述，更不要替用户补充或收窄细节（尤其是画图的画面描述）。',
       '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
+      '新旧任务由你判断：默认开新任务（全新沙箱）。用户明确说「继续/接着上次的/改一下刚才那个」才填 continue_run（任务号看 work_status，或 latest）；只是提到旧任务里的东西但要求的是新东西，仍开新任务。',
       '这件活要靠更早的聊天内容（之前提过的要求/偏好/来龙去脉）时，用 context_quotes 带上：每段从你看到的消息里**一字不差地引用**原文片段，程序核对后把整条原话附给 work。只能选、不能改——转述或改写的片段会被丢弃。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
       '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
@@ -333,6 +343,7 @@ export function setup(ctx: PluginContext): void {
       properties: {
         task: { type: 'string', description: '你对这件活的一句话理解（程序拿它对准用户原话，不会作为任务正文派出）' },
         requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
+        continue_run: { type: 'string', description: '用户明确要「接着旧任务继续」时填：work_status 列出的任务号，或 latest=他最近一个任务。填了=沿用那个任务的沙箱与文件；不填=全新任务（全新沙箱，看不到旧任务文件）。用户没明确要继续就不要填。' },
         context_quotes: {
           type: 'array', maxItems: 8, items: { type: 'string' },
           description: '这件活相关的更早聊天记录：每段从你看到的消息里一字不差地引用原文片段（程序逐字核对，改写/转述的会被丢弃）。只挑真正相关的，没有就不填。',
@@ -378,7 +389,7 @@ export function setup(ctx: PluginContext): void {
         started = true;
         off?.();
         if (timer) clearTimeout(timer);
-        const r = ctx.work.dispatch({ chat, task, label, userId, nickname, role });
+        const r = ctx.work.dispatch({ chat, task, label, userId, nickname, role, continueRun: args.continue_run ? String(args.continue_run) : undefined });
         if (!r.ok) ctx.log.warn(`派活没有开跑：${r.reason ?? '未知原因'}`);
       };
       off = ctx.bus.on(busEvents.agentEnd, (p: { chatKey?: string }) => {
@@ -395,12 +406,13 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'work_status',
-    description: '查询当前会话里、问的人自己派的活做到哪了：已跑多久、第几轮、几次工具调用、用了多少 token、现在在干什么、任务清单做到第几项，有没有停下来等他回答。用户问「做到哪了/还要多久/进度怎么样/在干嘛」时用。只会返回调用者自己的活，看不到别人的。',
+    description: '查询问的人自己的活：正在跑的进度（用时/轮次/工具调用/token/任务清单），以及他最近的几个任务（含任务号与状态）。用户问「做到哪了/还要多久」时用；用户提到之前的活、或你说不清他要的是新活还是接着旧活做时也先用这个看清他有哪些任务。只返回调用者自己的活（跨群、跨私聊都算他的），看不到别人的。',
     surface: 'chat',
-    promptSnippet: '查自己派的活的进度（用时/当前动作/任务清单）',
+    promptSnippet: '查自己的活的进度与最近任务清单（判断新活还是续接旧活）',
     promptGuidelines: [
       '用户问进度时先查再答；没有在跑的活就如实说没有，不要编。',
       '时间、当前动作和任务清单用工具给的事实，不要自己估；清单有几项完成就报几项，别把没做的说成做完。',
+      '分不清用户要新活还是接着旧活做时，先看这里的最近任务清单再决定：用户明确要「继续/接着上次的」→ work_dispatch 带 continue_run（任务号或 latest）；只是提到旧活里的东西但要的是新东西 → 照常新任务。',
       '用你自己的语气说，别报任务编号，也别把 [x]/[~]/[ ] 这些内部符号原样念出来。',
     ],
     parameters: { type: 'object', properties: {} },
@@ -408,9 +420,9 @@ export function setup(ctx: PluginContext): void {
       if (!canWork(String(tctx.role))) {
         return '（权限不足：只有管理员能查看派活进度。用你自己的语气婉拒对方，别提到权限系统或工具。）';
       }
-      const st = ctx.work.status(chatKeyOf(tctx.chat), tctx.event.userId);
+      const st = ctx.work.status(tctx.event.userId);
       const body = renderStatus(st);
-      return `${body}\n（用你自己的语气转述给问的人；只说他自己这件活，不要提任务编号、工具名、系统这些词。）`;
+      return `${body}\n（用你自己的语气转述给问的人；只说他自己这些活，不要提任务编号、工具名、系统这些词。）`;
     },
   });
   ctx.llm.registerTool({
@@ -432,13 +444,12 @@ export function setup(ctx: PluginContext): void {
     },
     handler: async (args, tctx) => {
       const chat = chatRefOf(tctx);
-      const chatKey = `${chat.type}_${chat.chatId}`;
-      // 清单按聊天找（同一个人在群里几次交付仍是一份），但沙箱是按发起人分的：
-      // 带上调用者 userId 才能定位到他自己的 work 沙箱目录（`group_x__uQQ`）。
-      const last = ctx.work.latestArtifacts(chatKey, tctx.event.userId);
-      if (!last) return '（这个会话还没有产出过文件，没有可发的东西。）';
-      // 发送用带作用域的 ref：不带 scope 拿到的是聊天级沙箱，那里没有 work 产物
-      const workChat: ChatRef = { ...chat, scope: workScopeOf(last.userId || tctx.event.userId) };
+      // 清单与沙箱都按人找（2026-10-25 任务隔离：任务空间跟人走，跨群/私聊同一份）。
+      const last = ctx.work.latestArtifacts(tctx.event.userId);
+      if (!last) return '（还没有产出过文件，没有可发的东西。）';
+      // 任务沙箱：优先用运行自己的 sandbox_key；老交付（没有该列值）回退旧式按人沙箱
+      const taskRef = last.sandboxKey ? sandboxRefOfKey(last.sandboxKey) : undefined;
+      const workChat: ChatRef = taskRef ?? { ...chat, scope: workScopeOf(last.userId || tctx.event.userId) };
       const wanted = String(args.path ?? '').trim().replace(/\\/g, '/');
       const pick = wanted
         ? last.artifacts.filter((a) => a === wanted || a.endsWith('/' + wanted) || a.split('/').pop() === wanted)

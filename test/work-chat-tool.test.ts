@@ -102,14 +102,14 @@ test('work_status：只回调用者自己的活（同群另一个人的进度看
     // 第一轮先报一次用量（有 tool 调用），第二轮延迟 1.2s：这段时间 status 要能查到实时进度
     g.mock.script.push({ toolCalls: [{ name: 'sandbox_list', args: {} }] });
     g.mock.script.push({ content: '还在算', delayMs: 1200, toolCalls: [{ name: 'work_finish', args: { summary: 'A 做完了' } }] });
-    await until(() => g.kernel.workRunner.liveStatus(g.chatKey, '10001').active.length > 0, 8000, 'A 开跑');
+    await until(() => g.kernel.workRunner.liveStatus('10001').active.length > 0, 8000, 'A 开跑');
 
     const b = g.kernel.workRunner.run({
       chat, task: 'B 的慢活', taskLabel: 'B 的慢活', userId: '10002', nickname: 'B',
       role: 'admin', agent, tools, trigger: 'command', depth: 0,
     });
     g.mock.script.push({ content: 'B 也在算', delayMs: 800, toolCalls: [{ name: 'work_finish', args: { summary: 'B 做完了' } }] });
-    await until(() => g.kernel.workRunner.liveStatus(g.chatKey, '10002').active.length > 0, 8000, 'B 开跑');
+    await until(() => g.kernel.workRunner.liveStatus('10002').active.length > 0, 8000, 'B 开跑');
 
     const status = g.tools('owner').find((t) => t.name === 'work_status')!;
     const text = String(await status.handler({}, g.tctx('10001', 'owner') as any));

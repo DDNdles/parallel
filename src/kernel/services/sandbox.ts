@@ -792,8 +792,12 @@ export class SandboxService {
     // work 会话集合：凡在 work_runs 表里出现过的会话，按 work 档 TTL（产物值得多留）
     let workChats = new Set<string>();
     try {
+      // 2026-10-25 任务隔离：新落库的行带 sandbox_key（private_u{userId}__t{taskId}）；
+      // 老行没有，回退用 chat_key+user_id 拼旧式按人键（group_x__uY）
       workChats = new Set(
-        this.db.all<{ chat_key: string }>('SELECT DISTINCT chat_key FROM work_runs').map((r) => r.chat_key),
+        this.db.all<{ k: string }>(
+          `SELECT DISTINCT COALESCE(sandbox_key, chat_key || '__u' || user_id) AS k FROM work_runs`,
+        ).map((r) => r.k),
       );
     } catch { /* 表未建（旧库）时退回 chat 档 */ }
     const rows = this.db.all<{ chat_key: string; rel_path: string; last_access: number }>(

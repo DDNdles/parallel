@@ -103,6 +103,8 @@ export class AgentLoop {
   ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[]; finished: boolean }> {
     const { chat } = ctx;
     const chatKey = opts.chatKey;
+    // 入账会话（work 轮=汇报聊天；chat 本身是任务沙箱 ref——2026-10-25 任务隔离）
+    const ledger = ctx.reportChat ?? ctx.chat;
     const chain: ModelChainKind = opts.chain ?? (ctx.workTurn ? 'work' : 'chat');
     const steps: string[] = [];
     const step = (s: string) => { steps.push(s); opts.onStep?.(s); };
@@ -129,7 +131,7 @@ export class AgentLoop {
     const cap: RunCapture = { rounds: 0, toolCalls: 0, lastText: '', settled: false, usage: [] };
 
     this.bus.emit(busEvents.agentStart, { chatKey, userId: ctx.event.userId });
-    this.sessionLog.append(chat.chatId, chat.type, {
+    this.sessionLog.append(ledger.chatId, ledger.type, {
       type: 'agent_start', role: 'system', text: 'agent loop 开始', lane: ctx.workTurn ? 'work' : 'chat',
     });
 
@@ -164,7 +166,7 @@ export class AgentLoop {
     };
     const imageCount = msgs.reduce((n, _m, i) => n + attsAt(i).filter((a) => a.kind === 'image').length, 0);
     if (!imageAllowed && imageCount) {
-      this.errors.record('warn', 'provider', `链上模型不收图片（模型页那行没勾「图片」），本轮 ${imageCount} 张图片没送出`, { chatId: chat.chatId });
+      this.errors.record('warn', 'provider', `链上模型不收图片（模型页那行没勾「图片」），本轮 ${imageCount} 张图片没送出`, { chatId: ledger.chatId });
     }
     const seeded = await toPiMessages(
       msgs,
@@ -178,11 +180,11 @@ export class AgentLoop {
       },
     );
     if (seeded.failedImages) {
-      this.errors.record('warn', 'provider', `窗口内 ${seeded.failedImages} 张图片读不动（路径/URL 取不到），这一轮没送出`, { chatId: chat.chatId });
+      this.errors.record('warn', 'provider', `窗口内 ${seeded.failedImages} 张图片读不动（路径/URL 取不到），这一轮没送出`, { chatId: ledger.chatId });
     }
     // 动图没摊成分帧拼图：图照送（模型只看到首帧），但要在报错中心说清这张没被完整读到
     for (const w of seeded.imageWarnings ?? []) {
-      this.errors.record('warn', 'provider', w, { chatId: chat.chatId });
+      this.errors.record('warn', 'provider', w, { chatId: ledger.chatId });
     }
     // 音频/视频收成一个数组（当前批次 + 窗口内历史），上限 audio ≤ 8 / video ≤ 4；
     // 超出的如实报掉——静默丢媒体正是"bot 装作没听见语音"那类 bug 藏久的原因。
@@ -204,7 +206,7 @@ export class AgentLoop {
       }
     }
     if (droppedMedia.length) {
-      this.errors.record('warn', 'provider', `语音最多 ${MEDIA_CAP.audio} 条、视频最多 ${MEDIA_CAP.video} 条，超出的没送出：${droppedMedia.join('、')}`, { chatId: chat.chatId });
+      this.errors.record('warn', 'provider', `语音最多 ${MEDIA_CAP.audio} 条、视频最多 ${MEDIA_CAP.video} 条，超出的没送出：${droppedMedia.join('、')}`, { chatId: ledger.chatId });
     }
     const history = seeded.messages;
     const modelStub = await pie.piModelFor({
@@ -217,7 +219,7 @@ export class AgentLoop {
     const replyCap = ctx.workTurn ? 0 : Math.round(Number(this.config.config.humanlike.outgoing.maxReplyTokens) || 0);
     const rawStream = this.llm.chainStreamFn(chain, {
       attachments: media,
-      chatId: chat.chatId,
+      chatId: ledger.chatId,
       // 并发的 work 任务各钉一个起始模型；chat 链不分槽
       start: chain === 'work' ? ctx.workSlot : undefined,
     });
@@ -255,6 +257,7 @@ export class AgentLoop {
                 messages: agent.state.messages as any[],
                 chat, summaryOf: lastSummary, reserveTokens: compaction.reserveTokens,
                 keepRecentTokens: compaction.keepRecentTokens, chain, signal: opts.abort, round: cap.rounds,
+                ledgerChat: ledger,
               });
               if (!done) return undefined;
               lastSummary = done.summary;
@@ -272,7 +275,7 @@ export class AgentLoop {
     const onAbort = () => agent.abort();
     opts.abort?.addEventListener('abort', onAbort, { once: true });
 
-    const off = agent.subscribe((ev: any) => this.onAgentEvent(ev, ctx, cap, { chatKey, step, event }));
+    const off = agent.subscribe((ev: any) => this.onAgentEvent(ev, ctx, cap, { chatKey, step, event, agent }));
 
     try {
       // 历史最后一条就是本轮用户发言：用 continue 从当前 transcript 接着跑
@@ -335,7 +338,7 @@ export class AgentLoop {
       // unfinished，由 WorkRunner 判未完成——强制 work_finish 才算完成（2026-10-25 用户定）。
       const finished = !ctx.workTurn || cap.settled || !!opts.abort?.aborted;
 
-      this.sessionLog.append(chat.chatId, chat.type, {
+      this.sessionLog.append(ledger.chatId, ledger.type, {
         type: 'agent_end', role: 'system', lane: ctx.workTurn ? 'work' : 'chat',
         text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
         // chat 段没有 work.done 那种结算：把每轮用量挂在 agent_end 上，抽屉用最近一条画
@@ -346,7 +349,7 @@ export class AgentLoop {
       return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps, finished };
     } catch (e) {
       const err = e as Error;
-      this.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });
+      this.sessionLog.append(ledger.chatId, ledger.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });
       throw e;
     } finally {
       off();
@@ -412,7 +415,7 @@ export class AgentLoop {
     ev: any,
     ctx: LLMRequestContext,
     cap: RunCapture,
-    h: { chatKey: string; step: (s: string) => void; event: (e: LoopEvent) => void },
+    h: { chatKey: string; step: (s: string) => void; event: (e: LoopEvent) => void; agent?: { abort(): void } },
   ): void {
     const { chat } = ctx;
     // 同一条会话日志里混着 chat 轮与 work 轮的条目：标出来，桌面端才能分成两段显示
@@ -469,7 +472,7 @@ export class AgentLoop {
         h.step(`▶ ${ev.toolName} ${truncate(args, 160)}`);
         h.event({ kind: 'tool', round: cap.rounds, name: ev.toolName, args: truncate(args, 400) });
         this.bus.emit(busEvents.toolCall, { chatKey: h.chatKey, name: ev.toolName, args: ev.args ?? {}, id: ev.toolCallId, ts: Date.now() });
-        this.sessionLog.append(chat.chatId, chat.type, {
+        this.sessionLog.append((ctx.reportChat ?? ctx.chat).chatId, (ctx.reportChat ?? ctx.chat).type, {
           type: 'tool_call', role: 'tool', text: ev.toolName, lane,
           data: { args: truncate(args, 600), callId: ev.toolCallId },
         });
@@ -480,11 +483,17 @@ export class AgentLoop {
         const text = contentText(ev.result?.content);
         h.step(`◀ ${ev.toolName}: ${truncate(text.replace(/\s+/g, ' '), 200)}`);
         h.event({ kind: 'toolResult', round: cap.rounds, name: ev.toolName, text: truncate(text, 1200), meta: ev.result?.details });
+        // cap.settled 由 toAgentTool 在 handler 返回后置位（finalReply 已拿到）。pi 的批终止
+        // 语义是 every（整批工具都 terminate 才停），收尾工具前面混着普通工具时批不会停、
+        // 会再烧一次模型调用——这里在收尾工具结果落地后直接 abort，后续工具/下一轮都不该再有。
+        if (ctx.workTurn && ev.result?.terminate === true && h.agent) {
+          try { h.agent.abort(); } catch { /* 已在收尾流程就不影响 */ }
+        }
         this.bus.emit(busEvents.toolResult, {
           chatKey: h.chatKey, name: ev.toolName, result: truncate(text, 4000),
           id: ev.toolCallId, ts: Date.now(), meta: ev.result?.details,
         });
-        this.sessionLog.append(chat.chatId, chat.type, {
+        this.sessionLog.append((ctx.reportChat ?? ctx.chat).chatId, (ctx.reportChat ?? ctx.chat).type, {
           type: 'tool_result', role: 'tool', text: ev.toolName, lane,
           data: { result: truncate(text, 1200), callId: ev.toolCallId, meta: ev.result?.details },
         });
@@ -533,6 +542,8 @@ export class AgentLoop {
     chain?: ModelChainKind;
     signal?: AbortSignal;
     round: number;
+    /** 压缩条目落的会话（work 轮=汇报聊天，chat 本身是任务沙箱 ref） */
+    ledgerChat?: ChatRef;
   }): Promise<{ summary: string; dropped: number; tokensBefore: number; messages: any[] } | null> {
     const plan = planCut(opts.messages, opts.keepRecentTokens);
     // 整段都要被丢掉（没有可保留的尾巴）时不压：压了等于把当前对话整个换成摘要，得不偿失
@@ -551,14 +562,15 @@ export class AgentLoop {
           stream: false,
           signal: opts.signal,
         },
-        { chatId: opts.chat.chatId, chain: opts.chain },
+        { chatId: (opts.ledgerChat ?? opts.chat).chatId, chain: opts.chain },
       );
       const summary = trimSummary(resp.content ?? '', opts.reserveTokens);
       if (!summary.trim()) return null;
       // 落一条 compaction 条目：它标记"这一刻之前的历史由这段摘要代替"。
       // firstKeptEntryId 给 null = 只保留摘要；字段留着是为了将来做更细的切分（pi 的语义）。
       try {
-        this.sessionLog.appendCompaction(opts.chat.chatId, opts.chat.type, {
+        const ledgerChat = opts.ledgerChat ?? opts.chat;
+        this.sessionLog.appendCompaction(ledgerChat.chatId, ledgerChat.type, {
           summary, firstKeptEntryId: null, tokensBefore: plan.droppedTokens,
         });
       } catch { /* 落盘失败不影响本次请求 */ }

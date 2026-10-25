@@ -23,9 +23,10 @@ import type { Scheduler } from './scheduler.ts';
 import type { Logger } from './types.ts';
 import { McpStdioClient } from './services/mcp.ts';
 import { resolveWorkAgent, discoverWorkAgents, resolveWorkAgentByName, ENTRY_AGENT_NAME } from './work-agent.ts';
-import { composeContinueTask } from './work-prompt.ts';
+import { composeContinueTask, composeTaskResume } from './work-prompt.ts';
+import { sandboxRefOfKey } from './services/work.ts';
 import { atomicWriteJson, readJson } from './util/fsutil.ts';
-import { newId, nowMs } from './util/misc.ts';
+import { clip, newId, nowMs } from './util/misc.ts';
 
 export type PluginSource = 'builtin' | 'example' | 'user';
 export type PluginRuntimeState = 'loaded' | 'disabled' | 'error';
@@ -399,6 +400,7 @@ export class PluginContainer {
    */
   async resumeWork(input: {
     chatKey: string;
+    runId?: string;
     task: string;
     userId: string;
     nickname?: string;
@@ -412,6 +414,10 @@ export class PluginContainer {
     const agent = this.workAgent();
     const all = this.listWorkAgents();
     const role = input.role;
+    // 2026-10-25 任务隔离：续跑要沿用原任务的沙箱（桌面端/内核自用的续跑入口）。
+    // 找不到原沙箱（老行）就按新任务开——文件在新沙箱里没有，但任务原文还在。
+    const prev = input.runId ? this.deps.work.runForUser(input.runId, input.userId) : this.deps.work.runForUser(undefined, input.userId);
+    const sandboxRef = prev?.sandboxKey ? sandboxRefOfKey(prev.sandboxKey) : undefined;
     void this.deps.work.run({
       chat,
       task: input.task,
@@ -425,6 +431,7 @@ export class PluginContainer {
       depth: 0,
       groupTitle: this.deps.groupTitle(chat.chatId),
       runHooks: (req) => this.runWorkHooks(req),
+      sandboxRef,
     }).catch(() => { /* run() 内部已把失败落进事件与报错中心 */ });
     return { ok: true };
   }
@@ -908,7 +915,7 @@ function makeGatedWork(
     modelLabel: () => deps.work.workModelLabel(),
     agents: () => plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
     list: (limit?: number) => deps.work.list(limit ?? 30),
-    latestArtifacts: (chatKey: string, userId?: string) => deps.work.latestArtifacts(chatKey, userId),
+    latestArtifacts: (userId: string) => deps.work.latestArtifacts(userId),
     delegate: async (input: WorkDelegateInput) => {
       can();
       const depth = input.depth ?? 0;
@@ -951,10 +958,23 @@ function makeGatedWork(
       const agent = plugins.workAgent();
       const chat = input.chat;
       const role = input.role as Role;
-      const chatKey = `${chat.type}_${chat.chatId}`;
-      const pending = deps.work.takePending(chatKey, input.userId);
-      const task = pending ? composeContinueTask(pending, input.task) : input.task;
-      const label = pending ? `${pending.label}（续）` : (input.label?.trim() || input.task);
+      // 续接的优先级：还在等回答的提问现场 > chat 模型点名的旧任务 > 全新任务。
+      // 2026-10-25 任务隔离：续接必须沿用旧任务的沙箱 ref（文件/容器都在那），新任务才开新沙箱。
+      const pending = deps.work.takePending(input.userId);
+      let task = input.task;
+      let label = input.label?.trim() || input.task;
+      let sandboxRef: ChatRef | undefined;
+      if (pending) {
+        task = composeContinueTask(pending, input.task);
+        label = `${pending.label}（续）`;
+        sandboxRef = pending.sandboxKey ? sandboxRefOfKey(pending.sandboxKey) : undefined;
+      } else if (input.continueRun) {
+        const prev = deps.work.runForUser(input.continueRun === 'latest' ? undefined : input.continueRun, input.userId);
+        if (!prev) return { ok: false, reason: `没找到这个用户能续接的任务（${input.continueRun === 'latest' ? '最近没有任务' : `任务 ${input.continueRun} 不存在或不是他的`}）` };
+        task = composeTaskResume(prev, input.task);
+        label = `${clip(prev.task, 24)}（续）`;
+        sandboxRef = prev.sandboxKey ? sandboxRefOfKey(prev.sandboxKey) : undefined;
+      }
       void deps.work.run({
         chat,
         task,
@@ -969,12 +989,13 @@ function makeGatedWork(
         depth: 0,
         groupTitle: deps.groupTitle(chat.chatId),
         runHooks: (req) => plugins.runWorkHooks(req),
+        sandboxRef,
       }).catch(() => { /* run() 内部已把失败落进事件与报错中心 */ });
       return { ok: true, label };
     },
 
     /** 该会话里这位发起人自己的进度（别人的活不返回） */
-    status: (chatKey: string, userId: string) => deps.work.liveStatus(chatKey, userId),
+    status: (userId: string) => deps.work.liveStatus(userId),
   };
 }
 

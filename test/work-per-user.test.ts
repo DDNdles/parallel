@@ -110,8 +110,8 @@ test('work 按人隔离：同一个群里两位发起人各是独立运行，产
     assert.ok(byUser.get('10001') && byUser.get('10002'), '两条运行要能按发起人区分');
 
     // 产物归属：A 只看得见自己的，B 也是
-    const artA = g.kernel.workRunner.latestArtifacts(chatKey, '10001');
-    const artB = g.kernel.workRunner.latestArtifacts(chatKey, '10002');
+    const artA = g.kernel.workRunner.latestArtifacts('10001');
+    const artB = g.kernel.workRunner.latestArtifacts('10002');
     assert.deepEqual(artA?.artifacts, ['a.txt']);
     assert.deepEqual(artB?.artifacts, ['b.txt']);
     assert.equal(artA?.userId, '10001');
@@ -179,7 +179,7 @@ test('work 记录落库：重启后仍能列出运行并带回 events/usage（�
       assert.ok(r.events.some((e: any) => e.kind === 'usage'), 'usage 事件要在（圆环/缓存/TPS 的数据源）');
       assert.ok(r.usage && r.usage.cacheHit > 0, '结算 usage 要落库');
       // 重启后 deliver_file 仍能找到产物（沙箱文件也还在）
-      const last = k2.workRunner.latestArtifacts('group_9303', '10001');
+      const last = k2.workRunner.latestArtifacts('10001');
       assert.deepEqual(last?.artifacts, ['out.md']);
     } finally {
       await k2.shutdown();
@@ -229,6 +229,70 @@ test('work 轮的会话日志条目标成 work 车道（前端才分得开两段
     const end = tail.find((e) => e.type === 'agent_end');
     assert.equal(start?.lane, 'work');
     assert.equal(end?.lane, 'work');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+// ============================================================
+// 任务隔离（2026-10-25 用户定）：用户层之上一任务一沙箱；群聊不再是隔离层。
+// 新任务开新沙箱（看不到旧任务文件）；只有明确续接（continue_run / 回答提问）
+// 才沿用旧任务的沙箱。沙箱键落 work_runs.sandbox_key（跨重启可续）。
+// ============================================================
+
+test('任务隔离：新任务各开各的沙箱（跨群也隔离），续接沿用旧任务沙箱，status 列最近任务', async () => {
+  const g = await boot(30000 + (process.pid % 20000));
+  try {
+    const chatA = { platform: 'qq' as const, type: 'group' as const, chatId: '9306' };
+    const chatB = { platform: 'qq' as const, type: 'group' as const, chatId: '9307' };
+    for (const id of ['sandbox', 'work']) g.kernel.container.setGroupState(id, '9306', true, '1');
+    for (const id of ['sandbox', 'work']) g.kernel.container.setGroupState(id, '9307', true, '1');
+    const tools = () => g.kernel.container.workToolsFor({ ...chatA }, 'owner', g.kernel.container.workAgent(), 0);
+
+    // 任务 1：在 A 群派活，写一个文件
+    g.kernel.sandbox.write({ platform: 'qq', type: 'private', chatId: 'u10001', scope: 'tX' }, 'unused.txt', '');
+    g.mock.script.push({ toolCalls: [
+      { name: 'sandbox_write', args: { path: 'task1.txt', content: '第一个任务的产物' } },
+      { name: 'work_finish', args: { summary: '任务一完成', artifacts: ['task1.txt'] } },
+    ] });
+    const r1 = await g.kernel.workRunner.run(workInput(chatA, '10001', '做任务一', tools()));
+    assert.equal(r1.ok, true);
+    const key1 = r1.sandboxKey;
+    assert.ok(key1?.startsWith('private_u10001__t'), `任务沙箱键跟人走+任务号：${key1}`);
+
+    assert.ok(g.kernel.sandbox.read({ platform: 'qq', type: 'private', chatId: 'u10001', scope: key1.split('__')[1] }, 'task1.txt').includes('第一个'));
+
+    // 任务 2：同一人在 B 群开新活——新沙箱，看不到任务 1 的文件
+    g.mock.script.push({ toolCalls: [
+      { name: 'sandbox_list', args: {} },
+      { name: 'work_finish', args: { summary: '任务二完成' } },
+    ] });
+    const r2 = await g.kernel.workRunner.run(workInput(chatB, '10001', '做任务二', tools()));
+    assert.equal(r2.ok, true);
+    assert.notEqual(r2.sandboxKey, key1, '新任务必须开新沙箱');
+    const list2 = g.kernel.sandbox.list({ platform: 'qq', type: 'private', chatId: 'u10001', scope: r2.sandboxKey!.split('__')[1] });
+    assert.ok(!list2.some((e) => e.name === 'task1.txt'), '新任务看不到旧任务的文件');
+
+    // 续接：continueRun 沿用任务 1 的沙箱（工具从 chat 面取 work_dispatch）
+    const dispatch = g.kernel.container.toolsForChat(chatA, 'owner', 'chat').find((t) => t.name === 'work_dispatch')!;
+    g.kernel.sandbox.write({ platform: 'qq', type: 'private', chatId: 'u10001', scope: key1.split('__')[1] }, 'marker.txt', '在场标记');
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '续接完成' } }] });
+    g.mock.script.push({ content: '续接好了。' });
+    const ret = String(await dispatch.handler(
+      { task: '接着任务一继续', continue_run: r1.id },
+      {
+        event: { platform: chatA.platform, type: chatA.type, chatId: chatA.chatId, userId: '10001', nickname: '群友10001', senderRole: 'owner', segments: [], text: '接着任务一继续', isAtMe: true, isReplyToMe: false, raw: null, ts: Date.now(), role: 'owner' },
+        chat: chatA, role: 'owner',
+      } as any,
+    ));
+    console.log('RET:', ret);
+    await new Promise((res) => setTimeout(res, 7000));
+    const cont = g.kernel.workRunner.list(5, 'group_9306')[0];
+    assert.ok(cont, '续接的任务要落库');
+    assert.equal(cont.sandboxKey, key1, '续接必须沿用旧任务的沙箱');
+    // list().task 是短标；全文落 work_runs 表（work_status/recent 与桌面端同源）
+    const row = g.kernel.db.get('SELECT task FROM work_runs WHERE id=?', cont.id) as { task: string };
+    assert.match(row.task, /接着上次的任务继续做/, '任务正文要带续接拼装');
   } finally {
     await g.cleanup();
   }

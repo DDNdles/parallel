@@ -745,6 +745,7 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   const WORK_GROUP = '7001';
   const chatKey = `group_${WORK_GROUP}`;
   kernel.container.setGroupState('work', WORK_GROUP, true, String(MASTER));
+  kernel.container.setGroupState('sandbox', WORK_GROUP, true, String(MASTER));
   const done = new Promise<any>((resolve) => {
     const off = kernel.bus.on('work.done' as any, (d: any) => {
       if (d.chatKey === chatKey && d.trigger === 'chat') { off(); resolve(d); }
@@ -756,12 +757,17 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
     if (p.chat?.type === 'group' && String(p.chat?.chatId) === WORK_GROUP) outs.push(p);
   });
   mock.actions.length = 0;
-  // work 产物落在发起人自己的沙箱作用域里；汇报轮的正文与产物会合并成一条聊天记录
-  kernel.sandbox.write({ platform: 'ui', type: 'group', chatId: WORK_GROUP, scope: `u${MASTER}` }, 'out.md', '# 结果\n1024\n');
-  // chat 第一轮调 work_dispatch；第二轮应下；work 收尾；最后一轮是人格化汇报（正文+产物进聊天记录）
+  // 2026-10-25 任务隔离：产物落在本任务的沙箱里（work 自己写），汇报轮的正文与产物合并成一条聊天记录
+  // chat 第一轮调 work_dispatch；第二轮应下；work 写产物+收尾；最后一轮是人格化汇报（正文+产物进聊天记录）
   mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '算一下 2**10' } }] });
   mockProvider.script.push({ content: '好，我去算一下。' });
-  mockProvider.script.push({ content: '算一下这个。', toolCalls: [{ name: 'work_finish', args: { summary: '算完了，2 的 10 次方是 1024', artifacts: ['out.md'] } }] });
+  mockProvider.script.push({
+    content: '算一下这个。',
+    toolCalls: [
+      { name: 'sandbox_write', args: { path: 'out.md', content: '# 结果\n1024\n' } },
+      { name: 'work_finish', args: { summary: '算完了，2 的 10 次方是 1024', artifacts: ['out.md'] } },
+    ],
+  });
   mockProvider.script.push({ content: '算好了，是 1024。文件也给你。' });
   kernel.pipeline.submit({
     id: 'work-ev-1', platform: 'ui', type: 'group', chatId: WORK_GROUP, userId: String(MASTER),
@@ -781,7 +787,8 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   assert.ok(kinds.includes('text'), '要有正文事件');
   assert.ok(kinds.includes('tool') && kinds.includes('toolResult'), '要有工具调用与返回事件');
   assert.ok(kinds.includes('final'), '要有收敛回答事件');
-  assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'work_finish');
+  assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'sandbox_write', '先写产物再收尾');
+  assert.ok(evs.some((e: any) => e.kind === 'tool' && e.name === 'work_finish'), '收尾要有 work_finish');
   // 2026-10-24 起一字不差传话：进度条/列表展示的是**用户原话**（程序代传），不是 chat 模型写的 task
   assert.equal(runs[0].task, '帮我算一下 2 的 10 次方', '展示的必须是用户原话，不是工具转述的 task');
   assert.ok(runs[0].usage, '要带本次任务的 token 账');
@@ -837,7 +844,7 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   assert.equal(run1.summary, '用哪份文件？', '结论就是那个问题，不是「## 待确认」那坨文本');
   assert.equal(run1.awaiting?.question, '用哪份文件？');
   assert.equal(run1.awaiting?.notes, '已把 inbox 列出来');
-  assert.ok(kernel.workRunner.livePending(chatKey, String(MASTER)), '要记下"等这个人回答"的现场');
+  assert.ok(kernel.workRunner.livePending(String(MASTER)), '要记下"等这个人回答"的现场');
 
   // 汇报轮口径：不能说成"已完成"，也不能再让用户发 /work
   await quiesce();
@@ -869,7 +876,7 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   assert.equal(run2.awaiting, undefined, '这一轮是正常交付，不该再挂着"等回答"');
   assert.equal(run2.summary, '整理完了，产出 report.md');
   assert.equal(run2.task, '帮我整理一下那份报表（续）', '列表里显示短标题（用户原话+续），不是拼接文本');
-  assert.equal(kernel.workRunner.livePending(chatKey, String(MASTER)), undefined, '回答后现场要消费掉');
+  assert.equal(kernel.workRunner.livePending(String(MASTER)), undefined, '回答后现场要消费掉');
 
   // 待答复已被消费：再派一件新活不该再粘上那段历史
   const done3 = waitDone();

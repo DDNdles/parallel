@@ -211,9 +211,11 @@ export class ChatService implements ChatSendService {
     mention?: { userId: string };
     selfId?: string;
     selfNickname?: string;
+    /** 产物所在的沙箱（2026-10-25 任务隔离：任务沙箱 ≠ 发送目标聊天）；缺省用 chat 自己的 */
+    sandboxChat?: ChatRef;
   }): Promise<void> {
     const text = String(opts.text ?? '').trim();
-    const root = normalize(this.opts.sandboxRoot(chat));
+    const root = normalize(this.opts.sandboxRoot(opts.sandboxChat ?? chat));
     const files: { rel: string; name: string; abs: string; size: number }[] = [];
     for (const rel of opts.artifacts ?? []) {
       try {
