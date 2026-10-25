@@ -112,9 +112,45 @@ test('投递：最多 6 条气泡，超过时均衡合并（不丢字、不把�
   const out = splitIntoBubbles(text);
   assert.equal(MAX_BUBBLES, 6, '硬上限按用户口径是 6 条');
   assert.equal(out.length, MAX_BUBBLES);
-  assert.equal(out.join(''), 'abcdefghijkl', '句号去掉，内容不丢');
+  // 2026-10-25 起清洗挪到合并之后：合并组内保留原句标点（"呜。没有啦"不能粘成"呜没有啦"），组尾照旧剥
+  assert.equal(out.join(''), 'a。bc。de。fg。hi。jk。l', '组内保留句号、组尾剥掉，内容不丢');
   const maxLen = Math.max(...out.map((x) => [...x].length));
-  assert.ok(maxLen <= 2, `均衡后最长一组不该超过 2 字: ${JSON.stringify(out)}`);
+  assert.ok(maxLen <= 3, `均衡后最长一组不该超过 3 字: ${JSON.stringify(out)}`);
+});
+
+test('投递：目标条数是程序约束 —— 超出目标时合并到目标条数，内容一个字不丢', () => {
+  const out = splitIntoBubbles('呜。没有啦。哼，不理你了。', 6, 24, 2);
+  assert.equal(out.length, 2, `3 句抽到目标 2 → 并成 2 条: ${JSON.stringify(out)}`);
+  assert.equal(out.join(''), '呜。没有啦哼，不理你了', '组内标点保留、组尾剥掉、内容零丢失');
+  // 不传目标 = 旧口径（只兜硬上限），1 句的短话照发
+  assert.deepEqual(splitIntoBubbles('在。有事说事。', 6, 24), ['在', '有事说事']);
+});
+
+test('投递：目标条数不强拆 —— 切出来比目标少就照发，不硬凑数', () => {
+  assert.deepEqual(splitIntoBubbles('嗯嗯。', 6, 24, 3), ['嗯嗯'], '1 句目标 3 不会拆成 3 条');
+  assert.deepEqual(splitIntoBubbles('好。', 6, 24, 1), ['好'], '目标 1 一句一条');
+});
+
+test('投递：内容真多时自动放行 —— 并到目标会出 40+ 字长条就回落硬上限', () => {
+  const text = '今天早上我去买了一杯热咖啡，然后还顺便买了个三明治。中午和同事一起吃了顿饭。下午开了个很长的会。';
+  const out = splitIntoBubbles(text, 6, 24, 1);
+  assert.ok(out.length > 1, `并 1 条会超 40 字 → 放行多条: ${JSON.stringify(out)}`);
+  assert.ok(out.every((b) => [...b].length <= 40), `放行后单条仍不超 40 字: ${JSON.stringify(out)}`);
+  assert.equal(out.join('').replace(/[。，]/g, ''), text.replace(/[。，]/g, ''), '放行也不丢内容');
+});
+
+test('投递：模型明确换行时以行数为准 —— 目标被换行抬升（仍受硬上限封顶）', () => {
+  const out = splitIntoBubbles('呜。\n哼。\n不理你了。', 6, 24, 2);
+  assert.equal(out.length, 3, `模型写了 3 行 → 目标抬到 3，行内不并: ${JSON.stringify(out)}`);
+  // 超过硬上限的换行照样并：10 行 target 也只能抬到 6
+  const many = splitIntoBubbles('一\n二\n三\n四\n五\n六\n七\n八', 6, 24, 2);
+  assert.equal(many.length, 6, `8 行超过硬上限 → 封顶 6 条: ${JSON.stringify(many)}`);
+  assert.equal(many.join(''), '一二三四五六七八', '封顶合并不丢字');
+});
+
+test('投递：目标超过硬上限时夹紧到硬上限', () => {
+  const out = splitIntoBubbles('a。b。c。d。e。f。g。h。', 6, 24, 20);
+  assert.equal(out.length, 6, `target=20 > cap=6 → 按 6 收: ${JSON.stringify(out)}`);
 });
 
 test('投递：长逗号链在逗号处补切，短逗号句仍保持一条', () => {
@@ -544,6 +580,14 @@ test('服务：composeScene —— 超长按句边截断；沉默标记什么都
   assert.equal(silent.plans.length, 0);
   assert.equal(silent.spoke, false);
   assert.equal(silent.historyText, '');
+  svc.dispose();
+});
+
+test('服务：composeScene —— 当轮抽签的目标条数贯通到发送计划（提示与出站同源）', async () => {
+  const { svc } = makeService();
+  const { plans, historyText } = await svc.composeScene('呜。没有啦。哼，不理你了。', 2);
+  assert.equal(plans.length, 2, `抽到目标 2 → 出站就是 2 条: ${JSON.stringify(plans.map((p) => p.segments[0].data.text))}`);
+  assert.equal(historyText, '呜。没有啦\n哼，不理你了', '历史回灌与实际发出的 2 条同形');
   svc.dispose();
 });
 
