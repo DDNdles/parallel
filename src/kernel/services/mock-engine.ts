@@ -22,6 +22,9 @@ export interface MockScriptStep {
   toolCalls?: { name: string; args: Record<string, unknown> }[];
   /** 延迟这么久才吐字（毫秒）：给"生成期间群里又来了新消息"这类时序用例留窗口 */
   delayMs?: number;
+  /** 抛出这个错误（模拟模型瞬态中断，如 Gemini 的 MALFORMED_FUNCTION_CALL）——
+   *  pi 会把它转成 stopReason='error' 的空 assistant，agentloop 的重试逻辑据此接手 */
+  error?: string;
 }
 
 /** 固定的 usage：命中 80 / 未命中 20。测试只断言"有数且 prompt ≥ 命中"，不锁死具体值 */
@@ -180,6 +183,7 @@ export class MockEngine {
     let usage: AssistantMessage['usage'] | undefined;
 
     if (step) {
+      if (step.error) throw new Error(step.error);
       text = step.content ?? '';
       const toolCalls: ToolCall[] = (step.toolCalls ?? []).map((t, i) => ({
         type: 'toolCall' as const, id: `mock_${Date.now()}_${i}`, name: t.name, arguments: t.args as any,

@@ -282,6 +282,26 @@ export class AgentLoop {
       await agent.continue();
       await agent.waitForIdle();
 
+      // 模型瞬态中断重试（2026-10-25）：Gemini 生成工具调用参数时偶发
+      // MALFORMED_FUNCTION_CALL，pi 把它转成 stopReason='error' 的空 assistant 收场——
+      // 该轮直接作废、群里沉默。这类抽风重跑一次通常就好：把失败消息摘出 transcript
+      // 再 continue（最多一次，再失败走原路 = chat 沉默 / work 按空回复判失败）。
+      for (let retries = 0; retries < 1; retries++) {
+        const msgs = agent.state.messages as { role?: string; stopReason?: string; errorMessage?: string; content?: unknown }[];
+        const last = msgs[msgs.length - 1];
+        if (last?.role !== 'assistant' || last.stopReason !== 'error' || opts.abort?.aborted) break;
+        // 收尾工具落地后的主动 abort 也是 stopReason='error'（errorMessage="…aborted"）——
+        // 那是任务正常收尾，不是瞬态中断，重试它会把 abort 后的空转变成多烧一次模型调用
+        if (/abort/i.test(String(last.errorMessage ?? ''))) break;
+        msgs.pop();
+        const note = `模型瞬态中断：${truncate(String(last.errorMessage ?? ''), 140)}；重试一次`;
+        event({ kind: 'text', round: cap.rounds, text: `（${note}）` });
+        // chat 轮没有 work 事件流：落一条 gate 到会话日志，排障能看到
+        this.sessionLog.append(ledger.chatId, ledger.type, { type: 'gate', role: 'system', text: note });
+        await agent.continue();
+        await agent.waitForIdle();
+      }
+
       // work 轮只认 work_finish / work_ask 收尾（2026-10-25 用户定：强制 work_finish 才算完成）。
       // 纯文字轮（没调任何工具）在 agent 循环的默认语义里等于"跑完了"——但那多半是模型
       // 想继续干活的旁白，整场任务静默收在一句话上、work_finish 没走（Three.js 任务 178 轮
