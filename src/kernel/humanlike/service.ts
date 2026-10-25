@@ -716,7 +716,8 @@ export class HumanlikeService {
     const t = trimAtSentence(stripped, out.replyMaxCharacters);
     if (!t) return [];
     if (out.splitReplyMessages === false) return [clip(t, out.maxMessageCharacters)];
-    return splitIntoBubbles(t, MAX_BUBBLES, out.bubbleSoftMaxCharacters)
+    const maxBubbles = Math.max(1, Math.round(Number((out as { maxBubbles?: number }).maxBubbles) || MAX_BUBBLES));
+    return splitIntoBubbles(t, maxBubbles, out.bubbleSoftMaxCharacters)
       .map((b) => (b.length > out.maxMessageCharacters ? clip(b, out.maxMessageCharacters) : b));
   }
 

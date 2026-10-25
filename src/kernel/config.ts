@@ -130,6 +130,8 @@ export const DEFAULT_CONFIG = {
       replyMaxCharacters: 100,            // 回复总长硬上限（提示里推荐 50）：超了在最后一个句末标点处截断
       maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
       bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
+      expectedBubbles: 3,                 // 预期气泡数：提示里的推荐条数（必要时可突破）
+      maxBubbles: 6,                      // 最大气泡数：程序分条的硬上限（超出会被合并）
       typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）
       typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
       typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久

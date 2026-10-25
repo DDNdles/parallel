@@ -1347,6 +1347,8 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     let e = applyNum(t, outgoing, 'replyMaxCharacters', 20, 2000, '回复最长字符数'); if (e) return e;
     e = applyNum(t, outgoing, 'maxReplyTokens', 0, 8000, '回复 token 上限'); if (e) return e;
     e = applyNum(t, outgoing, 'bubbleSoftMaxCharacters', 10, 80, '单条气泡目标字数'); if (e) return e;
+    e = applyNum(t, outgoing, 'expectedBubbles', 1, 10, '预期气泡数'); if (e) return e;
+    e = applyNum(t, outgoing, 'maxBubbles', 1, 20, '最大气泡数'); if (e) return e;
     e = applyNum(t, outgoing, 'typingBaseDelaySeconds', 0, 60, '打字基础延迟'); if (e) return e;
     e = applyNum(t, outgoing, 'typingCharactersPerSecond', 1, 100, '打字速度'); if (e) return e;
     e = applyNum(t, outgoing, 'typingMaxDelaySeconds', 0, 120, '单条最长打字等待'); if (e) return e;

@@ -863,7 +863,7 @@ export class Pipeline {
         const out = this.humanlike.config.outgoing;
         systemSections.push({
           order: 440, title: 'chat-style',
-          text: chatOutputStyleText({ maxChars: out.replyMaxCharacters }),
+          text: chatOutputStyleText({ maxChars: out.replyMaxCharacters, expectedBubbles: out.expectedBubbles, maxBubbles: out.maxBubbles }),
         });
       }
       // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。

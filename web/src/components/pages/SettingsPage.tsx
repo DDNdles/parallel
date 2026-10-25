@@ -15,7 +15,8 @@ interface Humanlike {
   /** 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限 */
   outgoing: {
     splitReplyMessages: boolean; replyMaxCharacters: number; maxReplyTokens: number;
-    bubbleSoftMaxCharacters: number; typingEnabled?: boolean;
+    bubbleSoftMaxCharacters: number; expectedBubbles?: number; maxBubbles?: number;
+    typingEnabled?: boolean;
     typingBaseDelaySeconds: number; typingCharactersPerSecond: number;
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
   };
@@ -520,10 +521,14 @@ export default function SettingsPage() {
 
               <div className="mset-sec-h"><span>发送方式</span></div>
               <div className="set-grid" style={{ marginTop: 14 }}>
-                <Num label="回复最长字符数" hint="硬上限；提示里推荐 50 字、2～3 条气泡，必要时可突破推荐值" value={h.outgoing.replyMaxCharacters}
+                <Num label="回复最长字符数" hint="硬上限；提示里的推荐字数与气泡数见下面两项" value={h.outgoing.replyMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
                 <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
+                <Num label="预期气泡数（提示推荐）" hint="写进提示词的推荐条数，模型尽量照着来；必要时可突破" value={h.outgoing.expectedBubbles ?? 3}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
+                <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
                 {h.outgoing.typingEnabled === true && (<>

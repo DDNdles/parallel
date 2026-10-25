@@ -34,10 +34,11 @@ export const CHAT_STYLE_TEXT = `回复要求：简短自然、口语化、适合
  * 这是 chat 轮**唯一**一段规定"输出长什么样"的文字：说几条、多长、什么语气。
  * 模型说什么就发什么；程序侧只做兜底（按句分条、超长句边截断、token 硬顶），不做格式矫正。
  */
-export function chatOutputStyleText(opts: { maxChars: number }): string {
+export function chatOutputStyleText(opts: { maxChars: number; expectedBubbles?: number; maxBubbles?: number }): string {
   const n = Math.max(20, Math.round(opts.maxChars));
   const recommend = Math.min(RECOMMENDED_REPLY_CHARS, n);
-  const recommendBubbles = Math.min(RECOMMENDED_BUBBLES, MAX_BUBBLES);
+  const maxBubbles = Math.max(1, Math.round(opts.maxBubbles ?? MAX_BUBBLES));
+  const recommendBubbles = Math.max(1, Math.min(Math.round(opts.expectedBubbles ?? RECOMMENDED_BUBBLES), maxBubbles));
   return [
     `# 你的回复`,
     `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
@@ -46,7 +47,7 @@ export function chatOutputStyleText(opts: { maxChars: number }): string {
     `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
     `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
     `- 想发表情就写 [表情/微笑] 或 [表情/14]；名字必须完全匹配（比如「呜呜呜」不是「呜呜」，「大哭」不是「哭」），拿不准就用编号。不要写 [微笑] 这种纯文字，也不要描述表情。`,
-    `- 硬上限：一次回复总共不超过 ${n} 个字、最多 ${MAX_BUBBLES} 条气泡；超出字数的部分会被截掉，气泡太多会合并。想分条就换行写。`,
+    `- 硬上限：一次回复总共不超过 ${n} 个字、最多 ${maxBubbles} 条气泡；超出字数的部分会被截掉，气泡太多会合并。想分条就换行写。`,
   ].join('\n');
 }
 

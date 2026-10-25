@@ -21,6 +21,10 @@ export interface OutgoingConfig {
   maxReplyTokens: number;
   /** 单条气泡目标字数：超过后在逗号/顿号处补切（0 = 用默认 24） */
   bubbleSoftMaxCharacters: number;
+  /** 预期气泡数：提示里的推荐条数（2026-10-25 起设置页可调） */
+  expectedBubbles?: number;
+  /** 最大气泡数：程序分条硬上限（超出合并） */
+  maxBubbles?: number;
   /** 是否模拟「正在输入」的停顿（默认关：气泡之间立即发） */
   typingEnabled: boolean;
   /** 发送第二条及后续分段消息前的基础打字等待秒数 */
@@ -40,6 +44,8 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   replyMaxCharacters: 100,
   maxReplyTokens: 400,
   bubbleSoftMaxCharacters: 24,
+  expectedBubbles: 3,
+  maxBubbles: 6,
   typingEnabled: false,
   typingBaseDelaySeconds: 1,
   typingCharactersPerSecond: 8,
@@ -48,11 +54,11 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   maxMessageCharacters: 2000,
 };
 
-/** 气泡数硬上限：连续发送（中间没有对方插话）最多 6 条 */
+/** 气泡数硬上限的缺省值（设置页「最大气泡数」没配时的回落；程序读 outgoing.maxBubbles） */
 export const MAX_BUBBLES = 6;
 /** 提示里的推荐总长（字）：硬上限由设置页 replyMaxCharacters 决定，必要情况可以突破推荐值 */
 export const RECOMMENDED_REPLY_CHARS = 50;
-/** 提示里的推荐气泡数（2～3 条）：硬上限是 MAX_BUBBLES，必要情况可以超过 3 条 */
+/** 提示里推荐气泡数的缺省值（设置页「预期气泡数」没配时的回落） */
 export const RECOMMENDED_BUBBLES = 3;
 
 /** 句末标点（切分与句边截断共用） */
