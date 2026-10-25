@@ -86,7 +86,11 @@ test('work 按人隔离：同一个群里两位发起人各是独立运行，产
     const chat = { platform: 'qq' as const, type: 'group' as const, chatId: '9302' };
     const chatKey = 'group_9302';
 
-    // 两个人各跑一次 work（脚本：直接交一份产物）
+    // 两个人各跑一次 work（脚本：直接交一份产物）。
+    // 产物文件要先真实写进各自沙箱——交付清单只信沙箱里存在的文件（2026-10-25 起
+    // 不存在的文件名不再进 artifacts，防 ls 提到的旧文件污染交付）
+    g.kernel.sandbox.write({ ...chat, scope: 'u10001' }, 'a.txt', 'A 的产物');
+    g.kernel.sandbox.write({ ...chat, scope: 'u10002' }, 'b.txt', 'B 的产物');
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: 'A 做完了', artifacts: ['a.txt'] } }] });
     const ra = await g.kernel.workRunner.run(workInput(chat, '10001', '做 A'));
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: 'B 做完了', artifacts: ['b.txt'] } }] });
@@ -139,6 +143,8 @@ test('work 记录落库：重启后仍能列出运行并带回 events/usage（�
       cfg.masterIds = ['10001'];
       await k.boot();
       const mock = (k.llm as unknown as { providers: Map<string, any> }).providers.get('mock')!;
+      // 产物要真实存在才会进交付清单（extractArtifacts 的存在性校验）
+      k.sandbox.write({ platform: 'qq', type: 'group', chatId: '9303', scope: 'u10001' }, 'out.md', '# 结果\n');
       mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '完成了', artifacts: ['out.md'] } }] });
       const chat = { platform: 'qq' as const, type: 'group' as const, chatId: '9303' };
       const r = await k.workRunner.run(workInput(chat, '10001', '做个东西'));

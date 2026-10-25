@@ -270,6 +270,37 @@ export class AgentLoop {
       // 历史最后一条就是本轮用户发言：用 continue 从当前 transcript 接着跑
       await agent.continue();
       await agent.waitForIdle();
+
+      // work 轮的“旁白式收工”保护（2026-10-25 Three.js 任务实锤）：模型某轮只发了一段
+      // 叙述、没调任何工具，agent 循环就当任务自然结束——78 分钟的工作收在一句调试旁白上，
+      // work_finish 没走、交付格式没有、产物全靠补扫。work 任务只有 work_finish / work_ask
+      // 才算收尾：这种纯文字轮推一条内核提醒让它接着干或正式交付；最多推 2 次，
+      // 再不动就照旧收工（reply=最后那段文字），避免无限旁白循环。
+      let nudges = 0;
+      while (ctx.workTurn && !cap.settled && !opts.abort?.aborted && nudges < 2) {
+        const msgs = agent.state.messages as { role?: string; content?: unknown }[];
+        const last = msgs[msgs.length - 1];
+        const lastText = typeof last?.content === 'string'
+          ? last.content
+          : Array.isArray(last?.content)
+            ? (last.content as { type?: string; text?: string }[]).filter((c) => c?.type === 'text').map((c) => c.text ?? '').join('')
+            : '';
+        // 末条不是带正文的 assistant（比如工具结果后被打断）：不推，按原样结算
+        if (last?.role !== 'assistant' || !lastText.trim()) break;
+        nudges++;
+        event({
+          kind: 'text', round: cap.rounds + 1,
+          text: `（内核提醒 ${nudges}/2：这条回复没有调用工具，任务不算结束——继续执行，或调用 work_finish 交付）`,
+        });
+        agent.followUp({
+          role: 'user',
+          content: [{ type: 'text', text: '刚才那条回复没有调用任何工具，任务不能就此结束：请继续执行任务（调用工具）；做完了就调用 work_finish 正式交付；需要用户确认就调用 work_ask。不要只输出文字说明。' }],
+        } as never);
+        await agent.continue();
+        await agent.waitForIdle();
+        if (cap.settled) break;
+      }
+
       agent.clearAllQueues();
 
       let reply = (cap.finalReply ?? cap.lastText ?? '').trim();

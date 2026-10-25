@@ -21,12 +21,23 @@ let page = null;
 let lastUse = Date.now();
 let actions = 0;
 
+/** 等 ≥2 个 requestAnimationFrame：canvas/Three.js 页面至少画完一帧再返回（截图不再拍到空白或半成品） */
+async function waitForPaint(p) {
+  await p.evaluate(() => new Promise((res) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => res(undefined)));
+  })).catch(() => {});
+}
+
 async function ensurePage() {
   if (page && !page.isClosed()) return page;
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+      args: [
+        '--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
+        // 沙箱浏览器是"看最新内容"的：磁盘缓存全关，避免改完代码截图还是旧页
+        '--disk-cache-size=0', '--media-cache-size=0', '--disable-application-cache',
+      ],
     });
   }
   if (!context) {
@@ -37,6 +48,9 @@ async function ensurePage() {
     });
   }
   page = await context.newPage();
+  // HTTP 层也禁缓存（file:// 之外的 dev server 会按缓存语义回 304，模型改了文件截图却不变）
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
   return page;
 }
 
@@ -82,6 +96,7 @@ const ACTIONS = {
     if (!args.url) throw new Error('goto 需要 url');
     const resp = await p.goto(args.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     await p.waitForTimeout(600); // 给 SPA 一点渲染时间
+    await waitForPaint(p);
     const s = await snapshot(p);
     return { status: resp ? resp.status() : null, ...s };
   },
@@ -136,6 +151,7 @@ const ACTIONS = {
     return await snapshot(p);
   },
   async screenshot(p) {
+    await waitForPaint(p);
     const buf = await p.screenshot({ fullPage: !!arguments[1]?.fullPage, type: 'png' });
     return { image: buf.toString('base64'), url: p.url() };
   },
@@ -159,7 +175,7 @@ const ACTIONS = {
 };
 
 function renderResult(r) {
-  if (r.image) return { text: `（截图已保存）`, image: r.image, url: r.url };
+  if (r.image) return { text: `（已截图）`, image: r.image, url: r.url };
   const parts = [];
   if (r.url) parts.push(`URL: ${r.url}`);
   if (r.title) parts.push(`标题: ${r.title}`);

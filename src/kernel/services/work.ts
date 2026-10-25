@@ -12,7 +12,7 @@ import { busEvents } from '../bus.ts';
 import { buildWorkSections, parseWorkHandoff, type PendingAsk } from '../work-prompt.ts';
 import { DEFAULT_WORK_AGENT } from '../work-agent.ts';
 import { readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { ARTIFACT_SKIP_DIRS, ARTIFACT_SKIP_FILE, isDeliverableArtifact } from './artifacts.ts';
 
 /**
@@ -138,7 +138,9 @@ export function collectRecentArtifacts(root: string, startedAt: number): string[
       let st;
       try { st = statSync(abs); } catch { continue; }
       if (st.isDirectory()) {
-        if (ARTIFACT_SKIP_DIRS.has(name)) continue;
+        // `_` 前缀目录与同名文件同口径（_dev/_plan 一类是模型的内部工作区，不是交付物；
+        // 2026-10-25 Three.js 任务把 17 个 _dev/p_*.html 迭代预览页全扫进了交付清单）
+        if (name.startsWith('_') || ARTIFACT_SKIP_DIRS.has(name)) continue;
         walk(abs, depth + 1);
         continue;
       }
@@ -348,10 +350,11 @@ export class WorkRunner {
       // 结论与产物：优先用交付格式里的结构化字段，解析不到就回落到全文 + 正则兜底；
       // 最后再补扫沙箱——模型常用 run_bash/Python 直接写文件，不会经过 sandbox_write 的 artifact 回执。
       const handoff = parseWorkHandoff(reply);
-      const scanned = collectRecentArtifacts(this.sandbox.root(chat), startedAt);
+      const sandboxRoot = this.sandbox.root(chat);
+      const scanned = collectRecentArtifacts(sandboxRoot, startedAt);
       const artifacts = handoff.structured && handoff.artifacts.length
         ? dedupe([...handoff.artifacts, ...metaArtifacts, ...scanned])
-        : dedupe([...metaArtifacts, ...extractArtifacts(steps), ...scanned]);
+        : dedupe([...metaArtifacts, ...extractArtifacts(steps, sandboxRoot), ...scanned]);
       // 停下来提问：结论就是那个问题（交付文本里的「## 待确认/## 已做到」只是留给人读的）
       const ask = metaAsk as { question: string; notes?: string } | undefined;
       // 模型链一整轮什么都没吐（没接模型/额度耗尽/链全挂被吞成空流）：判成失败，
@@ -405,7 +408,7 @@ export class WorkRunner {
       // 跑挂了也要把已经写出来的文件带出去：失败报告至少能附上部分产物，
       // 不能因为最后一步模型链断了就把整场工作的文件全丢在沙箱里。
       const scanned = collectRecentArtifacts(this.sandbox.root(chat), startedAt);
-      const artifacts = dedupe([...metaArtifacts, ...extractArtifacts(r?.steps ?? rec.steps), ...scanned]);
+      const artifacts = dedupe([...metaArtifacts, ...extractArtifacts(r?.steps ?? rec.steps, this.sandbox.root(chat)), ...scanned]);
       const result: WorkRunResult = {
         id, ok: false, summary: '', rounds: r?.rounds ?? 0, toolCalls: r?.toolCalls ?? 0,
         durationMs: nowMs() - startedAt, artifacts, error: err, model,
@@ -630,13 +633,27 @@ export class WorkRunner {
  * 正则兜底：模型没按交付格式登记产物时，从步骤文本里捞路径。
  * 正常路径是工具通过 ToolMeta.artifacts 上报 + 交付格式的「产物」一节，这里只保底。
  */
-export function extractArtifacts(steps: string[]): string[] {
+/**
+ * 从步骤文本里兜底提取产物路径。正则天生会把 ls 输出、日志里出现过的**任何文件名**都当产物
+ * （2026-10-25 Three.js 任务的交付里混进了上一个任务的图——只因模型 ls 时看到过它），
+ * 所以给了 root 就逐个验存在且在沙箱内：验不过的一律不信。
+ */
+export function extractArtifacts(steps: string[], root?: string): string[] {
   const out = new Set<string>();
+  const realInRoot = (p: string): boolean => {
+    if (!root) return true;
+    try {
+      const abs = resolve(root, p);
+      const top = resolve(root);
+      if (abs !== top && !abs.startsWith(top + sep)) return false;
+      return statSync(abs).isFile();
+    } catch { return false; }
+  };
   for (const s of steps) {
     for (const m of s.matchAll(/(?:写入|已写入|saved|wrote)\s+([^\s（(]+\.\w{1,8})/gi)) out.add(m[1]);
     for (const m of s.matchAll(/([A-Za-z0-9_\-./]+\.(?:png|jpg|jpeg|csv|xlsx|md|txt|json|pdf|html|py|js))/g)) out.add(m[1]);
   }
-  return [...out].slice(0, 20);
+  return [...out].filter(realInRoot).slice(0, 20);
 }
 
 /** 运行中的 token 账：loop 的 usage 事件是每轮累加的原料（收尾前的 status 也拿得到） */
