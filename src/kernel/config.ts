@@ -261,6 +261,8 @@ export const DEFAULT_CONFIG = {
     workMaxSessionBytes: 1024 * 1024 * 1024, // work 模式会话沙箱容量上限（1GB）
     workExecTimeoutMs: 300000,            // work 档单次执行上限（5 分钟：长任务/构建）
     maxOutputBytes: 4096,
+    // work 档执行输出上限（2026-10-25 用户定：模型必须看到完整输出，build/测试日志不许砍）
+    workMaxOutputBytes: 1024 * 1024,
     maxRunsPerMin: 5,
     // 状态化会话容器（常驻，变量跨调用保留；空闲回收）
     session: {

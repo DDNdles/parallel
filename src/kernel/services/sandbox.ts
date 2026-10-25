@@ -526,7 +526,7 @@ export class SandboxService {
     }
     return new Promise((resolveP) => {
       const startTs = Date.now();
-      const outCap = this.config.config.sandbox.maxOutputBytes;
+      const outCap = work ? (this.config.config.sandbox as any).workMaxOutputBytes ?? this.config.config.sandbox.maxOutputBytes : this.config.config.sandbox.maxOutputBytes;
       let stdout = '', stderr = '', truncated = false, timedOut = false;
       const dockerBin = this.dockerBin ?? 'docker';
       const child = spawn(dockerBin, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: this.dockerEnv() });
@@ -577,7 +577,7 @@ export class SandboxService {
     args.push(cfg.dockerImageBash || 'parallel-sandbox-python:latest', 'bash', '-c', code);
     return new Promise((resolveP) => {
       const startTs = Date.now();
-      const outCap = this.config.config.sandbox.maxOutputBytes;
+      const outCap = (this.config.config.sandbox as any).workMaxOutputBytes ?? this.config.config.sandbox.maxOutputBytes;
       let stdout = '', stderr = '', truncated = false, timedOut = false;
       const dockerBin = this.dockerBin ?? 'docker';
       const child = spawn(dockerBin, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: this.dockerEnv() });

@@ -258,9 +258,9 @@ test('任务隔离：新任务各开各的沙箱（跨群也隔离），续接�
     const r1 = await g.kernel.workRunner.run(workInput(chatA, '10001', '做任务一', tools()));
     assert.equal(r1.ok, true);
     const key1 = r1.sandboxKey;
-    assert.ok(key1?.startsWith('private_u10001__t'), `任务沙箱键跟人走+任务号：${key1}`);
+    assert.ok(key1 && key1.startsWith('private_u10001__t'), `任务沙箱键跟人走+任务号：${key1}`);
 
-    assert.ok(g.kernel.sandbox.read({ platform: 'qq', type: 'private', chatId: 'u10001', scope: key1.split('__')[1] }, 'task1.txt').includes('第一个'));
+    assert.ok(g.kernel.sandbox.read({ platform: 'qq', type: 'private', chatId: 'u10001', scope: key1.split('__')[1]! }, 'task1.txt').includes('第一个'));
 
     // 任务 2：同一人在 B 群开新活——新沙箱，看不到任务 1 的文件
     g.mock.script.push({ toolCalls: [

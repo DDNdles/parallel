@@ -687,11 +687,12 @@ export class HumanlikeService {
     return (await this.composeScene(text)).plans;
   }
 
-  /** 汇报轮正文：不进聊天气泡那套「按句切、50 字截断」，只做可见化与平台硬上限 */
+  /** 汇报轮正文：不进聊天气泡那套「按句切、50 字截断」，也不设字数上限
+   *  （2026-10-25 用户定：聊天合集里的正文全文送出），只做可见化清洗。 */
   reportText(raw: string): string {
     const scene = String(raw ?? '');
     if (isSilentScene(scene)) return '';
-    return normalizeVisibleContent(scene, this.config.outgoing.maxMessageCharacters).trim();
+    return normalizeVisibleContent(scene, Number.MAX_SAFE_INTEGER).trim();
   }
 
   /** 单条文本的打字等待（秒），插件/命令想自己排节奏时用（下限 0.25s） */

@@ -262,7 +262,7 @@ export class AgentLoop {
               if (!done) return undefined;
               lastSummary = done.summary;
               compactions++;
-              event({ kind: 'compaction', round: cap.rounds, dropped: done.dropped, tokensBefore: done.tokensBefore, summary: truncate(done.summary, 600) });
+              event({ kind: 'compaction', round: cap.rounds, dropped: done.dropped, tokensBefore: done.tokensBefore, summary: done.summary });
               return { context: { messages: done.messages as never, tools: tools as never }, model: agent.state.model };
             }
           : undefined)
@@ -331,7 +331,8 @@ export class AgentLoop {
       }
       // 空输出不再编一句"没答好"的托词：模型没接、额度耗尽、链全挂时群里必须一个字都没有。
       // 沉默由 pipeline 落 gate 条目，错误细节走报错中心；work 链靠 WorkRunner 把空回复判成失败。
-      reply = reply.slice(0, 3500);
+      // 2026-10-25 用户定：work 的交付正文不设上限（聊天合集里全文送出）；chat 轮保留防抽风切片
+      if (!ctx.workTurn) reply = reply.slice(0, 3500);
       event({ kind: 'final', text: reply });
 
       // work 轮是否"正式收尾"（work_finish / work_ask）：提醒满限仍只发文字的如实报
@@ -395,7 +396,8 @@ export class AgentLoop {
           if (images?.length && !vision) {
             this.errors.record('warn', 'provider', `工具 ${def.name} 返回了 ${images.length} 张图片，但链首模型不收图片，已丢弃`, { chatId: ctx.chat.chatId });
           }
-          const content: any[] = [{ type: 'text', text: truncate(text, 4000) }];
+          // 2026-10-25 用户定：工具输出不截断——模型看不见完整输出就会瞎猜重做
+          const content: any[] = [{ type: 'text', text }];
           if (vision) for (const img of images ?? []) content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
           return { content, details: meta, terminate };
         } catch (e) {
@@ -469,20 +471,20 @@ export class AgentLoop {
       case 'tool_execution_start': {
         cap.toolCalls++;
         const args = safeJson(ev.args);
-        h.step(`▶ ${ev.toolName} ${truncate(args, 160)}`);
-        h.event({ kind: 'tool', round: cap.rounds, name: ev.toolName, args: truncate(args, 400) });
+        h.step(`▶ ${ev.toolName} ${args}`);
+        h.event({ kind: 'tool', round: cap.rounds, name: ev.toolName, args });
         this.bus.emit(busEvents.toolCall, { chatKey: h.chatKey, name: ev.toolName, args: ev.args ?? {}, id: ev.toolCallId, ts: Date.now() });
         this.sessionLog.append((ctx.reportChat ?? ctx.chat).chatId, (ctx.reportChat ?? ctx.chat).type, {
           type: 'tool_call', role: 'tool', text: ev.toolName, lane,
-          data: { args: truncate(args, 600), callId: ev.toolCallId },
+          data: { args, callId: ev.toolCallId },
         });
         break;
       }
 
       case 'tool_execution_end': {
         const text = contentText(ev.result?.content);
-        h.step(`◀ ${ev.toolName}: ${truncate(text.replace(/\s+/g, ' '), 200)}`);
-        h.event({ kind: 'toolResult', round: cap.rounds, name: ev.toolName, text: truncate(text, 1200), meta: ev.result?.details });
+        h.step(`◀ ${ev.toolName}: ${text.replace(/\s+/g, ' ')}`);
+        h.event({ kind: 'toolResult', round: cap.rounds, name: ev.toolName, text, meta: ev.result?.details });
         // cap.settled 由 toAgentTool 在 handler 返回后置位（finalReply 已拿到）。pi 的批终止
         // 语义是 every（整批工具都 terminate 才停），收尾工具前面混着普通工具时批不会停、
         // 会再烧一次模型调用——这里在收尾工具结果落地后直接 abort，后续工具/下一轮都不该再有。
@@ -490,12 +492,12 @@ export class AgentLoop {
           try { h.agent.abort(); } catch { /* 已在收尾流程就不影响 */ }
         }
         this.bus.emit(busEvents.toolResult, {
-          chatKey: h.chatKey, name: ev.toolName, result: truncate(text, 4000),
+          chatKey: h.chatKey, name: ev.toolName, result: text,
           id: ev.toolCallId, ts: Date.now(), meta: ev.result?.details,
         });
         this.sessionLog.append((ctx.reportChat ?? ctx.chat).chatId, (ctx.reportChat ?? ctx.chat).type, {
           type: 'tool_result', role: 'tool', text: ev.toolName, lane,
-          data: { result: truncate(text, 1200), callId: ev.toolCallId, meta: ev.result?.details },
+          data: { result: text, callId: ev.toolCallId, meta: ev.result?.details },
         });
         break;
       }
