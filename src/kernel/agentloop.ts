@@ -69,6 +69,12 @@ interface RunCapture {
  *  几十条一起塞会把请求体顶到对端拒收（图片按消息分流，不受这个上限约束）。 */
 const MEDIA_CAP = { audio: 8, video: 4 } as const;
 
+/** work 轮「纯文字旁白」保护的节奏（2026-10-25 用户定：强制 work_finish 才算完成）：
+ *  模型某轮只发文字、没调任何工具时，任务不算结束——等这么久还没下文就提醒它
+ *  「继续执行或调 work_finish」。提醒满 WORK_IDLE_REMIND_LIMIT 次仍不收尾的按未完成处理。 */
+export const WORK_IDLE_REMIND_MS = 60_000;
+export const WORK_IDLE_REMIND_LIMIT = 5;
+
 export class AgentLoop {
   constructor(
     private llm: LlmService,
@@ -91,8 +97,10 @@ export class AgentLoop {
       onStep?: (step: string) => void;
       /** 结构化事件（work 侧栏的 loop 视图：轮次/思考/工具/用量） */
       onEvent?: (ev: LoopEvent) => void;
+      /** work 纯文字轮的提醒等待（毫秒）；缺省 60s，测试调小 */
+      workIdleRemindMs?: number;
     },
-  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[] }> {
+  ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[]; finished: boolean }> {
     const { chat } = ctx;
     const chatKey = opts.chatKey;
     const chain: ModelChainKind = opts.chain ?? (ctx.workTurn ? 'work' : 'chat');
@@ -271,13 +279,13 @@ export class AgentLoop {
       await agent.continue();
       await agent.waitForIdle();
 
-      // work 轮的“旁白式收工”保护（2026-10-25 Three.js 任务实锤）：模型某轮只发了一段
-      // 叙述、没调任何工具，agent 循环就当任务自然结束——78 分钟的工作收在一句调试旁白上，
-      // work_finish 没走、交付格式没有、产物全靠补扫。work 任务只有 work_finish / work_ask
-      // 才算收尾：这种纯文字轮推一条内核提醒让它接着干或正式交付；最多推 2 次，
-      // 再不动就照旧收工（reply=最后那段文字），避免无限旁白循环。
-      let nudges = 0;
-      while (ctx.workTurn && !cap.settled && !opts.abort?.aborted && nudges < 2) {
+      // work 轮只认 work_finish / work_ask 收尾（2026-10-25 用户定：强制 work_finish 才算完成）。
+      // 纯文字轮（没调任何工具）在 agent 循环的默认语义里等于"跑完了"——但那多半是模型
+      // 想继续干活的旁白，整场任务静默收在一句话上、work_finish 没走（Three.js 任务 178 轮
+      // 实锤）。处理：等 WORK_IDLE_REMIND_MS 还没有下文，就提醒它继续执行或调 work_finish；
+      // 提醒满 WORK_IDLE_REMIND_LIMIT 次仍不收尾 → finished=false 交回 WorkRunner 判未完成。
+      let reminders = 0;
+      while (ctx.workTurn && !cap.settled && !opts.abort?.aborted && reminders < WORK_IDLE_REMIND_LIMIT) {
         const msgs = agent.state.messages as { role?: string; content?: unknown }[];
         const last = msgs[msgs.length - 1];
         const lastText = typeof last?.content === 'string'
@@ -285,20 +293,30 @@ export class AgentLoop {
           : Array.isArray(last?.content)
             ? (last.content as { type?: string; text?: string }[]).filter((c) => c?.type === 'text').map((c) => c.text ?? '').join('')
             : '';
-        // 末条不是带正文的 assistant（比如工具结果后被打断）：不推，按原样结算
+        // 末条不是带正文的 assistant（比如空回复/被中断）：不提醒，按原样结算
         if (last?.role !== 'assistant' || !lastText.trim()) break;
-        nudges++;
+        const waitMs = opts.workIdleRemindMs ?? WORK_IDLE_REMIND_MS;
+        await new Promise<void>((res) => {
+          const t = setTimeout(res, waitMs);
+          opts.abort?.addEventListener('abort', () => { clearTimeout(t); res(); }, { once: true });
+        });
+        if (cap.settled || opts.abort?.aborted) break;
+        // followUp 队列非空说明有消息在路上（比如插件 steer 过），让它先跑
+        if (agent.hasQueuedMessages()) continue;
+        reminders++;
         event({
           kind: 'text', round: cap.rounds + 1,
-          text: `（内核提醒 ${nudges}/2：这条回复没有调用工具，任务不算结束——继续执行，或调用 work_finish 交付）`,
+          text: `（内核提醒 ${reminders}/${WORK_IDLE_REMIND_LIMIT}：这条回复没有调用工具，任务未收尾——继续执行，或调用 work_finish 交付）`,
         });
         agent.followUp({
           role: 'user',
-          content: [{ type: 'text', text: '刚才那条回复没有调用任何工具，任务不能就此结束：请继续执行任务（调用工具）；做完了就调用 work_finish 正式交付；需要用户确认就调用 work_ask。不要只输出文字说明。' }],
+          content: [{
+            type: 'text',
+            text: '这条回复没有调用任何工具，任务还没有结束。请立即行动：任务没做完就继续执行（调用工具）；做完了就调用 work_finish 正式交付（summary 写给用户看的结论，artifacts 登记产物路径）；需要用户确认就调用 work_ask。不要只输出文字。',
+          }],
         } as never);
         await agent.continue();
         await agent.waitForIdle();
-        if (cap.settled) break;
       }
 
       agent.clearAllQueues();
@@ -313,6 +331,10 @@ export class AgentLoop {
       reply = reply.slice(0, 3500);
       event({ kind: 'final', text: reply });
 
+      // work 轮是否"正式收尾"（work_finish / work_ask）：提醒满限仍只发文字的如实报
+      // unfinished，由 WorkRunner 判未完成——强制 work_finish 才算完成（2026-10-25 用户定）。
+      const finished = !ctx.workTurn || cap.settled || !!opts.abort?.aborted;
+
       this.sessionLog.append(chat.chatId, chat.type, {
         type: 'agent_end', role: 'system', lane: ctx.workTurn ? 'work' : 'chat',
         text: `agent loop 结束（${cap.rounds} 轮 / ${cap.toolCalls} 次工具调用${compactions ? ` / 压缩 ${compactions} 次` : ''}）`,
@@ -321,7 +343,7 @@ export class AgentLoop {
         data: { rounds: cap.rounds, toolCalls: cap.toolCalls, usage: cap.usage, model: this.llm.servingLabel(chain) },
       });
       this.bus.emit(busEvents.agentEnd, { chatKey, reply, rounds: cap.rounds });
-      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps };
+      return { reply, rounds: cap.rounds, toolCalls: cap.toolCalls, steps, finished };
     } catch (e) {
       const err = e as Error;
       this.sessionLog.append(chat.chatId, chat.type, { type: 'error', role: 'system', text: `agent loop 异常: ${err.message}` });

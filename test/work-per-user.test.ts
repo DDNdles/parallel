@@ -44,11 +44,13 @@ async function boot(port: number) {
   };
 }
 
-/** 直接走 WorkRunner：不起协议端，只验执行面的隔离与记录口径 */
-function workInput(chat: { platform: 'qq'; type: 'group'; chatId: string }, userId: string, task: string) {
+/** 直接走 WorkRunner：不起协议端，只验执行面的隔离与记录口径。
+ *  工具面必须是真实的 workToolsFor——传空数组时 work_finish 不在面上，
+ *  「Tool not found」会把 run 推进旁白路径，5 次 60s 的提醒能把测试拖死。 */
+function workInput(chat: { platform: 'qq'; type: 'group'; chatId: string }, userId: string, task: string, tools: any[]) {
   return {
     chat, task, taskLabel: task, userId, nickname: `群友${userId}`, role: 'owner',
-    tools: [] as any[], trigger: 'command' as const, depth: 0,
+    tools, trigger: 'command' as const, depth: 0,
   };
 }
 
@@ -92,9 +94,9 @@ test('work 按人隔离：同一个群里两位发起人各是独立运行，产
     g.kernel.sandbox.write({ ...chat, scope: 'u10001' }, 'a.txt', 'A 的产物');
     g.kernel.sandbox.write({ ...chat, scope: 'u10002' }, 'b.txt', 'B 的产物');
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: 'A 做完了', artifacts: ['a.txt'] } }] });
-    const ra = await g.kernel.workRunner.run(workInput(chat, '10001', '做 A'));
+    const ra = await g.kernel.workRunner.run(workInput(chat, '10001', '做 A', g.kernel.container.workToolsFor(chat, 'owner', g.kernel.container.workAgent(), 0)));
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: 'B 做完了', artifacts: ['b.txt'] } }] });
-    const rb = await g.kernel.workRunner.run(workInput(chat, '10002', '做 B'));
+    const rb = await g.kernel.workRunner.run(workInput(chat, '10002', '做 B', g.kernel.container.workToolsFor(chat, 'owner', g.kernel.container.workAgent(), 0)));
 
     assert.equal(ra.ok, true);
     assert.equal(rb.ok, true);
@@ -147,7 +149,7 @@ test('work 记录落库：重启后仍能列出运行并带回 events/usage（�
       k.sandbox.write({ platform: 'qq', type: 'group', chatId: '9303', scope: 'u10001' }, 'out.md', '# 结果\n');
       mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '完成了', artifacts: ['out.md'] } }] });
       const chat = { platform: 'qq' as const, type: 'group' as const, chatId: '9303' };
-      const r = await k.workRunner.run(workInput(chat, '10001', '做个东西'));
+      const r = await k.workRunner.run(workInput(chat, '10001', '做个东西', k.container.workToolsFor(chat, 'owner', k.container.workAgent(), 0)));
       assert.equal(r.ok, true);
       await k.shutdown();
       await new Promise((res) => setTimeout(res, 300));
@@ -221,7 +223,7 @@ test('work 轮的会话日志条目标成 work 车道（前端才分得开两段
   try {
     const chat = { platform: 'qq' as const, type: 'group' as const, chatId: '9305' };
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '完成' } }] });
-    await g.kernel.workRunner.run(workInput(chat, '10001', '跑一下'));
+    await g.kernel.workRunner.run(workInput(chat, '10001', '跑一下', g.kernel.container.workToolsFor(chat, 'owner', g.kernel.container.workAgent(), 0)));
     const tail = g.kernel.sessionLog.tail(chat.chatId, 'group', 100);
     const start = tail.find((e) => e.type === 'agent_start');
     const end = tail.find((e) => e.type === 'agent_end');

@@ -3,6 +3,7 @@ import type { Db } from '../db.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { AgentLoop, LoopEvent } from '../agentloop.ts';
+import { WORK_IDLE_REMIND_LIMIT } from '../agentloop.ts';
 import type { LlmService, UsageSnapshot } from './llm.ts';
 import { usageDelta } from './llm.ts';
 import type { SandboxService } from './sandbox.ts';
@@ -63,6 +64,8 @@ export interface WorkRunInput {
   /** work 轮的插件钩子链（beforeWorkLLM）；缺省不跑 */
   runHooks?: (req: LLMRequestContext) => Promise<LLMRequestContext>;
   abort?: AbortSignal;
+  /** 纯文字轮的提醒等待毫秒（缺省 60s）。测试专用钩子，正常调用不传。 */
+  idleRemindMs?: number;
 }
 
 export interface WorkRunResult {
@@ -331,12 +334,14 @@ export class WorkRunner {
       };
       if (input.runHooks) ctx = await input.runHooks(ctx);
 
-      const { reply, rounds, toolCalls, steps } = await this.agentLoop.run(ctx, {
+      const { reply, rounds, toolCalls, steps, finished } = await this.agentLoop.run(ctx, {
         chatKey,
         abort: input.abort,
         // 轮次：work 轮不设上限（2026-10-23 用户定）；agent 定义里的 max_rounds 不再参与截断
         // 模型链：由 agent 定义决定（缺省 work；子代理可声明 chain: chat）
         chain: agent.chain ?? 'work',
+        // 纯文字轮的提醒等待（缺省 60s；测试调小）
+        workIdleRemindMs: input.idleRemindMs,
         // 每一步（工具调用）推给桌面端
         onStep: (s) => {
           const r = this.runs.get(id);
@@ -357,12 +362,17 @@ export class WorkRunner {
         : dedupe([...metaArtifacts, ...extractArtifacts(steps, sandboxRoot), ...scanned]);
       // 停下来提问：结论就是那个问题（交付文本里的「## 待确认/## 已做到」只是留给人读的）
       const ask = metaAsk as { question: string; notes?: string } | undefined;
-      // 模型链一整轮什么都没吐（没接模型/额度耗尽/链全挂被吞成空流）：判成失败，
-      // 不能给 ok:true 的空摘要让转述轮把"空结果"当完成讲出去。轮次与工具账都还在，一并保留。
-      if (!ask && !reply.trim()) {
-        const err = '模型链没有返回任何内容（请检查模型接入与额度）';
+      // 两种"不是成功"的结局（2026-10-25 用户定：强制 work_finish 才算完成）：
+      //  1. 模型链一整轮什么都没吐（没接模型/额度耗尽/链全挂被吞成空流）；
+      //  2. 提醒满限仍只发文字、没调 work_finish / work_ask——按未完成处理，
+      //     不能给 ok:true 让转述轮把一句旁白当"做完了"讲出去。轮次与工具账都保留。
+      const unfinished = !finished && !ask && !input.abort?.aborted && reply.trim().length > 0;
+      if (!ask && (!reply.trim() || unfinished)) {
+        const err = !reply.trim()
+          ? '模型链没有返回任何内容（请检查模型接入与额度）'
+          : `模型连续 ${WORK_IDLE_REMIND_LIMIT} 次提醒后仍未调用 work_finish 交付，任务按未完成处理（最后输出已保留在摘要里）`;
         const result: WorkRunResult = {
-          id, ok: false, summary: '', rounds, toolCalls,
+          id, ok: false, summary: clip(reply, 300), rounds, toolCalls,
           durationMs: nowMs() - startedAt, artifacts, error: err, model,
           usage: usageDelta(usageBefore, this.llm.usageSnapshot(input.chat.chatId)),
         };
