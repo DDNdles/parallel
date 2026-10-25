@@ -510,9 +510,25 @@ async def generate(request: Request) -> Response:
     if not _authorized(request):
         return _json(401, "unauthorized")
 
-    body = await request.body()
-    if len(body) > BODY_MAX_BYTES:
-        return _json(413, "请求体太大")
+    # 先看 content-length 预检：声明就超限的请求连 body 都不读，直接 413。
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = 0
+        if declared > BODY_MAX_BYTES:
+            return _json(413, "请求体太大")
+
+    # content-length 缺失/撒谎时按流式读取累计，超限立刻停，不把整段 body 读进内存。
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > BODY_MAX_BYTES:
+            return _json(413, "请求体太大")
+        chunks.append(chunk)
+    body = b"".join(chunks)
 
     try:
         lyrics, tags, seconds, ref = _parse_payload(body)

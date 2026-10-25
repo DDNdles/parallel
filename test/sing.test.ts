@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { MockOneBot } from './helpers/mock-onebot.ts';
+import { estimateSeconds } from '../src/plugins/sing/index.ts';
 import type { ChatRef } from '../src/kernel/types.ts';
 
 // ============================================================
@@ -30,10 +31,33 @@ const RESULT_URL = `${FAL_SUBMIT}/requests/req_1`;
 const MEDIA_URL = 'https://v3.fal.media/files/test/out.mp3';
 const MINIMAX_URL = 'https://api.minimax.cn/v1/music_generation';
 
-/** ID3 头 + 一点负载：插件只嗅文件头，不解码 */
-const MP3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(4096, 0x55)]);
+/** MPEG1 Layer III 128kbps / 44.1kHz 的一帧：FF FB 90 00 + 413 字节负载（帧长 417） */
+const MP3_FRAME = Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x00]), Buffer.alloc(413)]);
+/** ID3v2 空标签（10 字节头，size=0）——插件要能跳过它找到第一帧 */
+const ID3_HEADER = Buffer.concat([Buffer.from('ID3'), Buffer.from([0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])]);
+/** 10 帧有效 mp3：插件只嗅文件头 + 解析帧头估时长，不解码 */
+const MP3 = Buffer.concat([ID3_HEADER, ...Array.from({ length: 10 }, () => MP3_FRAME)]);
 /** 参考音频：RIFF/WAVE 头够插件认出 wav */
 const WAV = Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]), Buffer.from('WAVEfmt '), Buffer.alloc(64, 0)]);
+
+/** 造一段带 fmt/data 块的标准 PCM WAV（用于估时长单测，不在网络 mock 里用） */
+function wavOf(byteRate: number, dataBytes: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii');
+  header.writeUInt32LE(36 + dataBytes, 4);
+  header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);          // PCM
+  header.writeUInt16LE(1, 22);          // 单声道
+  header.writeUInt32LE(16000, 24);      // sampleRate
+  header.writeUInt32LE(byteRate, 28);   // byteRate
+  header.writeUInt16LE(2, 32);          // blockAlign
+  header.writeUInt16LE(16, 34);         // bitsPerSample
+  header.write('data', 36, 'ascii');
+  header.writeUInt32LE(dataBytes, 40);
+  return Buffer.concat([header, Buffer.alloc(dataBytes)]);
+}
 
 const freePort = () => new Promise<number>((res) => {
   const s = createServer();
@@ -518,6 +542,169 @@ test('发送被限速整批丢弃：返回失败，不保留额度与冷却', as
     const second = await k.call({ lyrics: '失败后冷却不该占住' });
     assert.match(second, /限速|没真的发出去/, second);
     assert.equal(mock.calls.length, 2, '第一次发送失败后冷却与在途锁都应释放');
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('estimateSeconds：mp3 按 MPEG 帧头码率、wav 按 fmt byteRate，解析失败回退并标 exact=false', () => {
+  // 100 帧 × 417 字节 @128kbps ≈ 2.6 秒 → 3 秒
+  const mp3 = Buffer.concat([ID3_HEADER, ...Array.from({ length: 100 }, () => MP3_FRAME)]);
+  const mp3Est = estimateSeconds(mp3, 'audio/mpeg');
+  assert.equal(mp3Est.exact, true, '有合法 MPEG 帧头时不该走粗估');
+  assert.equal(mp3Est.seconds, Math.round((100 * 417 * 8) / 128000));
+
+  const wav = wavOf(32000, 64000);   // 32000 B/s × 2s
+  const wavEst = estimateSeconds(wav, 'audio/wav');
+  assert.deepEqual(wavEst, { seconds: 2, exact: true });
+
+  // 只有 ID3 头、没有合法帧：退回旧的 128kbps 粗估
+  const brokenMp3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(4096, 0x55)]);
+  const brokenMp3Est = estimateSeconds(brokenMp3, 'audio/mpeg');
+  assert.equal(brokenMp3Est.exact, false);
+  assert.equal(brokenMp3Est.seconds, 1);
+
+  // fmt 块 size=0 的坏 wav：同样回退
+  const brokenWavEst = estimateSeconds(WAV, 'audio/wav');
+  assert.equal(brokenWavEst.exact, false);
+  assert.equal(brokenWavEst.seconds, 1);
+});
+
+test('estimateSeconds：VBR mp3 逐帧累计（首帧码率不再代表整段），断链只当参考', () => {
+  // 32kbps 首帧（104 字节）+ 99 帧 128kbps：真时长 = 100 帧 × 1152 / 44100 ≈ 2.6 秒，
+  // 按首帧码率算会得出 ~10 秒的错值
+  const frame32 = Buffer.concat([Buffer.from([0xff, 0xfb, 0x10, 0x00]), Buffer.alloc(100)]);
+  const vbr = Buffer.concat([ID3_HEADER, frame32, ...Array.from({ length: 99 }, () => MP3_FRAME)]);
+  const est = estimateSeconds(vbr, 'audio/mpeg');
+  assert.equal(est.exact, true, '帧链走完的 VBR 应逐帧精确');
+  assert.equal(est.seconds, Math.round((100 * 1152) / 44100));
+
+  // 帧链中途断掉（第二帧不是同步头）：不能再宣称精确，回退粗估
+  const broken = Buffer.concat([ID3_HEADER, frame32, Buffer.alloc(2048, 0x55)]);
+  const brokenEst = estimateSeconds(broken, 'audio/mpeg');
+  assert.equal(brokenEst.exact, false);
+  assert.equal(brokenEst.seconds, 1);
+});
+
+test('REST /preview：主人试唱只落盘不发送；/records 记一条，/audio 回同字节，假 id 与越界都 404', async () => {
+  const base = 'http://127.0.0.1:18087';
+  const k = await boot({
+    apiKey: 'cus-key-456',
+    connect: true,
+    config: { provider: 'custom', baseUrl: base, cooldownSeconds: 0, dailyQuota: 5 },
+  });
+  const mock = mockFetch((url) => (url === `${base}/generate` ? audioResp() : undefined));
+  try {
+    const resp = await k.kernel.container.dispatchHttp('sing', 'POST', '/preview', {}, {
+      lyrics: '桌面端试唱一句', tags: 'pop', seconds: 20,
+    });
+    assert.ok(resp);
+    assert.equal(resp!.status, 200);
+    const preview = JSON.parse(String(resp!.body)) as { ok: boolean; id: string; seconds: number };
+    assert.equal(preview.ok, true);
+    assert.match(preview.id, /^sing_[a-z0-9]+$/);
+    assert.ok(preview.seconds >= 1);
+
+    // 试唱不能真的发消息：协议端只该有握手动作
+    const sends = k.mock!.actions.filter((a) => a.action === 'send_group_msg' || a.action === 'send_private_msg');
+    assert.equal(sends.length, 0, '试唱不应发送任何消息');
+
+    const disk = join(k.dataDir, 'plugin-data', 'sing', 'sing', `${preview.id}.mp3`);
+    assert.deepEqual(readFileSync(disk), MP3, '试唱产物要落盘');
+
+    const recResp = await k.kernel.container.dispatchHttp('sing', 'GET', '/records', {}, {});
+    const recBody = JSON.parse(String(recResp!.body));
+    assert.equal(recBody.ok, true);
+    assert.equal(recBody.records.length, 1, '成功试唱要记进 records');
+    const rec = recBody.records[0];
+    assert.deepEqual(
+      Object.keys(rec).sort(),
+      ['chatId', 'file', 'id', 'mime', 'provider', 'seconds', 'ts', 'userId'],
+      '/records 只返回约定字段',
+    );
+    assert.equal(rec.id, preview.id);
+    assert.equal(rec.file, `${preview.id}.mp3`, 'file 只存文件名');
+    assert.equal(rec.userId, 'desktop', '试唱记录标 desktop');
+    assert.equal(rec.chatId, 'desktop');
+    assert.equal(rec.provider, 'custom');
+    assert.equal(rec.mime, 'audio/mpeg');
+    assert.equal(rec.seconds, preview.seconds);
+    assert.deepEqual(recBody.lastErrors, []);
+
+    const audio = await k.kernel.container.dispatchHttp('sing', 'GET', '/audio', { id: preview.id }, {});
+    assert.equal(audio!.status, 200);
+    assert.equal(audio!.headers['content-type'], 'audio/mpeg');
+    assert.deepEqual(audio!.body, MP3, '/audio 回与落盘一致的字节');
+
+    const fake = await k.kernel.container.dispatchHttp('sing', 'GET', '/audio', { id: 'sing_nope' }, {});
+    assert.equal(fake!.status, 404, '假 id 必须 404');
+
+    // 就算 state 里被塞进 ../ 文件名，/audio 也必须拒绝（只认 records + 边界校验）
+    writeFileSync(join(k.dataDir, 'plugin-data', 'sing', 'evil.mp3'), Buffer.from('evil'));
+    k.kernel.db.run(
+      `INSERT INTO plugin_kv (plugin_id, key, value, updated_at) VALUES (?,?,?,?)
+       ON CONFLICT(plugin_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      'sing', 'records',
+      JSON.stringify([{
+        id: 'sing_evil', ts: Date.now(), userId: 'desktop', chatId: 'desktop', seconds: 1,
+        provider: 'custom', file: '../evil.mp3', mime: 'audio/mpeg',
+      }]),
+      Date.now(),
+    );
+    const evil = await k.kernel.container.dispatchHttp('sing', 'GET', '/audio', { id: 'sing_evil' }, {});
+    assert.equal(evil!.status, 404, '路径穿越必须被拒');
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('REST /send：按 id 把已有录音补发到指定会话（record 段 file:// + 可选文字）', async () => {
+  const base = 'http://127.0.0.1:18088';
+  const k = await boot({
+    apiKey: 'cus-key-456',
+    connect: true,
+    config: { provider: 'custom', baseUrl: base, cooldownSeconds: 0, dailyQuota: 5 },
+  });
+  const mock = mockFetch((url) => (url === `${base}/generate` ? audioResp() : undefined));
+  try {
+    const made = await k.kernel.container.dispatchHttp('sing', 'POST', '/preview', {}, {
+      lyrics: '先唱一首存着', tags: 'pop', seconds: 20,
+    });
+    const preview = JSON.parse(String(made!.body)) as { ok: boolean; id: string };
+
+    const from = k.mock!.actions.length;
+    // chatId 先过格式关：不足 5 位的手误直接 400，不进协议端
+    const bad = await k.kernel.container.dispatchHttp('sing', 'POST', '/send', {}, {
+      id: preview.id, type: 'group', chatId: '8899', text: '来听这段',
+    });
+    assert.ok(bad);
+    assert.equal(bad!.status, 400);
+    assert.match(String(bad!.body), /5~12 位数字/);
+
+    const resp = await k.kernel.container.dispatchHttp('sing', 'POST', '/send', {}, {
+      id: preview.id, type: 'group', chatId: '88990', text: '来听这段',
+    });
+    assert.ok(resp);
+    assert.equal(resp!.status, 200);
+    const body = JSON.parse(String(resp!.body));
+    assert.equal(body.ok, true);
+    assert.equal(typeof body.messageId, 'string');
+
+    const act = await k.mock!.waitForAction('send_group_msg', 5000, from);
+    assert.equal(String(act.params.group_id), '88990');
+    // 语音与文字分开发：record 先走（才是补发的主体），文字随后单独一条
+    const all = k.mock!.actions.slice(from).filter((a) => a.action === 'send_group_msg');
+    const recSeg = all.flatMap((a) => (a.params.message ?? []) as any[]).find((s) => s.type === 'record');
+    assert.ok(recSeg, `补发必须有 record 段`);
+    assert.match(String(recSeg.data.file), /^file:\/\//, 'record 段要自己转 file://');
+    const abs = fileURLToPath(String(recSeg.data.file));
+    assert.deepEqual(readFileSync(abs), MP3, '补发指向 preview 落盘的那份文件');
+    assert.equal(abs, join(k.dataDir, 'plugin-data', 'sing', 'sing', `${preview.id}.mp3`));
+    // 语音发出去之后，文字条也跟着走（同一次补发的第二条）
+    const textSeg = all.flatMap((a) => (a.params.message ?? []) as any[]).find((s) => s.type === 'text');
+    assert.equal(textSeg?.data?.text, '来听这段');
   } finally {
     mock.restore();
     await k.cleanup();

@@ -34,7 +34,7 @@
     "voiceId": {
       "type": "string",
       "default": "",
-      "description": "通用占位字段：当前内置 preset（ACE-Step / MiniMax / custom）都不支持持久克隆音色 id，请保持留空，把 10~30 秒干声填进 refAudio；填克隆 id 会提示当前供应商不支持"
+      "description": "参考音色的备用来源，不是可复用的克隆音色 id：refAudio 为空时，fal-ai-ace-step 与 minimax-music 会把这里填的值当作音频来源解析（公网 URL / 本地路径 / data URI / 原始 base64），每次请求随参考音频一起发送；填一个纯克隆 id 会提示当前供应商不支持。custom 不会发送 voiceId/refAudio，音色由自部署服务自己决定。建议留空，把 10~30 秒干声填进 refAudio"
     },
     "refAudio": {
       "type": "string",

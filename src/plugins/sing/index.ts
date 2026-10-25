@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { ChatRef, PluginContext, Role } from '../../kernel/types.ts';
+import type { ChatRef, MsgSegment, PluginContext, Role } from '../../kernel/types.ts';
 import { clamp, newId, sleep } from '../../kernel/util/misc.ts';
 
 // ============================================================
@@ -30,6 +30,9 @@ import { clamp, newId, sleep } from '../../kernel/util/misc.ts';
 //
 // 关键坑：adapter 的 localizeSegment 只把 image 的本地路径转 file://，
 // record 不会自动转 —— 这里必须自己给 pathToFileURL(abs).href。
+//
+// REST：/api/plugin/sing/{status,records,audio,preview,send}（桌面端「唱歌」页；
+// records 只留最近 50 条成功产物，audio 只认这些记录里的文件名，preview 只落盘不发送）。
 // ============================================================
 
 const DEFAULT_PROVIDER = 'fal-ai-ace-step';
@@ -51,6 +54,11 @@ const KEEP_MS = 24 * 3600_000;
 const USAGE_PREFIX = 'usage:';
 const COOLDOWN_KEY = 'cooldown';
 const LAST_AT_KEY = 'lastAt';
+/** 桌面端记录：最近 50 条成功生成 + 最近 10 条失败（失败只留排障够用的一条，不让 state 无限长） */
+const RECORDS_KEY = 'records';
+const ERRORS_KEY = 'lastErrors';
+const RECORDS_MAX = 50;
+const ERRORS_MAX = 10;
 
 const FAL_SUBMIT = 'https://queue.fal.run/fal-ai/ace-step/audio-to-audio';
 const MINIMAX_SUBMIT = 'https://api.minimax.cn/v1/music_generation';
@@ -110,17 +118,176 @@ function mimeFromContentType(contentType?: string): AudioMime | undefined {
   return undefined;
 }
 
-/** 估个时长给模型一句「约 N 秒」：不为了报时长去解码整首歌 */
-export function estimateSeconds(buf: Buffer, mime: AudioMime): number {
-  if (mime === 'audio/wav') {
-    // 标准 PCM WAV：fmt chunk 的 byteRate 在 offset 28，data 从 44 开始
-    if (buf.length >= 44 && buf.toString('ascii', 0, 4) === 'RIFF') {
-      const byteRate = buf.readUInt32LE(28);
-      if (byteRate > 0) return Math.max(1, Math.round((buf.length - 44) / byteRate));
-    }
-    return Math.max(1, Math.round(buf.length / 32000));   // 16kHz / 16bit / 单声道兜底
+// MPEG 音频帧头的码率表（下标 = 4bit bitrate index；0=free，15=invalid）
+// 来源：ISO/IEC 11172-3 / 13818-3 的 Table 2.4.2.3-1（MPEG1）与 2.4.2.3-2（MPEG2/2.5）
+const MPEG1_BITRATES: Record<number, number[]> = {
+  3: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],   // Layer I
+  2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],      // Layer II
+  1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],       // Layer III
+};
+const MPEG2_BITRATES: Record<number, number[]> = {
+  3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],      // Layer I
+  2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],           // Layer II
+  1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],           // Layer III
+};
+const MPEG_SAMPLE_RATES: Record<number, number[]> = {
+  3: [44100, 48000, 32000],   // MPEG1
+  2: [22050, 24000, 16000],   // MPEG2
+  0: [11025, 12000, 8000],    // MPEG2.5
+};
+
+interface MpegFrameInfo {
+  bitrateKbps: number;
+  /** 整帧长度（字节），用来验证下一帧是否也是同步头 */
+  length: number;
+  /** 这一层/版本每帧的固定样本数（VBR 逐帧累计时长要用） */
+  samplesPerFrame: number;
+  sampleRate: number;
+}
+
+/** 解析 offset 处的一个 MPEG 帧头；不是有效帧返回 undefined（不做任何解码） */
+function mpegFrameAt(buf: Buffer, offset: number): MpegFrameInfo | undefined {
+  if (offset < 0 || offset + 4 > buf.length) return undefined;
+  if (buf[offset] !== 0xff || (buf[offset + 1]! & 0xe0) !== 0xe0) return undefined;
+
+  const versionBits = (buf[offset + 1]! >> 3) & 0x03;   // 3=MPEG1, 2=MPEG2, 0=MPEG2.5, 1=保留
+  const layerBits = (buf[offset + 1]! >> 1) & 0x03;     // 3=Layer I, 2=Layer II, 1=Layer III
+  if (versionBits === 1 || layerBits === 0) return undefined;
+
+  const bitrateIndex = (buf[offset + 2]! >> 4) & 0x0f;
+  const sampleRateIndex = (buf[offset + 2]! >> 2) & 0x03;
+  if (bitrateIndex === 0 || bitrateIndex === 15 || sampleRateIndex === 3) return undefined;
+
+  const table = versionBits === 3 ? MPEG1_BITRATES : MPEG2_BITRATES;
+  const bitrateKbps = table[layerBits]![bitrateIndex]!;
+  const sampleRate = MPEG_SAMPLE_RATES[versionBits]![sampleRateIndex]!;
+  if (!bitrateKbps || !sampleRate) return undefined;
+
+  const padding = (buf[offset + 2]! >> 1) & 0x01;
+  // Layer I：4 字节槽 × (12 × bitrate / sampleRate + padding)；
+  // Layer II / MPEG1 Layer III：144；MPEG2/2.5 Layer III：72
+  let length: number;
+  let samplesPerFrame: number;
+  if (layerBits === 3) {
+    length = Math.floor((12 * bitrateKbps * 1000) / sampleRate + padding) * 4;
+    samplesPerFrame = 384;
+  } else {
+    const coef = versionBits === 3 || layerBits === 2 ? 144 : 72;
+    length = Math.floor((coef * bitrateKbps * 1000) / sampleRate) + padding;
+    samplesPerFrame = layerBits === 2 ? 1152 : versionBits === 3 ? 1152 : 576;
   }
-  return Math.max(1, Math.round((buf.length * 8) / 128000)); // MP3 按 128kbps 估
+  if (length < 4) return undefined;
+  return { bitrateKbps, length, samplesPerFrame, sampleRate };
+}
+
+/** ID3v2 标签总长度（含 10 字节头与可选 footer）；没有标签返回 0，标签声明越界返回 undefined */
+function id3v2Length(buf: Buffer): number | undefined {
+  if (buf.length < 10 || buf.toString('ascii', 0, 3) !== 'ID3') return 0;
+  const size = ((buf[6]! & 0x7f) << 21) | ((buf[7]! & 0x7f) << 14) | ((buf[8]! & 0x7f) << 7) | (buf[9]! & 0x7f);
+  const total = 10 + size + ((buf[5]! & 0x10) !== 0 ? 10 : 0);
+  return total <= buf.length ? total : undefined;
+}
+
+/** 在 ID3 标签之后找第一个 MPEG 帧，然后顺着帧链走到底：数帧、看码率是否恒定、有没有走到文件尾。
+ *  CBR 用首帧码率就准；VBR（Xing/LAME 输出常见）首帧码率不代表整段，必须逐帧累计时长。 */
+function walkMpegFrames(buf: Buffer, start: number): {
+  frames: number;
+  sampleRate: number;
+  samplesPerFrame: number;
+  /** 全程同一码率（CBR） */
+  uniform: boolean;
+  firstBitrateKbps: number;
+  /** 帧链走到了文件尾（容一个 128 字节 ID3v1 尾标签）；断链说明中间有垃圾字节，帧数只能当参考 */
+  complete: boolean;
+  audioBytes: number;
+} | undefined {
+  // 只在文件头 64KB 内找第一帧：正常 mp3 第一帧就在最前面，扫太远只会把随机字节认成帧头
+  const limit = Math.min(buf.length - 4, start + 64 * 1024);
+  for (let off = Math.max(0, start); off <= limit; off++) {
+    const first = mpegFrameAt(buf, off);
+    if (!first) continue;
+    const nextOff = off + first.length;
+    // 单帧到尾（容 ID3v1 尾标签）才允许只凭一帧认头；后面还有字节时要求第二帧也同步，
+    // 否则随机字节凑出的假帧头会把整段带偏
+    if (nextOff < buf.length - 128 && !mpegFrameAt(buf, nextOff)) continue;
+    let frames = 0;
+    let bitrate = 0;
+    let uniform = true;
+    let cursor = off;
+    for (;;) {
+      const f = mpegFrameAt(buf, cursor);
+      if (!f) break;
+      frames += 1;
+      if (bitrate === 0) bitrate = f.bitrateKbps;
+      else if (f.bitrateKbps !== bitrate) uniform = false;
+      cursor += f.length;
+      if (cursor + 4 > buf.length) break;
+    }
+    return {
+      frames,
+      sampleRate: first.sampleRate,
+      samplesPerFrame: first.samplesPerFrame,
+      uniform,
+      firstBitrateKbps: bitrate,
+      complete: cursor >= buf.length - 128,
+      audioBytes: buf.length - off,
+    };
+  }
+  return undefined;
+}
+
+/** 按 WAV 的 fmt 块 byteRate 与 data 块长度估时长（不依赖固定的 44 字节头） */
+function wavSeconds(buf: Buffer): number | undefined {
+  if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
+    return undefined;
+  }
+  let off = 12;
+  let byteRate = 0;
+  let dataBytes = 0;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4);
+    const size = buf.readUInt32LE(off + 4);
+    const body = off + 8;
+    if (size === 0) break;   // 坏块（size=0）会让偏移原地踏步，直接当解析失败
+    if (id === 'fmt ' && size >= 12 && body + size <= buf.length) {
+      byteRate = buf.readUInt32LE(body + 8);
+    } else if (id === 'data') {
+      // 流式写入的 wav 常把 data size 写成 0xFFFFFFFF：按文件剩余字节截断
+      dataBytes = Math.min(size, buf.length - body);
+    }
+    off = body + size + (size % 2);   // chunk 按偶数字节对齐
+  }
+  if (!byteRate || dataBytes <= 0) return undefined;
+  return Math.max(1, Math.round(dataBytes / byteRate));
+}
+
+export interface SecondsEstimate {
+  seconds: number;
+  /** false = 头部解析失败，退回旧的粗估法；工具回复此时不要写「约 N 秒」 */
+  exact: boolean;
+}
+
+/** 估个时长给模型一句「约 N 秒」：只解析头部，不为了报时长去解码整首歌 */
+export function estimateSeconds(buf: Buffer, mime: AudioMime): SecondsEstimate {
+  if (mime === 'audio/wav') {
+    const seconds = wavSeconds(buf);
+    if (seconds !== undefined) return { seconds, exact: true };
+    return { seconds: Math.max(1, Math.round(buf.length / 32000)), exact: false };   // 16kHz / 16bit / 单声道兜底
+  }
+  const id3 = id3v2Length(buf);
+  if (id3 !== undefined) {
+    const walk = walkMpegFrames(buf, id3);
+    if (walk) {
+      // CBR：首帧码率 × 全部音频字节（尾标签 ≤128 字节的误差可忽略）
+      if (walk.uniform) {
+        return { seconds: Math.max(1, Math.round((walk.audioBytes * 8) / (walk.firstBitrateKbps * 1000))), exact: true };
+      }
+      // VBR：每帧样本数固定，逐帧累计就是真时长；链没走完则是低估，只当参考值
+      const seconds = Math.max(1, Math.round((walk.frames * walk.samplesPerFrame) / walk.sampleRate));
+      return { seconds, exact: walk.complete };
+    }
+  }
+  return { seconds: Math.max(1, Math.round((buf.length * 8) / 128000)), exact: false };   // MP3 按 128kbps 粗估
 }
 
 type ProviderKind = 'fal' | 'minimax' | 'custom';
@@ -244,6 +411,38 @@ interface GenInput {
   lyrics: string;
   tags: string;
   seconds?: number;
+}
+
+/** 桌面端成功记录（/records 只返回这些字段；file 只存文件名，不存绝对路径） */
+export interface SingRecord {
+  id: string;
+  ts: number;
+  userId: string;
+  chatId: string;
+  seconds: number;
+  provider: string;
+  file: string;
+  mime: AudioMime;
+}
+
+/** 最近失败（/records 的 lastErrors）：够主人排障，不把整段异常堆栈存进 state */
+interface SingError {
+  ts: number;
+  chatId: string;
+  error: string;
+}
+
+interface SingOpts {
+  chat: ChatRef;
+  userId: string;
+  role: Role;
+  lyrics: unknown;
+  tags: unknown;
+  seconds: unknown;
+  /** false = 只生成落盘、不发送（桌面端试唱）；默认发送 */
+  deliver?: boolean;
+  /** records 里记的 userId（试唱标 desktop；额度仍按 userId 算） */
+  recordUserId?: string;
 }
 
 type FailCode = 'config' | 'limit' | 'api' | 'timeout' | 'storage';
@@ -568,9 +767,10 @@ export function setup(ctx: PluginContext): void {
     const map = usageOf(day);
     map[userId] = Math.max(0, Math.floor(Number(map[userId]) || 0) + delta);
     ctx.state.set(key, map);
-    // 只留今天的计数：跨天后旧 key 没意义，不清理会一直长
+    // 只清理比这天更旧的桶（day 是零填充的 yyyy-mm-dd，字典序即可比大小）：
+    // 跨天回滚（23:59 开始、00:00 后失败）要把昨天的计数写回去，不能把今天别人的计数顺手删掉
     for (const k of Object.keys(ctx.state.all())) {
-      if (k.startsWith(USAGE_PREFIX) && k !== key) ctx.state.delete(k);
+      if (k.startsWith(USAGE_PREFIX) && k.slice(USAGE_PREFIX.length) < day) ctx.state.delete(k);
     }
   }
 
@@ -643,16 +843,47 @@ export function setup(ctx: PluginContext): void {
     } catch { /* 目录不可读也不影响主流程 */ }
   }
 
+  // ---------- 成功记录 / 最近失败（桌面端 /records、/audio、/send 用） ----------
+
+  function records(): SingRecord[] {
+    const v = ctx.state.get<SingRecord[]>(RECORDS_KEY, []);
+    return Array.isArray(v) ? v.filter((x) => x && typeof x.id === 'string' && typeof x.file === 'string') : [];
+  }
+
+  function addRecord(rec: SingRecord): void {
+    const list = records();
+    list.unshift(rec);
+    ctx.state.set(RECORDS_KEY, list.slice(0, RECORDS_MAX));
+  }
+
+  function lastErrors(): SingError[] {
+    const v = ctx.state.get<SingError[]>(ERRORS_KEY, []);
+    return Array.isArray(v) ? v.filter((x) => x && typeof x.error === 'string') : [];
+  }
+
+  function addError(chatId: string, error: string): void {
+    const list = lastErrors();
+    list.unshift({ ts: Date.now(), chatId, error });
+    ctx.state.set(ERRORS_KEY, list.slice(0, ERRORS_MAX));
+  }
+
+  /** /audio 只认 records 里的文件名，再按 singDir 做边界校验（防路径穿越） */
+  function insideSingDir(rel: string): string {
+    const root = resolve(singDir);
+    const abs = resolve(root, rel);
+    if (abs !== root && !abs.startsWith(root + sep)) {
+      throw new Error(`路径越界：只能读插件数据目录 sing/ 下的文件（${rel}）`);
+    }
+    return abs;
+  }
+
   // ---------- 核心：工具与 REST 共用 ----------
 
   type SingResult =
-    | { ok: true; path: string; seconds: number; provider: string }
+    | { ok: true; id: string; path: string; seconds: number; secondsExact: boolean; provider: string }
     | { ok: false; code: FailCode; error: string };
 
-  async function sing(opts: {
-    chat: ChatRef; userId: string; role: Role;
-    lyrics: unknown; tags: unknown; seconds: unknown;
-  }): Promise<SingResult> {
+  async function singCore(opts: SingOpts): Promise<SingResult> {
     const c = cfg();
     const kind = providerKindOf(c.provider);
     const label = providerLabelOf(kind);
@@ -773,7 +1004,9 @@ export function setup(ctx: PluginContext): void {
       return { ok: false, code: 'api', error: '唱歌服务回来的不是 mp3/wav 音频（可能把错误信息当音频返回了），稍后再试。' };
     }
 
-    const abs = join(singDir, `${newId('sing_')}.${mime === 'audio/wav' ? 'wav' : 'mp3'}`);
+    const id = newId('sing_');
+    const file = `${id}.${mime === 'audio/wav' ? 'wav' : 'mp3'}`;
+    const abs = join(singDir, file);
     try {
       writeFileSync(abs, out.data);
     } catch (e) {
@@ -784,17 +1017,20 @@ export function setup(ctx: PluginContext): void {
     // record 段不会被 adapter 自动本地化（localizeSegment 只处理 image），必须自己给 file://
     // 注意：ChatService 在限速令牌不足时会「正常返回但整批丢弃」，所以要看投递回执，
     // 不能把 send resolve 当作已送达（否则模型会宣称发了语音，实际没有）。
-    try {
-      const receipt = await ctx.chat.sendTracked(opts.chat, [{ type: 'record', data: { file: pathToFileURL(abs).href } }]);
-      if (receipt.sent <= 0) {
+    // deliver=false 是桌面端试唱：只落盘，不碰任何会话。
+    if (opts.deliver !== false) {
+      try {
+        const receipt = await ctx.chat.sendTracked(opts.chat, [{ type: 'record', data: { file: pathToFileURL(abs).href } }]);
+        if (receipt.sent <= 0) {
+          try { unlinkSync(abs); } catch { /* ignore */ }
+          rollback();
+          return { ok: false, code: 'api', error: '歌是唱好了，但语音被发送限速拦下了、没有真的发出去；过一会儿再点。' };
+        }
+      } catch (e) {
         try { unlinkSync(abs); } catch { /* ignore */ }
         rollback();
-        return { ok: false, code: 'api', error: '歌是唱好了，但语音被发送限速拦下了、没有真的发出去；过一会儿再点。' };
+        return { ok: false, code: 'api', error: `歌是唱好了，但语音没发出去（${(e as Error).message}）；先别跟对方说唱好了。` };
       }
-    } catch (e) {
-      try { unlinkSync(abs); } catch { /* ignore */ }
-      rollback();
-      return { ok: false, code: 'api', error: `歌是唱好了，但语音没发出去（${(e as Error).message}）；先别跟对方说唱好了。` };
     }
 
     // 成功：额度保留；冷却从真正发出去的时刻重新算
@@ -803,8 +1039,35 @@ export function setup(ctx: PluginContext): void {
     releaseSlot();
     if (c.cooldownSeconds > 0) setCooldown(chatKey, Date.now());
     ctx.state.set(LAST_AT_KEY, Date.now());
+    const est = estimateSeconds(out.data, mime);
+    addRecord({
+      id,
+      ts: Date.now(),
+      userId: opts.recordUserId ?? opts.userId,
+      chatId: opts.chat.chatId,
+      seconds: est.seconds,
+      provider: c.provider,
+      file,
+      mime,
+    });
     cleanupOld();
-    return { ok: true, path: abs, seconds: estimateSeconds(out.data, mime), provider: c.provider };
+    return { ok: true, id, path: abs, seconds: est.seconds, secondsExact: est.exact, provider: c.provider };
+  }
+
+  /**
+   * 生成入口：所有失败都顺手记进 /records 的 lastErrors。
+   * 核心逻辑仍在 singCore —— 这里不改变任何返回语义，只做失败留痕。
+   */
+  async function sing(opts: SingOpts): Promise<SingResult> {
+    try {
+      const r = await singCore(opts);
+      if (!r.ok) addError(opts.chat.chatId, r.error);
+      return r;
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e).replace(/\s+/g, ' ').slice(0, 160);
+      addError(opts.chat.chatId, `唱歌失败：工具内部出了意外（${msg}），稍后再试。`);
+      throw e;
+    }
   }
 
   // ---------- LLM 工具（chat 面） ----------
@@ -840,7 +1103,9 @@ export function setup(ctx: PluginContext): void {
           seconds: args.seconds,
         });
         if (!r.ok) return r.error;
-        return `已把这段歌唱进语音发到会话里了（约 ${r.seconds} 秒）。正文用一两句收尾就行，不要复述歌词全文。`;
+        return r.secondsExact
+          ? `已把这段歌唱进语音发到会话里了（约 ${r.seconds} 秒）。正文用一两句收尾就行，不要复述歌词全文。`
+          : '已把这段歌唱进语音发到会话里了。正文用一两句收尾就行，不要复述歌词全文。';
       } catch (e) {
         // 最后一道兜底：状态库/路径这类意外也不能把异常抛回内核
         const msg = String((e as Error)?.message ?? e).replace(/\s+/g, ' ').slice(0, 160);
@@ -890,5 +1155,101 @@ export function setup(ctx: PluginContext): void {
         today: { userId, count: usedOf(dayKeyOf(), userId) },
       },
     };
+  });
+
+  /** 桌面端没有会话上下文：试唱固定用它，聊天记录里也只留个 desktop 标记 */
+  const desktopChat = (): ChatRef => ({ platform: 'ui', type: 'private', chatId: 'desktop' });
+
+  // 最近成功生成 + 最近失败：records 只给约定字段，file 是 sing/ 下的文件名（不含绝对路径）
+  ctx.http.on('GET', '/records', () => ({
+    body: {
+      ok: true,
+      records: records().map((r) => ({
+        id: r.id, ts: r.ts, userId: r.userId, chatId: r.chatId, seconds: r.seconds,
+        provider: r.provider, file: r.file, mime: r.mime,
+      })),
+      lastErrors: lastErrors().map((e) => ({ ts: e.ts, chatId: e.chatId, error: e.error })),
+    },
+  }));
+
+  // 按 id 取音频字节：id 只在 records 里查，再对文件名做 singDir 边界校验（不能靠 query 直接拼路径）
+  ctx.http.on('GET', '/audio', (req) => {
+    const id = String(req.query.id ?? '').trim();
+    const rec = id ? records().find((r) => r.id === id) : undefined;
+    if (!rec) return { status: 404, body: { ok: false, error: '没有这条录音（id 不存在或已被清理）' } };
+
+    let abs: string;
+    try { abs = insideSingDir(rec.file); }
+    catch (e) { return { status: 404, body: { ok: false, error: `音频读不到：${(e as Error).message}` } }; }
+
+    let buf: Buffer;
+    try { buf = readFileSync(abs); }
+    catch { return { status: 404, body: { ok: false, error: '音频文件已被清理' } }; }
+
+    return {
+      // content-type 按落盘的扩展名给（与 mime 字段同源）；记录异常时再现场嗅探兜底
+      headers: { 'content-type': mimeFromName(rec.file) ?? rec.mime ?? sniffAudioMime(buf) ?? 'application/octet-stream' },
+      body: buf,
+    };
+  });
+
+  // 桌面端试唱：与 chat 工具同一条生成路径（主人身份、不限额），只落盘不发送
+  ctx.http.on('POST', '/preview', async (req) => {
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    try {
+      const r = await sing({
+        chat: desktopChat(),
+        userId: ownerId(),
+        role: 'owner',
+        recordUserId: 'desktop',
+        deliver: false,
+        lyrics: body.lyrics,
+        tags: body.tags,
+        seconds: body.seconds,
+      });
+      if (!r.ok) return { status: 400, body: { ok: false, error: r.error } };
+      return { body: { ok: true, id: r.id, seconds: r.seconds } };
+    } catch (e) {
+      return { status: 400, body: { ok: false, error: `试唱失败：${(e as Error).message}` } };
+    }
+  });
+
+  // 补发：把已生成的录音按 id 发到指定会话（record 一定转 file://，可选先带一条文字）
+  ctx.http.on('POST', '/send', async (req) => {
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const id = String(body.id ?? '').trim();
+    const type = body.type === 'private' ? 'private' : body.type === 'group' ? 'group' : null;
+    const chatId = String(body.chatId ?? '').trim();
+    const text = String(body.text ?? '').trim().slice(0, 200);
+
+    const rec = id ? records().find((r) => r.id === id) : undefined;
+    if (!rec) return { status: 404, body: { ok: false, error: '没有这条录音（id 不存在或已被清理）' } };
+    if (!type || !chatId) return { status: 400, body: { ok: false, error: '要指定 type（group/private）与 chatId' } };
+    // 这是唯一由人手填的发送目标：先挡住手误，别等 OneBot 回 502 才暴露
+    if (!/^\d{5,12}$/.test(chatId)) return { status: 400, body: { ok: false, error: 'chatId 要是 QQ 号/群号（5~12 位数字）' } };
+
+    let abs: string;
+    try { abs = insideSingDir(rec.file); }
+    catch (e) { return { status: 400, body: { ok: false, error: (e as Error).message } }; }
+    if (!existsSync(abs)) return { status: 404, body: { ok: false, error: '音频文件已被清理' } };
+
+    const target = { platform: 'qq', type, chatId } as const;
+    try {
+      // 语音与附言分开发、分开看回执：合在一条 sendTracked 里，文字先发成功、语音被限速
+      // 丢掉时 sent 仍 >0，会假成功（splitSegments 会把它们拆成两条）
+      const voice = await ctx.chat.sendTracked(target, [{ type: 'record', data: { file: pathToFileURL(abs).href } }]);
+      if (voice.sent <= 0) {
+        return { status: 502, body: { ok: false, error: '发送被限速拦下了，没有真的发出去' } };
+      }
+      let warning = '';
+      if (text) {
+        const textReceipt = await ctx.chat.sendTracked(target, [{ type: 'text', data: { text } }]);
+        if (textReceipt.sent <= 0) warning = '附言被限速拦下，没有发出去';
+      }
+      ctx.log.info(`录音补发 ${id} → ${type}_${chatId}${text ? `（附言：${text.slice(0, 40)}）` : ''}`);
+      return { body: { ok: true, messageId: voice.ids[0] ?? null, ...(warning ? { warning } : {}) } };
+    } catch (e) {
+      return { status: 502, body: { ok: false, error: `发不出去：${(e as Error).message}` } };
+    }
   });
 }
