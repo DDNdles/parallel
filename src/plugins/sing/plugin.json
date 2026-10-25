@@ -1,0 +1,75 @@
+{
+  "id": "sing",
+  "name": "唱歌",
+  "version": "1.0.0",
+  "description": "用你自己的云 API Key 让 bot 以自己的音色唱歌：歌词直接唱成语音发进当前会话。内置 ACE-Step（fal.ai，参考音频克隆）与 MiniMax 音乐接口预设，也可接自部署的通用 /generate 服务。不附带任何本地模型。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "keywords": [
+    "sing",
+    "music",
+    "voice",
+    "ace-step"
+  ],
+  "category": "fun",
+  "trust": "builtin",
+  "permissions": [
+    "network"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {
+    "provider": {
+      "type": "string",
+      "default": "fal-ai-ace-step",
+      "description": "唱歌服务：fal-ai-ace-step（默认，ACE-Step，参考音频克隆音色）、minimax-music（仅 MiniMax 老用户，整曲翻唱、不支持克隆音色）、custom（自部署通用 /generate，body 为 {lyrics,tags,seconds}）"
+    },
+    "apiKey": {
+      "type": "string",
+      "default": "",
+      "description": "服务商 API Key（fal.ai 填 FAL_KEY；MiniMax 填开放平台 Key；custom 填自部署服务的 Bearer Key）",
+      "secret": true
+    },
+    "voiceId": {
+      "type": "string",
+      "default": "",
+      "description": "通用占位字段：当前内置 preset（ACE-Step / MiniMax / custom）都不支持持久克隆音色 id，请保持留空，把 10~30 秒干声填进 refAudio；填克隆 id 会提示当前供应商不支持"
+    },
+    "refAudio": {
+      "type": "string",
+      "default": "",
+      "description": "参考音频（10~30 秒纯净干声）：本地文件路径、base64、data URI 或公网 URL；留空则尝试用 voiceId。ACE-Step 强烈建议先做人声分离，带伴奏会污染音色"
+    },
+    "baseUrl": {
+      "type": "string",
+      "default": "",
+      "description": "服务地址：provider=custom 时必填（如 http://127.0.0.1:8080）；内置 preset 也可填来走代理/网关，留空用官方地址"
+    },
+    "maxSeconds": {
+      "type": "number",
+      "default": 60,
+      "description": "单次唱歌时长上限（秒，实际钳到 10~120）；不支持指定时长的供应商按歌词长短自动决定"
+    },
+    "cooldownSeconds": {
+      "type": "number",
+      "default": 60,
+      "description": "同一会话两次成功唱歌的最小间隔（秒），防止连着点歌"
+    },
+    "dailyQuota": {
+      "type": "number",
+      "default": 5,
+      "description": "普通成员每个自然日（本地时区零点翻篇）成功唱歌的上限；云 API 按次计费，别设太大"
+    },
+    "ownerUnlimited": {
+      "type": "boolean",
+      "default": true,
+      "description": "主人与管理员不受每日次数限制"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "default": 300000,
+      "description": "单次生成总超时（毫秒，含任务轮询与下载），默认 5 分钟"
+    }
+  }
+}

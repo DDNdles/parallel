@@ -64,7 +64,18 @@ export class ChatService implements ChatSendService {
 
   /** 发一组消息段（不分条、无停顿）。命令回复、通知这类"整块内容"走这里。 */
   async send(chat: ChatRef, segments: MsgSegment[]): Promise<void> {
-    await this.sendPlanned(chat, [{ segments, pauseMs: 0 }]);
+    await this.sendTracked(chat, segments);
+  }
+
+  /**
+   * 同 `send`，但返回真实投递回执：`sent === 0` = 被限速整批丢弃。
+   * 调用方需要区分「已送达」与「静默丢弃」时用它（send 的 resolve 不能证明送达）。
+   */
+  async sendTracked(chat: ChatRef, segments: MsgSegment[]): Promise<{ sent: number; ids: string[] }> {
+    const r = await this.sendPlanned(chat, [{ segments, pauseMs: 0 }]);
+    // 不能用 r.sent：它统计的是协议端返回的消息 id 数（ui 模拟发送、或协议端不返 id 时会误报 0）。
+    // sentTexts 是真正处理过的段数，才是「有没有发出去」的可靠口径。
+    return { sent: r.sentTexts.length, ids: r.ids };
   }
 
   /**

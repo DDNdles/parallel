@@ -22,3 +22,7 @@ dist/
 
 # 本地记忆镜像（个人浏览用，不入库）
 .memory/
+
+# 唱歌插件运行产物（参考音色副本 / Python 缓存），正本在 data/sing/ref（data/ 已整体忽略）
+docker/sing/ref/
+__pycache__/

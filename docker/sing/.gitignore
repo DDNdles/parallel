@@ -1,0 +1,6 @@
+# 本地密钥/环境覆盖，绝不入库
+.env
+.env.*
+# Python 缓存
+__pycache__/
+*.pyc

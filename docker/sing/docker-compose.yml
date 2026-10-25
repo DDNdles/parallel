@@ -1,0 +1,80 @@
+# =============================================================================
+# 唱歌 TTS 服务（ACE-Step 1.5 包装），端口 8046
+#
+#   cp ../../data/sing/ref/dafatyu.wav ./ref/     # 首次：放参考音频
+#   SING_API_KEY=<你的 Bearer Key> docker compose up -d --build
+#   curl -fsS http://127.0.0.1:8046/health
+#
+# 服务器没有 GPU 时不要启动（ACE-Step 会退到 CPU，单曲要几分钟到十几分钟）。
+# =============================================================================
+name: qqbot-sing
+
+services:
+  sing:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # GitHub 不通时改成本地可访问的镜像仓库
+        ACESTEP_REPO: ${ACESTEP_REPO:-https://github.com/ace-step/ACE-Step-1.5.git}
+        ACESTEP_REF: ${ACESTEP_REF:-main}
+    image: qqbot-sing:1.5
+    container_name: qqbot-sing
+    restart: unless-stopped
+
+    ports:
+      - "8046:8046"
+
+    environment:
+      # 可选鉴权：不设置 = 不校验（插件仍要求 apiKey 非空，填占位串即可）。
+      # 生产环境务必设置，且只从宿主机环境/.env 注入，不写进任何文件。
+      SING_API_KEY: ${SING_API_KEY:-}
+      SING_REF_DEFAULT: ${SING_REF_DEFAULT:-dafatyu}
+      SING_VOCAL_LANGUAGE: ${SING_VOCAL_LANGUAGE:-zh}
+      SING_INFERENCE_STEPS: ${SING_INFERENCE_STEPS:-8}
+      SING_DEFAULT_TAGS: ${SING_DEFAULT_TAGS:-cute female vocal, pop, bright}
+
+      # Tier 4 (8-12GB, e.g. RTX 3080 10GB) 显存保护（调研结论）
+      ACESTEP_OFFLOAD_TO_CPU: "true"
+      ACESTEP_OFFLOAD_DIT_TO_CPU: "true"
+      ACESTEP_QUANTIZATION: ${ACESTEP_QUANTIZATION:-int8_weight_only}
+      ACESTEP_LM_BACKEND: ${ACESTEP_LM_BACKEND:-vllm}
+      ACESTEP_CONFIG_PATH: ${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
+      ACESTEP_LM_MODEL_PATH: ${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-0.6B}
+      ACESTEP_CHECKPOINTS_DIR: /app/checkpoints
+      # 权重自动下载源：modelscope（国内）/ huggingface / 留空自动探测
+      ACESTEP_DOWNLOAD_SOURCE: ${ACESTEP_DOWNLOAD_SOURCE:-modelscope}
+
+      # 国内下载加速
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /app/.cache/huggingface
+      MODELSCOPE_CACHE: /app/.cache/modelscope
+
+    volumes:
+      # 参考音频：只读挂载；dafatyu.wav 由部署者从 data/sing/ref 拷进来
+      - ./ref:/ref:ro
+      # 权重和下载缓存：命名卷，重建镜像/容器不重复下载
+      - sing-models:/app/checkpoints
+      - sing-cache:/app/.cache
+
+    # 声明 GPU。Docker 19.03+ + nvidia-container-toolkit 直接可用；
+    # 老版本 compose 若忽略该字段，可改用 `runtime: nvidia`。
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8046/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 首次启动要下载/加载权重，给足 10 分钟
+      start_period: 600s
+
+volumes:
+  sing-models:
+  sing-cache:

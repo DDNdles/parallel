@@ -609,6 +609,11 @@ export interface Bus {
 
 export interface ChatSendService {
   send(chat: ChatRef, segments: MsgSegment[]): Promise<void>;
+  /**
+   * 发送并返回真实投递回执：`sent === 0` 表示被限速整批丢弃（内核不会抛错）。
+   * 需要确认「对方真的收到了」的调用方（如唱歌发语音）必须看这个值，不能把 send resolve 当送达。
+   */
+  sendTracked(chat: ChatRef, segments: MsgSegment[]): Promise<{ sent: number; ids: string[] }>;
   sendText(chat: ChatRef, text: string): Promise<void>;
   /** 发送文件：仅允许沙箱内路径（内核强校验） */
   sendFile(chat: ChatRef, sandboxPath: string): Promise<void>;
