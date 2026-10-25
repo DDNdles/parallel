@@ -65,6 +65,17 @@ const CONTAINER_HARDEN = [
 ];
 
 /**
+ * 包管理器下载缓存（Docker named volume，所有容器共享）：
+ * 一次性容器跑完即销毁，pip/npm 装的东西随容器丢；挂上缓存卷后下载环节读本地缓存，
+ * npm/pip install 从分钟级降到秒级（解压安装仍要跑）。只是下载缓存，不影响隔离模型。
+ * 卷不存在时 docker run 会自动创建同名卷；偶尔 `docker volume rm` 清一次即可。
+ */
+const PACKAGE_CACHE_MOUNTS = [
+  '-v', 'parallel-pip-cache:/root/.cache/pip',
+  '-v', 'parallel-npm-cache:/root/.npm',
+];
+
+/**
  * 轻沙箱（非隔离档，红线见 README）：
  * - 每个会话一个沙箱根目录，LLM 文件工具只能触达当前会话目录（防路径穿越）
  * - 临时性：TTL 自动清理；单文件/单会话配额
@@ -514,6 +525,7 @@ export class SandboxService {
       // chat 档断网；work 档按 sandbox.workNetwork（默认联网，2026-10-24 用户定）
       ...(work && this.workNetworkOn() ? [] : ['--network', 'none']),
       ...CONTAINER_HARDEN,
+      ...PACKAGE_CACHE_MOUNTS,
       '-v', `${hostDir}:/ws`,
       '-w', '/ws',
       '--cpus', '1', '--memory', '512m',
@@ -573,7 +585,7 @@ export class SandboxService {
   private execDockerShell(chat: ChatRef, code: string, timeoutMs: number): Promise<SandboxRunResult> {
     const cfg = this.config.config.sandbox as { dockerImageBash?: string };
     const hostDir = resolve(this.root(chat)).replace(/^([A-Za-z]):[\\/]/, (_m, d: string) => `//${d.toLowerCase()}/`).replace(/\\/g, '/');
-    const args = ['run', '--rm', '-i', ...(this.workNetworkOn() ? [] : ['--network', 'none']), ...CONTAINER_HARDEN, '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
+    const args = ['run', '--rm', '-i', ...(this.workNetworkOn() ? [] : ['--network', 'none']), ...CONTAINER_HARDEN, ...PACKAGE_CACHE_MOUNTS, '-v', `${hostDir}:/ws`, '-w', '/ws', '--cpus', '1', '--memory', '512m'];
     args.push(cfg.dockerImageBash || 'parallel-sandbox-python:latest', 'bash', '-c', code);
     return new Promise((resolveP) => {
       const startTs = Date.now();

@@ -118,6 +118,8 @@ export class SessionContainers {
     ];
     // compute 是 work 专用容器：默认联网（workNetworkOn），关了才 --network none
     if (kind === 'compute' && this.sandboxCfg.workNetwork === false) args.push('--network', 'none');
+    // compute 容器也共享 pip 下载缓存（容器被 LRU 回收重建后 install 不用重新下载）
+    if (kind === 'compute') args.push('-v', 'parallel-pip-cache:/root/.cache/pip');
     args.push(image);
     const r = spawnSync(bin, args, 60_000, this.dockerEnv());
     if (!r.ok) throw new Error(`启动 ${kind} 容器失败：${r.stderr || r.stdout}`.slice(0, 400));

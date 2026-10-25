@@ -25,6 +25,10 @@ RUN set -eu; \
         | tar -xz -C /usr/local --strip-components=1; \
       node --version && npm --version
 
+# 常见前端构建工具预装全局（2026-10-25）：work 任务反复要用，装一次省得每个任务 npm install；
+# 没预装到的包走 npm 共享缓存卷（下载读本地缓存），install 也是秒级
+RUN npm install -g --no-fund --no-audit vite typescript esbuild && npm cache clean --force 2>/dev/null || true
+
 WORKDIR /ws
 COPY bridge.py /bridge.py
 COPY client.py /client.py
