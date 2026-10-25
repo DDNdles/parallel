@@ -523,6 +523,17 @@ export class HumanlikeService {
    * 说出去了：记进存在感窗口、清退避计数，并把这一轮的**节奏签名**记进窗口。
    * `bubbles` 是实际发出去的那几条，用于 HDSI ChatRhythm 的定型检测。
    */
+  /** 最近几轮的粗结构（rhythmSigs 的结构维度：1 / 2 / 3+→4），给气泡数抽签做避重 */
+  recentBubbleShapes(chat: ChatRef, n = 3): number[] {
+    const st = this.state(chat);
+    return st.rhythmSigs.slice(-n).map((sig) => {
+      const head = String(sig).split(/[|/]/)[0].trim();
+      if (head === '1') return 1;
+      if (head === '2') return 2;
+      return 4;
+    });
+  }
+
   noteSpoke(chat: ChatRef, count = 1, bubbles: string[] = []): void {
     const st = this.state(chat);
     const now = this.now();

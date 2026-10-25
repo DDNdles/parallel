@@ -15,7 +15,7 @@ import { busEvents } from './bus.ts';
 import type { Db } from './db.ts';
 import type { HumanlikeService } from './humanlike/index.ts';
 import type { TriggerBatch } from './humanlike/types.ts';
-import { SILENT_MARKER, isSilentScene } from './humanlike/delivery.ts';
+import {SILENT_MARKER, isSilentScene, pickBubbleTarget } from './humanlike/delivery.ts';
 import { shouldInterrupt } from './humanlike/interrupt.ts';
 import { repetitionRetryConstraint } from './humanlike/repetition.ts';
 
@@ -863,7 +863,13 @@ export class Pipeline {
         const out = this.humanlike.config.outgoing;
         systemSections.push({
           order: 440, title: 'chat-style',
-          text: chatOutputStyleText({ maxChars: out.replyMaxCharacters, expectedBubbles: out.expectedBubbles, maxBubbles: out.maxBubbles }),
+          text: chatOutputStyleText({
+            maxChars: out.replyMaxCharacters,
+            targetBubbles: pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
+              recentShapes: this.humanlike.recentBubbleShapes(chat),
+            }),
+            maxBubbles: out.maxBubbles,
+          }),
         });
       }
       // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。

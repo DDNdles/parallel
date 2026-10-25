@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { idleCompensation, talkValueFor, idleBackoffSeconds, backoffBypassed } from '../src/kernel/humanlike/frequency.ts';
 import {
   normalizeVisibleContent, trimAtSentence, splitIntoBubbles, typingDelayMs, clip,
-  isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING, MAX_BUBBLES,
+  isSilentScene, SILENT_MARKER, DEFAULT_OUTGOING, MAX_BUBBLES, pickBubbleTarget,
 } from '../src/kernel/humanlike/delivery.ts';
 import { shouldInterrupt } from '../src/kernel/humanlike/interrupt.ts';
 import { HumanlikeService } from '../src/kernel/humanlike/service.ts';
@@ -861,4 +861,40 @@ test('服务：仅 @ 后才回复——名字提及与叫醒词都不直通', ()
   const r = svc.ingest(ev('鲸鲸在吗'), { isCommand: false });
   assert.equal(r.action, 'handled', '仅 @ 模式下叫醒词不算 @，只进缓冲');
   svc.dispose();
+});
+
+// ============================================================
+// 随机气泡数（2026-10-25）：每轮抽一个目标条数写进提示——固定推荐值会让
+// 输出形状定型；分布以 expected 为峰三角衰减、远处留地板，最近同形降权。
+// ============================================================
+
+test('pickBubbleTarget：范围夹紧、众数落在预期附近、最近同形被降权', () => {
+  // 确定性 rand：≈0 抽中第一格（i=1；权重数组从 1 开始顺序累计）
+  assert.equal(pickBubbleTarget(3, 6, { rand: () => 0.0001 }), 1);
+
+  // expected 超界时夹紧到 max：peak=6 时 6 是最高频
+  const hi = new Map<number, number>();
+  for (let i = 0; i < 1000; i++) {
+    const v = pickBubbleTarget(99, 6);
+    hi.set(v, (hi.get(v) ?? 0) + 1);
+  }
+  const top = [...hi.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  assert.equal(top, 6, 'expected 超界要夹到 max 作峰');
+  assert.equal(pickBubbleTarget(3, 1, { rand: () => 0.0001 }), 1, 'max=1 时只能 1');
+
+  // 统计：1000 次抽样，峰值附近（±1）占多数，且所有值都在范围内
+  const counts = new Map<number, number>();
+  for (let i = 0; i < 1000; i++) {
+    const v = pickBubbleTarget(3, 6);
+    assert.ok(v >= 1 && v <= 6, `越界：${v}`);
+    counts.set(v, (counts.get(v) ?? 0) + 1);
+  }
+  const near = (counts.get(2) ?? 0) + (counts.get(3) ?? 0) + (counts.get(4) ?? 0);
+  assert.ok(near > 600, `峰值附近应占多数，实际 ${near}/1000：${JSON.stringify([...counts])}`);
+
+  // 避重：最近都是 3 → 这次抽 3 的占比显著低于无避重基线
+  let repeat = 0;
+  for (let i = 0; i < 1000; i++) if (pickBubbleTarget(3, 6, { recentShapes: [4, 4, 3] }) === 3) repeat++;
+  const base = counts.get(3) ?? 0;
+  assert.ok(repeat < base, `近形应降权：避重后抽 3 = ${repeat}，基线 ${base}`);
 });

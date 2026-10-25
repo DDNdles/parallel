@@ -11,7 +11,7 @@
 // ============================================================
 
 import type { Role } from './types.ts';
-import { MAX_BUBBLES, RECOMMENDED_BUBBLES, RECOMMENDED_REPLY_CHARS } from './humanlike/delivery.ts';
+import { MAX_BUBBLES, RECOMMENDED_REPLY_CHARS, pickBubbleTarget } from './humanlike/delivery.ts';
 
 /** 信任边界：不可信输入的判据。chat/work 两轮共用。 */
 export const TRUST_BOUNDARY_TEXT = [
@@ -34,16 +34,22 @@ export const CHAT_STYLE_TEXT = `回复要求：简短自然、口语化、适合
  * 这是 chat 轮**唯一**一段规定"输出长什么样"的文字：说几条、多长、什么语气。
  * 模型说什么就发什么；程序侧只做兜底（按句分条、超长句边截断、token 硬顶），不做格式矫正。
  */
-export function chatOutputStyleText(opts: { maxChars: number; expectedBubbles?: number; maxBubbles?: number }): string {
+export function chatOutputStyleText(opts: {
+  maxChars: number;
+  /** 每轮程序抽签的目标气泡数（必传）；expectedBubbles/maxBubbles 是抽签参数与兜底 */
+  targetBubbles: number;
+  expectedBubbles?: number;
+  maxBubbles?: number;
+}): string {
   const n = Math.max(20, Math.round(opts.maxChars));
   const recommend = Math.min(RECOMMENDED_REPLY_CHARS, n);
   const maxBubbles = Math.max(1, Math.round(opts.maxBubbles ?? MAX_BUBBLES));
-  const recommendBubbles = Math.max(1, Math.min(Math.round(opts.expectedBubbles ?? RECOMMENDED_BUBBLES), maxBubbles));
+  const target = Math.max(1, Math.min(Math.round(opts.targetBubbles), maxBubbles));
   return [
     `# 你的回复`,
     `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
     `- 一句一条最好；单条尽量不超过 20 个字，句尾不用加句号，别把一长串用逗号连成一句。`,
-    `- 推荐一次回 2～${recommendBubbles} 条气泡、总共 ${recommend} 字以内；必要的时候可以突破推荐值（比如要把一件事讲清楚），但别为了凑条数硬拆。`,
+    `- 这次回复发 ${target} 条气泡、总共 ${recommend} 字以内；说的内容确实需要更多时可以多几条，但一次最多 ${maxBubbles} 条（超出的会被合并），别为了凑条数把一句话硬拆成几条。`,
     `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
     `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
     `- 想发表情就写 [表情/微笑] 或 [表情/14]；名字必须完全匹配（比如「呜呜呜」不是「呜呜」，「大哭」不是「哭」），拿不准就用编号。不要写 [微笑] 这种纯文字，也不要描述表情。`,

@@ -74,6 +74,43 @@ const SOFT_BREAKS = new Set([...'，,、：:']);
 const HARD_BUBBLE_CHARS = 40;
 
 /**
+ * 每轮随机抽一个「目标气泡数」（2026-10-25）：写进当轮提示规定模型说几条，
+ * 必要情况允许它突破（程序只兜 maxBubbles 的合并）。固定推荐值会让输出形状定型，
+ * 每轮抽签 + 最近形状降权（与 rhythm 反定型同路数）才是活的节奏。
+ *
+ * 分布：以 expected 为峰的三角权重向两边线性衰减，但远处保留 ~15% 地板——
+ * 偶尔抽到 1 条或接近上限，形状才活得起来。最近几轮出现过的粗结构再打折
+ * （连着两轮都用同一个数就太刻意）。
+ */
+export function pickBubbleTarget(
+  expected: number,
+  maxBubbles: number,
+  opts: { recentShapes?: number[]; rand?: () => number } = {},
+): number {
+  const max = Math.max(1, Math.round(maxBubbles));
+  const peak = Math.min(max, Math.max(1, Math.round(expected)));
+  const recent = (opts.recentShapes ?? []).slice(-3);
+  const weights: number[] = [];
+  for (let i = 1; i <= max; i++) {
+    let w = Math.max(0.15, 1 - Math.abs(i - peak) * 0.45);
+    // 与最近一轮相同的形状降权；最近两轮连续同构的再砍一刀（1 条连发 / 3+ 连发都太刻意）
+    for (let k = 0; k < recent.length; k++) {
+      const shape = recent[recent.length - 1 - k];
+      const same = k === 0 ? shape === i : recent[recent.length - 1 - k] === i && recent[recent.length - k] === i;
+      if (same) w *= k === 0 ? 0.45 : 0.3;
+    }
+    weights.push(w);
+  }
+  const total = weights.reduce((a, b) => a + b, 0);
+  let roll = (opts.rand ?? Math.random)() * total;
+  for (let i = 0; i < weights.length; i++) {
+    roll -= weights[i];
+    if (roll <= 0) return i + 1;
+  }
+  return peak;
+}
+
+/**
  * 气泡清洁：去掉切分标点与句尾句号。
  * 保留问号/叹号/省略号（这些是语气，不是句末句号）；逗号/顿号/冒号/分号在切分点剥掉。
  */
