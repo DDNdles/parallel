@@ -4,7 +4,7 @@ import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import type {
   CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext,
   WorkDelegateInput, WorkDispatchInput, GatedHumanlike, LLMRequestContext, WorkAgentDef, PluginHttpHandler,
-  PluginHttpResponse,
+  PluginHttpResponse, HistoryHit,
 } from './types.ts';
 import type { Db } from './db.ts';
 import type { Bus } from './bus.ts';
@@ -622,7 +622,7 @@ export class PluginContainer {
       session: makeGatedSession(manifest, this.deps),
       work: makeGatedWork(manifest, { work: this.deps.work, plugins: this, groupTitle: this.deps.groupTitle }),
       humanlike: makeGatedHumanlike(this.deps.humanlike),
-      history: makeGatedHistory(manifest, this.deps.sessionLog),
+      history: makeGatedHistory(manifest, { sessionLog: this.deps.sessionLog, sandbox: this.deps.sandbox }),
       http: {
         on: (method, path, handler) => {
           const m = String(method ?? '').toUpperCase();
@@ -801,8 +801,10 @@ function makeGatedHumanlike(humanlike: HumanlikeService): GatedHumanlike {
   };
 }
 
-/** 会话历史检索门控：权限来自 manifest（history.search）；范围钉死在调用方给的会话上，插件拿不到全库 */
-function makeGatedHistory(manifest: PluginManifest, sessionLog: SessionLog) {
+/** 会话历史检索门控：权限来自 manifest（history.search）；范围钉死在调用方给的会话上，插件拿不到全库。
+ *  2026-10-26：命中的消息如果带了图片，顺手读成视觉输入一起交回（最多 3 张）——
+ *  翻旧账找「上次那张图」时，模型要看见图本身，而不只是 `[图片]` 三个字。 */
+function makeGatedHistory(manifest: PluginManifest, deps: { sessionLog: SessionLog; sandbox: SandboxService }) {
   const can = () => {
     if (!manifest.permissions.includes('history.search' as any)) {
       throw new PermissionDeniedError(`插件 ${manifest.id} 未声明权限 "history.search"，会话历史检索被拒绝`);
@@ -811,7 +813,21 @@ function makeGatedHistory(manifest: PluginManifest, sessionLog: SessionLog) {
   return {
     searchMessages: (chat: ChatRef, q: string, limit?: number, beforeTs?: number) => {
       can();
-      return sessionLog.searchMessages(chat.chatId, chat.type, { q, limit, beforeTs });
+      const hits: HistoryHit[] = deps.sessionLog.searchMessages(chat.chatId, chat.type, { q, limit, beforeTs });
+      let left = 3;
+      for (const h of hits) {
+        if (left <= 0) break;
+        for (const f of h.files ?? []) {
+          if (left <= 0) break;
+          try {
+            const img = deps.sandbox.readImage(chat, f.rel);
+            if (!img) continue;
+            (h.images ??= []).push({ data: img.data, mimeType: img.mime, name: f.name });
+            left--;
+          } catch { /* 文件已被清理 / 太大：跳过这一张，检索本身照常返回 */ }
+        }
+      }
+      return hits;
     },
   };
 }

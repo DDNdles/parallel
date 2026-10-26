@@ -92,6 +92,40 @@ test('search_history：空关键词与无命中', async () => {
   assert.match(String(tool('search_history').handler({ query: '绝对不存在的词xyz' }, tctx())), /没有相关消息|没在你们之前聊过/);
 });
 
+test('search_history：命中消息里的图片一起返回（读不动的跳过）；不收图的模型如实说看不到', async () => {
+  const chatRef = { platform: 'qq' as const, type: 'group' as const, chatId: String(GROUP) };
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  kernel.sandbox.write(chatRef, 'inbox/old1.png', png);
+  kernel.sandbox.write(chatRef, 'inbox/old2.png', png);
+  kernel.sessionLog.append(String(GROUP), 'group', {
+    type: 'message_in', role: 'user', userId: '10003', nickname: '小明', text: '看这张鲸鱼图',
+    data: {
+      files: [
+        { name: 'old1.png', rel: 'inbox/old1.png', size: png.length },
+        { name: 'gone.png', rel: 'inbox/gone.png', size: 1 },        // 文件已被清理：跳过
+        { name: 'old2.png', rel: 'inbox/old2.png', size: png.length },
+      ],
+    },
+  } as never);
+
+  const r = await Promise.resolve(tool('search_history').handler({ query: '鲸鱼图' }, tctx()) as any);
+  assert.equal(typeof r, 'object', '带图时要返回带附件的对象');
+  assert.equal(r.images?.length, 2, '存在的两张都带上，已清理的那张跳过');
+  assert.equal(r.images[0].mimeType, 'image/png');
+  assert.equal(r.images[0].data, png.toString('base64'), 'base64 原样回传');
+  assert.match(r.content, /这条带了 2 张图，图片附在本结果里/);
+
+  // 链首模型不收图：不塞附件，但也不能骗它说看得见
+  const plain = await Promise.resolve(tool('search_history').handler(
+    { query: '鲸鱼图' }, { ...(tctx() as any), vision: false } as any,
+  ) as any);
+  assert.equal(typeof plain, 'string');
+  assert.match(plain, /你看不到图片本身/);
+});
+
 test('search_history：只翻窗口之外——模型眼前就有的那几条不该还回去', async () => {
   const G = 412;
   kernel.container.setGroupState('chat', String(G), true, String(MASTER));

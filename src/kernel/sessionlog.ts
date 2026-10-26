@@ -90,6 +90,23 @@ function mimeOf(hint: string): string | undefined {
 }
 
 /**
+ * 落账条目里的文件清单（`data.files`）→ `{name, rel}`。
+ * 检索命中要能把"这条消息当时带了哪张图"带回去（有无图片由调用方按扩展名判断）。
+ */
+function filesOfEntry(e: SessionLogEntry): { name: string; rel: string }[] {
+  const raw = (e.data as { files?: unknown } | undefined)?.files;
+  if (!Array.isArray(raw)) return [];
+  const out: { name: string; rel: string }[] = [];
+  for (const f of raw) {
+    if (typeof f === 'string') { if (f.trim()) out.push({ name: f, rel: `inbox/${f}` }); continue; }
+    const o = f as { name?: unknown; rel?: unknown } | null;
+    const rel = String(o?.rel ?? '').trim();
+    if (rel) out.push({ name: String(o?.name ?? rel.split('/').pop() ?? ''), rel });
+  }
+  return out;
+}
+
+/**
  * 落账文件（`data.files` / 记录节点的 `files`）→ 可重放的附件。
  *
  * 与 `pipeline.attachmentsOf` 同一条底线：**url 与 path 都没有的不产出**。
@@ -342,13 +359,13 @@ export class SessionLog {
    * 按行整段解码不会劈开多字节字符）；窗口起头截在半行上的残段整行丢弃（宁少一行不错一行），
    * 命中数够了就停。语义上仍是"最近的 N 条命中"——更老的零星命中交给 recall/长期记忆。
    */
-  searchMessages(chatId: string, chatType: string, opts: { q: string; limit?: number; beforeTs?: number }): { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] {
+  searchMessages(chatId: string, chatType: string, opts: { q: string; limit?: number; beforeTs?: number }): { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string; files?: { name: string; rel: string }[] }[] {
     const q = opts.q.trim().toLowerCase();
     if (!q) return [];
     const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 20), 100));
     const file = join(this.dir, this.chatKey(chatId, chatType) + '.jsonl');
     if (!existsSync(file)) return [];
-    const hits: { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string }[] = [];
+    const hits: { ts: number; role: 'user' | 'assistant'; nickname?: string; text: string; files?: { name: string; rel: string }[] }[] = [];
     try {
       const size = statSync(file).size;
       const windowLen = Math.min(size, SEARCH_SCAN_MAX_BYTES);
@@ -378,7 +395,7 @@ export class SessionLog {
         if (!isUser && !isAssistant) continue;
         const text = String(e.text ?? '');
         if (!text || !text.toLowerCase().includes(q)) continue;
-        hits.push({ ts: e.ts, role: isUser ? 'user' : 'assistant', nickname: e.nickname, text });
+        hits.push({ ts: e.ts, role: isUser ? 'user' : 'assistant', nickname: e.nickname, text, files: filesOfEntry(e) });
         if (hits.length >= limit) break;
       }
     } catch {

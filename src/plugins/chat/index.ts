@@ -551,7 +551,7 @@ export function setup(ctx: PluginContext): void {
   // 于是换词连查四五次、每查一次多吃一轮，回复迟到半分钟（2026-10-16 活体报文实测）。
   ctx.llm.registerTool({
     name: 'search_history',
-    description: '检索本会话更早的聊天记录原文（**上下文之外**的旧消息，带时间与说话人）。当话题涉及「之前、上次、我们说过什么」而最近几分钟的上下文不够时使用。只搜当前会话，按关键词匹配。',
+    description: '检索本会话更早的聊天记录原文（**上下文之外**的旧消息，带时间与说话人）。当话题涉及「之前、上次、我们说过什么」而最近几分钟的上下文不够时使用。只搜当前会话，按关键词匹配；命中的消息里带的图片会一起返回（最多 3 张），能看见图本身。',
     parameters: {
       type: 'object',
       properties: {
@@ -580,8 +580,19 @@ export function setup(ctx: PluginContext): void {
         return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
       };
       // 每条截 200 字：50 条 × 200 字封顶，别让一次翻旧账把上下文顶爆
-      return `找到 ${hits.length} 条相关消息：\n` +
-        hits.map((h) => `- [${fmt(h.ts)}] ${h.role === 'user' ? (h.nickname || '用户') : '我'}：${h.text.slice(0, 200)}`).join('\n');
+      // 命中的消息带图时把图片一起交回去（模型收图才带，否则只报"这条带了几张图"）
+      const vision = tctx.vision !== false;
+      const images: { data: string; mimeType: string }[] = [];
+      const lines = hits.map((h) => {
+        const imgs = vision ? (h.images ?? []) : [];
+        for (const img of imgs) images.push({ data: img.data, mimeType: img.mimeType });
+        const head = `- [${fmt(h.ts)}] ${h.role === 'user' ? (h.nickname || '用户') : '我'}：${h.text.slice(0, 200)}`;
+        const n = (h.images ?? []).length;
+        if (!n) return head;
+        return vision ? `${head}（这条带了 ${n} 张图，图片附在本结果里）` : `${head}（这条带了 ${n} 张图，但你看不到图片本身）`;
+      });
+      const body = `找到 ${hits.length} 条相关消息：\n${lines.join('\n')}`;
+      return images.length ? { content: body, images } : body;
     },
   });
 

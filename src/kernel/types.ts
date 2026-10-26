@@ -757,6 +757,10 @@ export interface HistoryHit {
   role: 'user' | 'assistant';
   nickname?: string;
   text: string;
+  /** 这条消息当时带的文件（相对会话沙箱）；命中带图时由内核读成 images 一起交回 */
+  files?: { name: string; rel: string }[];
+  /** 命中消息里的图片（base64；一次检索最多 3 张，读不动的跳过） */
+  images?: { data: string; mimeType: string; name?: string }[];
 }
 
 export interface GatedHistory {
