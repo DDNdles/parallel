@@ -111,7 +111,13 @@ async function tick(state) {
   const list = await jobs();
   const mine = list.find((j) => j.name === JOB_NAME && String(j.state).toUpperCase() === 'RUNNING' && j.nodes && j.nodes !== 'None');
   if (mine) {
-    const node = String(mine.nodes).split(',')[0].trim();
+    // 注意：运行作业里 `nodes` 是节点"数量"（字符串 "1"），节点名在 `nodesOrReason`
+    // （排队的作业该字段是原因文本）。拿 nodes 会拼出 http://1:8046。
+    const node = String(mine.nodesOrReason || '').split(',')[0].trim();
+    if (!/^[A-Za-z0-9._-]+$/.test(node)) {
+      log(`作业 ${mine.jobId} 在跑但节点名看不懂（nodesOrReason=${JSON.stringify(mine.nodesOrReason)}），下轮再试`);
+      return;
+    }
     if (node !== state.node) {
       log(`发现作业 ${mine.jobId} 在 ${node} 上运行`);
       if (await wire(node)) state.node = node;
