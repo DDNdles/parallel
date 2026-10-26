@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
@@ -23,7 +23,7 @@ async function boot(group: string) {
   cfg.onebot.port = 30000 + (process.pid % 20000);
   (cfg.providers as Record<string, unknown>).mock = {
     label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
-    models: [{ id: 'mock-1', enabled: true }],
+    models: [{ id: 'mock-1', enabled: true, inputTypes: ['text', 'image'] }],
   };
   cfg.llm.activeProvider = 'mock';
   cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
@@ -369,6 +369,76 @@ test('work_dispatch 端到端：直接使用 chat 传入的 task（不再由程�
     const body = String(call.usersJoined);
     assert.ok(body.includes('帮我画一张豆包和奶龙对打的图，豆包要占上风'), 'chat 传入的 task 进任务正文');
     assert.ok(!body.includes('你根本没派'), '本轮催促消息不该覆盖任务正文');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('work_dispatch：本轮用户发的图片随任务一起交给 work（第一轮请求就带图）', async () => {
+  const g = await boot('9407');
+  g.mock.script.length = 0;
+  const dir = mkdtempSync(join(tmpdir(), 'parallel-workimg-'));
+  try {
+    // 1x1 透明 PNG 落到本机文件：附件按 path 读取（与真人发图落盘同一条路）
+    const pngPath = join(dir, 'task.png');
+    writeFileSync(pngPath, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    ));
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '解完了' } }] });
+    g.mock.script.push({ content: '好了' });
+    const ret = String(await dispatch.handler(
+      { task: '解这道模电题，写出详细推导' },
+      {
+        ...g.tctx('10001', 'owner'),
+        vision: true,
+        attachments: [
+          { kind: 'image' as const, path: pngPath, mime: 'image/png', name: 'task.png' },
+          { kind: 'image' as const, path: pngPath, mime: 'image/png', name: 'task.png' },  // 同一张重复引用只带一次
+        ],
+      } as any,
+    ));
+    assert.match(ret, /已接下这件活/);
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+
+    const call = await until(
+      () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('解这道模电题')),
+      8000, 'work 首轮请求',
+    );
+    assert.ok((call.media ?? []).includes('image'), `图片要附在 work 的第一轮请求里：${JSON.stringify(call.media)}`);
+    assert.ok(String(call.usersJoined).includes('1 张图已随这条消息附上'), `任务里要说明图已附上：${call.usersJoined}`);
+    // 列表/进度条上的短标不带这段附件说明
+    const run = await until(() => g.kernel.workRunner.list(10, g.chatKey)[0], 8000, '任务开跑');
+    assert.equal(run.task, '解这道模电题，写出详细推导');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await g.cleanup();
+  }
+});
+
+test('work_dispatch：链首模型不收图时只把图片位置写进任务，不塞附件', async () => {
+  const g = await boot('9408');
+  g.mock.script.length = 0;
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '做完了' } }] });
+    g.mock.script.push({ content: '好了' });
+    await dispatch.handler(
+      { task: '看看这张图' },
+      {
+        ...g.tctx('10001', 'owner'),
+        vision: false,
+        attachments: [{ kind: 'image' as const, path: join(tmpdir(), 'x.png'), mime: 'image/png' }],
+      } as any,
+    );
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+    const call = await until(
+      () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('看看这张图')),
+      8000, 'work 首轮请求',
+    );
+    assert.ok(String(call.usersJoined).includes('用 sandbox_read 打开看'), `要告诉它自己去看：${call.usersJoined}`);
+    assert.ok(!(call.media ?? []).includes('image'), '不收图的模型不该塞图片');
   } finally {
     await g.cleanup();
   }

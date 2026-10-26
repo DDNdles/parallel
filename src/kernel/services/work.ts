@@ -7,7 +7,7 @@ import { WORK_IDLE_REMIND_LIMIT } from '../agentloop.ts';
 import type { LlmService, UsageSnapshot } from './llm.ts';
 import { usageDelta } from './llm.ts';
 import type { SandboxService } from './sandbox.ts';
-import type { ToolDef, ChatMessage, ChatRef, LLMRequestContext, WorkAgentDef, WorkLiveStatus } from '../types.ts';
+import type { ToolDef, ChatMessage, ChatRef, LLMRequestContext, MessageAttachment, WorkAgentDef, WorkLiveStatus } from '../types.ts';
 import { newId, nowMs, clip } from '../util/misc.ts';
 import { busEvents } from '../bus.ts';
 import { buildWorkSections, parseWorkHandoff, type PendingAsk } from '../work-prompt.ts';
@@ -71,6 +71,8 @@ export interface WorkRunInput {
    * （`private_u{userId}__t{runId}`）；子代理委派不传它——父层已把任务 ref 放进 input.chat。
    */
   sandboxRef?: ChatRef;
+  /** 随任务交给 work 的附件（用户这一轮发的图片）：挂在 work 第一轮的最后一条 user 消息上 */
+  attachments?: MessageAttachment[];
 }
 
 export interface WorkRunResult {
@@ -350,6 +352,7 @@ export class WorkRunner {
         system: built.system,
         systemSections: built.sections,
         messages: [{ role: 'user', content: input.task } as ChatMessage],
+        attachments: input.attachments,
         tools: input.tools,
         workTurn: true,
         workTask: input.task,

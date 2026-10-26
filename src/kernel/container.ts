@@ -991,6 +991,7 @@ function makeGatedWork(
         groupTitle: deps.groupTitle(chat.chatId),
         runHooks: (req) => plugins.runWorkHooks(req),
         sandboxRef,
+        attachments: input.attachments,
       }).catch(() => { /* run() 内部已把失败落进事件与报错中心 */ });
       return { ok: true, label };
     },

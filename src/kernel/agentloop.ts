@@ -393,6 +393,7 @@ export class AgentLoop {
             historyWindowStartTs: ctx.historyWindowStartTs,
             work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
             vision,
+            attachments: ctx.attachments,
             // 窗口消息快照（user/assistant）：work_dispatch 核对 chat 侧选录的原文片段用，
             // 只读投影——工具拿不到也改不了这份上下文本身
             contextMessages: ctx.messages

@@ -156,6 +156,8 @@ export interface ToolContext {
   work?: { depth: number; runId?: string; agent?: string };
   /** 本轮链首模型是否收图片（模型页「输入类型」勾了 image）。工具据此决定要不要把图片塞回模型 */
   vision?: boolean;
+  /** 本轮真人输入带的附件（图片/语音/视频）：work_dispatch 用它把用户这轮发的图直接交给 work */
+  attachments?: MessageAttachment[];
 }
 
 /**
@@ -778,6 +780,8 @@ export interface WorkDispatchInput {
    * 缺省 = 全新任务（新沙箱，看不到旧任务文件）。
    */
   continueRun?: string;
+  /** 本轮用户发的图片：随任务一起交给 work（work 第一轮请求里就能看见，不必自己去 inbox 里猜） */
+  attachments?: MessageAttachment[];
 }
 
 export interface WorkDispatchResult {

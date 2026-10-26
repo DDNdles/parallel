@@ -372,6 +372,24 @@ export function setup(ctx: PluginContext): void {
         : [];
       const picked = selectChatContext(quotes, tctx.contextMessages);
       if (picked.section) task += picked.section;
+      // 本轮用户发的图片：直接随任务交给 work（第一轮请求里就看得见），不必让它自己在一堆 inbox 文件里猜哪张。
+      // 去重按路径/URL，最多 4 张；链首模型不收图时就只报个位置，让它用 sandbox_read 自己看。
+      const seenImg = new Set<string>();
+      const images = (tctx.attachments ?? [])
+        .filter((a) => a.kind === 'image')
+        .filter((a) => {
+          const k = a.path || a.url || '';
+          if (!k || seenImg.has(k)) return false;
+          seenImg.add(k);
+          return true;
+        })
+        .slice(0, 4);
+      const attached = tctx.vision === false ? [] : images;
+      if (images.length) {
+        task += attached.length
+          ? `\n\n（本轮消息里带的 ${attached.length} 张图已随这条消息附上，直接看；同样的图也在沙箱 inbox/ 里。）`
+          : `\n\n（本轮消息里带的 ${images.length} 张图在沙箱 inbox/ 里，用 sandbox_read 打开看。）`;
+      }
       const label = modelTask;
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
@@ -387,7 +405,7 @@ export function setup(ctx: PluginContext): void {
         started = true;
         off?.();
         if (timer) clearTimeout(timer);
-        const r = ctx.work.dispatch({ chat, task, label, userId, nickname, role, continueRun: args.continue_run ? String(args.continue_run) : undefined });
+        const r = ctx.work.dispatch({ chat, task, label, userId, nickname, role, continueRun: args.continue_run ? String(args.continue_run) : undefined, attachments: attached.length ? attached : undefined });
         if (!r.ok) ctx.log.warn(`派活没有开跑：${r.reason ?? '未知原因'}`);
       };
       off = ctx.bus.on(busEvents.agentEnd, (p: { chatKey?: string }) => {
