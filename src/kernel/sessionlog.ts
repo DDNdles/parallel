@@ -13,6 +13,8 @@ export type SessionLogType =
   | 'error' | 'system'
   /** 戳一戳（双击头像）：不是消息，但会话流里要留下这一下 */
   | 'poke'
+  /** 贴表情：别人消息下面的表情回应（不是消息，会话流留一行） */
+  | 'reaction'
   /** 上下文压缩：这条之前的消息在后续请求里由 summary 代替（对齐 pi 的 compaction 条目） */
   | 'compaction'
   /** 拟人层决策：这一轮为什么开口 / 为什么沉默（含开口概率、动态预算与空窗补偿明细） */

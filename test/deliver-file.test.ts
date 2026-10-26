@@ -45,6 +45,7 @@ async function boot(group: string) {
     send: async () => 'mid',
     sendForward: async () => undefined,
     sendPoke: async () => {},
+    sendReaction: async () => {},
     sendFile: async (_c, abs) => { files.push(abs); return 'fid'; },
     connected: () => true,
     status: () => ({ connected: true }),

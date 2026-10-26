@@ -1065,6 +1065,28 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
     );
   }
 
+  // 贴表情（消息下面的表情回应）：一行居中的小提示，表情直接用 /face 图标（与会话里的脸图同一套资源）
+  if (e.type === 'reaction') {
+    const r = (e.data as any)?.reaction;
+    if (!r) {
+      return (
+        <div className="turn turn-poke"><span className="poke-line">{e.text || '贴了个表情'}</span></div>
+      );
+    }
+    return (
+      <div className="turn turn-poke">
+        <span className="poke-line reaction-line">
+          贴了个表情
+          {r.emojiId
+            ? <img className="reaction-face" src={`/face/${r.emojiId}.webp`} alt={r.emojiName || ''} title={r.emojiName || ''} loading="lazy"
+                onError={(ev) => { (ev.target as HTMLImageElement).style.display = 'none'; }} />
+            : <span>{r.emojiName || ''}</span>}
+          {r.nickname ? <span className="reaction-who">· {r.nickname}</span> : null}
+        </span>
+      </div>
+    );
+  }
+
   if (e.type === 'message_in') {
     const media = mediaRefs(e.data?.files);
     const live = (list: FRef[]) => list.filter((f) => !dead.includes(f.rel));

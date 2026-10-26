@@ -470,8 +470,7 @@ export class OneBot11Adapter implements TransportAdapter {
   }
 
   /** 戳一戳：优先 go-cqhttp 的 send_poke；老协议端退回 group_poke / friend_poke */
-  async sendPoke(chat: ChatRef, userId: string): Promise<void> {
-    if (chat.type === 'group') {
+  async sendPoke(chat: ChatRef, userId: string): Promise<void> {    if (chat.type === 'group') {
       try {
         await this.call('send_poke', { group_id: chat.chatId, user_id: userId });
       } catch {
@@ -484,6 +483,18 @@ export class OneBot11Adapter implements TransportAdapter {
     } catch {
       await this.call('friend_poke', { user_id: chat.chatId });
     }
+  }
+
+  /**
+   * 贴表情（在别人的消息下面挂一个 QQ 表情回应）：LLBot 的 `set_msg_emoji_like`。
+   *
+   * emoji_id 传 **face 编号**（如 14=微笑、76=赞）。LLBot 底层按 code 长度推断类型
+   * （≤3 位当 face，更长当 unicode emoji），经典表情最多 3 位，正好落 face 档。
+   * 协议端只支持群聊消息的回应（LLBot 会对私聊直接报「只支持群聊消息」）。
+   */
+  async sendReaction(chat: ChatRef, messageId: string, emojiId: string): Promise<void> {
+    if (chat.type !== 'group') throw new Error('贴表情只支持群聊消息');
+    await this.call('set_msg_emoji_like', { message_id: messageId, emoji_id: emojiId, set: true });
   }
 
   async sendFile(chat: ChatRef, absPath: string): Promise<string | undefined> {

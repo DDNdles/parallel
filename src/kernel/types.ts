@@ -619,6 +619,13 @@ export interface ChatSendService {
   sendFile(chat: ChatRef, sandboxPath: string): Promise<void>;
   /** 戳一戳（双击头像）：target 可以是 QQ 号或最近说话的昵称；私聊省略 = 对面 */
   poke(chat: ChatRef, target?: string): Promise<{ userId: string; nickname?: string }>;
+  /**
+   * 贴表情（在别人的群消息下面挂一个 QQ 表情回应）：模型看不到消息号，目标消息由程序定位 ——
+   * target 是 QQ 号/昵称（贴他最近一条），省略 = 贴对面刚说的那条。只支持群聊。
+   */
+  react(chat: ChatRef, emoji: string, target?: string): Promise<{
+    messageId: string; emojiId: string; emojiName: string; userId?: string; nickname?: string;
+  }>;
   /** 直接回复某个事件（省去构造 ChatRef） */
   reply(event: ChatEvent, text: string): Promise<void>;
   /** 该会话有没有在途的可打断发送（还剩几条）；没有返回 undefined */

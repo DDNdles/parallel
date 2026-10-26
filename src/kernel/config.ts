@@ -124,6 +124,8 @@ export const DEFAULT_CONFIG = {
     repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
     // 戳一戳（chat 工具）：模型在有明确指向/犯贱时调用；冷却与小时上限是硬护栏
     poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
+    // 贴表情（chat 工具）：在别人的群消息下面贴 QQ 表情回应；冷却与小时上限是硬护栏
+    reaction: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
     // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
       splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
@@ -132,7 +134,7 @@ export const DEFAULT_CONFIG = {
       bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
       expectedBubbles: 3,                 // 预期气泡数：提示里的推荐条数（必要时可突破）
       maxBubbles: 6,                      // 最大气泡数：程序分条的硬上限（超出会被合并）
-      bubbleWeights: [],                  // 气泡数概率自定义权重（索引对 1..N 条；空 = 自动三角分布）
+      bubbleWeights: [] as number[],      // 气泡数概率自定义权重（索引对 1..N 条；空 = 自动三角分布）
       typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）
       typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
       typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久

@@ -677,6 +677,7 @@ function makeChat(opts: { ratePerMin: number }) {
     send: async (_chat, segments) => { sent.push(segments.filter((s) => s.type === 'text').map((s) => String(s.data.text)).join('')); return `m${++n}`; },
     sendForward: async () => 'f',
     sendPoke: async () => {},
+    sendReaction: async () => {},
     sendFile: async () => 'f',
     connected: () => true,
     status: () => ({}),

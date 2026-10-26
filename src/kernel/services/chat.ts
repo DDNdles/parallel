@@ -3,7 +3,7 @@ import { busEvents } from '../bus.ts';
 import type { ChatRef, ChatSendService, MsgSegment } from '../types.ts';
 import type { SendPlan } from '../humanlike/index.ts';
 import { RateLimiter } from '../ratelimit.ts';
-import { faceTokensToSegments } from '../util/qqface.ts';
+import { faceTokensToSegments, qqFaceId, qqFaceName } from '../util/qqface.ts';
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { join, resolve, sep, normalize } from 'node:path';
@@ -17,6 +17,8 @@ export interface TransportAdapter {
   sendForward(chat: ChatRef, nodes: { userId?: string; nickname?: string; content: MsgSegment[] }[]): Promise<string | undefined>;
   /** 戳一戳（双击头像）；群聊需要 userId，私聊传对面 userId */
   sendPoke(chat: ChatRef, userId: string): Promise<void>;
+  /** 贴表情（消息下面的表情回应）：只支持群聊消息 */
+  sendReaction(chat: ChatRef, messageId: string, emojiId: string): Promise<void>;
   /** 发送本地文件（OneBot 场景传 file:// URI）；仅内核在沙箱校验后调用 */
   sendFile(chat: ChatRef, absPath: string): Promise<string | undefined>;
   connected(): boolean;
@@ -386,6 +388,53 @@ export class ChatService implements ChatSendService {
     this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'poke', role: 'assistant', text, data: { poke: { userId, nickname } } });
     this.bus.emit(busEvents.chatOut, { chat, segments: [], text, ts: Date.now(), poke: { userId, nickname } });
     return { userId, nickname };
+  }
+
+  /**
+   * 贴表情（在别人的群消息下面挂一个 QQ 表情回应）。
+   *
+   * 模型看不到消息号（编号戳 2026-10-17 已删），所以「贴哪条」由程序定位：
+   *  - 给了 target（QQ 号或昵称）→ 这个人最近一条入站消息；
+   *  - 没给 → 本会话最近一条入站消息（对面刚说的那句）。
+   * emoji 走内核既有的 QQ 表情名体系（`[表情/微笑]` 那套名字/别名/编号），
+   * 解析出的 face 编号直接当 `emoji_id` 用（LLBot 按长度判 face 档）。
+   */
+  async react(chat: ChatRef, emoji: string, target?: string): Promise<{
+    messageId: string; emojiId: string; emojiName: string; userId?: string; nickname?: string;
+  }> {
+    if (chat.type !== 'group') throw new Error('贴表情只支持群聊（协议端不支持私聊消息上的表情回应）');
+    const rawEmoji = String(emoji ?? '').trim();
+    const emojiId = qqFaceId(rawEmoji);
+    if (!emojiId) throw new Error(`认不出这个表情「${rawEmoji}」：写表情名（如 微笑/笑哭/赞）或编号`);
+    const emojiName = qqFaceName(emojiId);
+    const raw = String(target ?? '').trim();
+    // 昵称/QQ 号只在最近 500 条里找：模型看到的就是这些名字
+    const tail = this.opts.sessionLog.tail(chat.chatId, chat.type, 500);
+    let hit: (typeof tail)[number] | undefined;
+    const byId = /^\d{4,}$/.test(raw);
+    for (let i = tail.length - 1; i >= 0; i--) {
+      const e = tail[i];
+      if (e?.type !== 'message_in') continue;
+      if (!raw) { hit = e; break; }
+      if (byId ? String(e.userId) === raw : e.nickname === raw) { hit = e; break; }
+    }
+    if (!hit) {
+      throw new Error(raw ? `没找到${byId ? ' ' + raw : `最近说话的「${raw}」`}的消息` : '这个会话里还没有能贴表情的消息');
+    }
+    const messageId = String((hit.data as { messageId?: string } | undefined)?.messageId ?? '');
+    if (!messageId) throw new Error('这条消息没有消息号（协议端没给），贴不了表情');
+    const userId = String(hit.userId ?? '');
+    const nickname = String(hit.nickname ?? '');
+    if (!this.adapter?.connected()) throw new Error('协议端未连接');
+    await this.adapter.sendReaction(chat, messageId, emojiId);
+    const text = `贴了个表情 ${emojiName}${nickname ? `（${nickname}的消息）` : ''}`;
+    this.opts.onUsage('out');
+    this.opts.sessionLog.append(chat.chatId, chat.type, {
+      type: 'reaction', role: 'assistant', text,
+      data: { reaction: { messageId, emojiId, emojiName, userId, nickname } },
+    });
+    this.bus.emit(busEvents.chatOut, { chat, segments: [], text, ts: Date.now(), reaction: { messageId, emojiId, emojiName, userId, nickname } });
+    return { messageId, emojiId, emojiName, userId, nickname };
   }
 
   async reply(event: { chatId: string; type: 'group' | 'private'; platform: string }, text: string): Promise<void> {

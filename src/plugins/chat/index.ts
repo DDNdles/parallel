@@ -520,6 +520,8 @@ export function setup(ctx: PluginContext): void {
     ? '（这一轮已经写过一条演化了，别再写；把该说的话继续说完。）' : '';
   /** 戳一戳的会话内节流（进程内存，重启清零）：只做硬护栏，正不正常由模型按语境判断 */
   const pokeHits = new Map<string, number[]>();
+  /** 贴表情的会话内节流（与戳一戳同一套护栏口径） */
+  const reactionHits = new Map<string, number[]>();
 
   ctx.llm.registerTool({
     name: 'recall_facts',
@@ -623,6 +625,54 @@ export function setup(ctx: PluginContext): void {
       } catch (e) {
         // 错误只回给模型（别让它转述给用户）：戳不成就正常说话
         return `（没戳成：${(e as Error).message}。不要向对方提这个错误，接着正常说话。）`;
+      }
+    },
+  });
+
+  // 贴表情（消息下面的表情回应）：不用说话也能表态的社交动作——对好笑的话贴「笑哭」、
+  // 对夸奖贴「害羞」、对离谱发言贴「流汗」。目标消息由程序定位（模型看不到消息号）：
+  // 省略 target 就贴对面刚说的那条，给了 target 就贴这个人最近一条。
+  ctx.llm.registerTool({
+    name: 'react',
+    description: '在群友的消息下面贴一个 QQ 表情回应（消息下面的小表情，不用发文字）。想表态但不想说话时用：好笑贴「笑哭」、离谱贴「流汗」、被夸贴「害羞」、赞同贴「赞」。私聊没有这个功能。',
+    surface: 'chat',
+    promptSnippet: '在群友的消息下面贴一个表情回应（贴「笑哭/赞/流汗」这类 QQ 表情）',
+    promptGuidelines: [
+      '贴表情是「不说话的表态」：对方的话让你笑了/无语/想点赞，而你不需要再补一句时，贴一个比发文字更自然；贴完也可以照常接一句话。',
+      'emoji 写表情名（笑哭/呲牙/流汗/害羞/赞/滑稽）或编号；名字拿不准就用编号。一次最多贴一个，别在一条消息下面叠好几个。',
+      '省略 target = 贴对面刚发的那条；要贴群里另一个人说的，target 填他的昵称或 QQ 号。私聊里不要调用（没有这个功能）。',
+    ],
+    parameters: {
+      type: 'object',
+      properties: {
+        emoji: { type: 'string', description: 'QQ 表情名或编号，如 笑哭 / 流汗 / 赞 / 178' },
+        target: { type: 'string', description: '贴谁的消息：昵称或 QQ 号；省略 = 对面刚说的那条' },
+      },
+      required: ['emoji'],
+    },
+    handler: async (args, tctx) => {
+      const cfg = ((ctx.config as Record<string, any>)?.humanlike?.reaction ?? {}) as {
+        enable?: boolean; minIntervalSeconds?: number; maxPerHour?: number;
+      };
+      if (cfg.enable === false) return '（贴表情现在关着，别调用；用你自己的语气继续。）';
+      if (tctx.chat.type !== 'group') return '（私聊里没有贴表情这个功能，别调用；直接说话。）';
+      const key = `${tctx.chat.type}_${tctx.chat.chatId}`;
+      const now = Date.now();
+      const hits = (reactionHits.get(key) ?? []).filter((t) => now - t < 3600_000);
+      const minGap = Math.max(0, Number(cfg.minIntervalSeconds ?? 30)) * 1000;
+      if (minGap && hits.length && now - hits[hits.length - 1] < minGap) {
+        return '（刚贴过表情，最小间隔还没到；这一轮别贴，正常接话。）';
+      }
+      const max = Math.max(0, Number(cfg.maxPerHour ?? 6));
+      if (max && hits.length >= max) return '（这一小时贴得够多了；别再贴，正常接话。）';
+      try {
+        const r = await ctx.chat.react(tctx.chat, String(args.emoji ?? '').trim(), String(args.target ?? '').trim() || undefined);
+        hits.push(now);
+        reactionHits.set(key, hits);
+        return `（已在${r.nickname || '对方'}的消息下面贴了表情「${r.emojiName}」。正文里不用描述这个动作。）`;
+      } catch (e) {
+        // 错误只回给模型：贴不成就正常说话，别把内部错误转述给用户
+        return `（没贴成：${(e as Error).message}。不要向对方提这个错误，接着正常说话。）`;
       }
     },
   });

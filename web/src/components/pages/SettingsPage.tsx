@@ -35,6 +35,8 @@ interface Humanlike {
   expression?: { enable: boolean };
   /** 戳一戳（chat 工具）：开关 + 冷却 / 小时上限 */
   poke: { enable?: boolean; minIntervalSeconds: number; maxPerHour: number };
+  /** 贴表情（chat 工具）：在别人的群消息下面贴 QQ 表情回应 */
+  reaction?: { enable?: boolean; minIntervalSeconds: number; maxPerHour: number };
   /** 重复惩罚：最近多轮反复出现的词/人设名 → 提醒 + 一次重写 */
   repetition?: {
     enable: boolean; windowMessages: number; minMessages: number; cooldownMinutes: number;
@@ -470,7 +472,7 @@ export default function SettingsPage() {
             </>
           )}
 
-          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
+          {sec === 'humanlike' && (!h.outgoing || !h.rhythm || !h.agency || !h.schedule || !h.poke || !h.reaction || !intr ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <>
               <div className="mset-sec-h"><span>回复时机</span></div>
               <div className="set-grid">
@@ -643,6 +645,20 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ poke: { ...h.poke, minIntervalSeconds: v } })} />
                 <Num label="每小时最多戳几次（0=不限）" value={h.poke.maxPerHour}
                   onChange={(v) => patchH({ poke: { ...h.poke, maxPerHour: v } })} />
+              </div>
+              <div className="mset-sec-h"><span>贴表情</span></div>
+              <div className="mset-models">
+                <div className="mset-mrow">
+                  <span className="plg-v">允许在别人的消息下贴表情<Hint text="QQ 消息下面的表情回应；只在群聊可用，贴不贴由她自己判断" /></span>
+                  <span className="mset-macts"><Switch on={h.reaction!.enable !== false}
+                    onChange={() => patchH({ reaction: { ...h.reaction!, enable: !(h.reaction!.enable !== false) } }, true)} /></span>
+                </div>
+              </div>
+              <div className="set-grid" style={{ marginTop: 14 }}>
+                <Num label="两次贴表情的最小间隔（秒）" value={h.reaction!.minIntervalSeconds}
+                  onChange={(v) => patchH({ reaction: { ...h.reaction!, minIntervalSeconds: v } })} />
+                <Num label="每小时最多贴几次（0=不限）" value={h.reaction!.maxPerHour}
+                  onChange={(v) => patchH({ reaction: { ...h.reaction!, maxPerHour: v } })} />
               </div>
               <div className="mset-field" style={{ marginTop: 14 }}>
                 <label className="mset-flabel">节奏反定型档位</label>

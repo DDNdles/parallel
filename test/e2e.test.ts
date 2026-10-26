@@ -158,8 +158,8 @@ test('群聊 @机器人触发完整 agent loop（记忆查询 + 回复）', asyn
     .map((t) => t.name).sort();
   assert.deepEqual(
     chatTools,
-    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'sing', 'steal_sticker', 'work_dispatch', 'work_status'],
-    `chat 面只该有记忆读写、戳一戳、work 派活/进度、表情包与唱歌: ${chatTools}`,
+    ['poke', 'react', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'sing', 'steal_sticker', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳/贴表情、work 派活/进度、表情包与唱歌: ${chatTools}`,
   );
 
   // 脚本：先调一次记忆查询（chat 面的工具），拿到结果后作答
@@ -288,8 +288,8 @@ test('chat 工具面 = 记忆读写三件套 + work 派活/进度 + 表情包：
     .map((t) => t.name).sort();
   assert.deepEqual(
     names,
-    ['poke', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'sing', 'steal_sticker', 'work_dispatch', 'work_status'],
-    `chat 面只该有记忆读写、戳一戳、work 派活/进度、表情包与唱歌: ${names}`,
+    ['poke', 'react', 'recall_facts', 'remember_setting', 'search_history', 'send_sticker', 'sing', 'steal_sticker', 'work_dispatch', 'work_status'],
+    `chat 面只该有记忆读写、戳一戳/贴表情、work 派活/进度、表情包与唱歌: ${names}`,
   );
   // 忘记走桌面端用户页（记忆服务层），模型侧不再有入口；用户事实写入由后台自动提炼承担
   for (const gone of ['forget_me', 'remember_fact', 'plan_schedule', 'reply_quote']) {

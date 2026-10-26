@@ -1299,6 +1299,15 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     if ('maxPerHour' in poke) t.maxPerHour = Math.min(120, Math.max(0, Math.round(Number(poke.maxPerHour) || 0)));
   }
 
+  // 贴表情（chat 工具）：开关 + 最小间隔/小时上限（与戳一戳同一套护栏口径）
+  const reaction = body.reaction as Record<string, unknown> | undefined;
+  if (reaction && typeof reaction === 'object') {
+    const t = target.reaction as { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
+    applyBool(t, reaction, 'enable');
+    if ('minIntervalSeconds' in reaction) t.minIntervalSeconds = Math.min(3600, Math.max(0, Math.round(Number(reaction.minIntervalSeconds) || 0)));
+    if ('maxPerHour' in reaction) t.maxPerHour = Math.min(120, Math.max(0, Math.round(Number(reaction.maxPerHour) || 0)));
+  }
+
   // 节奏反定型（HDSI ChatRhythm）
   const rhythm = body.rhythm as Record<string, unknown> | undefined;
   if (rhythm && typeof rhythm === 'object') {

@@ -67,6 +67,8 @@ export interface HumanlikeConfig {
   repeat: RepeatConfig;
   /** 戳一戳（chat 工具）：有明确指向/犯贱时的社交动作；冷却与小时上限是硬护栏 */
   poke: { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
+  /** 贴表情（chat 工具）：在别人的群消息下面贴一个 QQ 表情回应；冷却与小时上限是硬护栏 */
+  reaction: { enable: boolean; minIntervalSeconds: number; maxPerHour: number };
   /** 回复时机（群聊/私聊同一个对象；talkValue 与 privateTalkValue 各自生效） */
   timing: TimingConfig;
   /** 出站投递（纯程序）：按句分条、句边截断、打字节奏、单条长度上限 */
@@ -124,6 +126,7 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
   repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
   poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
+  reaction: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   timing: {
     pendingThreshold: 12,
     talkValue: 1,
