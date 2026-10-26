@@ -35,7 +35,9 @@ from fastapi.responses import JSONResponse, Response
 
 ROOT = Path(os.environ.get("COVER_ROOT", Path.home() / "cover")).resolve()
 RVC_PACKAGE = Path(os.environ.get("COVER_RVC_PACKAGE", ROOT / "models" / "FeiyuVoice-RVC")).resolve()
-RVC_PYTHON = Path(os.environ.get("COVER_RVC_PYTHON", ROOT / "rvc" / "venv" / "bin" / "python")).resolve()
+# Keep the venv path as-is: resolving the python symlink points at uv's base
+# interpreter, whose site-packages does not contain numpy/torch.
+RVC_PYTHON = Path(os.environ.get("COVER_RVC_PYTHON", ROOT / "rvc" / "venv" / "bin" / "python")).expanduser()
 RVC_RUNTIME = Path(os.environ.get("COVER_RVC_RUNTIME", ROOT / "rvc" / "runtime.local.json")).resolve()
 WORK = Path(os.environ.get("COVER_WORK_DIR", ROOT / "work")).resolve()
 MODEL_DIR = Path(os.environ.get("COVER_SEPARATOR_MODEL_DIR", ROOT / "separator-models")).resolve()
@@ -242,6 +244,7 @@ def rvc_convert(vocal_wav: Path, out_dir: Path) -> Path:
             site = ""
     if site:
         env["PYTHONPATH"] = site
+    print(f"[cover] rvc python={RVC_PYTHON} site={site or '(unresolved)'}", flush=True)
     env["HF_HUB_OFFLINE"] = "1"
     env["TRANSFORMERS_OFFLINE"] = "1"
     result = subprocess.run(
@@ -337,6 +340,7 @@ def health():
         "uptime": round(time.time() - _started, 1),
         "rvc_package": RVC_PACKAGE.is_dir(),
         "rvc_python": RVC_PYTHON.is_file(),
+        "rvc_python_path": str(RVC_PYTHON),
         "runtime": RVC_RUNTIME.is_file(),
         "separator_model": SEPARATOR_MODEL,
         "separator_loaded": _separator is not None,

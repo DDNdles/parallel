@@ -91,21 +91,46 @@ docker/cover/
  "separator_model":"UVR-MDX-NET-Inst_HQ_3.onnx","separator_loaded":false,"device":"cuda"}
 ```
 
-### `POST /cover`
+### `POST /cover` → 202 Job
 
 `multipart/form-data`：
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `audio` | 是 | 原曲文件（mp3/wav/flac/m4a…）；≤ `COVER_MAX_UPLOAD_MB` |
-| `with_instrumental` | 否 | 默认 `true`；`false` 只返回换声后的人声 |
+| `with_instrumental` | 否 | 默认 `true`；`false` 只处理人声 |
 | `vocal_gain` | 否 | 人声音量，默认 `1.0`（0~2） |
 | `instrumental_gain` | 否 | 伴奏音量，默认 `1.0`（0~2） |
 
-成功返回 `audio/mpeg`，响应头 `x-cover-seconds` 是原曲时长。失败返回
-`{"ok":false,"error":"..."}`，HTTP 400/413/422/500/503。
+提交成功后立即返回：
 
-单 GPU 串行：同时只处理一个请求，忙时返回 503。
+```json
+{"ok":true,"id":"<job id>","status":"queued","seconds":67.0}
+```
+
+> 为什么不是同步返回音频：107 的 SCOW nginx 代理约 60 秒就 504，分离+RVC
+> 很容易超过。任务在服务端串行队列里跑，客户端轮询短请求即可。
+
+### `GET /jobs/{id}`
+
+```json
+{"ok":true,"id":"...","status":"running|done|failed","seconds":67.0,"bytes":0,"error":"","elapsed":12.3}
+```
+
+### `GET /jobs/{id}/audio`
+
+`status=done` 后返回 `audio/mpeg`，响应头 `x-cover-seconds` 是原曲时长；
+未完成返回 409，任务不存在返回 404。
+
+单 GPU 串行：一个 worker 顺序处理队列；提交本身不占 GPU，`/health` 不会被
+分离任务堵住。
+
+### 分离速度
+
+默认强制 ONNX CPU（`COVER_SEPARATOR_CPU=1`）：MDX 分离约 5~6 倍音频时长，
+20 秒音频约 1 分 40 秒，整首歌会明显更久。A100 上 ONNX CUDA 路径在首次推理
+时会挂住（GPU 0%、进程空闲），所以默认不用；要试 CUDA 可设
+`COVER_SEPARATOR_CPU=0`，失败时再退回 CPU。
 
 ## 许可与合规
 
