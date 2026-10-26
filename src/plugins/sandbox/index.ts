@@ -61,9 +61,13 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'sandbox_read',
-    description: '读取当前会话沙箱内的文本文件。长文件按行分页：先用默认读开头，再用 offset 续读（会告诉你还有多少行）。',
-    promptSnippet: '读会话沙箱内的文本文件（长文件用 offset 续读）',
-    promptGuidelines: ['读大文件先看开头再决定读哪一段：一次全读进来既费上下文，也常被截断。'],
+    description: '读取当前会话沙箱内的文件。文本文件按行分页（先用默认读开头，再用 offset 续读，会告诉你还有多少行）；图片文件（png/jpg/webp/gif）直接把图片本身返回给你看。',
+    promptSnippet: '读会话沙箱内的文件：文本分页读，图片直接看',
+    promptGuidelines: [
+      '读大文件先看开头再决定读哪一段：一次全读进来既费上下文，也常被截断。',
+      '要看沙箱里的图片（题图、截图、参考图）就直接 sandbox_read 它——图片会作为画面返回，不要用 OCR 去抠字，也不用装任何库。',
+      '超过 8 MB 的图片会读不了：先用 Python（PIL 可用）缩小另存一份，再读那个小文件。',
+    ],
     parameters: {
       type: 'object',
       properties: {
@@ -74,8 +78,19 @@ export function setup(ctx: PluginContext): void {
       required: ['path'],
     },
     handler: (args, tctx) => {
+      const rel = String(args.path ?? '');
       try {
-        const content = sb.read(chatRefOf(tctx), String(args.path));
+        // 图片走视觉通道：模型直接看见画面；非图片扩展名 readImage 返回 null，照旧按文本读
+        const img = sb.readImage(chatRefOf(tctx), rel);
+        if (img) {
+          const kb = Math.max(1, Math.round(img.size / 1024));
+          return {
+            content: `[图片] ${rel}（${img.mime}，${kb} KB）已随这条结果附上，直接看这张图。`,
+            images: [{ data: img.data, mimeType: img.mime }],
+            meta: { path: rel },
+          };
+        }
+        const content = sb.read(chatRefOf(tctx), rel);
         const lines = content.split('\n');
         const offset = Math.max(1, Math.floor(Number(args.offset) || 1));
         const limit = Math.min(Math.max(1, Math.floor(Number(args.limit) || READ_LINES)), READ_MAX_LINES);

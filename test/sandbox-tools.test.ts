@@ -43,6 +43,31 @@ async function boot(group = '7001') {
   };
 }
 
+test('sandbox_read：图片文件作为视觉输入原样返回（不用 OCR、不当文本读）', async () => {
+  const k = await boot('7002');
+  try {
+    // 1x1 透明 PNG
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    k.kernel.sandbox.write(k.chat, 'shots/a.png', png);
+    const r = await k.toolOf('sandbox_read').handler({ path: 'shots/a.png' }, k.tctx) as any;
+    assert.equal(typeof r, 'object', '图片结果要是带附件的对象，不是字符串');
+    assert.equal(r.images?.length, 1, '要带一张图片');
+    assert.equal(r.images[0].mimeType, 'image/png');
+    assert.equal(r.images[0].data, png.toString('base64'), 'base64 原样回传');
+    assert.match(r.content, /shots\/a\.png/);
+    assert.equal(r.meta?.path, 'shots/a.png');
+
+    // 非图片照旧按文本读（不受影响）
+    await k.call('sandbox_write', { path: 'note.txt', content: 'hi' });
+    assert.equal(await k.call('sandbox_read', { path: 'note.txt' }), 'hi');
+  } finally {
+    await k.cleanup();
+  }
+});
+
 test('sandbox_read：长文件分页，给出续读位置；小文件不加脚注', async () => {
   const k = await boot('7001');
   try {

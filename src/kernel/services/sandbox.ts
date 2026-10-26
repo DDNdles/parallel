@@ -33,7 +33,7 @@ const INLINE_IMAGE_MIME: Record<string, string> = {
   webp: 'image/webp', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
 };
 
-/** 语音/视频内联播放白名单（会话页的聊天记录卡片要用）。silk 是 QQ 语音的原容器。 */
+/** 语音/视频内联播放白名单（会话页的聊天记录卡片要用）。silk 是 QQ 语音的原容器。 *//** 语音/视频内联播放白名单（会话页的聊天记录卡片要用）。silk 是 QQ 语音的原容器。 */
 const INLINE_MEDIA_MIME: Record<string, string> = {
   mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', opus: 'audio/ogg', m4a: 'audio/mp4',
   aac: 'audio/aac', flac: 'audio/flac', amr: 'audio/amr', silk: 'audio/silk', slk: 'audio/silk',
@@ -41,6 +41,16 @@ const INLINE_MEDIA_MIME: Record<string, string> = {
 };
 /** 视频动辄几十 MB：流式发不占内存，但仍要有个天花板，别让人拿一条转发把磁盘 IO 拖死 */
 const INLINE_MEDIA_MAX = 200 * 1024 * 1024;
+
+/**
+ * 能给模型「看」的图片类型：tiff/bmp/heic 多数供应商不收，gif 只取首帧，都排除在外。
+ * 沙箱里的题图、截图、参考图走这条（sandbox_read 读到图片就把它当视觉输入递过去）。
+ */
+const VISION_IMAGE_MIME: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+};
+/** 单张图片的上限：base64 会再涨三分之一，再大就把请求体顶到对端拒收 */
+const VISION_IMAGE_MAX = 8 * 1024 * 1024;
 
 /** 交给系统默认程序不会触发脚本执行的类型；不在此列的一律只在文件管理器里选中 */
 const SAFE_OPEN_EXT = new Set([
@@ -236,6 +246,27 @@ export class SandboxService {
     if (st.size > cap) throw new SandboxError(`文件过大（${st.size} > ${cap} 字节），拒绝读取`);
     this.touchFile(chat, relPath, st.size);
     return readFileSync(abs, 'utf-8');
+  }
+
+    /**
+   * 把沙箱里的图片读成模型的视觉输入（base64）：`sandbox_read` 读到图片走这条。
+   * 非图片扩展名返回 null（调用方退回按文本读）；文件不存在/过大照实抛错。
+   * 不收图的模型由 agent loop 统一丢弃并留 warn，这里不做模型能力判断。
+   */
+  readImage(chat: ChatRef, relPath: string): { data: string; mime: string; size: number } | null {
+    const abs = this.resolveInside(chat, relPath);
+    const ext = /\.([A-Za-z0-9]+)$/.exec(abs)?.[1]?.toLowerCase() ?? '';
+    const mime = VISION_IMAGE_MIME[ext];
+    if (!mime) return null;
+    if (!existsSync(abs) || !statSync(abs).isFile()) throw new SandboxError(`文件不存在: ${relPath}`);
+    const st = statSync(abs);
+    if (st.size > VISION_IMAGE_MAX) {
+      throw new SandboxError(
+        `图片过大（${(st.size / 1024 / 1024).toFixed(1)} MB > 8 MB），没法直接看；先用 Python 缩小一版（PIL 可用）再读`,
+      );
+    }
+    this.touchFile(chat, relPath, st.size);
+    return { data: readFileSync(abs).toString('base64'), mime, size: st.size };
   }
 
 /** 桌面端预览：文本文件给内容（按字符截断，不切坏中文），二进制给 null（由 UI 决定改走系统程序打开） */

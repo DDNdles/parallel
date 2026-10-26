@@ -850,6 +850,7 @@ function makeGatedSandbox(manifest: PluginManifest, deps: { sandbox: SandboxServ
     list: (chat: ChatRef, p?: string) => { can('fs.sandbox'); return deps.sandbox.list(chat, p); },
     walkFiles: (chat: ChatRef, p?: string, o?: { maxFiles?: number; maxDepth?: number }) => { can('fs.sandbox'); return deps.sandbox.walkFiles(chat, p, o); },
     read: (chat: ChatRef, p: string) => { can('fs.sandbox'); return deps.sandbox.read(chat, p); },
+    readImage: (chat: ChatRef, p: string) => { can('fs.sandbox'); return deps.sandbox.readImage(chat, p); },
     write: (chat: ChatRef, p: string, c: string | Buffer, o?: { work?: boolean }) => { can('fs.sandbox'); return deps.sandbox.write(chat, p, c, o); },
     delete: (chat: ChatRef, p: string) => { can('fs.sandbox'); return deps.sandbox.delete(chat, p); },
     run: (chat: ChatRef, o: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }) => {

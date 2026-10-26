@@ -693,6 +693,8 @@ export interface GatedSandbox {
   /** 递归收集文件清单（带上限截断标记）；sandbox 插件的 grep/glob 工具在用 */
   walkFiles(chat: ChatRef, relPath?: string, opts?: { maxFiles?: number; maxDepth?: number }): { files: SandboxEntry[]; truncated: boolean };
   read(chat: ChatRef, relPath: string): string;
+  /** 读图片为模型可看的视觉输入（base64）；非图片扩展名返回 null，由调用方退回按文本读 */
+  readImage(chat: ChatRef, relPath: string): { data: string; mime: string; size: number } | null;
   write(chat: ChatRef, relPath: string, content: string | Buffer, opts?: { work?: boolean }): SandboxWriteResult;
   delete(chat: ChatRef, relPath: string): void;
   run(chat: ChatRef, opts: { language: 'python' | 'javascript'; code: string; timeoutMs?: number }): Promise<SandboxRunResult>;
