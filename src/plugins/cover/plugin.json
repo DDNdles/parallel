@@ -1,0 +1,66 @@
+{
+  "id": "cover",
+  "name": "翻唱",
+  "version": "1.0.0",
+  "description": "让 bot 翻唱现成的歌：按歌名找原曲，分离人声/伴奏，用 FeiyuVoice-RVC 换成大肥鱼音色，再混回伴奏发语音。需要自部署 RVC 服务（不附带模型权重）。",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "MIT",
+  "keywords": [
+    "cover",
+    "rvc",
+    "singing",
+    "voice"
+  ],
+  "category": "fun",
+  "trust": "builtin",
+  "permissions": [
+    "network"
+  ],
+  "defaultGroupState": "on",
+  "userConfig": {
+    "baseUrl": {
+      "type": "string",
+      "default": "",
+      "description": "翻唱服务地址（如 https://107.ustc.edu.cn/api/proxy/training/relative/anode23/8047，或 http://127.0.0.1:8047）"
+    },
+    "apiKey": {
+      "type": "string",
+      "default": "",
+      "description": "翻唱服务的 Bearer Key（服务端 COVER_API_KEY；留空表示服务端未开鉴权）",
+      "secret": true
+    },
+    "cookie": {
+      "type": "string",
+      "default": "",
+      "description": "SCOW 门户代理的会话 Cookie（如中科大一〇七平台：SCOW_USER=ustc-...）。服务部署在 SCOW 代理后面时填；普通自部署留空",
+      "secret": true
+    },
+    "cooldownSeconds": {
+      "type": "number",
+      "default": 120,
+      "description": "同一会话两次成功翻唱的最小间隔（秒），防止连着点歌"
+    },
+    "dailyQuota": {
+      "type": "number",
+      "default": 5,
+      "description": "普通成员每个自然日（本地时区零点翻篇）成功翻唱的上限"
+    },
+    "ownerUnlimited": {
+      "type": "boolean",
+      "default": true,
+      "description": "主人与管理员不受每日次数限制"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "default": 600000,
+      "description": "单次翻唱总超时（毫秒，含搜歌、下载、分离、RVC、混音、发送），默认 10 分钟"
+    },
+    "maxSongMb": {
+      "type": "number",
+      "default": 30,
+      "description": "原曲文件大小上限（MB），超过就换一首"
+    }
+  }
+}
