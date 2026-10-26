@@ -355,7 +355,16 @@ def _ffmpeg_to_mp3(src: Path) -> bytes:
     """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise ApiError(500, "服务端缺少 ffmpeg，无法转码")
+        # 无系统 ffmpeg（HPC 计算节点常见）时退回 pip 装的静态二进制：
+        # 部署包非 docker 场景只需 venv 里有 imageio-ffmpeg，不用 root 装包。
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:  # noqa: BLE001 - 没装就用下面的统一报错
+            ffmpeg = None
+    if not ffmpeg:
+        raise ApiError(500, "服务端缺少 ffmpeg，无法转码（pip install imageio-ffmpeg 可提供静态二进制）")
 
     cmd = [
         ffmpeg,

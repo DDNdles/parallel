@@ -400,6 +400,8 @@ interface Cfg {
   voiceId: string;
   refAudio: string;
   baseUrl: string;
+  /** SCOW 等门户代理的会话 Cookie（如 107 平台：SCOW_USER=...）；仅 custom 契约发送 */
+  cookie: string;
   maxSeconds: number;
   cooldownSeconds: number;
   dailyQuota: number;
@@ -704,7 +706,12 @@ async function generateCustom(cfg: Cfg, input: GenInput): Promise<Outcome> {
   try {
     resp = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${cfg.apiKey}`,
+        // SCOW 门户代理（107 平台 /api/proxy/...）只认会话 Cookie；普通自部署留空即可
+        ...(cfg.cookie ? { cookie: cfg.cookie } : {}),
+      },
       body: JSON.stringify({
         lyrics: input.lyrics,
         tags: input.tags,
@@ -744,6 +751,7 @@ export function setup(ctx: PluginContext): void {
     voiceId: String(ctx.userConfig.voiceId ?? '').trim(),
     refAudio: String(ctx.userConfig.refAudio ?? '').trim(),
     baseUrl: String(ctx.userConfig.baseUrl ?? '').trim().replace(/\/+$/, ''),
+    cookie: String(ctx.userConfig.cookie ?? '').trim(),
     maxSeconds: numOf(ctx.userConfig.maxSeconds, 60, 10, 120),
     cooldownSeconds: numOf(ctx.userConfig.cooldownSeconds, 60, 0, 3600),
     dailyQuota: numOf(ctx.userConfig.dailyQuota, 5, 0, 100),

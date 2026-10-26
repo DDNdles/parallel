@@ -46,6 +46,12 @@
       "default": "",
       "description": "服务地址：provider=custom 时必填（如 http://127.0.0.1:8080）；内置 preset 也可填来走代理/网关，留空用官方地址"
     },
+    "cookie": {
+      "type": "string",
+      "default": "",
+      "description": "SCOW 门户代理的会话 Cookie（如中科大一〇七平台：SCOW_USER=ustc-...）。服务部署在 SCOW 代理后面时，baseUrl 填 https://门户/api/proxy/...，这里填登录后浏览器里的 Cookie；普通自部署留空",
+      "secret": true
+    },
     "maxSeconds": {
       "type": "number",
       "default": 60,

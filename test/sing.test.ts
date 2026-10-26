@@ -103,6 +103,7 @@ const audioResp = () => new Response(MP3, { status: 200, headers: { 'content-typ
 
 async function boot(opts: {
   apiKey?: string;
+  cookie?: string;
   config?: Record<string, unknown>;
   refWav?: boolean;
   connect?: boolean;
@@ -114,6 +115,8 @@ async function boot(opts: {
   cfg.onebot.port = await freePort();
   cfg.masterIds = ['10001'];
   if (opts.apiKey !== undefined) kernel.config.setPluginSecret('sing', 'apiKey', opts.apiKey);
+  // cookie 是 secret 字段：必须走 secrets 存储，写 plugin_user_config 读不到
+  if (opts.cookie !== undefined) kernel.config.setPluginSecret('sing', 'cookie', opts.cookie);
 
   const values: Record<string, unknown> = { ...(opts.config ?? {}) };
   if (opts.refWav) {
@@ -249,12 +252,15 @@ test('fal-ai-ace-step：提交 → 轮询 → 下载 mp3，record 语音发进�
   }
 });
 
-test('provider=custom：POST {baseUrl}/generate，body {lyrics,tags,seconds}，响应体直接是音频', async () => {
+test('provider=custom：POST {baseUrl}/generate，body {lyrics,tags,seconds}，响应体直接是音频（SCOW 代理带上会话 Cookie）', async () => {
   const base = 'http://127.0.0.1:18080';
   const k = await boot({
     apiKey: 'cus-key-456',
+    cookie: 'SCOW_USER=ustc-test-token',   // 107 平台这类 SCOW 代理只认 Cookie
     connect: true,
-    config: { provider: 'custom', baseUrl: base, cooldownSeconds: 0, dailyQuota: 5 },
+    config: {
+      provider: 'custom', baseUrl: base, cooldownSeconds: 0, dailyQuota: 5,
+    },
   });
   const mock = mockFetch((url) => (url === `${base}/generate` ? audioResp() : undefined));
   try {
@@ -266,6 +272,7 @@ test('provider=custom：POST {baseUrl}/generate，body {lyrics,tags,seconds}，�
     assert.equal(req.method, 'POST');
     assert.equal(req.url, `${base}/generate`);
     assert.equal(req.headers.authorization, 'Bearer cus-key-456');
+    assert.equal(req.headers.cookie, 'SCOW_USER=ustc-test-token', '配了 cookie 就要随 custom 请求带上');
     assert.deepEqual(req.body, { lyrics: '啦啦啦大肥鱼', tags: 'chill, female vocal', seconds: 25 });
 
     const abs = recordFileOf(await k.mock!.waitForAction('send_group_msg', 5000));

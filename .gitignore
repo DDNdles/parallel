@@ -26,3 +26,6 @@ dist/
 # 唱歌插件运行产物（参考音色副本 / Python 缓存），正本在 data/sing/ref（data/ 已整体忽略）
 docker/sing/ref/
 __pycache__/
+
+# 一次性部署草稿（含密钥/临时配置），不入库
+.tmp-ustc/

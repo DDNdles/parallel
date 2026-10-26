@@ -448,7 +448,11 @@ tail -n 100 logs/qqbot-sing-*.out
 所以 107 上把 `server.py` 当普通 Python 进程跑即可；Docker 相关文件只在
 自管 GPU 主机上使用。
 
-### 6.4 实测结论（2026-10-26）：今天不能交付可常驻调用的服务
+### 6.4 上午的实测结论（2026-10-26）：SSH/短信通道走不通
+
+> 本节是上午的结论。下午实测发现**统一认证这次没触发二次验证**、SCOW 代理可以
+> 用 Cookie 直连任意节点端口、且插件已补上 Cookie 支持——实际路线见 §6.5。
+> 两条结论不冲突：**能接线了，但仍受「只有一个 Students 分区 + 4 小时作业窗口 + 排队」限制。**
 
 本节是交付后在宿舍网 Windows 机器上实际尝试登录/部署的记录，**不是推测**。
 结论：**平台统一身份密码有效，但被短信二次验证挡住；即使通过认证，107 的机制
@@ -517,6 +521,68 @@ Cookie `SCOW_USER`；插件 custom 分支只发 `Authorization: Bearer`、不发
 
 > 结论：107 适合课程作业与离线训练，不适合作为 QQ bot 的 24h 在线推理后端。
 > 要「随叫随到」，优先本机独显或公网 GPU 主机；107 只能作为临时演示。
+
+### 6.5 下午实测修订（2026-10-26）：SCOW 代理 + Cookie 路线，已打通到「等 GPU 槽位」
+
+以下全部在本机 + 平台实机验证过（登录、上传、装依赖、代理穿透）。核心结论：
+**没有 SSH 也能连上计算节点上的服务——走 SCOW 门户的通用代理，鉴权用登录后的
+Cookie `SCOW_USER`；插件已支持 `cookie` 配置项。剩下的唯一阻塞是 GPU 排队。**
+
+1. **登录**：内置浏览器打开 <https://107.ustc.edu.cn/> →「统一认证登录」→ 学号/密码，
+   本次直接进了 dashboard（未触发短信二次验证；若触发，按 §6.4 ③ 的协作流程处理）。
+2. **环境（登录节点）**：平台没有 docker 和 conda；按官方文档口径用 venv。实测：
+   ```bash
+   pip3 install --user --break-system-packages uv        # 系统 pip 有 PEP668 限制
+   git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git ~/sing/ace-step
+   cd ~/sing/ace-step
+   UV_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple \
+   UV_HTTP_TIMEOUT=60 ~/.local/bin/uv sync --frozen --no-dev     # 约 30 分钟、venv 7.5G
+   ~/.local/bin/uv pip install --python .venv/bin/python imageio-ffmpeg
+   ```
+   注意：不带 `--frozen` 时 uv 会在解析阶段长时间无输出，看起来像卡死；venv 里
+   torch 2.10.0+cu128，`from acestep.handler import AceStepHandler` / `LLMHandler` /
+   `ensure_lm_model` / `GenerationParams, GenerationConfig, generate_music`
+   四个导入实测通过。**权重要在首次启动时由服务自己下**（ModelScope，
+   `ACESTEP_DOWNLOAD_SOURCE=modelscope`），落在 `~/sing/checkpoints`（共享存储，重启不重下）。
+3. **文件上传**：`parallel` 仓库是私有的，登录节点拉不到；用「登录节点临时 PUT 服务 +
+   SCOW 代理」从本机推 `server.py` 与 `ref/dafatyu.wav`，用完即杀（本次已验证）：
+   ```bash
+   # 登录节点：单文件的 PUT 接收器（0.0.0.0:18047）
+   # 本机：
+   curl -X PUT -H "Cookie: SCOW_USER=..." --data-binary @docker/sing/server.py \
+     https://107.ustc.edu.cn/api/proxy/training/relative/11.11.10.202/18047/server.py
+   ```
+4. **作业**：`~/sing/sing.sbatch`（Students 分区、`--gres=gpu:1 -c 4 --mem=16G -t 03:58:00`）。
+   配额实测：该账号只能用 `Students`（`qos_stu_default`）；`P107-*`、`GPU-*`、`CPU-*`
+   一律 `Invalid qos specification`；交互式应用（JupyterLab 的 `qos_stu001`）同样被拒。
+   当前队列对本科账号的预估开始时间是 **当晚 21:00 左右**（约 9 小时排队），
+   没有可插队的资源形态。
+5. **网络通道（关键）**：SCOW 通用代理的路由是
+   `/api/proxy/{clusterId}/{type}/{node}/{port}/{path}`，`type` 只接受 `relative`/`absolute`
+   （源码 `apps/portal-web/src/server/setup/proxy.ts`：登录节点直连 `http://{node}:{port}`，
+   计算节点转发给 proxyGateway），鉴权只读 Cookie `SCOW_USER`。因此 bot 侧地址是：
+   ```
+   https://107.ustc.edu.cn/api/proxy/training/relative/<计算节点>/8046/generate
+   ```
+   已实测：内核 → 该代理 → 登录节点临时端口能拿到真实 HTTP 响应（插件返回 501 转述）。
+   代理 URL 里的节点名随作业变化，需要自动接线（见下）。
+6. **内核要求**：门户证书链缺中间证书，Node 自带 CA 会报
+   `UNABLE_TO_VERIFY_LEAF_SIGNATURE`。`bin/parallel.js` 启动器已加 `--use-system-ca`
+   （走 Windows 系统信任库），重启内核即生效；独立脚本也要带这个标志。
+7. **自动接线**：`scripts/sing/ustc-watch.mjs` 轮询 SCOW 作业 API（同样 Cookie 鉴权，
+   `GET /api/job/getRunningJobs?userId=<学号>&cluster=training`），发现 `sing` 作业 RUNNING
+   就取节点名、探 `/health`、把 `provider=custom / baseUrl=<代理地址> / apiKey / cookie`
+   写进内核插件配置并热重载；作业结束自动清空 baseUrl。用法：
+   ```bash
+   node --use-system-ca scripts/sing/ustc-watch.mjs \
+     --cookie "SCOW_USER=ustc-..." --api-key "<sing.sbatch 里的 SING_API_KEY>"
+   ```
+   Cookie 会随会话过期（过期后 watcher 日志会提示重登换 cookie）。4 小时作业到期后
+   需要重新 `sbatch`——目前这一步要人在 Web Shell 里执行；作业脚本与权重都在
+   `~/sing`，重提一条 `sbatch ~/sing/sing.sbatch` 即可。
+
+> 一句话：**代理通道已验证、插件与自动接线已就绪；服务会在 GPU 槽位排到的第一次
+> 作业启动时自动上线，之后每条 4 小时作业需要重新提交。**
 
 ---
 
