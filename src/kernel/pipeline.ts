@@ -32,7 +32,7 @@ interface RepeatHook {
 import { AGENCY_REASON_ZH } from './humanlike/agency.ts';
 import { todayKey, newId } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
-import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem, chatOutputStyleText } from './prompt-sections.ts';
+import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem, chatOutputStyleText, chatTurnBubbleNote } from './prompt-sections.ts';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
 
@@ -855,23 +855,29 @@ export class Pipeline {
           ].join('\n'),
         });
       }
-      // 输出口径（order 440）：chat 轮**唯一**一段规定"输出长什么样"的指令 ——
-      // 短句、镜像长度、不写动作描写，总长上限写进词里。剧本体（HDSI 的 <say> 小说格式）已删，
-      // 模型说什么就发什么，分条与截断由程序侧兜底（humanlike/delivery.ts）。
+      // 输出口径（order 440）：chat 轮规定"输出长什么样"的固定规则节（跨轮稳定，保住前缀缓存）；
+      // 每轮抽签的目标条数在 beforeLLM 与入历史之后追加到最后一条 user 消息末尾（紧挨生成起点，压住历史里的多行示范）。
       // 汇报轮不加：那轮要的是把工作结果讲清楚，不是聊天。
+      let turnBubbleNote = '';
       if (!isReport) {
         const out = this.humanlike.config.outgoing;
+        const targetBubbles = pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
+          recentShapes: this.humanlike.recentBubbleShapes(chat),
+          weights: out.bubbleWeights,
+        });
         systemSections.push({
           order: 440, title: 'chat-style',
           text: chatOutputStyleText({
             maxChars: out.replyMaxCharacters,
-            targetBubbles: pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
-              recentShapes: this.humanlike.recentBubbleShapes(chat),
-              weights: out.bubbleWeights,
-            }),
             maxBubbles: out.maxBubbles,
           }),
         });
+        if (!opts?.proactive) {
+          turnBubbleNote = chatTurnBubbleNote({
+            targetBubbles,
+            maxBubbles: out.maxBubbles,
+          });
+        }
       }
       // HDSI 的两个子系统：ChatRhythm 节奏提醒(460) / 日程(470)。汇报轮同样不加。
       if (!isReport) {
@@ -961,6 +967,22 @@ export class Pipeline {
       // 汇报轮的输入是内核写的内部汇报单，也不该伪装成发起人的发言——模型自己的汇报正文会入历史。
       // 附件跟着入账：窗口内的历史消息要能重放"这条当时带了图/语音/视频"。
       if (!opts?.proactive && !opts?.report) this.history.pushUser(chat, userText, ctx.attachments);
+
+      // 当轮气泡条数软约束挂在最后一条 user 消息末尾：只进本次请求体，不进 history、不污染 beforeLLM 的关键词匹配。
+      if (turnBubbleNote) {
+        const lastUserIdx = ctx.messages.map((m) => m.role).lastIndexOf('user');
+        if (lastUserIdx >= 0) {
+          const last = ctx.messages[lastUserIdx];
+          ctx = {
+            ...ctx,
+            messages: [
+              ...ctx.messages.slice(0, lastUserIdx),
+              { ...last, content: `${last.content}\n\n${turnBubbleNote}` },
+              ...ctx.messages.slice(lastUserIdx + 1),
+            ],
+          };
+        }
+      }
 
       const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 

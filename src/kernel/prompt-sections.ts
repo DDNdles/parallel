@@ -11,7 +11,7 @@
 // ============================================================
 
 import type { Role } from './types.ts';
-import { MAX_BUBBLES, RECOMMENDED_REPLY_CHARS, pickBubbleTarget } from './humanlike/delivery.ts';
+import { MAX_BUBBLES } from './humanlike/delivery.ts';
 
 /** 信任边界：不可信输入的判据。chat/work 两轮共用。 */
 export const TRUST_BOUNDARY_TEXT = [
@@ -31,30 +31,46 @@ export const CHAT_STYLE_TEXT = `回复要求：简短自然、口语化、适合
 
 /**
  * chat 轮的输出口径（order 440，内核固定节）——2026-10-17 起取代 HDSI 的剧本体格式指令。
- * 这是 chat 轮**唯一**一段规定"输出长什么样"的文字：说几条、多长、什么语气。
- * 模型说什么就发什么；程序侧只做兜底（按句分条、超长句边截断、token 硬顶），不做格式矫正。
+ * 这是 chat 轮规定"输出长什么样"的固定规则节；2026-10-26 起不再把每轮抽签的目标条数写进这里
+ * （保持跨轮稳定、保住前缀缓存，同时避免被历史里的多行示范压过），每轮条数由 `chatTurnBubbleNote`
+ * 追加在本轮最后一条 user 消息末尾。模型说什么就发什么；程序侧只做兜底（按句分条、超长句边截断、token 硬顶）。
  */
 export function chatOutputStyleText(opts: {
   maxChars: number;
-  /** 每轮程序抽签的目标气泡数（必传）；expectedBubbles/maxBubbles 是抽签参数与兜底 */
-  targetBubbles: number;
+  /** @deprecated 每轮目标条数已挪到 chatTurnBubbleNote，保留可选字段兼容旧调用 */
+  targetBubbles?: number;
   expectedBubbles?: number;
   maxBubbles?: number;
 }): string {
   const n = Math.max(20, Math.round(opts.maxChars));
-  const recommend = Math.min(RECOMMENDED_REPLY_CHARS, n);
   const maxBubbles = Math.max(1, Math.round(opts.maxBubbles ?? MAX_BUBBLES));
-  const target = Math.max(1, Math.min(Math.round(opts.targetBubbles), maxBubbles));
   return [
     `# 你的回复`,
     `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
-    `- 一句一条最好；单条尽量不超过 20 个字，句尾不用加句号，别把一长串用逗号连成一句。`,
-    `- 这次回复就发 ${target} 条气泡、总共 ${recommend} 字以内：把回复写成 ${target} 行、一行一条，程序照你写的行发。内容确实说不完时可以多写几行，但一次最多 ${maxBubbles} 条（超出的会被合并），别为了凑条数把一句话硬拆成几条。`,
+    `- 一行就是一条气泡：程序按你写的行发。`,
+    `- 每轮该发几条写在最新那条消息末尾的【本轮】里，照它来。`,
     `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
     `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
     `- 想发表情就写 [表情/微笑] 或 [表情/14]；名字必须完全匹配（比如「呜呜呜」不是「呜呜」，「大哭」不是「哭」），拿不准就用编号。不要写 [微笑] 这种纯文字，也不要描述表情。`,
-    `- 硬上限：一次回复总共不超过 ${n} 个字、最多 ${maxBubbles} 条气泡；超出字数的部分会被截掉，气泡太多会合并。想分条就换行写。`,
+    `- 硬上限：一次回复总共不超过 ${n} 个字、最多 ${maxBubbles} 条气泡；超出字数的部分会被截掉，气泡太多会合并。`,
+    `- 上面历史里你以前每次发了几条不用参考，那是以前的条数；这次只看【本轮】。`,
+    `- 一行只放一句话、20 字以内：一行里出现 。！？；会被程序从那里拆开，一行太长会被截断。`,
   ].join('\n');
+}
+
+/**
+ * chat 轮追加在本轮最后一条 user 消息末尾的条数软约束（只进当次请求体，不进会话历史）：
+ *  - 为什么放消息末尾而不是 system 440：history.pushAssistant 把过往每轮的气泡用换行拼进历史，
+ *    模型眼前全是几行一条的示范；目标数写在 system 中段会被近因示范压过，紧挨生成起点才能压住历史惯性；
+ *  - 软约束口径：闲聊照抽签的 target 行写；对方明确要列举、讲步骤或一次问多件事时按需要写够（最多 maxBubbles 条）。
+ */
+export function chatTurnBubbleNote(opts: {
+  targetBubbles: number;
+  maxBubbles?: number;
+}): string {
+  const maxBubbles = Math.max(1, Math.round(opts.maxBubbles ?? MAX_BUBBLES));
+  const target = Math.max(1, Math.min(Math.round(opts.targetBubbles), maxBubbles));
+  return `【本轮】闲聊就回 ${target} 条：写 ${target} 行，一行一句。对方明确要你列举、讲步骤，或一次问了好几件事时，按需要写够（最多 ${maxBubbles} 条），不受 ${target} 条限制 —— 但还是一行一句、别把一行写长。`;
 }
 
 /** 会话标签：'QQ 群聊「名字」(号)' / 'QQ 私聊(号)' */

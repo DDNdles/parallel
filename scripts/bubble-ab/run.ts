@@ -2,7 +2,7 @@
 // 气泡数软约束 A/B：同一真实上下文、同一目标条数，比较不同提示写法下「模型写了几行 → 程序实际发几条」
 import fs from 'node:fs';
 import { normalizeVisibleContent, splitIntoBubbles, trimAtSentence } from '../../src/kernel/humanlike/delivery.ts';
-import { chatOutputStyleText } from '../../src/kernel/prompt-sections.ts';
+import { chatOutputStyleText, chatTurnBubbleNote } from '../../src/kernel/prompt-sections.ts';
 // @ts-ignore
 import { buildContexts } from './ctx.mjs';
 
@@ -36,18 +36,31 @@ const STABLE_440_D = (max: number) => STABLE_440(max) + '\n' + [
   `- 一行只放一句话、20 字以内：一行里出现 。！？；会被程序从那里拆开，一行太长会被截断。`,
 ].join('\n');
 
+const LEGACY_440 = (t: number, max: number) => [
+  `# 你的回复`,
+  `- 像随手打的消息：口语、短句，一两句话说清就停 —— 不解释、不总结、不追着一串问。`,
+  `- 一句一条最好；单条尽量不超过 20 个字，句尾不用加句号，别把一长串用逗号连成一句。`,
+  `- 这次回复就发 ${t} 条气泡、总共 50 字以内：把回复写成 ${t} 行、一行一条，程序照你写的行发。内容确实说不完时可以多写几行，但一次最多 ${max} 条（超出的会被合并），别为了凑条数把一句话硬拆成几条。`,
+  `- 对面短你也短：对方发几个字，你回一大段就出戏了。`,
+  `- 不用 Markdown、不用列表；不要写括号或星号包起来的动作、神态 —— 你只是在打字说话。`,
+  `- 想发表情就写 [表情/微笑] 或 [表情/14]；名字必须完全匹配，拿不准就用编号。不要写 [微笑] 这种纯文字，也不要描述表情。`,
+  `- 硬上限：一次回复总共不超过 100 个字、最多 ${max} 条气泡；超出字数的部分会被截掉，气泡太多会合并。想分条就换行写。`,
+].join('\n');
+
 function tail(variant: string, t: number, max: number): string {
   if (variant === 'B') return `\n\n【本轮】这次回 ${t} 条：写 ${t} 行，一行一条。内容确实说不完可以多写几行，最多 ${max} 条。`;
   if (variant === 'C') return `\n\n【本轮】这次回 ${t} 条：写 ${t} 行。` + (t === 1 ? '只写一行、一句话。' : '') + `对方问的事一两句讲不清时可以多写，最多 ${max} 条；闲聊就照 ${t} 条。`;
   if (variant === 'D') return `\n\n【本轮】这次回 ${t} 条：写 ${t} 行，一行一句。只有对方问的事 ${t} 条确实讲不清时才多写几行（最多 ${max} 条）—— 宁可多一行，也别把一行写长。`;
-  if (variant === 'E') return `\n\n【本轮】闲聊就回 ${t} 条：写 ${t} 行，一行一句。对方明确要你列举、讲步骤，或一次问了好几件事时，按需要写够（最多 ${max} 条），不受 ${t} 条限制 —— 但还是一行一句、别把一行写长。`;
+  if (variant === 'E') return `\n\n` + chatTurnBubbleNote({ targetBubbles: t, maxBubbles: max });
   return '';
 }
 
 function system(variant: string, t: number, isGroup: boolean, file: string): string {
   const sec = variant === 'A'
-    ? chatOutputStyleText({ maxChars: 100, targetBubbles: t, maxBubbles: 6 })
-    : variant === 'B' ? STABLE_440(6) : (variant === 'D' || variant === 'E') ? STABLE_440_D(6) : STABLE_440_PLUS(6);
+    ? LEGACY_440(t, 6)
+    : variant === 'E'
+      ? chatOutputStyleText({ maxChars: 100, maxBubbles: 6 })
+      : variant === 'B' ? STABLE_440(6) : variant === 'D' ? STABLE_440_D(6) : STABLE_440_PLUS(6);
   let s = base.slice(0, s440) + sec + base.slice(e440);
   if (!isGroup) s = s.replace(/当前会话：.*?\n/, `当前会话：QQ 私聊(${file.match(/\d+/)![0]})。\n`);
   return s;

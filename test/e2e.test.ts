@@ -1272,6 +1272,9 @@ test('拟人化：首轮请求不会把同一条用户消息发两遍', async ()
   const joined = String(call?.usersJoined ?? '');
   const hits = joined.split('独一无二的一句话').length - 1;
   assert.equal(hits, 1, `同一条消息只该出现一次，实际 ${hits} 次: ${joined}`);
+  assert.ok(joined.includes('【本轮】闲聊就回'), `请求体末条 user 应带【本轮】条数软约束: ${joined}`);
+  const hist = kernel.history.snapshot({ platform: 'qq', type: 'group', chatId: String(G) });
+  assert.ok(!hist.some((m) => String(m.content).includes('【本轮】')), '【本轮】尾注只进请求体，不该污染会话历史');
 });
 
 test('拟人化：她还在发气泡时被插话打断，剩下的气泡不发也不进历史', async () => {

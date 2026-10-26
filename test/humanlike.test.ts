@@ -17,6 +17,7 @@ import {
   DEFAULT_SCHEDULE, currentActivity, upcoming, prunePlan, schedulePrompt,
 } from '../src/kernel/humanlike/schedule.ts';
 import { DEFAULT_CONFIG } from '../src/kernel/config.ts';
+import { chatOutputStyleText, chatTurnBubbleNote } from '../src/kernel/prompt-sections.ts';
 import { Bus } from '../src/kernel/bus.ts';
 import { ErrorCenter } from '../src/kernel/errors.ts';
 import { ChatService, type TransportAdapter } from '../src/kernel/services/chat.ts';
@@ -924,3 +925,18 @@ test('pickBubbleTarget 自定义权重：按权重归一化、0=禁用、缺档�
   // 负数/超 100 夹紧 [0,100]
   assert.equal(pickBubbleTarget(3, 2, { weights: [-5, 999], rand: () => 0.99 }), 2);
 });
+
+test('气泡条数软约束：440 节跨轮稳定不写每轮目标数，当轮条数与列举/多问突破规则写在 chatTurnBubbleNote', () => {
+  const s1 = chatOutputStyleText({ maxChars: 100, targetBubbles: 1, maxBubbles: 6 });
+  const s4 = chatOutputStyleText({ maxChars: 100, targetBubbles: 4, maxBubbles: 6 });
+  assert.equal(s1, s4, '440 节不随每轮 target 变化（保住前缀缓存）');
+  assert.ok(s1.includes('【本轮】'), '440 节指向末尾【本轮】');
+  assert.ok(s1.includes('以前每次发了几条不用参考'), '440 节提醒忽略历史里的行数示范');
+  assert.ok(s1.includes('一行里出现 。！？；会被程序从那里拆开'), '440 节如实告知句末标点会拆条');
+
+  const n2 = chatTurnBubbleNote({ targetBubbles: 2, maxBubbles: 6 });
+  assert.ok(n2.startsWith('【本轮】闲聊就回 2 条：写 2 行，一行一句。'), n2);
+  assert.ok(n2.includes('列举、讲步骤，或一次问了好几件事') && n2.includes('最多 6 条'), n2);
+  assert.ok(chatTurnBubbleNote({ targetBubbles: 99, maxBubbles: 5 }).includes('闲聊就回 5 条'), 'target 超出 maxBubbles 时夹紧');
+});
+
