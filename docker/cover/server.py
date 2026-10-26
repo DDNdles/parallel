@@ -215,7 +215,10 @@ def rvc_convert(vocal_wav: Path, out_dir: Path) -> Path:
     if not runner.exists():
         raise RuntimeError(f"找不到 RVC 入口：{runner}")
     env = dict(os.environ)
+    env.pop("PYTHONHOME", None)
     # setup_runtime may record a separate libpython directory (uv builds).
+    # Set this BEFORE probing sysconfig: without it the RVC Python cannot start
+    # and the probe returns empty, leaving the job's PYTHONPATH in place.
     try:
         profile = json.loads((RVC_PACKAGE / "runtime.local.json").read_text(encoding="utf-8"))
         libdir = str(profile.get("python_library_dir") or "").strip()
@@ -223,6 +226,22 @@ def rvc_convert(vocal_wav: Path, out_dir: Path) -> Path:
             env["LD_LIBRARY_PATH"] = libdir + ":" + env.get("LD_LIBRARY_PATH", "")
     except Exception:  # noqa: BLE001
         pass
+    # The job env (ACE-Step) may carry a PYTHONPATH that shadows the RVC venv;
+    # pin the venv's own site-packages (numpy/torch/etc. live there).
+    venv_lib = RVC_PYTHON.parent.parent / "lib"
+    sites = sorted(venv_lib.glob("python*/site-packages"))
+    site = str(sites[0]) if sites else ""
+    if not site:
+        try:
+            probe = subprocess.run(
+                [str(RVC_PYTHON), "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+            site = probe.stdout.strip() if probe.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            site = ""
+    if site:
+        env["PYTHONPATH"] = site
     env["HF_HUB_OFFLINE"] = "1"
     env["TRANSFORMERS_OFFLINE"] = "1"
     result = subprocess.run(
