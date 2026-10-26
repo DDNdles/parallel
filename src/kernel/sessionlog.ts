@@ -440,13 +440,50 @@ export class SessionLog {
     });
   }
 
-  /** 按协议端消息号在本会话的内存尾里找一条（引用回查用）。找不到就 null——UI 留着 [回复:id] 占位 */
+  /** 按协议端消息号在本会话里找一条（引用回查用）：先查内存尾，查不到再回磁盘里找。
+   *  内存尾只有 tailSize 条（引用却常常指向很久以前发的一张图），磁盘日志才是全的；
+   *  磁盘这一层同样走尾部限窗，只为一次引用不回读几十兆。找不到才 null（UI 留着 [回复:id] 占位）。 */
   findByMessageId(chatId: string, chatType: string, messageId: string): SessionLogEntry | null {
     if (!messageId) return null;
     const buf = this.tail(chatId, chatType, Number.MAX_SAFE_INTEGER);
     for (let i = buf.length - 1; i >= 0; i--) {
       const e = buf[i];
-      if ((e.data as { messageId?: string } | undefined)?.messageId === messageId) return e;
+      if (String((e.data as { messageId?: string } | undefined)?.messageId ?? '') === messageId) return e;
+    }
+    return this.findByMessageIdOnDisk(chatId, chatType, messageId);
+  }
+
+  /** findByMessageId 的磁盘兜底：从文件尾部限窗倒着扫，命中就返回（新→旧，取最新一条） */
+  private findByMessageIdOnDisk(chatId: string, chatType: string, messageId: string): SessionLogEntry | null {
+    const file = join(this.dir, this.chatKey(chatId, chatType) + '.jsonl');
+    if (!existsSync(file)) return null;
+    try {
+      const size = statSync(file).size;
+      const windowLen = Math.min(size, SEARCH_SCAN_MAX_BYTES);
+      const window = Buffer.alloc(windowLen);
+      const fd = openSync(file, 'r');
+      try {
+        readSync(fd, window, 0, windowLen, size - windowLen);
+      } finally {
+        closeSync(fd);
+      }
+      // 窗口起头截在半行上时整行丢弃（宁少一行不错一行），与 searchMessages 同一口径
+      let from = 0;
+      if (size > windowLen) {
+        const firstNl = window.indexOf(0x0a);
+        if (firstNl === -1) return null;
+        from = firstNl + 1;
+      }
+      const lines = window.toString('utf8', from).split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        let e: SessionLogEntry;
+        try { e = JSON.parse(line); } catch { continue; }
+        if (String((e.data as { messageId?: string } | undefined)?.messageId ?? '') === messageId) return e;
+      }
+    } catch {
+      return null;
     }
     return null;
   }

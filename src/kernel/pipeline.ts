@@ -3,6 +3,7 @@ import { composeSystem } from './types.ts';
 import type { PluginContainer } from './container.ts';
 import type { AgentLoop, HistoryStore } from './agentloop.ts';
 import type { ChatService } from './services/chat.ts';
+import type { SandboxService } from './services/sandbox.ts';
 import type { LlmService } from './services/llm.ts';
 import type { MemoryService } from './services/memory.ts';
 import type { SessionLog } from './sessionlog.ts';
@@ -34,7 +35,8 @@ import { todayKey, newId } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
 import { CONTEXT_CONTINUITY_TEXT, TRUST_BOUNDARY_TEXT, chatIdentitySystem, chatOutputStyleText, chatTurnBubbleNote } from './prompt-sections.ts';
 import { fileURLToPath } from 'node:url';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { existsSync } from 'node:fs';
 
 /** 按扩展名猜媒体类型；猜不出来返回 undefined，由线格式按 kind 兜底 */
 function mimeOf(hint: string): string | undefined {
@@ -263,6 +265,7 @@ export class Pipeline {
     private llm: LlmService,
     private history: HistoryStore,
     private chat: ChatService,
+    private sandbox: SandboxService,
     private memory: MemoryService,
     private sessionLog: SessionLog,
     private config: ConfigStore,
@@ -495,6 +498,32 @@ export class Pipeline {
 
   private queueLen(key: string): number {
     return this.queueLens.get(key) ?? 0;
+  }
+
+  /**
+   * 被引用消息里的图片（2026-10-26）：`attachReply` 已经把原消息的 files 一起取回来了，
+   * 但正文里只是一句「（引用「某人」：[图片]）」——图片消息的正文就是占位符，
+   * 模型据此并不知道图上画了什么。这里把那些文件读成本轮附件，引用回来的是图本身。
+   * 只认沙箱里还在的图片文件（被 TTL 清掉的跳过，不当成"有图但看不见"）；最多 3 张。
+   */
+  private quotedImages(events: ChatEvent[], chat: ChatRef): MessageAttachment[] {
+    const out: MessageAttachment[] = [];
+    const seen = new Set<string>();
+    const root = this.sandbox.root(chat);
+    for (const e of events) {
+      for (const f of e.replyTo?.files ?? []) {
+        const rel = String(f.rel ?? '').trim();
+        if (!rel) continue;
+        const mime = mimeOf(rel);
+        if (!mime || !mime.startsWith('image/')) continue;
+        const abs = isAbsolute(rel) ? rel : join(root, rel);
+        if (seen.has(abs) || !existsSync(abs)) continue;
+        seen.add(abs);
+        out.push({ kind: 'image', path: abs, name: f.name || rel.split('/').pop(), mime });
+        if (out.length >= 3) return out;
+      }
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------- 处理
@@ -837,7 +866,11 @@ export class Pipeline {
       // 合并轮里 carrier 只是最后那条，只看它会把前面几条的图/语音一起吞掉（事件少时等价于旧行为）。
       const batch = opts?.batch ?? [];
       const batchMedia = batch.map((e) => ({ e, atts: attachmentsOf(e) }));
-      const turnAttachments = batch.length ? batchMedia.flatMap((x) => x.atts) : attachmentsOf(event);
+      // 被引用消息里的图：和本轮自带的媒体一起去重后附上（引用一张图 = 让模型看见那张图）
+      const quotedImages = this.quotedImages(batch.length ? batch : [event], chat);
+      const ownAttachments = batch.length ? batchMedia.flatMap((x) => x.atts) : attachmentsOf(event);
+      const seenAtt = new Set(ownAttachments.map((a) => a.path || a.url || '').filter(Boolean));
+      const turnAttachments = [...ownAttachments, ...quotedImages.filter((a) => !seenAtt.has(a.path || a.url || ''))];
       // 本轮媒体补传：说清"这一发请求里带了哪些媒体、分别长在哪条消息上"。
       // 图片由播种区按消息归位；语音/视频块统一补在最新那条用户消息上——两件事都交代清楚，模型才找得到。
       const mediaLines = [
@@ -845,6 +878,10 @@ export class Pipeline {
         // 窗口内的历史消息：ChatMessage 不带作者（只有 role/正文/时刻），按"更早的消息"标注
         ...windowHistory.map((m) => mediaLineOf('更早的消息', m.ts, m.attachments)),
       ].filter((l): l is string => !!l);
+      const quotedNew = turnAttachments.length - ownAttachments.length;
+      if (quotedNew > 0) {
+        mediaLines.push(`被引用的那条消息里的 ${quotedNew} 张图也附在这一轮（引用回来的是图本身，不只是「[图片]」这个占位）`);
+      }
       if (mediaLines.length) {
         systemSections.push({
           order: 475, title: 'media-handoff',

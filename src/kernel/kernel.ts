@@ -237,7 +237,7 @@ export class Kernel {
       return { connected: !!s.connected, selfId: s.selfId ?? '', nickname: s.selfNickname ?? '' };
     });
     this.pipeline = new Pipeline(
-      this.container, this.agentLoop, this.llm, this.history, this.chat, this.memory, this.sessionLog,
+      this.container, this.agentLoop, this.llm, this.history, this.chat, this.sandbox, this.memory, this.sessionLog,
       this.config, this.errors, this.bus, this.db, this.workRunner, this.humanlike,
       (event) => this.resolveRole(event),
       (chatId) => this.adapter.groupName(chatId) || `群${chatId}`,

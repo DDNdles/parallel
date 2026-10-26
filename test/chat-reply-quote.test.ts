@@ -45,7 +45,8 @@ test('引用 bot 的出站消息：出站落账带 messageId，入站回查成 r
   const mock = new MockOneBot(`ws://127.0.0.1:${cfg.onebot.port}/onebot`, kernel.config.secrets.onebotAccessToken);
   await mock.connect();
   try {
-    await until(() => mock.actions.some((a) => a.action === 'get_login_info'), 5000, '协议端握手');
+    // 等 selfId 就位再发：@ 判断靠它，登录回包还没处理完就发会被当成普通消息（frequency 门控会攒着不动）
+    await until(() => (kernel.adapter as any).status?.()?.selfId, 5000, '协议端登录');
 
     const groupId = '9600';
     const chat = { platform: 'qq' as const, type: 'group' as const, chatId: groupId };
@@ -73,6 +74,90 @@ test('引用 bot 的出站消息：出站落账带 messageId，入站回查成 r
     assert.ok(quote, '引用应该被查回成快照，而不是只留 [回复:id] 占位');
     assert.equal(quote!.text, '被引用的原话');
     assert.equal(quote!.nickname, 'parallel-test', '引用自己的消息时，昵称用 bot 自己的');
+  } finally {
+    mock.close();
+    await kernel.shutdown();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('引用回查：内存尾之外的旧消息按消息号回磁盘找回来', async () => {
+  const { SessionLog } = await import('../src/kernel/sessionlog.ts');
+  const { Bus } = await import('../src/kernel/bus.ts');
+  const d = mkdtempSync(join(tmpdir(), 'parallel-reply-deep-'));
+  try {
+    const first = new SessionLog(d, new Bus());
+    first.append('g9', 'group', {
+      type: 'message_in', role: 'user', userId: '1', nickname: 'A', text: '[图片]',
+      data: { messageId: '9001', files: [{ name: 'old.png', rel: 'inbox/old.png', sandboxPath: 'x', size: 1 }] },
+    } as any);
+    // 往后灌 340 条，把那条挤出内存尾（tailSize=300）
+    for (let i = 0; i < 340; i++) {
+      first.append('g9', 'group', { type: 'gate', role: 'system', text: `g${i}`, data: {} } as any);
+    }
+    const second = new SessionLog(d, new Bus());   // 新实例：内存里只有最后 300 条
+    const inMem = second.tail('g9', 'group', Number.MAX_SAFE_INTEGER);
+    assert.ok(!inMem.some((e) => (e.data as any)?.messageId === '9001'), '老消息不该在内存尾里');
+
+    const hit = second.findByMessageId('g9', 'group', '9001');
+    assert.ok(hit, '内存尾查不到时要回磁盘里找回来');
+    assert.equal(hit!.text, '[图片]');
+    assert.equal((hit!.data as any).files[0].rel, 'inbox/old.png', '被引用消息的文件清单要一起带回来');
+    assert.equal(second.findByMessageId('g9', 'group', '不存在'), null, '真没有就返回 null');
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('引用一张图：那张图作为附件进本轮请求，模型真的看得见', async () => {
+  const { Kernel } = await import('../src/kernel/kernel.ts');
+  const dataDir = mkdtempSync(join(tmpdir(), 'parallel-reply-img-'));
+  const kernel = new Kernel({ dataDir, noApi: true });
+  const cfg = kernel.config.config as any;
+  cfg.onebot.port = 30000 + (process.pid % 20000);
+  cfg.providers.mock = {
+    label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
+    models: [{ id: 'mock-1', enabled: true, inputTypes: ['text', 'image'] }],
+  };
+  cfg.llm.activeProvider = 'mock';
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.risk.replyRatePerMin = 10_000;
+  cfg.masterIds = ['10008'];
+  Object.assign(cfg.humanlike.outgoing, {
+    typingBaseDelaySeconds: 0, typingMaxDelaySeconds: 0, typingJitterRatio: 0,
+  });
+  await kernel.boot();
+  const groupId = '9601';
+  const chat = { platform: 'qq' as const, type: 'group' as const, chatId: groupId };
+  kernel.container.setGroupState('chat', groupId, true, '10008');
+  const mock = new MockOneBot(`ws://127.0.0.1:${cfg.onebot.port}/onebot`, kernel.config.secrets.onebotAccessToken);
+  await mock.connect();
+  try {
+    // 等 selfId 就位再发：@ 的判定靠它，登录回包还没处理完就发，这条会被当成普通消息攒进 frequency 门控
+    await until(() => String((kernel.adapter as any).status?.()?.selfId ?? ''), 5000, '协议端登录');
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    kernel.sandbox.write(chat, 'inbox/q.png', png);
+    // 旧的那条图片消息（引用回查靠协议端消息号对上）
+    kernel.sessionLog.append(groupId, 'group', {
+      type: 'message_in', role: 'user', userId: '10008', nickname: '小明', text: '[图片]',
+      data: { messageId: '777001', files: [{ name: 'q.png', rel: 'inbox/q.png', size: png.length }] },
+    } as any);
+
+    const provider = (kernel.llm as any).providers.get('mock');
+    mock.sendGroupMessage({
+      groupId: Number(groupId), userId: 10008, text: '这张图里是什么', atMe: true,
+      extraSegments: [{ type: 'reply', data: { id: '777001' } }],
+    });
+    const call = await until(
+      () => provider.calls.find((c: any) => String(c.usersJoined ?? '').includes('这张图里是什么')),
+      8000, '本轮请求',
+    );
+    assert.ok((call.media ?? []).includes('image'), `被引用的图要作为附件附上：${JSON.stringify(call.media)}`);
+    assert.ok(String(call.usersJoined).includes('引用'), `引用块要保留：${call.usersJoined}`);
   } finally {
     mock.close();
     await kernel.shutdown();
