@@ -10,7 +10,7 @@
     "sandbox.exec"
   ],
   "core": true,
-  "defaultGroupState": "off",
+  "defaultGroupState": "on",
   "userConfig": {
     "defaultTimeoutMs": {
       "type": "number",
