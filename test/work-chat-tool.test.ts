@@ -339,7 +339,7 @@ test('一字不差传话：verbatimTaskOf 任务正文=发起人原话，chat �
   assert.equal(stripRelayNoise(' [回复:123] @3893163081 画一张 @all 的图 [图片] '), '画一张 @all 的图 [图片]');
 });
 
-test('work_dispatch 端到端：派出去的是用户原话（程序代传），列表短标=原话单行', async () => {
+test('work_dispatch 端到端：直接使用 chat 传入的 task（不再由程序强制用本轮消息覆盖，多轮催促也不丢任务）', async () => {
   const g = await boot('9406');
   g.mock.script.length = 0;
   try {
@@ -349,27 +349,26 @@ test('work_dispatch 端到端：派出去的是用户原话（程序代传），
       userId, nickname, senderRole: 'member' as const, segments: [], text,
       isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: 'member' as any,
     });
-    const ask = ev('30003', '小明', '帮我画一张豆包和奶龙对打的图，豆包要占上风');
-    ask.role = 'admin';   // 派活按提需求者的角色判：小明得是管理员这件活才派得出去
+    const nudge = ev('30003', '小明', '你根本没派');
+    nudge.role = 'admin';   // 派活按提需求者的角色判：小明得是管理员这件活才派得出去
     const chatter = ev('10002', 'Lawrence', '哈哈这个梗好笑');
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '画好了' } }] });
     g.mock.script.push({ content: '好了' });
     await dispatch.handler(
-      { task: '生成一张豆包与奶龙战斗、豆包占上风的趣味插画', requester: '小明' },
-      { event: chatter, batch: [ask, chatter], chat: g.chat, role: 'owner' as const } as any,
+      { task: '帮我画一张豆包和奶龙对打的图，豆包要占上风', requester: '小明' },
+      { event: chatter, batch: [nudge, chatter], chat: g.chat, role: 'owner' as const } as any,
     );
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
     const run = await until(() => g.kernel.workRunner.list(10, g.chatKey)[0], 8000, '任务开跑');
-    // 列表/进度条上的 task 是短标（原话单行），不是 chat 的转述
+    // 列表/进度条上的 task 与 work 收到的任务正文都直接使用 chat 传入的 task，不会被本轮的「你根本没派」覆盖
     assert.equal(run.task, '帮我画一张豆包和奶龙对打的图，豆包要占上风');
-    // work 真正收到的任务正文（首轮请求里）是原话块，chat 的措辞不许出现
     const call = await until(
-      () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('用户原话（一字未改）')),
+      () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('豆包要占上风')),
       8000, 'work 首轮请求',
     );
     const body = String(call.usersJoined);
-    assert.ok(body.includes('豆包要占上风'), '原话进任务正文');
-    assert.ok(!body.includes('趣味插画'), 'chat 转述不许进任务正文');
+    assert.ok(body.includes('帮我画一张豆包和奶龙对打的图，豆包要占上风'), 'chat 传入的 task 进任务正文');
+    assert.ok(!body.includes('你根本没派'), '本轮催促消息不该覆盖任务正文');
   } finally {
     await g.cleanup();
   }

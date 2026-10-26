@@ -326,22 +326,22 @@ export function setup(ctx: PluginContext): void {
 
   ctx.llm.registerTool({
     name: 'work_dispatch',
-    description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。派出去的是**用户原话**（程序原样代传，不经你转述）。',
+    description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。',
     // 不设 minRole：普通群友的 chat 也要"知道有这个能力、然后拒绝"，而不是工具凭空消失
     surface: 'chat',
-    promptSnippet: '把需要实际动手的活派给工作子代理（任务按用户原话代传，可附聊天原文上下文）',
+    promptSnippet: '把需要实际动手的活派给工作子代理（task 尽量保留用户原话，自带前因后果）',
     promptGuidelines: [
-      'task 只填你对这件活的一句话理解——它只用来对准用户哪句话是需求，真正派出去的是**用户原话**，由程序原样代传。你不负责转述，更不要替用户补充或收窄细节（尤其是画图的画面描述）。',
+      '派活的 task 就是工作子代理真正收到的任务正文（它看不到你们的聊天）：把用户的**原话要求**完整写进 task，不要擅自删改、润色或脑补细节（尤其是画图的画面描述，用户怎么说就怎么传）；如果需求散在前面几轮对话里，把前因后果和用户的原话一并整理进 task。',
       '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
       '新旧任务由你判断，但**用户对刚做完（或最近）的任务提修改、调整条件、说不满意、要求照着改一版——一律算那个任务的延续**：带 continue_run（任务号看 work_status，或 latest）沿用原沙箱接着做，绝不能新开任务从头重做（对方看得见你重做了几遍）。只有和要求无关的新事情才开新任务。',
-      '这件活要靠更早的聊天内容（之前提过的要求/偏好/来龙去脉）时，用 context_quotes 带上：每段从你看到的消息里**一字不差地引用**原文片段，程序核对后把整条原话附给 work。只能选、不能改——转述或改写的片段会被丢弃。',
+      '这件活要靠更早的聊天内容（之前提过的要求/偏好/来龙去脉）时，除了写进 task，也可以用 context_quotes 附上你看到的消息原文片段。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
       '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
     ],
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '你对这件活的一句话理解（程序拿它对准用户原话，不会作为任务正文派出）' },
+        task: { type: 'string', description: '要交给工作子代理做的事：尽量保留用户的原话要求（不要擅自改写或脑补细节），需要前文背景时一并写清目标、输入和要交回什么' },
         requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
         continue_run: { type: 'string', description: '用户明确要「接着旧任务继续」时填：work_status 列出的任务号，或 latest=他最近一个任务。填了=沿用那个任务的沙箱与文件；不填=全新任务（全新沙箱，看不到旧任务文件）。用户没明确要继续就不要填。' },
         context_quotes: {
@@ -363,18 +363,16 @@ export function setup(ctx: PluginContext): void {
       if (ctx.work.modelLabel() === '—') {
         return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
       }
-      // 一字不差传话：任务正文=用户原话（程序代传）；本轮找不到原话（比如发起人只发了图）才退回 chat 的理解，并注明是转述
-      const verbatim = verbatimTaskOf(modelTask, tctx, who);
-      let task = verbatim.task
-        || `${modelTask}\n\n（注：本轮没找到发起人的文字原话，以上是聊天侧的理解，仅此情况允许转述。）`;
-      // 相关聊天上下文：chat 模型只给原文片段，内核逐字核对后整条附上（它选得了、改不了）
+      // 2026-10-26 用户改定：不再由程序强制拿本轮消息覆盖 task（多轮对话后用户催一句"你根本没派"
+      // 会把催促当成任务正文派出去），直接采用 chat 模型写的 task，由提示词约束它保留用户原话与前文背景。
+      let task = modelTask;
+      // 相关聊天上下文：chat 模型给了原文片段时，内核逐字核对后整条附上
       const quotes = Array.isArray(args.context_quotes)
         ? (args.context_quotes as unknown[]).map((q) => String(q ?? '')).filter(Boolean)
         : [];
       const picked = selectChatContext(quotes, tctx.contextMessages);
       if (picked.section) task += picked.section;
-      // 短标只用于进度条/列表：有原话用原话单行；退回转述时保留全文（老口径：任务全文不截断）
-      const label = verbatim.label || modelTask;
+      const label = modelTask;
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
       const userId = who.userId || tctx.event.userId;

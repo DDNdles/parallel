@@ -419,7 +419,7 @@ export function setup(ctx: PluginContext): void {
     const lines = [
       '# 生图',
       '- 对方要图（画一张、生成图片、按描述作图、照这张图改）时，让 work 去做：work 有 generate_image 工具，支持文生图，也支持拿会话沙箱里的图片当参考。',
-      '- 派活走 work_dispatch，画面描述会按**用户原话**一字不差代传：不要替对方改写、翻译或润色他要的画面，他说什么就是什么。',
+      '- 派活走 work_dispatch，task 里把用户的画面描述**原话**完整带过去：不要替对方改写、翻译或润色他要的画面，他说什么就是什么。',
       `- 普通成员每个自然周（周一起算）最多 ${weeklyQuota} 张；主人与管理员${ownerUnlimited ? '不限张数' : '同样按这个额度算'}。额度用完就如实告诉对方下周再来，不要用文字假装已经画好。`,
     ];
     if (!apiKey) lines.push('- 这台 bot 目前还没配置 Gemini API Key，画不了图；对方要图时直说现在生不了。');
