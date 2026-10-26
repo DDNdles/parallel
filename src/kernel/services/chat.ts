@@ -391,18 +391,18 @@ export class ChatService implements ChatSendService {
   }
 
   /**
-   * 贴表情（在别人的群消息下面挂一个 QQ 表情回应）。
+   * 贴表情（在别人的消息下面挂一个 QQ 表情回应）。
    *
    * 模型看不到消息号（编号戳 2026-10-17 已删），所以「贴哪条」由程序定位：
    *  - 给了 target（QQ 号或昵称）→ 这个人最近一条入站消息；
-   *  - 没给 → 本会话最近一条入站消息（对面刚说的那句）。
+   *  - 没给 → 本会话最近一条入站消息（对面刚说的那句；私聊就是对方刚说的）。
    * emoji 走内核既有的 QQ 表情名体系（`[表情/微笑]` 那套名字/别名/编号），
    * 解析出的 face 编号直接当 `emoji_id` 用（LLBot 按长度判 face 档）。
+   * 群聊与私聊同一套逻辑；私聊能不能真贴上由协议端决定（NapCat 可以，LLBot 只做了群聊）。
    */
   async react(chat: ChatRef, emoji: string, target?: string): Promise<{
     messageId: string; emojiId: string; emojiName: string; userId?: string; nickname?: string;
   }> {
-    if (chat.type !== 'group') throw new Error('贴表情只支持群聊（协议端不支持私聊消息上的表情回应）');
     const rawEmoji = String(emoji ?? '').trim();
     const emojiId = qqFaceId(rawEmoji);
     if (!emojiId) throw new Error(`认不出这个表情「${rawEmoji}」：写表情名（如 微笑/笑哭/赞）或编号`);

@@ -18,7 +18,7 @@ export class MockOneBot {
   actions: { action: string; params: any; echo?: string }[] = [];
   private replies = new Map<string, unknown>();
   /** 一律回 failed 的动作（测"协议端不支持这个动作"） */
-  private fails = new Set<string>();
+  private fails = new Map<string, string>();
   connected = false;
 
   constructor(
@@ -64,8 +64,9 @@ export class MockOneBot {
         try { msg = JSON.parse(String(data)); } catch { return; }
         if (msg.echo) {
           this.actions.push({ action: msg.action, params: msg.params, echo: msg.echo });
-          if (this.fails.has(msg.action)) {
-            ws.send(JSON.stringify({ status: 'failed', retcode: 1400, message: '不支持的动作（测试设定）', echo: msg.echo }));
+          const failMsg = this.fails.get(msg.action);
+          if (failMsg !== undefined) {
+            ws.send(JSON.stringify({ status: 'failed', retcode: 1400, message: failMsg, echo: msg.echo }));
             return;
           }
           const raw = this.replies.get(msg.action) ?? this.defaultReply(msg.action, msg.params);
@@ -92,9 +93,9 @@ export class MockOneBot {
   /** 指定某动作的回包（覆盖默认）：测"段里只有一个 id、正文要再问一次"这类协议端往返 */
   setReply(action: string, data: unknown): void { this.replies.set(action, data); }
 
-  /** 让某动作一律回 failed（传 false 撤销）：测协议端不支持这个动作时内核怎么走 */
-  failAction(action: string, on = true): void {
-    if (on) this.fails.add(action); else this.fails.delete(action);
+  /** 让某动作一律回 failed（传 false 撤销；message 自定义报错文案）：测协议端不支持这个动作时内核怎么走 */
+  failAction(action: string, on = true, message = '不支持的动作（测试设定）'): void {
+    if (on) this.fails.set(action, message); else this.fails.delete(action);
   }
 
   /** 注入群消息事件 */

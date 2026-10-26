@@ -44,6 +44,9 @@ export class OneBot11Adapter implements TransportAdapter {
   private nameTimer?: ReturnType<typeof setInterval>;
   /** 登录号 ≠ 预期 bot 账号时记在这里；此后所有上行事件丢弃、不再代发 */
   private accountBlocked: { got: string; expected: string } | null = null;
+  /** 协议端是否已明确拒绝过私聊消息的表情回应（LLBot 只实现了群聊 reaction）：
+   *  一旦失败过就记住，后续私聊不再白跑一趟 action */
+  private privateReactionUnsupported = false;
   log: Logger;
 
   constructor(
@@ -490,11 +493,25 @@ export class OneBot11Adapter implements TransportAdapter {
    *
    * emoji_id 传 **face 编号**（如 14=微笑、76=赞）。LLBot 底层按 code 长度推断类型
    * （≤3 位当 face，更长当 unicode emoji），经典表情最多 3 位，正好落 face 档。
-   * 协议端只支持群聊消息的回应（LLBot 会对私聊直接报「只支持群聊消息」）。
+   *
+   * 群聊与私聊都发同一个 action：NapCat 的实现按 peer 直发（私聊可用），
+   * LLBot 的实现**显式判群**（私聊一律报「只支持群聊消息」）。后者不猜、直接发一次，
+   * 失败过就记住，后续私聊立刻拒绝，不再白跑。
    */
   async sendReaction(chat: ChatRef, messageId: string, emojiId: string): Promise<void> {
-    if (chat.type !== 'group') throw new Error('贴表情只支持群聊消息');
-    await this.call('set_msg_emoji_like', { message_id: messageId, emoji_id: emojiId, set: true });
+    if (chat.type === 'private' && this.privateReactionUnsupported) {
+      throw new Error('当前协议端不支持私聊消息的表情回应（LLBot 只实现了群聊贴表情）');
+    }
+    try {
+      await this.call('set_msg_emoji_like', { message_id: messageId, emoji_id: emojiId, set: true });
+    } catch (e) {
+      const msg = (e as Error).message || '';
+      if (chat.type === 'private' && /只支持群聊|不支持私聊/.test(msg)) {
+        this.privateReactionUnsupported = true;
+        throw new Error('当前协议端不支持私聊消息的表情回应（LLBot 只实现了群聊贴表情）');
+      }
+      throw e;
+    }
   }
 
   async sendFile(chat: ChatRef, absPath: string): Promise<string | undefined> {

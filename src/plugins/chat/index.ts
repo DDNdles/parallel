@@ -631,16 +631,16 @@ export function setup(ctx: PluginContext): void {
 
   // 贴表情（消息下面的表情回应）：不用说话也能表态的社交动作——对好笑的话贴「笑哭」、
   // 对夸奖贴「害羞」、对离谱发言贴「流汗」。目标消息由程序定位（模型看不到消息号）：
-  // 省略 target 就贴对面刚说的那条，给了 target 就贴这个人最近一条。
+  // 省略 target 就贴对面刚说的那条，给了 target 就贴这个人最近一条。群聊/私聊都走同一条链路。
   ctx.llm.registerTool({
     name: 'react',
-    description: '在群友的消息下面贴一个 QQ 表情回应（消息下面的小表情，不用发文字）。想表态但不想说话时用：好笑贴「笑哭」、离谱贴「流汗」、被夸贴「害羞」、赞同贴「赞」。私聊没有这个功能。',
+    description: '在对方的消息下面贴一个 QQ 表情回应（消息下面的小表情，不用发文字）。想表态但不想说话时用：好笑贴「笑哭」、离谱贴「流汗」、被夸贴「害羞」、赞同贴「赞」。',
     surface: 'chat',
-    promptSnippet: '在群友的消息下面贴一个表情回应（贴「笑哭/赞/流汗」这类 QQ 表情）',
+    promptSnippet: '在对方的消息下面贴一个表情回应（贴「笑哭/赞/流汗」这类 QQ 表情）',
     promptGuidelines: [
       '贴表情是「不说话的表态」：对方的话让你笑了/无语/想点赞，而你不需要再补一句时，贴一个比发文字更自然；贴完也可以照常接一句话。',
       'emoji 写表情名（笑哭/呲牙/流汗/害羞/赞/滑稽）或编号；名字拿不准就用编号。一次最多贴一个，别在一条消息下面叠好几个。',
-      '省略 target = 贴对面刚发的那条；要贴群里另一个人说的，target 填他的昵称或 QQ 号。私聊里不要调用（没有这个功能）。',
+      '省略 target = 贴对面刚发的那条；要贴群里另一个人说的，target 填他的昵称或 QQ 号。私聊也能贴（贴对方刚说的那条）。',
     ],
     parameters: {
       type: 'object',
@@ -655,7 +655,6 @@ export function setup(ctx: PluginContext): void {
         enable?: boolean; minIntervalSeconds?: number; maxPerHour?: number;
       };
       if (cfg.enable === false) return '（贴表情现在关着，别调用；用你自己的语气继续。）';
-      if (tctx.chat.type !== 'group') return '（私聊里没有贴表情这个功能，别调用；直接说话。）';
       const key = `${tctx.chat.type}_${tctx.chat.chatId}`;
       const now = Date.now();
       const hits = (reactionHits.get(key) ?? []).filter((t) => now - t < 3600_000);

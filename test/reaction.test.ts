@@ -97,12 +97,43 @@ test('react：省略 target 贴对面刚说的那条；编号/别名也认', asy
   }
 });
 
-test('react：私聊不支持、认不出的表情说清楚、没有消息可贴时说清楚', async () => {
+test('react：私聊也发同一个 action（贴对方刚说的那条）；协议端拒绝过就记住、不再白跑', async () => {
   const g = await boot();
   try {
     const priv = { platform: 'qq' as const, type: 'private' as const, chatId: '20003' };
-    await assert.rejects(() => g.kernel.chat.react(priv, '微笑'), /只支持群聊/);
+    g.mock.sendPrivateMessage({ userId: 20003, text: '在干嘛呢', nickname: '小红' });
+    await until(() => g.kernel.sessionLog.tail('20003', 'private').some((e) => e.type === 'message_in'),
+      5000, '私聊入站');
 
+    // 支持的协议端（如 NapCat）：私聊直接发出去
+    const r = await g.kernel.chat.react(priv, '害羞');
+    assert.equal(r.emojiId, '6', '害羞 → face 编号 6');
+    const act = await g.mock.waitForAction('set_msg_emoji_like', 5000);
+    assert.equal(String(act.params.message_id), r.messageId, '贴的是对方刚说的那条');
+    assert.equal(String(act.params.emoji_id), '6');
+    const log = g.kernel.sessionLog.tail('20003', 'private').find((e) => e.type === 'reaction');
+    assert.ok(log, '私聊会话流也要留一条 reaction');
+
+    // LLBot 的实现显式判群：私聊一律报「只支持群聊消息」→ 内核记住这一点，第二次不再发 action
+    g.mock.failAction('set_msg_emoji_like', true, '只支持群聊消息');
+    // 群聊里先有一条可贴的消息：群聊的失败原样抛出，不污染私聊缓存
+    g.mock.sendGroupMessage({ groupId: Number(g.group), userId: 20001, text: '嘿嘿', nickname: '小明', messageId: 778810 });
+    await until(() => g.kernel.sessionLog.tail(g.group, 'group').some((e) => e.type === 'message_in'),
+      5000, '群入站');
+    await assert.rejects(() => g.kernel.chat.react(g.chat, '微笑'), /只支持群聊消息/);
+    await assert.rejects(() => g.kernel.chat.react(priv, '微笑'), /不支持私聊消息的表情回应/);
+    const before = g.mock.actions.filter((a) => a.action === 'set_msg_emoji_like').length;
+    await assert.rejects(() => g.kernel.chat.react(priv, '微笑'), /不支持私聊消息的表情回应.*LLBot/);
+    const after = g.mock.actions.filter((a) => a.action === 'set_msg_emoji_like').length;
+    assert.equal(after, before, '已经知道私聊不支持后，不再发 action');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('react：认不出的表情说清楚、没有消息可贴时说清楚', async () => {
+  const g = await boot();
+  try {
     await assert.rejects(() => g.kernel.chat.react(g.chat, '没有这个表情'), /认不出这个表情/);
 
     // 群里还没有任何入站消息：无从定位
