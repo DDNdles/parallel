@@ -256,6 +256,26 @@ export class WorkRunner {
     return p && Date.now() - p.at <= PENDING_WORK_TTL_MS ? p : undefined;
   }
 
+  /** 正在跑的入口任务 → 插话句柄（agents.steer 排进 pi 的 steeringQueue） */
+  private steerers = new Map<string, { steer: (text: string) => boolean; record: (text: string) => void }>();
+
+  /** 向正在跑的任务插话（用户改需求）。没有在跑的活返回 false，调用方走正常派活。 */
+  steer(chat: ChatRef, userId: string, text: string): boolean {
+    const hot = this.steerers.get(`${chat.type}_${chat.chatId}|${userId}`);
+    if (!hot) return false;
+    // 刚好收尾的活不能接：收尾时队列会被 clearAllQueues 清掉，说"已插话"就是骗人
+    const key = `${chat.type}_${chat.chatId}`;
+    const active = [...this.runs.values()].some(
+      (r) => r.chatKey === key && r.userId === userId && (r.depth ?? 0) === 0 && r.phase === 'running',
+    );
+    if (!active) return false;
+    const body = String(text ?? '').trim();
+    if (!body) return false;
+    if (!hot.steer(body)) return false;
+    hot.record(body);
+    return true;
+  }
+
   async run(input: WorkRunInput): Promise<WorkRunResult> {
     const id = newId('work_');
     const startedAt = nowMs();
@@ -264,6 +284,10 @@ export class WorkRunner {
     // 并发的 work 任务轮流领不同的链上下标；每个任务仍从自己的槽起绕完整条替代链
     const slot = chainKind === 'work' ? this.acquireWorkSlot() : 0;
     const model = chainKind === 'work' ? this.llm.modelAt('work', slot) : this.llm.servingLabel('chat');
+    // 插话句柄按「聊天 + 发起人」挂：同群其他人正在跑的活不受影响。
+    // 子代理（depth>0）不接插话：它们是任务的内部实现，用户的话应该落到入口任务上。
+    const steerKey = `${input.chat.type}_${input.chat.chatId}|${input.userId}`;
+    let steerEntry: { steer: (text: string) => boolean; record: (text: string) => void } | undefined;
     try {
     const chatKey = `${input.chat.type}_${input.chat.chatId}`;
     /**
@@ -381,6 +405,27 @@ export class WorkRunner {
         },
         // 结构化事件：侧栏按轮次画 thinking / 工具调用 / 工具结果 / 压缩
         onEvent: track,
+        // 插话通道：拿到 pi Agent 后登记，用户后续的要求由 WorkRunner.steer() 排进 steeringQueue。
+        // pi 会在当前 assistant 轮结束后把它作为 user 消息注入，模型下一轮就看见。
+        onAgent: (ag) => {
+          if (depth > 0) return;
+          steerEntry = {
+            steer: (text) => {
+              try {
+                ag.steer({ role: 'user', content: [{ type: 'text', text }] } as never);
+                return true;
+              } catch { return false; }
+            },
+            record: (text) => {
+              track({ kind: 'steer', text: clip(text, 400) });
+              const line = `💬 用户插话：${clip(text, 120)}`;
+              const r = this.runs.get(id);
+              if (r) r.steps.push(line);
+              this.bus.emit(busEvents.workStep, { id, chatKey, step: line });
+            },
+          };
+          this.steerers.set(steerKey, steerEntry);
+        },
       });
 
       // 结论与产物：优先用交付格式里的结构化字段，解析不到就回落到全文 + 正则兜底；
@@ -465,6 +510,7 @@ export class WorkRunner {
       return result;
     }
     } finally {
+      if (steerEntry && this.steerers.get(steerKey) === steerEntry) this.steerers.delete(steerKey);
       if (chainKind === 'work') this.releaseWorkSlot(slot);
     }
   }

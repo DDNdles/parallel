@@ -12,7 +12,7 @@ import { fileIcon } from '@/lib/fileIcon';
 import { toolAction, splitMcp, argPath, ctxBadge, type ToolMeta } from '@/lib/entries';
 
 export interface LoopEvent {
-  kind: 'round' | 'delta' | 'thinkingDelta' | 'thinking' | 'text' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'final';
+  kind: 'round' | 'delta' | 'thinkingDelta' | 'thinking' | 'text' | 'tool' | 'toolResult' | 'usage' | 'compaction' | 'settle' | 'steer' | 'final';
   n?: number; round?: number; text?: string; name?: string; args?: string;
   meta?: ToolMeta;
   prompt?: number; completion?: number; cacheHit?: number; cacheMiss?: number;
@@ -165,6 +165,10 @@ export function loopActs(events: LoopEvent[], live: boolean): { acts: ActRow[]; 
         sub: `-${ev.dropped ?? 0} 条${ev.tokensBefore ? ` / 原 ~${Math.round(ev.tokensBefore / 1000)}k tokens` : ''}`,
         body: ev.summary ?? '',
       });
+    } else if (ev.kind === 'steer') {
+      closeStream();
+      // 任务运行中用户改需求：插话内容单列一行，方便回看"当时要求改成什么"
+      acts.push({ kind: 'note', subject: '用户插话', sub: '', body: String(ev.text ?? '') });
     } else if (ev.kind === 'settle' && ev.reason === 'max_rounds') {
       closeStream();
       // 正常收尾（terminate）不占行；只有被轮次上限强制收尾才提示

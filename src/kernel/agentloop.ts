@@ -47,6 +47,8 @@ export type LoopEvent =
   | { kind: 'usage'; round: number; prompt: number; completion: number; cacheHit: number; cacheMiss: number; ms?: number }
   | { kind: 'compaction'; round: number; dropped: number; tokensBefore: number; summary: string }
   | { kind: 'settle'; round: number; reason: 'terminate' | 'max_rounds' }
+  /** 任务运行中用户改需求：转发给正在跑的 work（插话） */
+  | { kind: 'steer'; text: string }
   | { kind: 'final'; text: string };
 
 /** 一次 run 里由事件与工具回调攒起来的东西（Agent 不给我们返回值，只能边跑边收） */
@@ -99,6 +101,8 @@ export class AgentLoop {
       onEvent?: (ev: LoopEvent) => void;
       /** work 纯文字轮的提醒等待（毫秒）；缺省 60s，测试调小 */
       workIdleRemindMs?: number;
+      /** 拿到正在跑的 pi Agent：work 任务插话用（只暴露 steer） */
+      onAgent?: (agent: { steer: (message: any) => void }) => void;
     },
   ): Promise<{ reply: string; rounds: number; toolCalls: number; steps: string[]; finished: boolean }> {
     const { chat } = ctx;
@@ -271,6 +275,10 @@ export class AgentLoop {
             return { context: { messages: agent.state.messages as never, tools: [] as never }, model: agent.state.model };
           }),
     });
+
+    // 交给调用方一个插话句柄：work 任务在跑时用户改需求，WorkRunner 用它 agent.steer()
+    // 把新消息排进 transcript（pi 会在当前 assistant 轮结束后注入，见 pi-agent-core 的 steeringQueue）
+    try { opts.onAgent?.(agent); } catch { /* 插话通道接不上不影响主流程 */ }
 
     const onAbort = () => agent.abort();
     opts.abort?.addEventListener('abort', onAbort, { once: true });

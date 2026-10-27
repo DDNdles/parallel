@@ -843,6 +843,11 @@ export interface GatedWork {
    * 上一次停下来提问的现场还没过期时，这次的话就是那个问题的回答（自动拼成续接任务）。
    */
   dispatch(input: WorkDispatchInput): WorkDispatchResult;
+  /**
+   * 向**正在跑**的任务插话（用户中途改需求）：新消息排进该任务 agent 的 steering 队列，
+   * 在当前轮结束后作为 user 消息注入。没有在跑的活返回 false（调用方走正常派活）。
+   */
+  steer(chat: ChatRef, userId: string, text: string): boolean;
   /** 这位发起人自己的活（按 userId 跨会话过滤；2026-10-25 任务隔离改版后群聊不再是一层边界） */
   status(userId: string): WorkLiveStatus;
   /** 最近任务（桌面端「工作」页） */

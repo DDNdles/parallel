@@ -246,6 +246,7 @@ export function setup(ctx: PluginContext): void {
     promptGuidelines: [
       '你**不能自己写任务正文**：只能用 messages 从当前聊天窗口里逐字引用用户的消息（一条或多条，可以只截一段，但必须一字不差）。程序会把命中的**整条原文**转发给 work，你自己写的任何文字都进不去，引用对不上会直接拒绝。',
       '用户后来的修改/补充要求也照样转发：引用那条消息的原文即可，不要改写成"把XX改成YY"再交付。危险/含糊的地方宁可先用一句话问清楚，让用户把要求说完整，再引用他的原话派活。',
+      '同一件活还在跑、用户中途又提新要求（改颜色/换风格/补充细节等）：仍然用 messages 引用他的原话，程序会把这些话**插话给正在跑的任务**（它下一轮就能看到），不会另开一个新任务。',
       '一轮里用户说了好几条相关的，就一次引用几条（按原顺序转发）；只引用真正和这件活有关的消息。',
       '新旧任务由你判断，但**用户对刚做完（或最近）的任务提修改、调整条件、说不满意——一律算那个任务的延续**：带 continue_run（任务号看 work_status，或 latest）沿用原沙箱接着做，绝不能新开任务从头重做。只有和旧任务无关的新事情才开新任务。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
@@ -278,6 +279,20 @@ export function setup(ctx: PluginContext): void {
       if (ctx.work.modelLabel() === '—') {
         return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
       }
+      const chat = tctx.chat;
+      const chatKey = chatKeyOf(chat);
+      const userId = relayed.userId || tctx.event.userId;
+      const nickname = relayed.nickname || tctx.event.nickname;
+      // 同一件事正在跑：用户中途改需求 → 插话给那个任务（pi 的 steer 队列，下一轮就能看见），
+      // 不另开新任务、也不动它已有的产物。
+      const steerImgs = (tctx.attachments ?? []).filter((a) => a.kind === 'image').length;
+      const steerText = steerImgs
+        ? `${relayed.text}\n\n（用户这轮还发了 ${steerImgs} 张图；插话只转文字，图没有进当前任务沙箱。）`
+        : relayed.text;
+      if (ctx.work.steer(chat, userId, steerText)) {
+        const imgNote = steerImgs ? `；注意它看不到你这轮的 ${steerImgs} 张图` : '';
+        return `（已把 ${relayed.count} 条消息的原文插话给${nickname ? ` ${nickname} ` : ''}正在跑的任务${relayed.trimmed ? `（其中 ${relayed.trimmed} 条只截了一段，转发的是整条原文）` : ''}${imgNote}。这一轮只用一句自然的话应下（比如"好，我让它改"），不要重复整段要求，也不要说已经改完。）`;
+      }
       let task = relayed.text;
       // 本轮用户发的图片：直接随任务交给 work（第一轮请求里就看得见），不必让它自己在一堆 inbox 文件里猜哪张。
       // 去重按路径/URL，最多 4 张；链首模型不收图时就只报个位置，让它用 sandbox_read 自己看。
@@ -298,10 +313,6 @@ export function setup(ctx: PluginContext): void {
           : `\n\n（本轮消息里带的 ${images.length} 张图在沙箱 inbox/ 里，用 sandbox_read 打开看。）`;
       }
       const label = relayed.label;
-      const chat = tctx.chat;
-      const chatKey = chatKeyOf(chat);
-      const userId = relayed.userId || tctx.event.userId;
-      const nickname = relayed.nickname || tctx.event.nickname;
       // 等本轮 chat 收尾再开跑：让"好，我去弄"先由人格说出去，也避免 work 的第一发请求
       // 和 chat 的第二轮抢同一份上下文/同一条模型链。agent 中途夭折时用 5s 兜底。
       let started = false;

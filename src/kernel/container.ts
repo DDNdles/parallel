@@ -934,6 +934,11 @@ function makeGatedWork(
     agents: () => plugins.listWorkAgents().map((a) => ({ name: a.name, description: a.description, tools: a.tools, source: a.source })),
     list: (limit?: number) => deps.work.list(limit ?? 30),
     latestArtifacts: (userId: string) => deps.work.latestArtifacts(userId),
+    /** 向正在跑的任务插话（用户改需求）；没有在跑的活返回 false */
+    steer: (chat: ChatRef, userId: string, text: string) => {
+      can();
+      return deps.work.steer(chat, userId, text);
+    },
     delegate: async (input: WorkDelegateInput) => {
       can();
       const depth = input.depth ?? 0;

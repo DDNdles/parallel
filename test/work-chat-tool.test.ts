@@ -511,6 +511,52 @@ test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状
 // 纯转发：引用命中的整条原文进任务；对不上整单拒绝
 // ============================================================
 
+test('work_dispatch：任务正在跑时，用户改需求以插话转发给该任务，不另开新活', async () => {
+  const g = await boot('9410');
+  g.mock.script.length = 0;
+  try {
+    const chat = g.chat;
+    const agent = g.kernel.container.workAgent();
+    const tools = g.kernel.container.workToolsFor(chat, 'owner', agent, 0);
+    // 一个跑得久的活：两轮工具、第二轮拖一下，留出插话窗口；第三轮才收尾
+    g.mock.script.push({ toolCalls: [{ name: 'sandbox_list', args: {} }] });
+    g.mock.script.push({ content: '还在做', delayMs: 1500, toolCalls: [{ name: 'sandbox_list', args: {} }] });
+    g.mock.script.push({ content: '收尾', toolCalls: [{ name: 'work_finish', args: { summary: '做完了' } }] });
+    const running = g.kernel.workRunner.run({
+      chat, task: '先画一张海报', taskLabel: '先画一张海报', userId: '10001', nickname: '主人',
+      role: 'owner', agent, tools, trigger: 'chat', depth: 0,
+    });
+    await until(() => g.kernel.workRunner.liveStatus('10001').active.length > 0, 8000, '任务开跑');
+    await new Promise((r) => setTimeout(r, 400));   // 等 pi Agent 建好、插话句柄登记
+
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const reply = String(await dispatch.handler(
+      { messages: ['背景换成红色'] },
+      {
+        event: { userId: '10001', nickname: '主人' }, chat, role: 'owner' as const,
+        contextMessages: [{ role: 'user' as const, content: '背景换成红色', ts: Date.now() }],
+      } as any,
+    ));
+    assert.match(reply, /插话给/, `应该是插话而不是新任务：${reply}`);
+
+    const runs = g.kernel.workRunner.list(10, g.chatKey);
+    assert.equal(runs.length, 1, '插话不能另开任务');
+    assert.equal(runs[0].task, '先画一张海报');
+    assert.ok(
+      (runs[0].events ?? []).some((e: any) => e.kind === 'steer' && String(e.text).includes('背景换成红色')),
+      '任务事件流里要有插话记录',
+    );
+
+    await running;
+    assert.ok(
+      g.mock.calls.some((c: any) => String(c.usersJoined ?? '').includes('背景换成红色')),
+      '插话内容要进模型下一轮请求',
+    );
+  } finally {
+    await g.cleanup();
+  }
+});
+
 test('work_dispatch：引用早前几条消息时按时间顺序转发整条原文（含群聊昵称前缀）', async () => {
   const g = await boot('9405');
   try {
