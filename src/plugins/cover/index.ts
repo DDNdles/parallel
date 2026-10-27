@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ChatRef, PluginContext, Role } from '../../kernel/types.ts';
 import { clamp, newId, sleep } from '../../kernel/util/misc.ts';
 
@@ -43,13 +44,22 @@ interface Cfg {
   ownerUnlimited: boolean;
   timeoutMs: number;
   maxSongMb: number;
+  /** 音源：netease（默认）/ custom（用户自填的第三方库）/ local（data/music 或 musicDir） */
+  source: 'netease' | 'custom' | 'local';
+  customBaseUrl: string;
+  customToken: string;
+  musicDir: string;
 }
 
 interface SongInfo {
-  id: number;
+  id: number | string;
   name: string;
   artists: string;
 }
+
+type SearchOutcome =
+  | { ok: true; song: SongInfo; alternates: SongInfo[] }
+  | { ok: false; code: FailCode; error: string };
 
 export interface CoverRecord {
   id: string;
@@ -121,11 +131,18 @@ function isTimeoutError(e: unknown): boolean {
     || /timeout|timed out/i.test(String(err?.message ?? ''));
 }
 
-function sniffAudioMime(buf: Buffer): 'audio/mpeg' | 'audio/wav' | undefined {
+function sniffAudioMime(buf: Buffer): string | undefined {
   if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WAVE') return 'audio/wav';
   if (buf.length >= 3 && buf.toString('ascii', 0, 3) === 'ID3') return 'audio/mpeg';
   if (buf.length >= 2 && buf[0] === 0xff && (buf[1]! & 0xe0) === 0xe0) return 'audio/mpeg';
+  if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'fLaC') return 'audio/flac';
+  if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'OggS') return 'audio/ogg';
+  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') return 'audio/mp4';
   return undefined;
+}
+
+function isInstrumentalName(name: string): boolean {
+  return /伴奏|纯音乐|instrumental|off\s*vocal|karaoke/i.test(name);
 }
 
 /** 网易云搜索：优先匹配歌手；过滤伴奏/纯音乐；取不到就报一句人话 */
@@ -158,7 +175,7 @@ export async function searchNetease(song: string, artist: string, timeoutMs: num
   }
   const clean = songs.filter((s) => {
     const name = String(s?.name ?? '');
-    return !/伴奏|纯音乐|instrumental|off\s*vocal|karaoke/i.test(name);
+    return !isInstrumentalName(name);
   });
   const pool = clean.length ? clean : songs;
   const wanted = artist.trim().toLowerCase();
@@ -239,6 +256,180 @@ export async function downloadNetease(id: number, timeoutMs: number, maxBytes: n
   return second.ok ? second : outer;
 }
 
+// ============================================================
+// 音源 2：自定义第三方库（用户自己部署/有授权的库）
+//
+// 契约（最小集）：
+//   GET {customBaseUrl}/search?q=<歌名 歌手>  -> {"songs":[{"id","name","artist"}]}
+//   GET {customBaseUrl}/download?id=<id>      -> 音频字节，或 {"url":"https://..."}
+// 可选 customToken 以 Authorization: Bearer 发送。
+// 仓库不内置任何第三方源地址；填什么由使用者自己负责。
+// ============================================================
+function customHeaders(cfg: Cfg): Record<string, string> {
+  return {
+    'user-agent': UA,
+    ...(cfg.customToken ? { authorization: `Bearer ${cfg.customToken}` } : {}),
+  };
+}
+
+async function searchCustom(cfg: Cfg, song: string, artist: string): Promise<SearchOutcome> {
+  const base = cfg.customBaseUrl.replace(/\/+$/, '');
+  if (!base) {
+    return { ok: false, code: 'config', error: '音源选了「自定义」，但没填自定义音源地址（customBaseUrl）；去「插件 → 翻唱」里补上。' };
+  }
+  let url: URL;
+  try { url = new URL(`${base}/search`); } catch {
+    return { ok: false, code: 'config', error: '自定义音源地址不是合法的 http(s) URL。' };
+  }
+  url.searchParams.set('q', `${song}${artist ? ` ${artist}` : ''}`.trim());
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      headers: customHeaders(cfg),
+      signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 20_000)),
+    });
+  } catch (e) {
+    return { ok: false, code: 'api', error: `自定义音源连不上（${(e as Error).message}）。` };
+  }
+  if (!resp.ok) return { ok: false, code: 'api', error: `自定义音源搜索返回 HTTP ${resp.status}。` };
+  let data: any;
+  try { data = await resp.json(); } catch { return { ok: false, code: 'api', error: '自定义音源搜索回了看不懂的内容（要 JSON）。' }; }
+  const raw: any[] = Array.isArray(data?.songs) ? data.songs : Array.isArray(data) ? data : [];
+  const infos = raw.map((s: any): SongInfo | null => {
+    const id = s?.id ?? s?.songId ?? s?.songid;
+    const name = String(s?.name ?? s?.title ?? '').trim();
+    const artists = Array.isArray(s?.artists)
+      ? s.artists.map((a: any) => String(a?.name ?? a ?? '')).filter(Boolean).join('/')
+      : String(s?.artist ?? s?.artists ?? '').trim();
+    return (id !== undefined && id !== null && String(id) && name) ? { id: String(id), name, artists } : null;
+  }).filter((x): x is SongInfo => !!x);
+  if (!infos.length) {
+    return { ok: false, code: 'notfound', error: `自定义音源没搜到《${song}》${artist ? `（${artist}）` : ''}，换个歌名或检查库的搜索接口。` };
+  }
+  const clean = infos.filter((x) => !isInstrumentalName(x.name));
+  const pool = clean.length ? clean : infos;
+  const wanted = artist.trim().toLowerCase();
+  const matched = wanted ? pool.filter((x) => x.artists.toLowerCase().includes(wanted)) : [];
+  const ordered = matched.length ? [...matched, ...pool.filter((x) => !matched.includes(x))] : pool;
+  const [first, ...rest] = ordered;
+  return { ok: true, song: first, alternates: rest.filter((x) => x.name === first.name).slice(0, 5) };
+}
+
+async function downloadCustom(cfg: Cfg, song: SongInfo): Promise<Outcome> {
+  const base = cfg.customBaseUrl.replace(/\/+$/, '');
+  if (!base) return { ok: false, code: 'config', error: '自定义音源地址是空的。' };
+  const maxBytes = cfg.maxSongMb * 1024 * 1024;
+  const timeout = Math.min(cfg.timeoutMs, 120_000);
+  let resp: Response;
+  try {
+    resp = await fetch(`${base}/download?id=${encodeURIComponent(String(song.id))}`, {
+      headers: customHeaders(cfg), redirect: 'follow', signal: AbortSignal.timeout(timeout),
+    });
+  } catch (e) {
+    return { ok: false, code: 'api', error: `自定义音源下载失败（${(e as Error).message}）。` };
+  }
+  if (!resp.ok) return { ok: false, code: 'api', error: `自定义音源下载返回 HTTP ${resp.status}。` };
+
+  const ctype = (resp.headers.get('content-type') ?? '').toLowerCase();
+  if (ctype.includes('application/json')) {
+    let link = '';
+    try { link = String((await resp.json())?.url ?? '').trim(); } catch { /* 下面统一报错 */ }
+    if (!/^https?:\/\//i.test(link)) {
+      return { ok: false, code: 'api', error: '自定义音源没有返回可用的音频地址（JSON 里缺 url）。' };
+    }
+    try {
+      resp = await fetch(link, { headers: { 'user-agent': UA }, redirect: 'follow', signal: AbortSignal.timeout(timeout) });
+    } catch (e) {
+      return { ok: false, code: 'api', error: `自定义音源给的音频地址下载失败（${(e as Error).message}）。` };
+    }
+    if (!resp.ok) return { ok: false, code: 'api', error: `自定义音源给的音频地址返回 HTTP ${resp.status}。` };
+  }
+
+  const len = Number(resp.headers.get('content-length') ?? 0);
+  if (len > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(len / 1024 / 1024)}MB），换一首。` };
+  let buf: Buffer;
+  try { buf = Buffer.from(await resp.arrayBuffer()); } catch (e) {
+    return { ok: false, code: 'api', error: `自定义音源下载中断（${(e as Error).message}）。` };
+  }
+  if (!buf.length) return { ok: false, code: 'api', error: '自定义音源下载回来是空文件。' };
+  if (buf.length > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(buf.length / 1024 / 1024)}MB），换一首。` };
+  const mime = sniffAudioMime(buf);
+  if (!mime) return { ok: false, code: 'api', error: `自定义音源(id=${song.id})回来的不是音频（可能是登录页/错误页）。` };
+  return { ok: true, data: buf, contentType: resp.headers.get('content-type') ?? mime };
+}
+
+// ============================================================
+// 音源 3：本地曲库（自己的文件；默认 data/music，可用 musicDir 改）
+// ============================================================
+const AUDIO_EXT = new Set(['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus']);
+
+async function searchLocal(cfg: Cfg, song: string, artist: string): Promise<SearchOutcome> {
+  const dir = resolve(cfg.musicDir);
+  if (!existsSync(dir)) {
+    return { ok: false, code: 'config', error: `本地曲库目录不存在：${dir}（把音频放进去，或在插件里改 musicDir）。` };
+  }
+  const files: string[] = [];
+  const walk = (d: string, depth: number): void => {
+    if (depth < 0 || files.length >= 5000) return;
+    let entries;
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      if (files.length >= 5000) return;
+      const p = join(d, ent.name);
+      if (ent.isDirectory()) walk(p, depth - 1);
+      else if (AUDIO_EXT.has(extname(ent.name).toLowerCase())) files.push(p);
+    }
+  };
+  walk(dir, 3);
+
+  const q = song.trim().toLowerCase();
+  const a = artist.trim().toLowerCase();
+  const hits = files
+    .map((p) => ({ p, name: basename(p, extname(p)) }))
+    .filter((x) => x.name.toLowerCase().includes(q) && (!a || x.name.toLowerCase().includes(a)));
+  if (!hits.length) {
+    return { ok: false, code: 'notfound', error: `本地曲库里没找到《${song}》${artist ? `（${artist}）` : ''}（${dir}）。` };
+  }
+  const exact = (x: { name: string }) => x.name.toLowerCase() === q;
+  hits.sort((x, y) => Number(exact(y)) - Number(exact(x)) || x.name.localeCompare(y.name));
+  const infos = hits.slice(0, 10).map((x) => ({ id: x.p, name: x.name, artists: '' }));
+  const [first, ...rest] = infos;
+  return { ok: true, song: first, alternates: rest.filter((x) => x.name === first.name) };
+}
+
+async function downloadLocal(cfg: Cfg, song: SongInfo): Promise<Outcome> {
+  const dir = resolve(cfg.musicDir);
+  const abs = resolve(String(song.id));
+  if (abs !== dir && !abs.startsWith(dir.endsWith(sep) ? dir : dir + sep)) {
+    return { ok: false, code: 'api', error: '本地曲库路径越界，拒绝读取。' };
+  }
+  const maxBytes = cfg.maxSongMb * 1024 * 1024;
+  try {
+    const st = statSync(abs);
+    if (!st.isFile()) return { ok: false, code: 'notfound', error: '本地曲库里的这个条目不是文件。' };
+    if (st.size > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(st.size / 1024 / 1024)}MB），换一首。` };
+    const buf = readFileSync(abs);
+    if (!buf.length) return { ok: false, code: 'api', error: '本地音频是空文件。' };
+    const mime = sniffAudioMime(buf);
+    if (!mime) return { ok: false, code: 'api', error: '本地文件不是可识别的音频（mp3/wav/flac/ogg/m4a）。' };
+    return { ok: true, data: buf, contentType: mime };
+  } catch (e) {
+    return { ok: false, code: 'api', error: `本地音频读不到（${(e as Error).message}）。` };
+  }
+}
+
+function searchTracks(cfg: Cfg, song: string, artist: string): Promise<SearchOutcome> {
+  if (cfg.source === 'custom') return searchCustom(cfg, song, artist);
+  if (cfg.source === 'local') return searchLocal(cfg, song, artist);
+  return searchNetease(song, artist, cfg.timeoutMs);
+}
+
+function downloadTrack(cfg: Cfg, song: SongInfo): Promise<Outcome> {
+  if (cfg.source === 'custom') return downloadCustom(cfg, song);
+  if (cfg.source === 'local') return downloadLocal(cfg, song);
+  return downloadNetease(Number(song.id), cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
+}
+
 function jobHeaders(cfg: Cfg): Record<string, string> {
   return {
     ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
@@ -262,21 +453,24 @@ async function submitCoverJob(
   if (!cfg.baseUrl) {
     return { ok: false, code: 'config', error: '翻唱服务还没配置：请主人在「插件 → 翻唱」里填 baseUrl（107 的 SCOW 代理地址）。' };
   }
-  const found = await searchNetease(songQuery, artistQuery, cfg.timeoutMs);
+  const found = await searchTracks(cfg, songQuery, artistQuery);
   if (!found.ok) return found;
   const candidates = [found.song, ...found.alternates];
   let song = candidates[0];
-  let downloaded = await downloadNetease(song.id, cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
-  // 首选版本可能是 VIP/版权拿不到流，按同名备选逐个再试（绝不跨歌名）
+  let downloaded = await downloadTrack(cfg, song);
+  // 首选版本拿不到流（VIP/版权/库换了镜像），按同名备选逐个再试（绝不跨歌名）
   for (let i = 1; i < candidates.length && !downloaded.ok; i++) {
     if (downloaded.code !== 'notfound' && downloaded.code !== 'api') break;
     song = candidates[i];
-    downloaded = await downloadNetease(song.id, cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
+    downloaded = await downloadTrack(cfg, song);
   }
   if (!downloaded.ok) return downloaded;
 
+  const mime = downloaded.contentType ?? 'audio/mpeg';
+  const ext = mime.includes('wav') ? '.wav' : mime.includes('flac') ? '.flac'
+    : mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.mp3';
   const form = new FormData();
-  form.append('audio', new Blob([new Uint8Array(downloaded.data)], { type: 'audio/mpeg' }), `${song.name || 'song'}.mp3`);
+  form.append('audio', new Blob([new Uint8Array(downloaded.data)], { type: mime }), `audio${ext}`);
   form.append('with_instrumental', withInstrumental ? 'true' : 'false');
   form.append('vocal_gain', '1');
   form.append('instrumental_gain', '1');
@@ -417,8 +611,14 @@ async function awaitCoverResult(
 
 export function setup(ctx: PluginContext): void {
   const coverDir = join(ctx.pluginDataDir, 'cover');
+  // 旧内核（本次改动前启动的进程）没有 ctx.dataDir：从 pluginDataDir 反推 data/
+  const kernelDataDir = ctx.dataDir || join(ctx.pluginDataDir, '..', '..');
   mkdirSync(coverDir, { recursive: true });
 
+  const sourceOf = (v: unknown): Cfg['source'] => {
+    const s = String(v ?? 'netease').trim().toLowerCase();
+    return s === 'custom' || s === 'local' ? s : 'netease';
+  };
   const cfg = (): Cfg => ({
     baseUrl: String(ctx.userConfig.baseUrl ?? '').trim().replace(/\/+$/, ''),
     apiKey: String(ctx.userConfig.apiKey ?? '').trim(),
@@ -428,6 +628,10 @@ export function setup(ctx: PluginContext): void {
     ownerUnlimited: ctx.userConfig.ownerUnlimited !== false,
     timeoutMs: numOf(ctx.userConfig.timeoutMs, 600_000, 30_000, 1_800_000),
     maxSongMb: numOf(ctx.userConfig.maxSongMb, 30, 5, 80),
+    source: sourceOf(ctx.userConfig.source),
+    customBaseUrl: String(ctx.userConfig.customBaseUrl ?? '').trim().replace(/\/+$/, ''),
+    customToken: String(ctx.userConfig.customToken ?? '').trim(),
+    musicDir: resolve(String(ctx.userConfig.musicDir ?? '').trim() || join(kernelDataDir, 'music')),
   });
 
   function usageOf(day: string): Record<string, number> {
@@ -739,6 +943,7 @@ export function setup(ctx: PluginContext): void {
       body: {
         ok: true,
         baseUrlSet: !!c.baseUrl,
+        cookieSet: !!c.cookie,
         lastGenerationAt: Number.isFinite(lastAt) && lastAt > 0 ? lastAt : null,
         today: { userId, count: usedOf(dayKey(), userId) },
       },
@@ -770,6 +975,47 @@ export function setup(ctx: PluginContext): void {
       headers: { 'content-type': rec.mime || 'audio/mpeg' },
       body: buf,
     };
+  });
+
+  // ---------- 半自动登录 107（打开真实浏览器，人过一次验证码，脚本回写 Cookie） ----------
+  const loginStatusFile = join(kernelDataDir, 'cover', 'login-status.json');
+  const loginScript = fileURLToPath(new URL('./scow-login.mjs', import.meta.url));
+  const loginStatus = (): Record<string, unknown> => {
+    let st: any = { status: 'idle' };
+    try { st = JSON.parse(readFileSync(loginStatusFile, 'utf8')); } catch { /* 没跑过 */ }
+    // 脚本被硬杀/机器重启时状态会停在 running：超过 11 分钟就当失败，允许重点
+    if (st?.status === 'running' && Date.now() - Number(st.ts ?? 0) > 11 * 60_000) {
+      return { status: 'failed', ts: st.ts, error: '上次登录没有完成（浏览器可能被关掉了），再点一次。' };
+    }
+    return st && typeof st === 'object' ? st : { status: 'idle' };
+  };
+
+  ctx.http.on('GET', '/login', () => ({ body: { ok: true, ...loginStatus() } }));
+
+  ctx.http.on('POST', '/login', () => {
+    if (loginStatus().status === 'running') {
+      return { status: 409, body: { ok: false, error: '已经在等待浏览器登录，先把那个窗口里的验证码输完。' } };
+    }
+    try {
+      mkdirSync(dirname(loginStatusFile), { recursive: true });
+      writeFileSync(loginStatusFile, JSON.stringify({ status: 'running', ts: Date.now() }));
+    } catch (e) {
+      return { status: 500, body: { ok: false, error: `写登录状态失败：${(e as Error).message}` } };
+    }
+    try {
+      const child = spawn(process.execPath, ['--use-system-ca', loginScript, '--data-dir', kernelDataDir], {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+      child.unref();
+      ctx.log.info('已拉起 107 登录向导（浏览器窗口里完成验证码）');
+      return { status: 202, body: { ok: true } };
+    } catch (e) {
+      try { writeFileSync(loginStatusFile, JSON.stringify({ status: 'failed', ts: Date.now(), error: (e as Error).message })); } catch { /* ignore */ }
+      return { status: 500, body: { ok: false, error: `拉起登录向导失败：${(e as Error).message}` } };
+    }
   });
 
   // 桌面端「试翻」是异步任务：HTTP 请求不能挂着等几十分钟（内核 server 5 分钟会掐断），

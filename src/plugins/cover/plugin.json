@@ -42,6 +42,27 @@
       "default": false,
       "description": "自动接线：parallel 启动时拉起守护进程，107 上没有作业就自动提交，作业起来后自动写地址（需要先填上面的 Cookie；作业最长 3 小时 58 分，排队时间取决于平台）"
     },
+    "source": {
+      "type": "string",
+      "default": "netease",
+      "description": "音源：netease=网易云（默认）；custom=自定义第三方库（需填 customBaseUrl，契约见 README）；local=本地曲库（data/music 或 musicDir）"
+    },
+    "customBaseUrl": {
+      "type": "string",
+      "default": "",
+      "description": "自定义音源地址：GET /search?q=... 回 {\"songs\":[{\"id\",\"name\",\"artist\"}]}；GET /download?id=... 回音频字节或 {\"url\"}。仓库不内置任何第三方源，地址和使用授权由填的人负责"
+    },
+    "customToken": {
+      "type": "string",
+      "default": "",
+      "description": "自定义音源的 Bearer Token（可选；以 Authorization: Bearer 发送）",
+      "secret": true
+    },
+    "musicDir": {
+      "type": "string",
+      "default": "",
+      "description": "本地曲库目录（source=local 时用；留空 = data/music。支持 mp3/wav/flac/m4a/ogg）"
+    },
     "cooldownSeconds": {
       "type": "number",
       "default": 120,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -563,6 +563,84 @@ test('没配 baseUrl：返回配置错误，不发请求；beforeLLM 追加 orde
     assert.match(sec.text, /还没配置翻唱服务地址/);
   } finally {
     mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('自定义音源：按 search/download 契约取歌，完全不碰网易云', async () => {
+  const k = await boot({
+    apiKey: 'cover-key-123',
+    connect: true,
+    config: {
+      baseUrl: COVER_BASE, cooldownSeconds: 0, dailyQuota: 5,
+      source: 'custom', customBaseUrl: 'http://custom.test',
+    },
+  });
+  const mock = mockFetch((url) => {
+    if (url.startsWith('http://custom.test/search')) {
+      return jsonResp({ songs: [{ id: 'c1', name: '起风了', artist: '买辣椒也用券' }] });
+    }
+    if (url.startsWith('http://custom.test/download')) {
+      return new Response(MP3, { status: 200, headers: { 'content-type': 'audio/mpeg' } });
+    }
+    if (url === COVER_URL) return audioResp(90);
+    return undefined;
+  });
+  try {
+    const out = await k.call({ song: '起风了' }, { role: 'owner' });
+    assert.match(out, /翻唱|发进会话/, out);
+    const urls = mock.calls.map((c) => c.url);
+    assert.ok(urls.some((u) => u.startsWith('http://custom.test/search')), '要走自定义搜索');
+    assert.ok(urls.some((u) => u.startsWith('http://custom.test/download')), '要按契约下载');
+    assert.ok(!urls.includes(SEARCH_URL), '不能偷偷回落到网易云');
+    const send = k.mock!.actions.find((a) => a.action === 'send_group_msg');
+    assert.ok(send, '翻唱完成后要发语音');
+    recordFileOf(send!);
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('本地曲库：按文件名找 data/music 里的音频，不走网络搜歌', async () => {
+  const k = await boot({
+    apiKey: 'cover-key-123',
+    connect: true,
+    config: { baseUrl: COVER_BASE, cooldownSeconds: 0, dailyQuota: 5, source: 'local' },
+  });
+  mkdirSync(join(k.dataDir, 'music'), { recursive: true });
+  writeFileSync(join(k.dataDir, 'music', '起风了.mp3'), MP3);
+  const mock = mockFetch((url) => (url === COVER_URL ? audioResp(60) : undefined));
+  try {
+    const out = await k.call({ song: '起风了' });
+    assert.match(out, /翻唱|发进会话/, out);
+    assert.ok(!mock.calls.some((c) => c.url === SEARCH_URL), '本地曲库不应请求网易云');
+    const send = k.mock!.actions.find((a) => a.action === 'send_group_msg');
+    assert.ok(send, '本地曲库翻唱完成后要发语音');
+    recordFileOf(send!);
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('REST /login：idle / running 409 / done 状态', async () => {
+  const k = await boot({ config: { baseUrl: COVER_BASE } });
+  try {
+    const idle = await k.kernel.container.dispatchHttp('cover', 'GET', '/login', {}, {});
+    assert.equal(idle!.status, 200);
+    assert.equal(JSON.parse(String(idle!.body)).status, 'idle');
+
+    const dir = join(k.dataDir, 'cover');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'login-status.json'), JSON.stringify({ status: 'running', ts: Date.now() }));
+    const dup = await k.kernel.container.dispatchHttp('cover', 'POST', '/login', {}, {});
+    assert.equal(dup!.status, 409);
+
+    writeFileSync(join(dir, 'login-status.json'), JSON.stringify({ status: 'done', ts: Date.now() }));
+    const done = await k.kernel.container.dispatchHttp('cover', 'GET', '/login', {}, {});
+    assert.equal(JSON.parse(String(done!.body)).status, 'done');
+  } finally {
     await k.cleanup();
   }
 });

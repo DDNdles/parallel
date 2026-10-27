@@ -318,6 +318,7 @@ export class Kernel {
     const key = `${plan.action}:${plan.reason}:${this.coverSupervisor.running}`;
     if (key === this.coverPlanKey) return;
     this.coverPlanKey = key;
+    if (plan.action === 'none') return; // 已经有一个在跑（自己的子进程或外部孤儿），别碰它
     if (plan.action === 'start') {
       this.coverSupervisor.start();
       this.log.info(`cover supervisor 已启动（${trigger}：${plan.reason}）`);

@@ -545,6 +545,8 @@ export interface PluginContext {
   manifest: PluginManifest;
   /** 插件专属数据目录（卸载时不删除，重装沿用） */
   pluginDataDir: string;
+  /** 内核数据目录（secrets.json / config.json 所在；插件只读用途，例如拉起需要凭据的子脚本） */
+  dataDir: string;
   log: Logger;
   /** 结构化事件总线 */
   bus: Bus;

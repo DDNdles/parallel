@@ -583,6 +583,7 @@ export class PluginContainer {
     const ctx: PluginContext = {
       manifest,
       pluginDataDir: this.pluginDataDir(manifest.id),
+      dataDir: this.dirs.dataDir,
       log,
       bus: {
         emit: (e, ...a) => bus.emit(e, ...a),

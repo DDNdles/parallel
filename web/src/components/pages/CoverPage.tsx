@@ -15,9 +15,10 @@ interface CoverRecord {
 }
 interface CoverError { ts: number; chatId: string; error: string }
 interface CoverStatus {
-  baseUrlSet: boolean; lastGenerationAt: number | null;
+  baseUrlSet: boolean; cookieSet?: boolean; lastGenerationAt: number | null;
   today: { userId: string; count: number };
 }
+interface LoginStatus { status: 'idle' | 'running' | 'done' | 'failed'; ts?: number; error?: string }
 interface DeskJob {
   ok?: boolean; status: 'running' | 'done' | 'failed'; error?: string; elapsed?: number;
   id?: string; song?: string; artist?: string; seconds?: number;
@@ -105,6 +106,9 @@ export default function CoverPage() {
   // —— 右栏行内展开：试听（auto = 试翻成功后自动播）与补发表单，各只开一条 ——
   const [play, setPlay] = useState<{ id: string; auto: boolean } | null>(null);
   const [send, setSend] = useState<SendBox | null>(null);
+  // —— 107 半自动登录：打开浏览器 → 人过验证码 → 回写 Cookie ——
+  const [login, setLogin] = useState<LoginStatus>({ status: 'idle' });
+  const [loginErr, setLoginErr] = useState('');
 
   const reload = useCallback(() => Promise.all([
     get('/api/plugin/cover/status').catch(() => null),
@@ -119,6 +123,42 @@ export default function CoverPage() {
     setLastErrors(r.lastErrors ?? []);
   }), []);
   useEffect(() => { void reload(); }, [reload]);
+
+  // 进页面先问一次登录状态（内核重启后状态文件还在）
+  useEffect(() => {
+    get('/api/plugin/cover/login').then((s) => setLogin(s as LoginStatus)).catch(() => { /* 未登录也能看别的 */ });
+  }, []);
+
+  // 登录向导在跑：2 秒看一次；完成/失败就停
+  useEffect(() => {
+    if (login.status !== 'running') return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const s = await get('/api/plugin/cover/login') as LoginStatus;
+        if (stopped) return;
+        setLogin(s);
+        if (s.status === 'done') { setLoginErr(''); void reload(); }
+        if (s.status === 'failed') setLoginErr(s.error || '登录失败，再试一次');
+      } catch { /* 单次拉不到等下一轮 */ }
+    };
+    const h = window.setInterval(() => void tick(), 2000);
+    void tick();
+    return () => { stopped = true; window.clearInterval(h); };
+  }, [login.status, reload]);
+
+  const startLogin = async () => {
+    if (login.status === 'running') return;
+    setLoginErr('');
+    try {
+      const r = await post('/api/plugin/cover/login', {}) as { ok?: boolean; error?: string };
+      if (r.ok === false) throw new Error(r.error || '拉起登录向导失败');
+      setLogin({ status: 'running', ts: Date.now() });
+    } catch (e) {
+      setLoginErr((e as Error)?.message ?? String(e));
+    }
+  };
+
 
   // 轮询在途任务：4s 一次；页面刷新丢了句柄也没关系，只是不再显示进度
   useEffect(() => {
@@ -222,6 +262,34 @@ export default function CoverPage() {
               ))}
             </div>
           )}
+        </div>
+
+        <div className="mset-group">
+          <div className="mset-group-t">107 登录</div>
+          <div className="cover-kv">
+            <span>Cookie</span>
+            <b>
+              {login.status === 'running' ? <span className="tag warn">等待浏览器登录</span>
+                : login.status === 'done' ? <span className="tag ok">已更新</span>
+                  : login.status === 'failed' ? <span className="tag warn">上次失败</span>
+                    : status?.cookieSet ? <span className="tag ok">已有 Cookie</span>
+                      : <span className="tag">未配置</span>}
+            </b>
+            <Hint text="打开浏览器后输入账号密码 + 验证码；登录成功会自动写回，不用手动复制 Cookie" />
+          </div>
+          {login.status === 'running' ? (
+            <div className="cover-kv" style={{ display: 'block' }}>
+              <span className="plg-hint">在刚打开的浏览器窗口里完成登录（账号密码 + 验证码，或统一认证），这个页面会自动更新。</span>
+            </div>
+          ) : (
+            <button className="mset-add" style={{ marginTop: 8 }} onClick={() => void startLogin()}>
+              <Icon name="refresh" size={13} /> {login.status === 'done' ? '再登录一次' : '打开登录页'}
+            </button>
+          )}
+          {login.status === 'done' && (
+            <div className="plg-hint" style={{ marginTop: 6 }}>Cookie 已写回，守护进程下一轮会自动重新接线（约 2 分钟）。</div>
+          )}
+          {loginErr && <div className="mset-err">{loginErr}</div>}
         </div>
 
         <div className="mset-group">
