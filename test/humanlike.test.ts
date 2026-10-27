@@ -944,6 +944,21 @@ test('pickBubbleTarget 自定义权重不吃避重折扣：实际频率就是设
   assert.ok(rate < 22, `自动分布仍应避重（3 条占比低于无避重时的 ~32%），实际 ${rate.toFixed(1)}%`);
 });
 
+test('recentBubbleShapes 记的是精确条数：3 条不再被当成 4', () => {
+  const { svc } = makeService();
+  svc.noteSpoke(chat, 3, ['a', 'b', 'c']);
+  svc.noteSpoke(chat, 4, ['a', 'b', 'c', 'd']);
+  svc.noteSpoke(chat, 5, ['a', 'b', 'c', 'd', 'e']);
+  assert.deepEqual(svc.recentBubbleShapes(chat), [3, 4, 5], '应原样记 3/4/5，不按 1/2/3+ 分桶');
+  // 连着三轮都发 3 条：抽签器能认出"上一轮是 3"，把 3 条本身也降权（旧分桶会漏罚 3 条）
+  const { svc: svc2 } = makeService();
+  for (let i = 0; i < 3; i++) svc2.noteSpoke(chat, 3, ['a', 'b', 'c']);
+  assert.deepEqual(svc2.recentBubbleShapes(chat), [3, 3, 3]);
+  assert.deepEqual(svc2.recentBubbleShapes(chat, 2), [3, 3], 'n 参数只取最近几轮');
+  svc.dispose();
+  svc2.dispose();
+});
+
 test('气泡条数软约束：440 节跨轮稳定不写每轮目标数，当轮条数与列举/多问突破规则写在 chatTurnBubbleNote', () => {
   const s1 = chatOutputStyleText({ maxChars: 100, targetBubbles: 1, maxBubbles: 6 });
   const s4 = chatOutputStyleText({ maxChars: 100, targetBubbles: 4, maxBubbles: 6 });

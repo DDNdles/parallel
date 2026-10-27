@@ -65,6 +65,8 @@ interface ChatState {
   lastWaitLoggedAt: number;
   /** 最近若干轮的「节奏签名」（HDSI ChatRhythm 的窗口） */
   rhythmSigs: string[];
+  /** 最近几轮实际发了几条气泡（气泡数避重用；rhythmSigs 只记 1 / 2 / 3+ 粗结构，分辨不出 3 和 4） */
+  bubbleCounts: number[];
   /** 连续注入了提示但节奏没变好的次数（熔断用） */
   rhythmExhausted: number;
   /** 最近 bot 实际说出去的整轮文本（重复惩罚用；每轮一条） */
@@ -159,7 +161,7 @@ export class HumanlikeService {
         recent: [], intervals: [],
         lastInboundAt: 0, lastSpokeAt: 0,
         consecutiveNoAction: 0, backoffUntil: 0, lastWaitLoggedAt: 0,
-        rhythmSigs: [], rhythmExhausted: 0,
+        rhythmSigs: [], bubbleCounts: [], rhythmExhausted: 0,
         selfTexts: [], inboundTexts: [], antiRepeat: [],
         schedule: emptyPlan(), lastProactiveAt: 0,
         hourly: new Array<number>(24).fill(0), hourlyTouchedAt: 0,
@@ -520,12 +522,12 @@ export class HumanlikeService {
   // ------------------------------------------------------------ 回合结果回执
 
   /**
-   * 说出去了：记进存在感窗口、清退避计数，并把这一轮的**节奏签名**记进窗口。
-   * `bubbles` 是实际发出去的那几条，用于 HDSI ChatRhythm 的定型检测。
+   * 最近几轮的**实际气泡条数**（精确值），给气泡数抽签做避重。
+   * 旧状态没记 bubbleCounts 时退回节奏签名（结构维度只有 1 / 2 / 3+→4，3 条会被当成 4）。
    */
-  /** 最近几轮的粗结构（rhythmSigs 的结构维度：1 / 2 / 3+→4），给气泡数抽签做避重 */
   recentBubbleShapes(chat: ChatRef, n = 3): number[] {
     const st = this.state(chat);
+    if (st.bubbleCounts.length) return st.bubbleCounts.slice(-n);
     return st.rhythmSigs.slice(-n).map((sig) => {
       const head = String(sig).split(/[|/]/)[0].trim();
       if (head === '1') return 1;
@@ -534,6 +536,10 @@ export class HumanlikeService {
     });
   }
 
+  /**
+   * 说出去了：记进存在感窗口、清退避计数，并把这一轮的**节奏签名**记进窗口。
+   * `bubbles` 是实际发出去的那几条，用于 HDSI ChatRhythm 的定型检测。
+   */
   noteSpoke(chat: ChatRef, count = 1, bubbles: string[] = []): void {
     const st = this.state(chat);
     const now = this.now();
@@ -546,6 +552,10 @@ export class HumanlikeService {
       const cfg = this.config.rhythm;
       st.rhythmSigs.push(rhythmSignature(bubbles));
       while (st.rhythmSigs.length > Math.max(5, cfg.historyLimit)) st.rhythmSigs.shift();
+      // 气泡数避重另记精确条数：节奏签名的 3+ 分桶分辨不出 3 和 4/5/6，
+      // 拿到抽签器里会漏罚 3 条、让 4 条替 5/6 条挨罚（2026-10-27 修）。
+      st.bubbleCounts.push(bubbles.length);
+      while (st.bubbleCounts.length > Math.max(5, cfg.historyLimit)) st.bubbleCounts.shift();
       // 重复惩罚按"轮"记：一轮多条气泡合成一条，避免一次回复里多说两遍就被算成两轮。
       const said = bubbles.map((b) => String(b ?? '').trim()).filter(Boolean).join('\n');
       if (said) {
