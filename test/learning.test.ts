@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   EXPRESSION_SYSTEM, buildExpressionPrompt, expressionDue, expressionSection,
+  expressionStyleKey, manualExpression,
   mergeExpressions, parseExpressions, selectExpressions,
   type ExpressionEntry, type ExpressionMessage,
 } from '../src/plugins/chat/expression.ts';
@@ -47,6 +48,16 @@ test('表达学习：合并按说法去重、只留最近的 maxPerChat 条', ()
   const merged = mergeExpressions([a, b], [c], 2);
   assert.deepEqual(merged.map((e) => e.style), ['说法二', '说法一']);
   assert.equal(merged[1].keys[0], 'c', '同说法保新的');
+});
+
+test('表达学习：手动补词走同一套清洗与去重键，空串不落', () => {
+  const e = manualExpression('  还有这等好事！ ', 9);
+  assert.ok(e);
+  assert.equal(e.style, '还有这等好事！');
+  assert.equal(e.situation, '手动补充');
+  assert.ok(e.keys.length >= 1);
+  assert.equal(expressionStyleKey('还有这等好事'), expressionStyleKey('还有这等好事！'));
+  assert.equal(manualExpression('   ', 1), null);
 });
 
 test('表达学习：到期判定 = 攒够条数 + 群已静默', () => {

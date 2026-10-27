@@ -110,8 +110,20 @@ function fallbackKeys(situation: string, style: string): string[] {
   return [...out];
 }
 
-/**
- * 解析模型输出 → 可落库的表达。
+/** 手动补充的说法：没有真实情境，关键词从说法本身取 */
+export function manualExpression(style: string, now: number): ExpressionEntry | null {
+  const s = clean(style, 40);
+  if (!s) return null;
+  const situation = '手动补充';
+  return { situation, style: s, keys: fallbackKeys('', s), at: now };
+}
+
+/** 说法去重键（去标点、小写）：学习去重与桌面端删除共用同一把尺子 */
+export function expressionStyleKey(style: string): string {
+  return norm(clean(style, 40));
+}
+
+/** 解析模型输出 → 可落库的表达。
  * 跳过空项、纯语气词、过短/过长、与已有重复的；批内去重；限长限量。
  */
 export function parseExpressions(text: string, existing: ExpressionEntry[], cap: number, now: number): ExpressionEntry[] {

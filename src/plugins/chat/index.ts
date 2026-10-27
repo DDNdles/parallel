@@ -10,6 +10,7 @@ import {
 } from './memory-extract.ts';
 import {
   EXPRESSION_SYSTEM, buildExpressionPrompt, expressionDue, expressionSection,
+  expressionStyleKey, manualExpression,
   mergeExpressions, parseExpressions, selectExpressions,
   EXPRESSION_BATCH_MAX, EXPRESSION_MAX_FAILS, EXPRESSION_QUEUE_MAX,
   type ExpressionCfg, type ExpressionEntry, type ExpressionMessage, type ExpressionQueue,
@@ -1100,6 +1101,62 @@ export function setup(ctx: PluginContext): void {
     } catch (e) {
       done(false, (e as Error).message);
     }
+  });
+
+  // ---------- HTTP：语气学习词表（桌面端设置页） ----------
+  // 只暴露「学到的说法」本身；情境与关键词不往桌面上送，页面上只看词。
+  const publicExpressions = (entries: ExpressionEntry[]) => entries.map((e) => ({ style: e.style, at: e.at }));
+  ctx.http.on('GET', '/expressions', () => ({
+    body: {
+      groups: Object.entries(exprStore)
+        .filter(([key, entries]) => key.startsWith('group_') && Array.isArray(entries))
+        .map(([chatKey, entries]) => ({ chatKey, entries: publicExpressions(entries) })),
+    },
+  }));
+  ctx.http.on('POST', '/expressions', (req) => {
+    const body = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    const chatKey = String(body.chatKey ?? '');
+    if (!/^group_[0-9A-Za-z_-]{1,64}$/.test(chatKey)) return { status: 400, body: { error: '群标识不对' } };
+    const action = String(body.action ?? '');
+    const existing = Array.isArray(exprStore[chatKey]) ? exprStore[chatKey] : [];
+    if (action === 'add') {
+      const at = body.at === undefined ? Date.now() : Number(body.at);
+      const entry = manualExpression(String(body.style ?? ''), Number.isFinite(at) ? at : Date.now());
+      if (!entry) return { status: 400, body: { error: '说法不能为空，最多 40 字' } };
+      // 手动补词也允许带情境/关键词（导入或恢复旧词时用；页面不传）
+      if (typeof body.situation === 'string' && body.situation.trim()) entry.situation = body.situation.trim().slice(0, 80);
+      if (Array.isArray(body.keys)) {
+        const keys = body.keys.map((k) => String(k ?? '').trim()).filter(Boolean).slice(0, 3);
+        if (keys.length) entry.keys = keys;
+      }
+      const key = expressionStyleKey(entry.style);
+      if (existing.some((e) => expressionStyleKey(e.style) === key)) {
+        return { status: 409, body: { error: '这个说法已经学过了' } };
+      }
+      const max = exprCfg().maxPerChat;
+      if (existing.length >= max) {
+        return { status: 409, body: { error: `词表已满（${max} 条），先删一条再加` } };
+      }
+      exprStore[chatKey] = mergeExpressions(existing, [entry], max);
+      learningDirty = true;
+      saveLearning();
+      return { body: { ok: true, entries: publicExpressions(exprStore[chatKey]) } };
+    }
+    if (action === 'delete') {
+      const key = expressionStyleKey(String(body.style ?? ''));
+      const at = body.at === undefined ? null : Number(body.at);
+      const idx = existing.findIndex((e) => expressionStyleKey(e.style) === key && (at === null || e.at === at));
+      if (idx < 0) return { status: 404, body: { error: '没找到这个说法' } };
+      const next = existing.slice();
+      next.splice(idx, 1);
+      if (next.length) exprStore[chatKey] = next; else delete exprStore[chatKey];
+      learningDirty = true;
+      saveLearning();
+      return { body: { ok: true, entries: publicExpressions(next) } };
+    }
+    return { status: 400, body: { error: 'action 只能是 add / delete' } };
   });
 
   // ---------- 后台学习接线 ----------

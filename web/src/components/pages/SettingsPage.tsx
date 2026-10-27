@@ -9,6 +9,7 @@ import { PillSelect, type PillOpt } from '@/components/PillSelect';
 import { Icon } from '@/components/Icon';
 import { Switch } from '@/components/Modal';
 import Hint from '@/components/Hint';
+import { VoiceLearningPanel } from '@/components/VoiceLearningPanel';
 
 /** 拟人层配置（内核 humanlike 段）：开口时机对齐 MaiBot，发出去的样子是纯程序（按句分条 + 句边截断） */
 interface Humanlike {
@@ -107,6 +108,7 @@ const SECTIONS: { v: string; t: string; icon: string }[] = [
   { v: 'search', t: '搜索', icon: 'globe' },
   { v: 'risk', t: '风控', icon: 'lock' },
   { v: 'humanlike', t: '拟人化', icon: 'think' },
+  { v: 'voice', t: '语气学习', icon: 'write' },
   { v: 'persona', t: '记忆', icon: 'memory' },
   { v: 'sticker', t: '表情包', icon: 'sticker' },
   { v: 'bilibili', t: 'b站搜索', icon: 'bilibili' },
@@ -690,6 +692,8 @@ export default function SettingsPage() {
               </div>
             </>
           ))}
+
+          {sec === 'voice' && <VoiceLearningPanel />}
 
           {sec === 'persona' && (() => {
             const setP = (p: Partial<Config['persona']>, immediate = false) => {
