@@ -368,6 +368,11 @@ export function setup(ctx: PluginContext): void {
     },
     handler: async (args, tctx) => {
       const rel = String(args.path ?? '');
+      // work 轮拿到的 chat 是任务沙箱的合成引用（private_u<QQ>__t<task>），不是真实收件人；
+      // 直接发会把合成 id 当 QQ 号传给协议端。产物一律走 work_finish 的 artifacts。
+      if (tctx.work || /^u\d+$/.test(tctx.chat.chatId)) {
+        return 'work 轮不要直接发文件：把路径登记进 work_finish 的 artifacts，交付轮会统一发给用户。';
+      }
       let abs: string;
       try {
         abs = joinPath(sb.root(chatRefOf(tctx)), rel);

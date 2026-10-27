@@ -693,12 +693,12 @@ export class HumanlikeService {
    *   ② 其余 → 归一化（剥占位/标签、单条上限硬截断）→ 按回复总长句边截断 → 按句/换行分条。
    * `historyText` 就是真正发出去的气泡合并 —— 历史里模型自己的话与群里看到的同形态。
    */
-  async composeScene(text: string): Promise<{ plans: SendPlan[]; historyText: string; spoke: boolean }> {
+  async composeScene(text: string, opts?: { maxBubbles?: number }): Promise<{ plans: SendPlan[]; historyText: string; spoke: boolean }> {
     const cfg = this.config;
     const scene = String(text ?? '');
     if (isSilentScene(scene)) return { plans: [], historyText: '', spoke: false };
 
-    const bubbles = this.collectBubbles(scene, cfg);
+    const bubbles = this.collectBubbles(scene, cfg, opts?.maxBubbles);
     return { plans: this.plan(bubbles), historyText: bubbles.join('\n'), spoke: bubbles.length > 0 };
   }
 
@@ -728,7 +728,7 @@ export class HumanlikeService {
    * 归一化 → 句边截断（回复总长上限的兜底）→ 按换行与句末标点分条。
    * 模型不写任何格式标记；关掉 `splitReplyMessages` 就整段一条发出去。
    */
-  private collectBubbles(text: string, cfg: HumanlikeConfig): string[] {
+  private collectBubbles(text: string, cfg: HumanlikeConfig, maxBubblesOverride?: number): string[] {
     const out = cfg.outgoing;
     // 顺序（2026-10-24 修）：剥标记 → 句边截断到「回复总长上限」→ 分条 → **逐条**套单条上限。
     // 之前把 maxMessageCharacters（单条平台安全垫，线上 24）套在整段回复上，
@@ -737,7 +737,9 @@ export class HumanlikeService {
     const t = trimAtSentence(stripped, out.replyMaxCharacters);
     if (!t) return [];
     if (out.splitReplyMessages === false) return [clip(t, out.maxMessageCharacters)];
-    const maxBubbles = Math.max(1, Math.round(Number((out as { maxBubbles?: number }).maxBubbles) || MAX_BUBBLES));
+    const maxBubbles = Math.max(1, Math.round(
+      Number(maxBubblesOverride ?? (out as { maxBubbles?: number }).maxBubbles) || MAX_BUBBLES,
+    ));
     return splitIntoBubbles(t, maxBubbles, out.bubbleSoftMaxCharacters)
       .map((b) => (b.length > out.maxMessageCharacters ? clip(b, out.maxMessageCharacters) : b));
   }

@@ -619,8 +619,12 @@ export interface ChatSendService {
    */
   sendTracked(chat: ChatRef, segments: MsgSegment[]): Promise<{ sent: number; ids: string[] }>;
   sendText(chat: ChatRef, text: string): Promise<void>;
-  /** 发送文件：仅允许沙箱内路径（内核强校验） */
-  sendFile(chat: ChatRef, sandboxPath: string): Promise<void>;
+  /**
+   * 发送文件：仅允许沙箱内路径（内核强校验）。
+   * `sandboxChat` 用于「文件在工作任务沙箱里、但要发到真实会话」的场景：
+   * 校验按它算，投递目标仍是 chat（任务沙箱的合成 chatId 如 u<QQ> 不能当收件人）。
+   */
+  sendFile(chat: ChatRef, sandboxPath: string, opts?: { sandboxChat?: ChatRef }): Promise<void>;
   /** 戳一戳（双击头像）：target 可以是 QQ 号或最近说话的昵称；私聊省略 = 对面 */
   poke(chat: ChatRef, target?: string): Promise<{ userId: string; nickname?: string }>;
   /**

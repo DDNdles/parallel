@@ -41,17 +41,18 @@ async function boot(group: string) {
 
   /** 记下协议端收到的文件（替身适配器：不连真协议端，只验证调用链把文件交出去了） */
   const files: string[] = [];
+  const targets: string[] = [];
   kernel.chat.attachAdapter({
     send: async () => 'mid',
     sendForward: async () => undefined,
     sendPoke: async () => {},
     sendReaction: async () => {},
-    sendFile: async (_c, abs) => { files.push(abs); return 'fid'; },
+    sendFile: async (_c, abs) => { files.push(abs); targets.push(String(_c.chatId)); return 'fid'; },
     connected: () => true,
     status: () => ({ connected: true }),
   });
   const mock = (kernel.llm as unknown as { providers: Map<string, any> }).providers.get('mock')!;
-  return { kernel, chat, chatKey, files, mock, cleanup: async () => { await kernel.shutdown(); rmSync(dataDir, { recursive: true, force: true }); } };
+  return { kernel, chat, chatKey, files, targets, mock, cleanup: async () => { await kernel.shutdown(); rmSync(dataDir, { recursive: true, force: true }); } };
 }
 
 test('deliver_file：work 交付登记过的产物，chat 真能发给用户（不是只回路径）', async () => {
@@ -82,6 +83,111 @@ test('deliver_file：work 交付登记过的产物，chat 真能发给用户（�
     assert.equal(g.files.length, 2, `应当发出两个文件，实际：${JSON.stringify(g.files)}`);
     assert.ok(g.files.some((f) => f.endsWith('report.html')), 'report.html 没发出去');
     assert.ok(g.files.some((f) => f.endsWith('pic.png')), 'pic.png 没发出去');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('deliver_file：私聊任务沙箱的产物发到真实 QQ 号（不把 u<QQ> 合成 id 当收件人）', async () => {
+  const g = await boot('9104');
+  try {
+    // 私聊 work 任务的沙箱引用：chatId 是 u<QQ>、scope 是任务号（真实收件人只有 QQ 号）
+    const taskId = 'tdeadbeef';
+    const sandboxKey = `private_u10001__${taskId}`;
+    const workChat = { platform: 'qq' as const, type: 'private' as const, chatId: 'u10001', scope: taskId };
+    g.kernel.sandbox.write(workChat, 'imagegen/poster.jpg', Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+    g.kernel.db.run(
+      `INSERT INTO work_runs (id, chat_key, task, model, trigger, phase, ok, rounds, tool_calls, duration_ms, summary, error, user_id, ts, artifacts, sandbox_key)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `work_${taskId}`, 'private_10001', '画海报', 'mock:mock-1', 'chat', 'done', 1, 3, 3, 1000, '', null, '10001', Date.now(),
+      JSON.stringify(['imagegen/poster.jpg']), sandboxKey,
+    );
+
+    const realChat = { platform: 'qq' as const, type: 'private' as const, chatId: '10001' };
+    const tool = g.kernel.container.toolsForChat(realChat, 'owner').find((t) => t.name === 'deliver_file');
+    assert.ok(tool);
+    const r = await tool!.handler({}, {
+      chat: realChat, role: 'owner',
+      event: {
+        platform: 'qq', type: 'private', chatId: '10001', userId: '10001', nickname: '主人',
+        segments: [], text: '我图图呢', isAtMe: true, isReplyToMe: false, senderRole: 'owner', raw: null, ts: Date.now(),
+      },
+    } as any);
+    const text = typeof r === 'string' ? r : r.content;
+    assert.match(text, /已发送/, `应当发送成功，实际：${text}`);
+    assert.equal(g.files.length, 1, `应当发出一个文件，实际：${JSON.stringify(g.files)}`);
+    assert.ok(g.files[0].endsWith('poster.jpg'));
+    assert.deepEqual(g.targets, ['10001'], `收件人必须是真实 QQ 号，实际：${JSON.stringify(g.targets)}`);
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('send_file：work 轮拒绝直接发（合成会话不是收件人），改用 work_finish 登记', async () => {
+  const g = await boot('9105');
+  try {
+    const workChat = { platform: 'qq' as const, type: 'private' as const, chatId: 'u10001', scope: 'tfeed' };
+    const tool = g.kernel.container.toolsForChat(workChat, 'owner', 'work').find((t) => t.name === 'send_file');
+    assert.ok(tool, 'work 面应当有 send_file（历史行为），但调用要被挡下');
+    const r = await tool!.handler({ path: 'x.txt' }, { chat: workChat, role: 'owner', work: { depth: 0 }, event: { userId: '10001' } } as any);
+    const text = typeof r === 'string' ? r : r.content;
+    assert.match(text, /work_finish/);
+    assert.equal(g.files.length, 0);
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('派活确认轮：maxBubbles=1 时只出一条气泡', async () => {
+  const g = await boot('9106');
+  try {
+    const { plans } = await g.kernel.humanlike.composeScene('收到，本鱼这就把活派下去画！居然敢说本鱼滞销。明明超抢手好不好！正在画啦。', { maxBubbles: 1 });
+    assert.equal(plans.length, 1);
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('汇报轮模型空输出：登记的产物照样发出去（不跟着沉默）', async () => {
+  const g = await boot('9107');
+  try {
+    const taskId = 'tabc';
+    const sandboxKey = `group_${g.chat.chatId}__${taskId}`;
+    const workChat = { platform: 'qq' as const, type: 'group' as const, chatId: g.chat.chatId, scope: taskId };
+    g.kernel.sandbox.write(workChat, 'imagegen/poster.jpg', Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+
+    const forwards: any[] = [];
+    g.kernel.chat.attachAdapter({
+      send: async () => 'mid',
+      sendForward: async (_c: any, nodes: any) => { forwards.push(nodes); return 'fid'; },
+      sendPoke: async () => {},
+      sendReaction: async () => {},
+      sendFile: async () => 'fid',
+      connected: () => true,
+      status: () => ({ connected: true }),
+    });
+    // 模型这一轮一个字都没产出（链挂/额度尽）
+    g.mock.script.push({ content: '' });
+
+    await (g.kernel.pipeline as any).agentTurn(
+      {
+        platform: 'qq', type: 'group', chatId: g.chat.chatId, userId: '10001', nickname: '主人', senderRole: 'owner',
+        segments: [], text: '', isAtMe: false, isReplyToMe: false, raw: { workReport: true }, ts: Date.now(),
+      },
+      'owner', g.chatKey,
+      {
+        report: {
+          task: '画海报',
+          result: {
+            id: `work_${taskId}`, ok: true, sandboxKey, summary: '画好了', rounds: 1, toolCalls: 1,
+            durationMs: 1, artifacts: ['imagegen/poster.jpg'], model: 'mock:mock-1',
+          },
+        },
+      },
+    );
+
+    assert.equal(forwards.length, 1, '空文本也不能把产物丢了');
+    assert.ok(JSON.stringify(forwards[0]).includes('poster.jpg'), '产物文件没进交付节点');
   } finally {
     await g.cleanup();
   }

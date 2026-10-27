@@ -375,7 +375,7 @@ export function setup(ctx: PluginContext): void {
     description: '画一张图（文生图；给了 refs 就用会话沙箱里的图片当参考）。产物落在当前会话沙箱的 imagegen/ 目录（PNG/JPEG 跟随模型返回格式），返回路径与大小。',
     promptSnippet: '用 Gemini 画图（文生图 / 参考图），产物落会话沙箱 imagegen/',
     promptGuidelines: [
-      '用户要图（画一张、生成图片、按描述作图、照这张图改）时直接用 generate_image 画，画完把返回的路径用 send_file 发给对方，不要只报路径。',
+      '用户要图（画一张、生成图片、按描述作图、照这张图改）时直接用 generate_image 画；画完把文件路径登记进 work_finish 的 artifacts，交付轮会发给用户（work 里不要自己 send_file，任务沙箱不是聊天目标）。',
       '任务正文里有「用户原话」时，prompt 必须原样粘贴那段原话，一字不改（"画一张"这类词保留也无妨）——不改写、不扩写、不加风格词；原话信息不够就 work_ask 问，不要自己脑补画面。',
       '参考图只能给会话沙箱内的相对路径（如 inbox/xxx.png），最多 4 张；图不在沙箱里就先让用户发过来。',
       '生图失败时如实说明原因，不要说已经画好；额度用完就告诉对方下周再来。',
@@ -405,7 +405,7 @@ export function setup(ctx: PluginContext): void {
       });
       if (!r.ok) return r.error;
       return {
-        content: `已生成 ${r.path}（${r.size} 字节${r.fallback ? `，主模型不可用、由备用 ${r.model} 生成` : ''}）。要发给用户就用 send_file 传这个路径。`,
+        content: `已生成 ${r.path}（${r.size} 字节${r.fallback ? `，主模型不可用、由备用 ${r.model} 生成` : ''}）。把 ${r.path} 登记进 work_finish 的 artifacts，交付轮会发给用户；work 里不要自己 send_file。`,
         meta: { path: r.path, artifacts: [r.path] },
       };
     },

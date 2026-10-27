@@ -298,8 +298,9 @@ export class ChatService implements ChatSendService {
       id = await this.adapter.sendForward(chat, nodes);
     } catch {
       // 老协议端/不支持 forward 的线格式：退回正文一条 + 文件逐条，至少不丢交付
+      // 文件在任务沙箱里时校验要按 sandboxChat 算，否则会被「只允许发当前会话沙箱」挡下
       await this.send(chat, content.length ? content : [{ type: 'text', data: { text: shownText } }]);
-      for (const f of delivery) await this.sendFile(chat, f.abs);
+      for (const f of delivery) await this.sendFile(chat, f.abs, { sandboxChat: opts.sandboxChat ?? chat });
       return;
     }
     this.opts.onUsage('out');
@@ -344,13 +345,17 @@ export class ChatService implements ChatSendService {
     return { file: { rel: `deliver/${name}`, name, abs, size: statSync(abs).size } };
   }
 
-  async sendFile(chat: ChatRef, sandboxPath: string): Promise<void> {
-    const root = normalize(this.opts.sandboxRoot(chat));
+  async sendFile(chat: ChatRef, sandboxPath: string, opts?: { sandboxChat?: ChatRef }): Promise<void> {
+    // 校验按文件所在沙箱算；投递目标永远是真 chat（任务沙箱的 chatId 是 u<QQ> 这类合成值）
+    const root = normalize(this.opts.sandboxRoot(opts?.sandboxChat ?? chat));
     const abs = normalize(resolve(sandboxPath));
     if (abs !== root && !abs.startsWith(root + sep)) {
       throw new Error('只允许发送当前会话沙箱内的文件');
     }
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`文件不存在: ${sandboxPath}`);
+    if (chat.type === 'private' && /^u\d+$/.test(chat.chatId)) {
+      throw new Error(`发送目标看起来是任务沙箱引用（${chat.chatId}），不是真实 QQ 号`);
+    }
     if (!this.adapter?.connected()) throw new Error('协议端未连接');
     await this.adapter.sendFile(chat, abs);
     this.opts.sessionLog.append(chat.chatId, chat.type, { type: 'message_out', role: 'assistant', text: `[文件] ${abs}`, data: { file: abs } });

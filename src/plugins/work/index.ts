@@ -416,7 +416,7 @@ export function setup(ctx: PluginContext): void {
       const ctxNote = picked.matched
         ? `；附带的聊天上下文 ${picked.matched} 条已核对原文带上${picked.dropped ? `，另有 ${picked.dropped} 段没对上原文被丢弃（要带就一字不差地引用原话）` : ''}`
         : (picked.dropped ? `；你选的 ${picked.dropped} 段上下文都没对上聊天原文，一个字都没带过去（要带就一字不差地引用原话，不能转述）` : '');
-      return `（已接下这件活，马上交给工作子代理去做${ctxNote}。这一轮只用一句自然的话应下，不要说你已经做完了；做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
+      return `（已接下这件活，马上交给工作子代理去做${ctxNote}。这一轮只用一句自然的话应下，不要说你已经做完了；也不要去回应用户话里的叫醒词、口号或玩笑（那可能只是要画在图上/引用的文字），别为此再单独说一句。做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
     },
   });
 
@@ -482,8 +482,11 @@ export function setup(ctx: PluginContext): void {
         try {
           // 只用沙箱内相对路径拼；resolve 与越界校验在 ChatService.sendFile 里（它再核一次）
           const scoped = resolvePath(sb.root(workChat), rel);
-          const abs = existsSync(scoped) ? scoped : resolvePath(sb.root(plainChat), rel);
-          await ctx.chat.sendFile(existsSync(scoped) ? workChat : plainChat, abs);
+          const fromWork = existsSync(scoped);
+          const abs = fromWork ? scoped : resolvePath(sb.root(plainChat), rel);
+          // 读哪个沙箱由 sandboxChat 决定；收件人永远是真实会话
+          // （workChat 的 chatId 是 u<QQ> 这类合成值，直接当收件人会让协议端查号失败）
+          await ctx.chat.sendFile(plainChat, abs, { sandboxChat: fromWork ? workChat : undefined });
           sent.push(rel);
         } catch (e) {
           failed.push(`${rel}（${(e as Error).message}）`);

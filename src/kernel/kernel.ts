@@ -317,15 +317,20 @@ export class Kernel {
   /** 幂等启停 cover supervisor：插件配置保存会触发重载，这里跟着重新评估，不会重复拉起 */
   ensureCoverSupervisor(trigger: string): void {
     const plan = this.coverPlan();
+    // start 不做 key 去重：守护进程崩溃后计划会回到和启动时一模一样的
+    // 「start:自动接线已开启」，按 key 比对会误判成重复而不拉起。
+    // start() 自己幂等（running 就不动），这里再判一次即可。
+    if (plan.action === 'start') {
+      if (this.coverSupervisor.running) return;
+      this.coverSupervisor.start();
+      this.log.info(`cover supervisor 已启动（${trigger}：${plan.reason}）`);
+      this.coverPlanKey = `start:${plan.reason}`;
+      return;
+    }
     const key = `${plan.action}:${plan.reason}:${this.coverSupervisor.running}`;
     if (key === this.coverPlanKey) return;
     this.coverPlanKey = key;
     if (plan.action === 'none') return; // 已经有一个在跑（自己的子进程或外部孤儿），别碰它
-    if (plan.action === 'start') {
-      this.coverSupervisor.start();
-      this.log.info(`cover supervisor 已启动（${trigger}：${plan.reason}）`);
-      return;
-    }
     if (this.coverSupervisor.running) {
       this.coverSupervisor.stop();
       this.log.info(`cover supervisor 已停止（${trigger}：${plan.reason}）`);

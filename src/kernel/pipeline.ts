@@ -1021,7 +1021,7 @@ export class Pipeline {
         }
       }
 
-      const { reply } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
+      const { reply, steps: turnSteps } = await this.agentLoop.run(ctx, { chatKey, abort: ac.signal });
 
       // 生成期被新消息打断：模型即使把结果吐完了也整段作废（新消息会成为下一轮的输入）。
       // abort 是否被 pi-agent-core 立刻兑现因供应商而异，所以这里再兜一层。
@@ -1039,7 +1039,18 @@ export class Pipeline {
 
       // 没接模型 / 额度耗尽 / 链全挂会被吞成空回复：这轮一个字不发，只落 gate 条目。
       // 群里出现"没答好请再问一次"式的托词比沉默更伤人设，失败细节都在报错中心与会话流里。
+      // 例外：汇报轮即使一个字没写出来，登记过的产物也必须发出去（否则"画好了却没图"）。
       if (!finalReply.trim()) {
+        const reportArtifacts = opts?.report?.result.artifacts ?? [];
+        if (isReport && reportArtifacts.length) {
+          await this.sendScene(chat, '', undefined, opts?.mention, {
+            artifacts: reportArtifacts,
+            userId: event.userId,
+            nickname: event.nickname,
+            sandboxKey: opts.report!.result.sandboxKey,
+          }, false);
+          return;
+        }
         this.humanlike.noteSilent(chat);
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system', text: '本轮没有产出内容（模型未接入或请求失败），保持沉默',
@@ -1104,9 +1115,11 @@ export class Pipeline {
       if (turn) turn.phase = 'sending';
 
       const quoteTarget = canQuoteTurn(event, opts) ? this.quoteTargetOf(event) : undefined;
+      // 这一轮派了活：确认只发一条气泡，避免"接活"和"回应叫醒词/梗"各说一句变成两条
+      const dispatchedWork = !isReport && turnSteps.some((s) => /▶\s*work_dispatch\b/.test(s));
       await this.sendScene(chat, finalReply, quoteTarget, opts?.mention,
         opts?.report ? { artifacts: opts.report.result.artifacts ?? [], userId: event.userId, nickname: event.nickname, sandboxKey: opts.report.result.sandboxKey } : undefined,
-        !forcedAt);
+        !forcedAt, dispatchedWork);
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
@@ -1222,6 +1235,8 @@ export class Pipeline {
     forward?: { artifacts: string[]; userId: string; nickname?: string; sandboxKey?: string },
     /** 这轮的气泡是否允许被插话砍掉；@ 轮与汇报轮传 false */
     interruptible = true,
+    /** 派活确认轮：只发一条气泡（"接活"和"回应叫醒词/梗"不该各占一条） */
+    singleBubble = false,
   ): Promise<void> {
     if (forward) {
       // 一条聊天记录：汇报正文整段进首节点（不按聊天气泡切/50 字截断），产物文件各占一个节点
@@ -1249,7 +1264,7 @@ export class Pipeline {
         this.errors.record('warn', 'work', `聊天记录发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
       }
     }
-    const { plans } = await this.humanlike.composeScene(raw);
+    const { plans } = await this.humanlike.composeScene(raw, singleBubble ? { maxBubbles: 1 } : undefined);
     if (!plans.length) {
       this.humanlike.noteSilent(chat);
       return;
