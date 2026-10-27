@@ -1191,6 +1191,7 @@ export function setup(ctx: PluginContext): void {
     }
     const deadline = Date.now() + cfg().timeoutMs;
     let seconds = job.seconds;
+    let emptyBase = 0;
     for (;;) {
       if (Date.now() >= deadline) {
         job.status = 'failed';
@@ -1200,6 +1201,16 @@ export function setup(ctx: PluginContext): void {
       await sleep(5000);
       // 每一轮重读配置：107 换作业时守护进程会改 baseUrl，旧地址上的任务已经没了
       const c = cfg();
+      if (!c.baseUrl) {
+        // 107 作业结束到新作业接线之间 baseUrl 是空的：别把槽位挂满整个 timeout
+        if (++emptyBase >= 3) {
+          job.status = 'failed';
+          job.error = '翻唱服务当前不在线（107 作业没在跑），这次试翻没跑成；等服务接上再点。';
+          break;
+        }
+        continue;
+      }
+      emptyBase = 0;
       const st = await fetchCoverStatus(c, job.serviceJobId);
       if (st.kind === 'failed') {
         job.status = 'failed';

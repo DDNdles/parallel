@@ -51,10 +51,25 @@ function readSecrets() {
     return { uiToken: '' };
   }
 }
-const sec = readSecrets();
-const COOKIE = arg('cookie', process.env.SCOW_COOKIE || sec.cookie || '');
-const API_KEY = arg('api-key', process.env.COVER_API_KEY || sec.apiKey || '');
-const UI_TOKEN = sec.uiToken ?? '';
+/** 命令行/环境变量显式给的凭据优先，且不再从 secrets.json 刷新它们 */
+const COOKIE_ARG = arg('cookie', process.env.SCOW_COOKIE || '');
+const API_ARG = arg('api-key', process.env.COVER_API_KEY || '');
+let COOKIE = COOKIE_ARG;
+let API_KEY = API_ARG;
+let UI_TOKEN = '';
+/**
+ * 每轮开头重读 secrets.json：107 登录回写后必须立刻换新 Cookie，
+ * 否则本进程会一直用旧 Cookie（作业 API 401），而且 wire() 发现插件里是新值
+ * 还会把旧值写回去——既毁掉新登录，又触发插件 reload 杀掉在跑的任务。
+ */
+function refreshSecrets() {
+  const s = readSecrets();
+  if (s.uiToken) UI_TOKEN = s.uiToken;
+  let changed = false;
+  if (!COOKIE_ARG && s.cookie && s.cookie !== COOKIE) { COOKIE = s.cookie; changed = true; }
+  if (!API_ARG && s.apiKey && s.apiKey !== API_KEY) { API_KEY = s.apiKey; changed = true; }
+  if (changed) log('已读取 secrets.json 里的新凭据（107 登录回写），本轮起生效');
+}
 const KERNEL = arg('kernel', 'http://127.0.0.1:3080').replace(/\/+$/, '');
 const ROOT_REMOTE = arg('root', REMOTE_ROOT);
 const INTERVAL = Math.max(30, Number(arg('interval', '120')) | 0);
@@ -254,6 +269,7 @@ async function submit(now) {
 }
 
 async function tick() {
+  refreshSecrets(); // 107 登录回写后立刻改用新 Cookie（见 refreshSecrets 注释）
   const now = Date.now();
   const st = readState();
   const cfg = await pluginConfig();
@@ -313,6 +329,7 @@ async function tick() {
 }
 
 async function main() {
+  refreshSecrets();
   if (!COOKIE) {
     console.error('缺少 Cookie：请在「插件 → 翻唱」里填 SCOW Cookie，或 --cookie "SCOW_USER=ustc-..."');
     process.exit(2);

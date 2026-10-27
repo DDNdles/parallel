@@ -92,6 +92,8 @@ export class Kernel {
   napcat: NapCatManager;
   container: PluginContainer;
   coverSupervisor: CoverSupervisor;
+  /** 守护进程健康检查：60s 一次，崩溃/被杀后自愈 */
+  private coverSupervisorTimer?: NodeJS.Timeout;
   private coverPlanKey = '';
   /** 桌面端/API 的 HTTP server（shutdown 时要关，否则测试进程无法退出） */
   private apiServer?: Server;
@@ -359,6 +361,9 @@ export class Kernel {
       this.apiServer = await startApiServer(this);
       // API 起来后再评估：supervisor 的第一轮就要读写插件配置
       this.ensureCoverSupervisor('内核启动');
+      // supervisor 可能崩溃/被手动杀：每分钟按配置重新评估一次（活着时是无操作）
+      this.coverSupervisorTimer = setInterval(() => this.ensureCoverSupervisor('心跳'), 60_000);
+      this.coverSupervisorTimer.unref();
       for (const ev of [busEvents.pluginLoaded, busEvents.pluginStateChanged]) {
         this.bus.on(ev, (d: { id?: string }) => {
           if (d?.id === 'cover') this.ensureCoverSupervisor('插件状态变化');
@@ -479,6 +484,7 @@ export class Kernel {
   }
 
   async shutdown(): Promise<void> {
+    if (this.coverSupervisorTimer) { clearInterval(this.coverSupervisorTimer); this.coverSupervisorTimer = undefined; }
     this.coverSupervisor.stop();
     for (const lp of this.container.list()) {
       await this.container.unload(lp.manifest.id).catch(() => {});

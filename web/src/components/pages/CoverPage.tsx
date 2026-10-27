@@ -103,6 +103,8 @@ export default function CoverPage() {
   const [job, setJob] = useState<{ id: string; elapsed: number } | null>(null);
   const [previewErr, setPreviewErr] = useState('');
   const pollRef = useRef<number | null>(null);
+  /** 插件重载/内核重启的瞬间会短暂 404：连续几次才算真丢，别吓人 */
+  const lostHits = useRef(0);
   // —— 右栏行内展开：试听（auto = 试翻成功后自动播）与补发表单，各只开一条 ——
   const [play, setPlay] = useState<{ id: string; auto: boolean } | null>(null);
   const [send, setSend] = useState<SendBox | null>(null);
@@ -168,6 +170,7 @@ export default function CoverPage() {
       try {
         const j = await get(`/api/plugin/cover/job?id=${encodeURIComponent(job.id)}`) as DeskJob;
         if (stopped) return;
+        lostHits.current = 0;
         if (j.status === 'done') {
           setJob(null);
           await reload();
@@ -182,8 +185,10 @@ export default function CoverPage() {
         }
         setJob((x) => (x ? { ...x, elapsed: j.elapsed ?? x.elapsed + 4 } : x));
       } catch (e) {
-        // 任务句柄丢了（插件热重载/内核重启）：轮下去也等不到结果，就地说明
+        // 任务句柄丢了（插件重载/内核重启）：短暂 404 先重试，连续 3 次（约 12 秒）才算真丢
         if (/没有这个试翻任务/.test((e as Error).message)) {
+          lostHits.current += 1;
+          if (lostHits.current < 3) return;
           setJob(null);
           setPreviewErr('试翻任务的进度丢了（服务可能刚重启），完成与否看下面的记录。');
           return;
@@ -200,6 +205,7 @@ export default function CoverPage() {
   const audition = async () => {
     if (!song.trim() || job) return;
     setPreviewErr('');
+    lostHits.current = 0;
     try {
       const r = await post('/api/plugin/cover/preview', {
         song: song.trim(),
