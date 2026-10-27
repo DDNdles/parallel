@@ -2,7 +2,7 @@
  * 拟人化服务 —— 内核里"什么时候说、怎么说"的那一半。
  *
  * 对上下暴露三件事：
- *  1. `ingest()`  入站消息的门控：命令立刻放行；私聊必回但也攒批（连发几句合成一个请求）；
+ *  1. `ingest()`  入站消息的门控：私聊必回但也攒批（连发几句合成一个请求）；
  *                 群聊按积压条数门槛 + 空窗补偿攒着，
  *                 攒够了再由回调叫 pipeline 去跑一轮（这就是"会接话"与"会主动说话"）。
  *  2. `compose()` 出站回复的塑形：按句分条 → 逐条打字停顿（纯程序，模型不写任何格式标记）。
@@ -177,20 +177,18 @@ export class HumanlikeService {
    * 入站消息进拟人层。返回 `{action:'pass', events}` 表示内核照常处理（events 可能含被合并的前序消息）；
    * `{action:'handled'}` 表示这层已经接管，内核不要重复处理。
    */
-  ingest(event: ChatEvent, opts: { isCommand: boolean }): { action: 'pass'; events: ChatEvent[]; merged: boolean } | { action: 'handled' } {
+  ingest(event: ChatEvent): { action: 'pass'; events: ChatEvent[]; merged: boolean } | { action: 'handled' } {
     if (this.disposed) return { action: 'pass', events: [event], merged: false };
     const cfg = this.config;
     const timing = cfg.timing;
     const st = this.state(event);
     const now = this.now();
 
-    // 统计：平均间隔 + 存在感窗口（命令也计入群节奏，因为它同样是"群里有动静"）
+    // 统计：平均间隔 + 存在感窗口（每条入站都算"群里有动静"）
     this.recordInbound(st, now);
-    // 重复惩罚的入站对照：命令不算"群里在聊这个词"
-    if (!opts.isCommand) this.recordInboundText(st, now, event.text);
+    // 重复惩罚的入站对照
+    this.recordInboundText(st, now, event.text);
 
-    // 命令是显式意图，任何时候都不参与拟人化门控
-    if (opts.isCommand) return { action: 'pass', events: [event], merged: false };
     // 私聊：**必回，但同样攒批**（2026-10-18 用户裁定）。
     // 打分与开口判定一概不做（私聊频率只影响主动发言，这条语义不变），只借合批那一层：
     // 对面连发三句是一件事，不该拆成三轮、每轮各起一组气泡（实测每条入站一个请求、
@@ -716,7 +714,7 @@ export class HumanlikeService {
     return normalizeVisibleContent(scene, Number.MAX_SAFE_INTEGER).trim();
   }
 
-  /** 单条文本的打字等待（秒），插件/命令想自己排节奏时用（下限 0.25s） */
+  /** 单条文本的打字等待（秒），插件想自己排节奏时用（下限 0.25s） */
   typingSeconds(text: string): number {
     return typingDelayMs(text, this.config.outgoing) / 1000;
   }
@@ -783,7 +781,7 @@ export class HumanlikeService {
     st.hourlyTouchedAt = now;
   }
 
-  /** 重复惩罚的入站对照：记录群里最近在聊什么（命令与空文本不算） */
+  /** 重复惩罚的入站对照：记录群里最近在聊什么（空文本不算） */
   private recordInboundText(st: ChatState, now: number, text: unknown): void {
     const t = String(text ?? '').trim();
     if (!t) return;

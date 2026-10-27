@@ -137,7 +137,7 @@ function ev(text: string, over: Partial<ChatEvent> = {}): ChatEvent {
  *  ts 必须钉在 fake 时钟上：服务内部所有时间窗（TTL/活跃/空窗）都拿 now - e.ts 比。 */
 async function feed(h: ReturnType<typeof makeService>, e: ChatEvent) {
   e.ts = h.now();
-  h.svc.ingest(e, { isCommand: false });
+  h.svc.ingest(e);
   await new Promise((r) => setTimeout(r, 10));
 }
 

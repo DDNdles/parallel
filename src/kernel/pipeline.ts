@@ -1,4 +1,4 @@
-import type { ChatEvent, ChatRef, ChatMessage, CommandReply, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
+import type { ChatEvent, ChatRef, ChatMessage, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
 import { composeSystem } from './types.ts';
 import type { PluginContainer } from './container.ts';
 import type { AgentLoop, HistoryStore } from './agentloop.ts';
@@ -152,7 +152,7 @@ function mediaLineOf(who: string, ts: number | undefined, atts: MessageAttachmen
 /**
  * 消息流水线（AstrBot 式分层 + 内置拟人层）：
  * 入站归一化 → 黑名单 → **拟人层门控**（@ 直通；群聊按积压条数 + 防抖合并；私聊不打分但同样合批）
- * → 插件钩子 → 命令分发 / AgentLoop → **逐条分段发送**。
+ * → 插件钩子 → AgentLoop → **逐条分段发送**。
  *
  * 与重构前的差别只在 chat 区：唤醒判定从「@ 或唤醒词」换成 MaiBot 那套打分，
  * 出站从「整条发」换成「按语义拆成几条短消息 + 打字停顿」。
@@ -319,14 +319,14 @@ export class Pipeline {
       try { this.jargon?.observe(event); } catch { /* 挖词失败不影响消息主流程 */ }
       // 跟屏复读只看真实群消息，放在门控之前：拟人层要不要接话是另一件事
       try { this.repeat?.observe(event); } catch { /* 复读观察出错不影响消息主流程 */ }
-      const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
+      const r = this.humanlike.ingest(event);
       if (r.action === 'handled') return;                    // 拟人层接管：攒着，攒够了它会回调 enqueueBatch
       this.enqueue(r.events);
       return;
     }
     // 私聊：必回，但同样经拟人层攒批（连发几句合成一个请求；单条时与旧的秒回等价）。
     // 它不评估开口，只借合批那一层，攒够后回调 enqueueBatch。
-    const r = this.humanlike.ingest(event, { isCommand: isCommandText(event.text) });
+    const r = this.humanlike.ingest(event);
     if (r.action === 'handled') return;
     this.enqueue(r.events);
   }
@@ -421,24 +421,20 @@ export class Pipeline {
    * **不看内容语义**（不认制止语、不看是不是 @）、不走模型 —— 要求是"对面发完立刻生效"，
    * 走一趟模型，剩下那几条早就按打字停顿发完了。
    *
-   * 命令（`/work`）是显式意图，不掷骰子：它本身就该立刻执行，顺手把没说完的话截断。
-   * 只有 chat 轮的回复登记了在途（`sendScene` 传 `interruptible`）：命令回执、跟屏复读、
-   * 桌面端手动发言都打断不到 —— 那些是"必须说完"的话。@ 触发的轮次同样传 false：
+   * 只有 chat 轮的回复登记了在途（`sendScene` 传 `interruptible`）：跟屏复读、桌面端手动发言
+   * 都打断不到 —— 那些是"必须说完"的话。@ 触发的轮次同样传 false：
    * @ 必回，插话打断对它直接失效。
    */
   private maybeInterrupt(chat: ChatRef, event: ChatEvent): void {
     const cfg = this.humanlike.config.interrupt;
     if (!cfg?.enable) return;
-    const isCommand = isCommandText(event.text);
 
     // ① 模型还在生成：新消息直接 abort 这一轮，已经想了一半的回复整段作废。
     //    "对面发完立刻生效"只能走 abort；等模型吐完再丢弃，人已经看到延迟了。
     //    转述轮（work 结果回讲）不登记 interruptible：那是必须说完、也不该被闲聊插掉的话。
     const turn = this.turnMeta.get(chat.chatId);
     if (turn && turn.phase === 'generating' && turn.interruptible) {
-      const d = isCommand
-        ? { interrupt: true, reason: '命令插话' }
-        : shouldInterrupt({ remaining: 1, probability: cfg.probability });
+      const d = shouldInterrupt({ remaining: 1, probability: cfg.probability });
       if (d.interrupt) {
         turn.abortReason = 'generation';
         this.aborts.get(chat.chatId)?.abort();
@@ -454,9 +450,7 @@ export class Pipeline {
     // ② 已经在发气泡：把剩下没发的砍掉（纯程序，零模型调用）。
     const pending = this.chat.pendingOutbound(chat);
     if (!pending || pending.remaining <= 0) return;
-    const d = isCommand
-      ? { interrupt: true, reason: '命令插话' }
-      : shouldInterrupt({ remaining: pending.remaining, probability: cfg.probability });
+    const d = shouldInterrupt({ remaining: pending.remaining, probability: cfg.probability });
     if (!d.interrupt) return;
     const r = this.chat.interrupt(chat);
     if (!r) return;
@@ -572,9 +566,8 @@ export class Pipeline {
 
     const role = this.resolveRole(event);
     event.role = role;
-    const text = event.text.trim();
 
-    // 「要不要理这条」只有拟人层一处判（群聊：积压条数 / @必回；私聊与命令直通）。
+    // 「要不要理这条」只有拟人层一处判（群聊：积压条数 / @必回；私聊直通）。
     // 这里不再补第二套唤醒判定 —— 两处判同一件事时，总有一处是死的。
 
     // ---- 插件 onChatMessage 钩子（仅本群生效中的插件） ----
@@ -586,15 +579,6 @@ export class Pipeline {
       } catch (e) {
         this.errors.record('warn', 'plugin', `onChatMessage 钩子出错（${lp.manifest.id}）: ${(e as Error).message}`, { pluginId: lp.manifest.id });
       }
-    }
-
-    // ---- 命令分发 ----
-    // 2026-10-21：/work 已删除（work 改成 chat 面的 work_dispatch 工具）。
-    // QQ 侧不再有任何内建命令；这里只剩用户插件注册的命令。
-    const cmdText = text.startsWith('/') ? text.slice(1) : text.startsWith('／') ? text.slice(1) : null;
-    if (cmdText !== null) {
-      await this.dispatchCommand(event, role, cmdText);
-      return;
     }
 
     // ---- Agent 对话轮（多用户消息合并进来时，把它们一起交给模型） ----
@@ -614,78 +598,6 @@ export class Pipeline {
     }
     this.lastTurn.set(chatKey, { text: dupText(userText), at: Date.now(), spoke: false });
     await this.agentTurn(event, role, chatKey, { userText, batch: allowed });
-  }
-
-  // ---------------- 命令 ----------------
-
-  private async dispatchCommand(event: ChatEvent, role: Role, cmdText: string): Promise<void> {
-    const parts = cmdText.trim().split(/\s+/);
-    const name = parts[0] ?? '';
-    const args = parts.slice(1);
-    const found = this.plugins.findCommand(name);
-
-    this.sessionLog.append(event.chatId, event.type, { type: 'command', role: 'user', userId: event.userId, text: `/${cmdText}` });
-
-    if (!found) {
-      // 内建指令面已清空（2026-10-21 起 /work 也没了），这里只会是用户插件注册过的命令；
-      // 不泄露其存在性：普通成员统一「未知命令」，管理员多带一个命令名（他没在套话）
-      await this.chat.reply(event, roleAtLeastRole(role, 'admin') ? `未知命令：/${name}` : '未知命令');
-      return;
-    }
-
-    // 后果严格成立：本群未生效 → 命令不可用；管理员可看到"未开启"提示，普通成员当未知命令
-    if (!this.plugins.effectiveEnabled(found.pluginId, event.chatId)) {
-      if (roleAtLeastRole(role, 'admin')) {
-        const lp = this.plugins.get(found.pluginId)!;
-        if (lp.manifest.locked && !roleAtLeastRole(role, 'owner')) {
-          await this.chat.reply(event, `插件 ${lp.manifest.name} 在本群未开启，人设类插件仅主人可操作。`);
-        } else {
-          await this.chat.reply(event, `插件「${lp.manifest.name}」在本群未开启。管理员可在桌面端「插件」页为本群开启。`);
-        }
-      } else {
-        await this.chat.reply(event, '未知命令');
-      }
-      return;
-    }
-
-    if (found.def.minRole && !roleAtLeastRole(role, found.def.minRole)) {
-      await this.chat.reply(event, '权限不足：该命令需要更高权限。');
-      return;
-    }
-
-    try {
-      // 命令执行与工具调用同样纳入插件崩溃隔离（连续同错自动停用）
-      const lp = this.plugins.get(found.pluginId)!;
-      let reply: CommandReply | undefined;
-      try {
-        reply = await this.plugins.guarded(lp, 'command', () => found.def.handler(args, event));
-      } catch (e) {
-        // 权限/边界类拒绝：如实回给用户
-        await this.chat.reply(event, `命令被拒绝：${(e as Error).message}`);
-        return;
-      }
-      if (reply === undefined) {
-        // guarded 已记录错误（可能触发自动停用）
-        await this.chat.reply(event, '命令执行出错：请稍后再试，连续出错时插件会被自动停用。');
-        return;
-      }
-      if (reply.sandboxFile) {
-        await this.chat.sendFile({ platform: event.platform, type: event.type, chatId: event.chatId }, reply.sandboxFile);
-      }
-      if (reply.segments?.length) {
-        await this.chat.send({ platform: event.platform, type: event.type, chatId: event.chatId }, reply.segments);
-      } else if (reply.text) {
-        await this.chat.reply(event, reply.text);
-      }
-      this.sessionLog.append(event.chatId, event.type, {
-        type: 'command_result', role: 'assistant', text: reply.text ?? `[segments:${reply.segments?.length ?? 0}]${reply.sandboxFile ? ' +文件' : ''}`,
-        data: { pluginId: found.pluginId, command: name },
-      });
-    } catch (e) {
-      const msg = (e as Error).message;
-      this.errors.record('warn', 'command', `命令 /${name} 失败: ${msg}`, { chatId: event.chatId, stack: (e as Error).stack });
-      await this.chat.reply(event, `命令执行出错：${msg}`);
-    }
   }
 
   // ---------------- Agent 对话 ----------------
@@ -1310,11 +1222,6 @@ export class Pipeline {
       this.db.run(`INSERT INTO usage_stats (day, provider, model, chat_id, ${field}) VALUES (?,?,?,?,1)`, day, provider, '', '-');
     }
   }
-}
-
-function isCommandText(text: string): boolean {
-  const t = text.trim();
-  return t.startsWith('/') || t.startsWith('／');
 }
 
 export function roleAtLeastRole(role: Role, min: Role): boolean {

@@ -31,7 +31,7 @@ export interface TimingConfig {
   privateTalkValue: number;
   /** 提到名字更容易回（默认关，与 MaiBot 一致）；仅 @ 模式下不生效 */
   mentionedBotReply: boolean;
-  /** 仅 @ 后才回复：群聊普通消息一律不开口（默认关）；私聊与命令不受影响 */
+  /** 仅 @ 后才回复：群聊普通消息一律不开口（默认关）；私聊不受影响 */
   onlyReplyWhenAt: boolean;
   /** 专注模式：不参与群聊激活度打分，只认强相关 */
   focusMode: boolean;
@@ -80,7 +80,7 @@ export interface HumanlikeConfig {
    */
   interrupt: {
     enable: boolean;
-    /** 插话打断的概率（0~1）；命令插话必断，不受它约束 */
+    /** 插话打断的概率（0~1） */
     probability: number;
   };
   /** 消息防抖合并（群聊与私聊共用：私聊不打分，但同样攒批） */

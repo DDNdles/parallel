@@ -44,7 +44,7 @@ export interface ChatEvent {
   forward?: ForwardRecord;
   raw: unknown;
   ts: number;
-  /** 内核解析后的三级角色（owner/admin/member），工具与命令边界用 */
+  /** 内核解析后的三级角色（owner/admin/member），工具边界用 */
   role?: Role;
 }
 
@@ -239,31 +239,10 @@ export interface ToolMeta {
   notes?: string;
 }
 
-// ---------------- 聊天命令 ----------------
-// 2026-10-17 起内建指令面清空：QQ 侧只剩内核拦截的 /work <任务>（管理员），
-// 其余命令全部删除。这套注册表留给插件（含 data/plugins 的用户插件）自用。
-
-export interface CommandDef {
-  name: string;                 // 命令名，不带斜杠
-  aliases?: string[];
-  description: string;
-  usage?: string;
-  minRole?: Role;
-  hidden?: boolean;             // 不出现在命令列表里（如主人专属命令）
-  handler(args: string[], event: ChatEvent): Promise<CommandReply> | CommandReply;
-}
-
-export interface CommandReply {
-  text?: string;
-  segments?: MsgSegment[];
-  /** 以文件回复（必须是当前会话沙箱内路径） */
-  sandboxFile?: string;
-}
-
 // ---------------- 生命周期钩子 ----------------
 
 export interface PluginHooks {
-  /** Pipeline 早期（唤醒判定后、命令分发前） */
+  /** Pipeline 早期（唤醒判定后、对话轮前） */
   onChatMessage?(event: ChatEvent): void | Promise<void>;
   /** LLM 请求发出前：可修改 system/messages（人格插件的核心插槽） */
   beforeLLM?(req: LLMRequestContext): Promise<LLMRequestContext> | LLMRequestContext;
@@ -533,7 +512,7 @@ export interface PluginHttp {
   /**
    * 注册端点：对外完整路径固定为 `/api/plugin/<pluginId><path>`，鉴权与其它 /api/* 一致（uiToken）。
    * path 需以 / 开头，按「方法 + 路径」精确匹配（查询串不参与）。
-   * 同 method + path 重复注册直接抛错（与工具/命令重名同口径：插件启动时暴露，而不是后者静默覆盖）。
+   * 同 method + path 重复注册直接抛错（与工具重名同口径：插件启动时暴露，而不是后者静默覆盖）。
    * 注册随插件卸载自动摘除；插件处于 disabled 运行态时整组端点 404。
    */
   on(method: string, path: string, handler: PluginHttpHandler): void;
@@ -582,8 +561,6 @@ export interface PluginContext {
     registerTool(def: ToolDef): void;
     chat(req: LLMChatRequest): Promise<LLMResponse>;
   };
-  /** 注册 QQ/桌面命令 */
-  registerCommand(def: CommandDef): void;
   /** 定时任务（需 schedule 权限） */
   schedule: {
     register(job: ScheduleJob): void;

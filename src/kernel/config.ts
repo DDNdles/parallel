@@ -152,7 +152,7 @@ export const DEFAULT_CONFIG = {
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
     // ③ 出站打断（纯程序，见 humanlike/interrupt.ts）：她还在发气泡时对面又开口，
-    //    按概率把剩下的气泡砍掉；模型还在生成时则直接 abort 这一轮。命令插话必断。
+    //    按概率把剩下的气泡砍掉；模型还在生成时则直接 abort 这一轮。
     interrupt: {
       enable: true,
       probability: 0.8,                   // 插话打断概率（0~1）

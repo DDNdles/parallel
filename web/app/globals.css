@@ -683,13 +683,6 @@ tr:hover td { background: var(--row-hover); }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; }
 .icon-btn svg { width: 14px; height: 14px; }
 
-/* 斜杠命令补全（ChatGPT 联想菜单同壳：圆角 12 面板 + mono 命令名 + 灰描述） */
-.ac-panel { position: absolute; bottom: calc(100% + 10px); left: 0; right: 0; background: var(--menu-bg-solid); border: 1px solid var(--border-strong); border-radius: var(--radius-panel); max-height: 290px; overflow-y: auto; z-index: 40; }
-.ac-item { padding: 9px 14px; cursor: pointer; font-size: 13.5px; display: flex; align-items: baseline; gap: 10px; border-radius: 8px; margin: 2px 4px; }
-.ac-item.sel { background: var(--bg-hover); }
-.ac-item .mono { color: var(--text); }
-.ac-item .d { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
 /* ---------------- toast（轻量反馈，替代 alert） ---------------- */
 .toast-wrap { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; }
 .toast { background: var(--menu-bg-solid); color: var(--text); border: 1px solid var(--border-strong); border-radius: 999px; padding: 9px 20px; font-size: 13px; box-shadow: var(--shadow-float); animation: toast-in .18s ease; }
@@ -824,8 +817,8 @@ tr:hover td { background: var(--row-hover); }
   box-shadow: var(--shadow-card-hover); border-color: var(--border-stronger); }
 .btn, .chip, .mp-btn, .seg-btn, .switch, .nav-item, .chat-item { transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-base) var(--ease-out), transform var(--dur-fast) var(--ease-out); }
 .btn:active, .mp-btn:active, .send-btn:active { transform: scale(.96); }
-.mp-menu, .ac-panel, .cmp-menu { animation: pop-in var(--dur-base) var(--ease-spring) both; transform-origin: top right; }
-.ac-panel, .cmp-menu { transform-origin: bottom left; }
+.mp-menu, .cmp-menu { animation: pop-in var(--dur-base) var(--ease-spring) both; transform-origin: top right; }
+.cmp-menu { transform-origin: bottom left; }
 .toast-wrap { bottom: 24px; }
 .toast { animation: toast-in var(--dur-moderate) var(--ease-out) both; }
 .dot-on { animation: pulse-dot 2.4s ease-in-out infinite; }

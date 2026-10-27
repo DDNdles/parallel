@@ -8,6 +8,7 @@ import type { Bus } from './bus.ts';
 import { busEvents } from './bus.ts';
 
 export type SessionLogType =
+  // command / command_result 是 2026-10-27 之前的旧条目类型，只为历史回放保留，不再写入
   | 'message_in' | 'message_out' | 'command' | 'command_result'
   | 'agent_start' | 'agent_end' | 'llm_call' | 'llm_delta' | 'tool_call' | 'tool_result'
   | 'error' | 'system'

@@ -26,7 +26,7 @@ const SUGGESTIONS: Partial<Record<ErrorCategory, string>> = {
   plugin: '插件运行出错：可尝试在插件管理里重载该插件；连续同错 3 次会被自动停用。',
   sandbox: '沙箱执行受限或失败：检查 Python/Node 是否可用、脚本是否超时或超出输出/资源限额。',
   storage: '数据读写异常：检查磁盘空间与 data 目录权限；配置文件损坏时会自动回退到 .bak 备份。',
-  command: '命令执行出错：查看插件日志；若持续出现请重载对应插件。',
+  command: '历史命令错误（2026-10-27 起斜杠命令已全部注销，不再产生）。',
   media: '图片/语音/视频没能送进模型：语音需要本机 ffmpeg 转码（装好后设 PARALLEL_FFMPEG 指向可执行文件并重启内核），或该模型未声明对应的输入类型。',
   kernel: '内核内部错误：请保存日志并反馈。',
 };

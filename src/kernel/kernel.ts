@@ -396,7 +396,7 @@ export class Kernel {
     buildProbe.unref();
   }
 
-  /** kernel.rpc：插件经事件总线向内核请求能力（桌面端 commands_visible 走 HTTP 直调，不在此处） */
+  /** kernel.rpc：插件经事件总线向内核请求能力 */
   private setupKernelRpc(): void {
     this.bus.on('kernel.rpc', (req: any) => {
       // 并发调用要能对上各自的回执：请求带 id 就在 reply 里原样带回；
@@ -409,13 +409,6 @@ export class Kernel {
           const role: Role = req.role ?? 'member';
           const chatId: string = req.chatId ?? '';
           switch (req.type) {
-            case 'commands_visible': {
-              const chat = { platform: 'qq', type: req.chatType ?? 'group', chatId };
-              return this.container.commandsForChat(chat, role).map((c) => ({
-                name: c.def.name, pluginId: c.pluginId, description: c.def.description,
-                enabled: c.enabled, minRole: c.def.minRole,
-              }));
-            }
             case 'plugins_visible': {
               const chat = { platform: 'qq', type: req.chatType ?? 'group', chatId };
               // hidden 只是不在桌面端「插件」页的列表里出现；分群开关仍要能开关（chat/sandbox 默认关，
@@ -451,7 +444,6 @@ export class Kernel {
                 description: redacted ? '（人格插件内容不公开）' : lp.manifest.description,
                 category: lp.manifest.category, enabled, locked: !!lp.manifest.locked,
                 permissions: redacted ? [] : lp.manifest.permissions,
-                commands: [...new Set([...lp.commands.values()])].filter((c) => !c.hidden).map((c) => c.name),
                 redacted,
               };
             }

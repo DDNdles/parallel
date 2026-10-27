@@ -13,7 +13,7 @@ interface CfgField { type: string; description: string; secret?: boolean; defaul
 interface PluginInfo {
   id: string; name: string; version: string; description: string; category: string; trust: string;
   permissions: string[]; core: boolean; locked: boolean; state: string; source: string;
-  tools: string[]; commands: string[]; groupStates: { chatId: string; enabled: boolean }[];
+  tools: string[]; groupStates: { chatId: string; enabled: boolean }[];
   userConfigSchema: Record<string, CfgField>;
   defaultGroupState: string; globalDefault: boolean; globalDefaultOverridden: boolean; hasMcp: boolean;
 }
@@ -171,10 +171,6 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
         <div className="mset-mrow">
           <span className="plg-k">工具</span>
           <span className="plg-v mono">{p.tools.length ? p.tools.join(' · ') : '无'}</span>
-        </div>
-        <div className="mset-mrow">
-          <span className="plg-k">命令</span>
-          <span className="plg-v mono">{p.commands.length ? p.commands.map((x) => '/' + x).join(' · ') : '无'}</span>
         </div>
         <div className="mset-mrow">
           <span className="plg-k">来源</span>

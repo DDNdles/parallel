@@ -204,13 +204,6 @@ test('群禁用的插件：工具缺席（命令面已整体清空）', async ()
   const chatOn = kernel.container.toolsForChat(chatRef, 'member').map((t) => t.name);
   assert.ok(!chatOn.includes('web_search'), `chat 面恒不含插件工具: ${chatOn}`);
 
-  // 关闭后：连命令表里也查不到它的命令（2026-10-17 指令面整体清空后，内建命令表本就是空的）
-  kernel.container.setGroupState('web-search', String(GROUP), false, String(MASTER));
-  assert.equal(
-    kernel.container.commandsForChat(chatRef, 'member').filter((c) => c.pluginId === 'web-search').length,
-    0, 'web-search 的 /搜索 已随指令面清空删除',
-  );
-
   // 全局运行时停用 → 所有群所有角色都不可见
   await kernel.container.setRuntimeEnabled('web-search', false);
   assert.equal(kernel.container.toolsForChat(chatRef, 'owner', 'work').filter((t) => t.name === 'web_search').length, 0);
@@ -219,45 +212,7 @@ test('群禁用的插件：工具缺席（命令面已整体清空）', async ()
 });
 
 // ============================================================
-// 4. 指令面（2026-10-17 清空，2026-10-21 /work 也删了）
-// ============================================================
-
-test('QQ 指令面为空：旧的 /帮助 /人格 /设定 /搜索 /work 一律未知命令', async () => {
-  mock.actions.length = 0;
-
-  // 内建命令表已清空（注册表留着给用户插件用；本仓库没有注册命令的用户插件）
-  const cmds = kernel.container.commandsForChat({ platform: 'qq', type: 'group', chatId: String(GROUP) }, 'owner');
-  assert.equal(cmds.length, 0, `内建命令表应为空，实得: ${cmds.map((c) => c.def.name).join(', ')}`);
-
-  // 主人发旧指令也只是「未知命令」——没有哪个被留成隐藏入口
-  for (const text of ['/帮助', '/人格', '/设定', '/搜索 猫']) {
-    const mark = mock.actions.length;
-    mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text, nickname: '主人' });
-    const reply = await mock.waitForReply(GROUP, 8000, mark);
-    assert.match(reply, /未知命令/, `${text} 该按未知命令处理：${reply}`);
-  }
-
-  // 普通成员视角同样只有「未知命令」（不泄露存在性）
-  let mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/帮助', nickname: '小明' });
-  let reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.equal(reply.trim(), '未知命令', `普通成员旧指令该得到统一未知命令：${reply}`);
-
-  // /work 2026-10-21 已删除（work 改为 chat 的 work_dispatch 工具）：管理员发也是未知命令
-  mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/work 算点什么', nickname: '主人' });
-  reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.match(reply, /未知命令/, `/work 应当已经不存在：${reply}`);
-
-  mark = mock.actions.length;
-  mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/work 算点什么', nickname: '小明' });
-  reply = await mock.waitForReply(GROUP, 8000, mark);
-  assert.equal(reply.trim(), '未知命令', `普通成员同样只是未知命令：${reply}`);
-  mock.actions.length = 0;
-});
-
-// ============================================================
-// 5. 用户记忆：FTS 检索 + 忘记我
+// 4. 用户记忆：FTS 检索 + 忘记我
 // ============================================================
 
 test('记忆服务：添加/检索/忘记', () => {
@@ -271,12 +226,12 @@ test('记忆服务：添加/检索/忘记', () => {
   assert.equal(kernel.memory.searchFacts(String(MEMBER), '乐队', 5).length, 0);
 });
 
-test('QQ 侧不再有清除记忆的入口：/忘记我 当未知命令处理，记忆不动', async () => {
+test('QQ 侧不再有清除记忆的入口：斜杠文本不再当命令，记忆不动', async () => {
   kernel.memory.addFact(String(MEMBER), { content: '爱吃香菜', sourcePlugin: 'test' });
   mock.actions.length = 0;
   mock.sendGroupMessage({ groupId: GROUP, userId: MEMBER, text: '/忘记我', nickname: '小明' });
-  const reply = await mock.waitForReply(GROUP);
-  assert.match(reply, /未知命令|没有这个命令|不认识/);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.ok(!mock.actions.some((a) => JSON.stringify(a.params).includes('未知命令')), '不再有未知命令回执');
   assert.equal(kernel.memory.topFacts(String(MEMBER), 10).length, 1, '群里一句话清不掉记忆');
   mock.actions.length = 0;
 });
@@ -484,9 +439,7 @@ test('发文件仅限沙箱内（发送服务强校验）', async () => {
 
 test('persona 插件对非主人脱敏（普通成员不可套取人设内容）', async () => {
   const chatRef = { platform: 'qq', type: 'group' as const, chatId: String(GROUP) };
-  // chat 是 persona 类且 locked：2026-10-17 指令面清空后它不再注册任何 QQ 命令
-  const cmds = kernel.container.commandsForChat(chatRef, 'member').filter((c) => c.pluginId === 'chat');
-  assert.equal(cmds.length, 0, '人格插件不该再有 QQ 命令入口');
+  // chat 是 persona 类且 locked：QQ 侧没有任何命令入口
 
   // 剩下的人设内容出口是内核 RPC 的插件详情：非主人读必须脱敏
   const ask = (role: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -522,16 +475,22 @@ test('插件连续同错 3 次自动停用', async () => {
   }));
   writeFileSync(join(pdir, 'index.ts'), `
     export function setup(ctx) {
-      ctx.registerCommand({ name: '必崩', handler: () => { throw new Error('boom-测试崩溃'); } });
+      ctx.llm.registerTool({
+        name: 'crashy_boom',
+        description: '测试用：每次都抛错',
+        parameters: { type: 'object', properties: {} },
+        handler: () => { throw new Error('boom-测试崩溃'); },
+      });
     }
   `);
   const installed = await kernel.container.installUserPlugins();
   assert.ok(installed.includes('crashy'));
 
-  // 调 3 次命令触发连续同错（命令路径不走 LLM，无需脚本）
+  // 直接走 guarded 调 3 次工具，触发连续同错
+  const lp = kernel.container.get('crashy');
+  assert.ok(lp, 'crashy 应已载入');
   for (let i = 0; i < 3; i++) {
-    mock.sendGroupMessage({ groupId: GROUP, userId: MASTER, text: '/必崩', nickname: '主人' });
-    await until(() => mock.actions.filter((a) => a.action === 'send_group_msg').length >= i + 1, 8000, `崩溃响应 ${i}`);
+    await kernel.container.guarded(lp, 'tool', () => { throw new Error('boom-测试崩溃'); });
   }
   await until(() => kernel.container.get('crashy')?.state === 'disabled', 5000, '自动停用');
   // 主人收到自动停用通知（notifyOwner → send_private_msg；注意区分 ErrorCenter 的普通报错通知）
@@ -558,7 +517,7 @@ test('群聊非 @机器人 时保持沉默', async () => {
   assert.equal(afterCount, before, '非唤醒消息不应回复');
 });
 
-test('隐藏会话：bot 收不到任何东西（消息不落账，也不回复/不命令/不主动）', async () => {
+test('隐藏会话：bot 收不到任何东西（消息不落账，也不回复/不主动）', async () => {
   const HIDE_GROUP = '7101';
   kernel.container.setGroupState('chat', HIDE_GROUP, true, 'ui');
   const selfId = (kernel.adapter.status() as unknown as { selfId?: string }).selfId || 'default';
@@ -568,7 +527,7 @@ test('隐藏会话：bot 收不到任何东西（消息不落账，也不回复/
     const scriptLen = mockProvider.script.length;
     mockProvider.script.push({ content: '（这句不该出现在任何地方）' });
     const mark = mock.actions.length;
-    mock.sendGroupMessage({ groupId: Number(HIDE_GROUP), userId: MASTER, text: '/work 算点什么', nickname: '主人' });
+    mock.sendGroupMessage({ groupId: Number(HIDE_GROUP), userId: MASTER, text: '算点什么', nickname: '主人' });
     // 隐藏即"收不到"：会话流里既没有入站也没有出站
     await new Promise((r) => setTimeout(r, 900));
     const tail = kernel.sessionLog.tail(HIDE_GROUP, 'group', 50);

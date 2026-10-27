@@ -76,10 +76,10 @@ test('回复时机全局一套：改群聊参数同样作用于别的群，没�
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
   });
-  svc.ingest(ev('普通消息'), { isCommand: false });
+  svc.ingest(ev('普通消息'));
   await wait(30);
   assert.equal(triggers.length, 0, '仅 @ 生效：普通消息不开口');
-  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  const at = svc.ingest(ev('在吗', { isAtMe: true }));
   assert.equal(at.action, 'pass', '@ 仍然直通');
   svc.dispose();
 });
@@ -267,10 +267,10 @@ test('出站塑形：单条上限逐条套用，整段回复不被 maxMessageCha
 
 test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消息被接管', async () => {
   const { svc } = makeService();
-  const plain = svc.ingest(ev('早上好'), { isCommand: false });
+  const plain = svc.ingest(ev('早上好'));
   assert.equal(plain.action, 'handled', '普通群消息进缓冲');
 
-  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  const at = svc.ingest(ev('在吗', { isAtMe: true }));
   assert.equal(at.action, 'pass');
   assert.equal((at as { events: ChatEvent[] }).events.length, 2, '攒着的那条跟在后面一起交出去');
   assert.equal((at as { events: ChatEvent[] }).events[0].text, '早上好');
@@ -280,8 +280,8 @@ test('服务：@ 立刻放行（并把攒着的消息一起带上）；普通消
 test('服务：人格叫醒词命中视为提及，并把攒着的消息一起带上', () => {
   const { svc } = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true } });
   svc.setMentionAliases(['鲸鲸', '大肥鱼']);
-  svc.ingest(ev('今天吃啥'), { isCommand: false });
-  const r = svc.ingest(ev('鲸鲸在吗'), { isCommand: false });
+  svc.ingest(ev('今天吃啥'));
+  const r = svc.ingest(ev('鲸鲸在吗'));
   assert.equal(r.action, 'pass');
   assert.equal((r as { events: ChatEvent[] }).events.length, 2);
   svc.dispose();
@@ -291,17 +291,16 @@ test('服务：叫醒词去掉单字，ASCII 按词边界（robot 不算 bot）'
   const { svc } = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true } });
   svc.setMentionAliases(['鱼', 'bot', 'BOT']);
   // 单字「鱼」被丢弃：鱼香肉丝不误触；robot 里的 bot 也不该命中
-  assert.equal(svc.ingest(ev('晚上吃鱼香肉丝'), { isCommand: false }).action, 'handled');
-  assert.equal(svc.ingest(ev('robot 在吗'), { isCommand: false }).action, 'handled');
-  assert.equal(svc.ingest(ev('bot 在吗'), { isCommand: false }).action, 'pass');
+  assert.equal(svc.ingest(ev('晚上吃鱼香肉丝')).action, 'handled');
+  assert.equal(svc.ingest(ev('robot 在吗')).action, 'handled');
+  assert.equal(svc.ingest(ev('bot 在吗')).action, 'pass');
   svc.dispose();
 });
 
-test('服务：命令立即放行；私聊不进打分但同样攒批', () => {
+test('服务：私聊不进打分但同样攒批', () => {
   const { svc } = makeService();
-  assert.equal(svc.ingest(ev('/work 算一下昨天的账'), { isCommand: true }).action, 'pass');
   // 私聊 2026-10-18 起借合批那一层（连发几句合成一个请求），因此这里返回 handled
-  assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'handled');
+  assert.equal(svc.ingest(ev('在吗', { type: 'private' })).action, 'handled');
   svc.dispose();
 });
 
@@ -310,9 +309,9 @@ test('服务：私聊连发几句合成一个批次，且不做开口打分', as
     merge: { enable: true, windowMs: 10, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
   });
   const priv = { type: 'private' as const, chatId: '777' };
-  svc.ingest(ev('在吗', priv), { isCommand: false });
-  svc.ingest(ev('问你个事', priv), { isCommand: false });
-  svc.ingest(ev('算了没事', priv), { isCommand: false });
+  svc.ingest(ev('在吗', priv));
+  svc.ingest(ev('问你个事', priv));
+  svc.ingest(ev('算了没事', priv));
   await wait(60);
   assert.equal(triggers.length, 1, '三条连发只起一轮');
   assert.equal(triggers[0].events.length, 3, '三条一起交出去');
@@ -326,17 +325,17 @@ test('服务：私聊关掉合批时仍逐条直通（与旧行为一致）', ()
   const { svc } = makeService({
     merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
   });
-  assert.equal(svc.ingest(ev('在吗', { type: 'private' }), { isCommand: false }).action, 'pass');
+  assert.equal(svc.ingest(ev('在吗', { type: 'private' })).action, 'pass');
   svc.dispose();
 });
 
 test('服务：提到名字走提及档位，mentionedBotReply 关时仍进缓冲', () => {
   const off = makeService();
-  assert.equal(off.svc.ingest(ev('麦麦 早'), { isCommand: false }).action, 'handled');
+  assert.equal(off.svc.ingest(ev('麦麦 早')).action, 'handled');
   off.svc.dispose();
 
   const on = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true } });
-  assert.equal(on.svc.ingest(ev('麦麦 早'), { isCommand: false }).action, 'pass');
+  assert.equal(on.svc.ingest(ev('麦麦 早')).action, 'pass');
   on.svc.dispose();
 });
 
@@ -350,11 +349,11 @@ test('服务：攒够 pendingThreshold 条后由定时器触发，而不是逐�
     merge: { enable: false, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 3 },
   });
-  svc.ingest(ev('一'), { isCommand: false });
-  svc.ingest(ev('二'), { isCommand: false });
+  svc.ingest(ev('一'));
+  svc.ingest(ev('二'));
   await wait(20);
   assert.equal(triggers.length, 0, '两条还不够');
-  svc.ingest(ev('三'), { isCommand: false });
+  svc.ingest(ev('三'));
   await wait(20);
   assert.equal(triggers.length, 1, '到阈值触发一次');
   assert.equal(triggers[0].events.length, 3, '三条一起交出去');
@@ -368,7 +367,7 @@ test('服务：合批关窗后按随机延时起跳，不是关窗就秒回', as
     merge: { enable: true, windowMs: 10, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 40, fireDelayMaxMs: 40 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1 },
   });
-  svc.ingest(ev('在吗'), { isCommand: false });
+  svc.ingest(ev('在吗'));
   await wait(25);
   assert.equal(triggers.length, 0, '关窗（windowMs=10ms）之后还要等起跳延时（40ms）');
   await wait(60);
@@ -381,7 +380,7 @@ test('服务：@ 直通不受合批与起跳延时影响（同步放行）', asy
     merge: { enable: true, windowMs: 10_000, maxWaitMs: 10_000, bufferTtlMs: 120_000, fireDelayMinMs: 5_000, fireDelayMaxMs: 5_000 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1 },
   });
-  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  const at = svc.ingest(ev('在吗', { isAtMe: true }));
   assert.equal(at.action, 'pass', '@ 立即交回调用方，不走合批与延时');
   assert.equal(triggers.length, 0, '直通路径由 pipeline 处理，不经过 trigger 回调');
   svc.dispose();
@@ -392,7 +391,7 @@ test('服务：frequency 模式攒不够就沉默，并把连续不说计数 +1�
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
   });
-  svc.ingest(ev('随便说说'), { isCommand: false });
+  svc.ingest(ev('随便说说'));
   await wait(30);
   assert.equal(triggers.length, 0, '普通发言不该开口');
   assert.ok((svc.snapshot(chat).consecutiveNoAction as number) >= 1, '门控评估没说，退避计数增加');
@@ -409,14 +408,14 @@ test('服务：空窗补偿需要至少一条积压消息（纯沉默不会自�
 
   // 先用 @ 消息把"群平均节奏"建起来（@ 直接放行，不进缓冲，但计入间隔）
   for (const t of ['a', 'b', 'c']) {
-    svc.ingest(ev(t, { isAtMe: true }), { isCommand: false });
+    svc.ingest(ev(t, { isAtMe: true }));
     await wait(60);
   }
   triggers.length = 0;
 
   // 一条没人理的普通消息：积压 1 条，门槛 2 ⇒ 先沉默（空窗补偿按 30s 下限算，不在测试里等）
   //（文本必须不是问句：2026-10-24 起末条问句会把门槛打对折，那是 B3 的设计行为）
-  svc.ingest(ev('风好大'), { isCommand: false });
+  svc.ingest(ev('风好大'));
   await wait(40);
   assert.equal(triggers.length, 0, '刚说完就回那是问答机器人，不是群友');
   svc.dispose();
@@ -427,7 +426,7 @@ test('服务：pending=0 时不会纯靠沉默自我唤醒（主动发言默认�
     merge: { enable: true, windowMs: 10, maxWaitMs: 0, bufferTtlMs: 600_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 2 },
   }, { realClock: true });
-  svc.ingest(ev('a', { isAtMe: true }), { isCommand: false });
+  svc.ingest(ev('a', { isAtMe: true }));
   await wait(60);
   triggers.length = 0;
   await wait(500);
@@ -475,7 +474,7 @@ test('服务：默认不模拟打字，所有气泡立即发（pauseMs 全 0）'
 
 test('服务：群里的普通消息一律进门控（没有"全都放行"的旁路）', () => {
   const { svc } = makeService();
-  assert.equal(svc.ingest(ev('普通消息'), { isCommand: false }).action, 'handled');
+  assert.equal(svc.ingest(ev('普通消息')).action, 'handled');
   svc.dispose();
 });
 
@@ -484,7 +483,7 @@ test('服务：关掉分条就整段一条发出去（分条是纯程序开关�
   const plans = await off.svc.compose(chat, '第一句。第二句。');
   assert.equal(plans.length, 1, '分条关掉 = 整段一条');
   assert.equal(plans[0].segments[0].data.text, '第一句。第二句。');
-  assert.equal(off.svc.ingest(ev('普通消息'), { isCommand: false }).action, 'handled', '门控仍然在');
+  assert.equal(off.svc.ingest(ev('普通消息')).action, 'handled', '门控仍然在');
   off.svc.dispose();
 });
 
@@ -496,12 +495,12 @@ test('服务：缓冲里的老消息会被 TTL 清掉（不复述几分钟前的
   });
   const at = (text: string) => ev(text, { ts: now() });
 
-  svc.ingest(at('过期话'), { isCommand: false });
+  svc.ingest(at('过期话'));
   await wait(20);
   tick(5000);                                   // 这条一下子放了两分钟
-  svc.ingest(at('新话一号'), { isCommand: false });
+  svc.ingest(at('新话一号'));
   await wait(20);                               // 这次评估顺手把它清掉
-  svc.ingest(at('新话二号'), { isCommand: false });
+  svc.ingest(at('新话二号'));
   await wait(20);
 
   assert.equal(triggers.length, 1, '到阈值触发一次');
@@ -823,7 +822,7 @@ test('重复惩罚：最近 3 轮都提同一个词 → 462 分节；成功重�
 
 test('重复惩罚：群里也在提同一个词 → 不注入（话题词不是口癖）', () => {
   const { svc } = makeService({ repetition: { ...DEFAULT_HUMANLIKE.repetition } });
-  for (let i = 0; i < 3; i++) svc.ingest(ev('梁文峰最近怎么样'), { isCommand: false });
+  for (let i = 0; i < 3; i++) svc.ingest(ev('梁文峰最近怎么样'));
   for (const line of repeatedLines) svc.noteSpoke(chat, 1, [line]);
   assert.equal(svc.sceneSections(chat).some((s) => s.order === 462), false);
   svc.dispose();
@@ -845,11 +844,11 @@ test('服务：仅 @ 后才回复——普通群消息连门槛都不看，@ 仍
     merge: { enable: true, windowMs: 0, maxWaitMs: 0, bufferTtlMs: 120_000, fireDelayMinMs: 0, fireDelayMaxMs: 0 },
     timing: { ...DEFAULT_HUMANLIKE.timing, pendingThreshold: 1, onlyReplyWhenAt: true },
   });
-  svc.ingest(ev('普通消息'), { isCommand: false });
+  svc.ingest(ev('普通消息'));
   await wait(30);
   assert.equal(triggers.length, 0, '仅 @ 模式下普通消息不开口（门槛=1 也不看）');
   assert.equal(svc.snapshot(chat).consecutiveNoAction, 0, '不评估就不该推进退避');
-  const at = svc.ingest(ev('在吗', { isAtMe: true }), { isCommand: false });
+  const at = svc.ingest(ev('在吗', { isAtMe: true }));
   assert.equal(at.action, 'pass', '@ 仍然直通');
   assert.equal((at as { events: ChatEvent[] }).events.length, 2, '@ 把攒着的普通消息一起带上');
   svc.dispose();
@@ -860,7 +859,7 @@ test('服务：仅 @ 后才回复——名字提及与叫醒词都不直通', ()
     timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: true, onlyReplyWhenAt: true },
   });
   svc.setMentionAliases(['鲸鲸']);
-  const r = svc.ingest(ev('鲸鲸在吗'), { isCommand: false });
+  const r = svc.ingest(ev('鲸鲸在吗'));
   assert.equal(r.action, 'handled', '仅 @ 模式下叫醒词不算 @，只进缓冲');
   svc.dispose();
 });

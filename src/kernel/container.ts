@@ -2,7 +2,7 @@ import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import type {
-  CommandDef, PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext,
+  PluginContext, PluginHooks, PluginManifest, ToolDef, ChatEvent, ChatRef, Role, ToolContext,
   WorkDelegateInput, WorkDispatchInput, GatedHumanlike, LLMRequestContext, WorkAgentDef, PluginHttpHandler,
   PluginHttpResponse, HistoryHit,
 } from './types.ts';
@@ -45,7 +45,6 @@ export interface LoadedPlugin {
   state: PluginRuntimeState;
   loadedAt: number;
   tools: Map<string, ToolDef>;
-  commands: Map<string, CommandDef>;
   /** 插件自定义 HTTP 端点：键 = "METHOD 规范化路径"（见 httpRouteKey） */
   httpRoutes: Map<string, PluginHttpHandler>;
   disposers: (() => void)[];
@@ -148,7 +147,7 @@ export class PluginContainer {
     const lp: LoadedPlugin = {
       manifest, dir, source,
       state: 'loaded', loadedAt: nowMs(),
-      tools: new Map(), commands: new Map(),
+      tools: new Map(),
       httpRoutes: new Map(),
       disposers: [], mcpClients: [],
       errStreak: new Map(),
@@ -179,8 +178,8 @@ export class PluginContainer {
       await this.unload(manifest.id).catch(() => {});
       throw e;
     }
-    this.deps.bus.emit(busEvents.pluginLoaded, { id: manifest.id, source, tools: [...lp.tools.keys()], commands: [...lp.commands.keys()] });
-    this.log.info(`插件已载入 ${manifest.id} v${manifest.version} (${source}) tools=${lp.tools.size} commands=${lp.commands.size}`);
+    this.deps.bus.emit(busEvents.pluginLoaded, { id: manifest.id, source, tools: [...lp.tools.keys()] });
+    this.log.info(`插件已载入 ${manifest.id} v${manifest.version} (${source}) tools=${lp.tools.size}`);
     this.pluginDirEvents.forEach((f) => f('loaded', manifest.id));
     return lp;
   }
@@ -455,34 +454,6 @@ export class PluginContainer {
     return ctx;
   }
 
-  commandsForChat(chat: ChatRef, role: Role): { def: CommandDef; pluginId: string; enabled: boolean }[] {
-    const out: { def: CommandDef; pluginId: string; enabled: boolean }[] = [];
-    const seen = new Set<CommandDef>();
-    for (const lp of this.plugins.values()) {
-      if (lp.state !== 'loaded') continue;
-      const on = this.effectiveEnabled(lp.manifest.id, chat.chatId);
-      // 非管理员：被禁用的插件完全不显示
-      if (!on && !roleAtLeast(role, 'admin')) continue;
-      for (const c of new Set(lp.commands.values())) {
-        if (seen.has(c)) continue;
-        seen.add(c);
-        if (c.hidden && !roleAtLeast(role, 'owner')) continue;
-        if (c.minRole && !roleAtLeast(role, c.minRole)) continue;
-        out.push({ def: c, pluginId: lp.manifest.id, enabled: on });
-      }
-    }
-    return out;
-  }
-
-  findCommand(name: string): { def: CommandDef; pluginId: string } | undefined {
-    for (const lp of this.plugins.values()) {
-      for (const c of lp.commands.values()) {
-        if (c.name === name || c.aliases?.includes(name)) return { def: c, pluginId: lp.manifest.id };
-      }
-    }
-    return undefined;
-  }
-
   isPluginVisibleToChat(pluginId: string, chatId: string, role: Role): boolean {
     const lp = this.plugins.get(pluginId);
     if (!lp || lp.state !== 'loaded') return false;
@@ -497,7 +468,7 @@ export class PluginContainer {
    * 返回 undefined = 这个请求不该由插件应答（插件未载入 / 已停用 / 没有这条路由），
    * 由 API 层统一回 404（插件未加载与"没有这条路由"对外不可区分，不暴露插件清单）。
    *
-   * 停用态也归入 404：端点与工具/命令同属插件的贡献面，插件事务性停用后应当整体消失，
+   * 停用态也归入 404：端点与工具同属插件的贡献面，插件事务性停用后应当整体消失，
    * 而不是留一个 403 让外部脚本以为"端点还在、只是这次没权限"。
    */
   async dispatchHttp(
@@ -645,17 +616,6 @@ export class PluginContainer {
           lp.tools.set(def.name, def);
         },
         chat: (req) => llm.chat(req, { pluginId: manifest.id }),
-      },
-      registerCommand: (def) => {
-        for (const existing of container.plugins.values()) {
-          for (const name of [def.name, ...(def.aliases ?? [])]) {
-            if (existing.commands.has(name) || existing.commands.has(name)) {
-              throw new Error(`命令 /${name} 已被插件 ${existing.manifest.id} 注册`);
-            }
-          }
-        }
-        lp.commands.set(def.name, def);
-        for (const a of def.aliases ?? []) lp.commands.set(a, def);
       },
       schedule: {
         register: (job) => {

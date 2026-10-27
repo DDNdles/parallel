@@ -64,7 +64,7 @@ export class ChatService implements ChatSendService {
     this.adapter = adapter;
   }
 
-  /** 发一组消息段（不分条、无停顿）。命令回复、通知这类"整块内容"走这里。 */
+  /** 发一组消息段（不分条、无停顿）。通知这类"整块内容"走这里。 */
   async send(chat: ChatRef, segments: MsgSegment[]): Promise<void> {
     await this.sendTracked(chat, segments);
   }

@@ -2,7 +2,7 @@
 /**
  * 会话页 —— Codex 任务页形态：
  * 会话列表（置顶/群聊/私聊 三组可折叠，长名渐隐，右键/悬停置顶删除）+ 居中会话列
- * + 宽卡片 composer（双模型选择 pill + 斜杠命令补全 + parallel 品牌 mark 插入光标）
+ * + 宽卡片 composer（双模型选择 pill + parallel 品牌 mark 插入光标）
  */
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { get, post, onEvent, fmtTime, mdLite, getToken } from '@/lib/api';
@@ -18,7 +18,6 @@ interface Entry {
   type: string; chatId?: string; chatType?: string; ts?: number; text?: string;
   userId?: string; nickname?: string; data?: any;
 }
-interface Cmd { name: string; description: string; enabled: boolean }
 interface Provider {
   id: string; label: string; model: string; implemented: boolean; enabled: boolean;
   configured: boolean; hasKey: boolean;
@@ -62,7 +61,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   const [entries, setEntries] = useState<Entry[]>([]);
   const [input, setInput] = useState('');
   const [models, setModels] = useState<ModelsData | null>(null);
-  const [ac, setAc] = useState<{ items: Cmd[]; sel: number } | null>(null);
   const [pinned, setPinned] = useState<Set<string>>(new Set());
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
@@ -95,7 +93,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
-  const cmdCache = useRef<{ key: string; cmds: Cmd[] }>({ key: '', cmds: [] });
   const listDragRef = useRef(false);
   /** mousedown 时缓存的会话列表左边界 + 元素本身 + 一帧合并一次写入（避免拖拽时读写布局互相打架） */
   const listElRef = useRef<HTMLElement>(null);
@@ -548,7 +545,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   const openChat = async (c: ChatInfo) => {
     setCurrent({ key: c.chatKey, type: c.chatType, id: c.chatId });
     if (narrow) onCloseList?.();   // 窄屏选完就把抽屉收起来，别让它压在对话上
-    cmdCache.current = { key: '', cmds: [] };
     setReview('');
     setWin(null);
     setDays([]);
@@ -566,40 +562,12 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
     const text = input.trim();
     if (!text || !current) return;
     setInput('');
-    if (ac) setAc(null);
     await post(`/api/chats/${current.key}/send`, { text })
       .catch(() => {});
   };
 
-  // 斜杠命令补全
-  const onInput = async (v: string) => {
-    setInput(v);
-    if (!v.startsWith('/') || !current) { setAc(null); return; }
-    if (cmdCache.current.key !== current.key) {
-      const m = current.key.match(/^(group|private)_(.+)$/);
-      cmdCache.current = {
-        key: current.key,
-        cmds: await post('/api/rpc/commands_visible', { chatId: m?.[2] ?? '', chatType: m?.[1] ?? 'group', role: 'owner' }).catch(() => []),
-      };
-    }
-    const q = v.slice(1).split(/\s/)[0].toLowerCase();
-    const items = cmdCache.current.cmds.filter((c) => c.name.toLowerCase().includes(q)).slice(0, 12);
-    setAc(items.length ? { items, sel: 0 } : null);
-  };
-  const pickAc = (c?: Cmd) => {
-    if (!c && !ac) return;
-    const cmd = c ?? ac!.items[ac!.sel];
-    setInput('/' + cmd.name + ' ');
-    setAc(null);
-    inputRef.current?.focus();
-  };
   const onKey = (e: React.KeyboardEvent) => {
-    if (ac) {
-      if (e.key === 'ArrowDown') { e.preventDefault(); setAc({ ...ac, sel: (ac.sel + 1) % ac.items.length }); return; }
-      if (e.key === 'ArrowUp') { e.preventDefault(); setAc({ ...ac, sel: (ac.sel - 1 + ac.items.length) % ac.items.length }); return; }
-      if (e.key === 'Escape') { setAc(null); return; }
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); pickAc(); return; }
-    } else if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
     }
@@ -743,16 +711,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
             </div>
             <div className="composer-wrap">
               <div className="composer-inner">
-                {ac && (
-                  <div className="ac-panel">
-                    {ac.items.map((c, i) => (
-                      <div key={c.name} className={'ac-item' + (i === ac.sel ? ' sel' : '')} onClick={() => pickAc(c)}>
-                        <span className="mono">/{c.name}</span>
-                        <span className="d">{c.description}{c.enabled === false ? '（未开启）' : ''}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
                 <div className="composer-box">
                   <div className="composer-input">
                     {/* 文本层：负责"看得见的字"，光标位作为内联元素插在中间（挤开后面的字） */}
@@ -771,7 +729,7 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
                       rows={1}
                       value={input}
                       aria-label="消息输入框"
-                      onChange={(e) => { setInput(e.target.value); onInput(e.target.value); autogrow(e.target); }}
+                      onChange={(e) => { setInput(e.target.value); autogrow(e.target); }}
                       onKeyDown={onKey}
                       onKeyUp={syncCaret}
                       onFocus={syncCaret}
@@ -1159,27 +1117,6 @@ const EntryRow = memo(function EntryRow({ e, preview, botId, srcOf, findQuoted, 
           {fwd
             ? <ForwardCard fwd={fwd} srcOf={srcOf} onZoom={onZoom} />
             : <div className="text-md" dangerouslySetInnerHTML={{ __html: faceHtml(mdLite(e.text || '')) + (e.data?.simulated ? '<span class="muted"> （桌面端模拟）</span>' : '') }} />}
-        </div>
-      </div>
-    );
-  }
-  if (e.type === 'command') {
-    return (
-      <div className="turn turn-user">
-        {preview && e.userId ? <Avatar userId={e.userId} /> : null}
-        <div className="turn-body">
-          <div className="meta">{e.nickname || e.userId || ''} · {fmtTime(e.ts)}</div>
-          <div className="bubble-user mono">/{e.text || ''}</div>
-        </div>
-      </div>
-    );
-  }
-  if (e.type === 'command_result') {
-    return (
-      <div className="turn turn-assistant">
-        {botId ? <Avatar userId={botId} /> : null}
-        <div className="turn-body">
-          <div className="text-md" dangerouslySetInnerHTML={{ __html: mdLite(e.text || '') }} />
         </div>
       </div>
     );

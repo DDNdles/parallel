@@ -360,12 +360,6 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     }
 
     // ================= RPC（UI 用） =================
-    if (area === 'api' && a === 'rpc' && b === 'commands_visible') {
-      const chat: ChatRef = { platform: 'ui', type: body.chatType === 'private' ? 'private' : 'group', chatId: String(body.chatId ?? '') };
-      return send(kernel.container.commandsForChat(chat, body.role ?? 'owner').map((cm) => ({
-        name: cm.def.name, pluginId: cm.pluginId, description: cm.def.description, enabled: cm.enabled, minRole: cm.def.minRole,
-      })));
-    }
 
     // ================= 状态总览 =================
     if (area === 'api' && a === 'state') {
@@ -406,7 +400,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         defaultGroupState: lp.manifest.defaultGroupState,
         globalDefault: kernel.container.getGlobalDefault(lp.manifest.id) ?? (lp.manifest.defaultGroupState === 'on'),
         globalDefaultOverridden: kernel.container.getGlobalDefault(lp.manifest.id) !== undefined,
-        tools: [...lp.tools.keys()], commands: [...new Set([...lp.commands.values()].map((x) => x.name))],
+        tools: [...lp.tools.keys()],
         groupStates: kernel.container.groupStates(lp.manifest.id),
         userConfigSchema: lp.manifest.userConfig ?? {},
         hasMcp: !!lp.manifest.mcpServers && Object.keys(lp.manifest.mcpServers).length > 0,
