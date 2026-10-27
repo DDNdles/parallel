@@ -1096,6 +1096,7 @@ export function setup(ctx: PluginContext): void {
       records: records().map((r) => ({
         id: r.id, ts: r.ts, userId: r.userId, chatId: r.chatId, song: r.song,
         artist: r.artist, seconds: r.seconds, file: r.file, mime: r.mime,
+        ...(r.srcJobId ? { srcJobId: r.srcJobId } : {}),
       })),
       lastErrors: lastErrors().map((e) => ({ ts: e.ts, chatId: e.chatId, error: e.error })),
     },
