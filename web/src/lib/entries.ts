@@ -19,8 +19,8 @@ export interface ToolMeta {
   changes?: { path: string; added: number; removed: number }[];
 }
 
-/** 工具能力归类（决定「工作」面板那行的图标与措辞）：执行 / 文件 / 联网 / 浏览器 / 协议动作 / 其他 */
-export type ToolKind = 'run' | 'file' | 'net' | 'browser' | 'todo' | 'ask' | 'done' | 'delegate' | 'skill' | 'other';
+/** 工具能力归类（决定「工作」面板那行的图标与措辞）：执行 / 读取 / 文件 / 联网 / 浏览器 / 协议动作 / 其他 */
+export type ToolKind = 'run' | 'read' | 'file' | 'net' | 'browser' | 'todo' | 'ask' | 'done' | 'delegate' | 'skill' | 'other';
 
 /** 协议类工具（清单/回问/交付/派生/技能）没有"能力词素"可判，按整名精确取形状 */
 const PROTO: Record<string, ToolKind> = {
@@ -40,6 +40,7 @@ export function toolAction(name: string): ToolKind {
   if (/(^|_)(browser|chrome|playwright|puppeteer)(_|$)/.test(t)) return 'browser';
   if (/(^|_)(web|http|url|link|search|fetch|crawl|query)(_|$)/.test(t)) return 'net';
   if (/(^|_)(run|exec|shell|bash|zsh|powershell|python|node|js|ts|deno|eval|command|script)(_|$)/.test(t)) return 'run';
+  if (/(^|_)read(s)?(_|$)/.test(t)) return 'read';
   if (/(^|_)(file|fs|sandbox|path|dir|read|write|edit|save|artifact|folder)(_|$)/.test(t)) return 'file';
   return 'other';
 }

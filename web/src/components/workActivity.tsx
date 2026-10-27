@@ -344,6 +344,7 @@ export function SecHead({ title, m, extra }: { title: string; m?: Metrics; extra
 /** 动作行的图标与措辞：按能力分五类（执行/文件/联网/浏览器/其他），另加思考、异常、压缩、收尾四种行 */
 const ACT = {
   run: { icon: 'console', label: '终端' },
+  read: { icon: 'search', label: '读取' },
   file: { icon: 'file', label: '文件' },
   net: { icon: 'globe', label: '联网' },
   browser: { icon: 'browser', label: '浏览器' },
@@ -478,11 +479,11 @@ export function actHead(name: string, args = '', meta?: ToolMeta): Pick<ActRow, 
   const mcp = name.includes('__') ? splitMcp(name) : null;
   const sub = mcp ? mcp.server : '';
   const base = mcp ? mcp.tool : name;
-  if (kind === 'file' || kind === 'net' || kind === 'browser') {
+  if (kind === 'read' || kind === 'file' || kind === 'net' || kind === 'browser') {
     const p = meta?.path || argPath(args);
     if (p) {
-      // 只有文件类带文件类型徽章（path 字段），联网/浏览器的主体是 URL 或查询词
-      return kind === 'file' && /[./\\]/.test(p) && !/\s/.test(p)
+      // 读取/文件类带文件类型徽章（path 字段），联网/浏览器的主体是 URL 或查询词
+      return (kind === 'read' || kind === 'file') && /[./\\]/.test(p) && !/\s/.test(p)
         ? { kind, subject: p, sub, nm: name, path: p }
         : { kind, subject: p, sub, nm: name };
     }
