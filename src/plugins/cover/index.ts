@@ -50,6 +50,8 @@ interface Cfg {
   customToken: string;
   neteaseApiBaseUrl: string;
   neteaseApiCookie: string;
+  /** 直连网易云音源用的账号 Cookie（含 MUSIC_U；有会员时 VIP 歌也能拿流） */
+  neteaseCookie: string;
   musicDir: string;
 }
 
@@ -148,8 +150,8 @@ function isInstrumentalName(name: string): boolean {
 }
 
 /** 网易云搜索：优先匹配歌手；过滤伴奏/纯音乐；取不到就报一句人话 */
-export async function searchNetease(song: string, artist: string, timeoutMs: number): Promise<
-  { ok: true; song: SongInfo; alternates: SongInfo[] } | { ok: false; code: FailCode; error: string }
+export async function searchNetease(song: string, artist: string, timeoutMs: number, cookie = ''): Promise<
+  { ok: true; song: SongInfo; alternates: SongInfo[] } | { ok: false, code: FailCode; error: string }
 > {
   const query = `${song}${artist ? ` ${artist}` : ''}`.trim();
   const body = new URLSearchParams({ s: query, type: '1', limit: '12', offset: '0' });
@@ -161,6 +163,7 @@ export async function searchNetease(song: string, artist: string, timeoutMs: num
         'user-agent': UA,
         referer: 'https://music.163.com/',
         'content-type': 'application/x-www-form-urlencoded',
+        ...(cookie ? { cookie } : {}),
       },
       body,
       signal: AbortSignal.timeout(Math.min(timeoutMs, 20_000)),
@@ -205,9 +208,9 @@ export async function searchNetease(song: string, artist: string, timeoutMs: num
   return { ok: true, song: first, alternates };
 }
 
-/** 取原曲音频字节：先走公开 outer 链，失败再问 player/url；VIP/版权歌会明确报错 */
-export async function downloadNetease(id: number, timeoutMs: number, maxBytes: number): Promise<Outcome> {
-  const headers = { 'user-agent': UA, referer: 'https://music.163.com/' };
+/** 取原曲音频字节：outer 链失败后问 player/url（带 VIP Cookie 时能直接给会员流），仍失败才报错 */
+export async function downloadNetease(id: number, timeoutMs: number, maxBytes: number, cookie = ''): Promise<Outcome> {
+  const headers = { 'user-agent': UA, referer: 'https://music.163.com/', ...(cookie ? { cookie } : {}) };
   const tryUrl = async (url: string): Promise<Outcome> => {
     let resp: Response;
     try {
@@ -237,10 +240,11 @@ export async function downloadNetease(id: number, timeoutMs: number, maxBytes: n
     if (again.ok) outer = again; else if (outer.error.includes('不是 mp3/wav')) outer = again;
   }
   if (outer.ok) return outer;
-  // outer 链对 VIP/版权歌经常 403/404；再试一次 player/url（标准音质，免登录可用时）。
+  // outer 链对 VIP/版权歌经常 403/404；再问 player/url 拿直链——带 VIP Cookie 时会员歌能直接给流。
+  // br=320000：免登录时本来也只给 128k，填高码率让会员 Cookie 拿到 exhigh。
   let resp: Response;
   try {
-    resp = await fetch(`https://music.163.com/api/song/enhance/player/url?ids=[${id}]&br=128000`, {
+    resp = await fetch(`https://music.163.com/api/song/enhance/player/url?ids=[${id}]&br=320000`, {
       headers, signal: AbortSignal.timeout(Math.min(timeoutMs, 20_000)),
     });
   } catch {
@@ -534,14 +538,14 @@ function searchTracks(cfg: Cfg, song: string, artist: string): Promise<SearchOut
   if (cfg.source === 'neteaseApi') return searchNeteaseApi(cfg, song, artist);
   if (cfg.source === 'custom') return searchCustom(cfg, song, artist);
   if (cfg.source === 'local') return searchLocal(cfg, song, artist);
-  return searchNetease(song, artist, cfg.timeoutMs);
+  return searchNetease(song, artist, cfg.timeoutMs, cfg.neteaseCookie);
 }
 
 function downloadTrack(cfg: Cfg, song: SongInfo): Promise<Outcome> {
   if (cfg.source === 'neteaseApi') return downloadNeteaseApi(cfg, song);
   if (cfg.source === 'custom') return downloadCustom(cfg, song);
   if (cfg.source === 'local') return downloadLocal(cfg, song);
-  return downloadNetease(Number(song.id), cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
+  return downloadNetease(Number(song.id), cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024, cfg.neteaseCookie);
 }
 
 function jobHeaders(cfg: Cfg): Record<string, string> {
@@ -747,6 +751,7 @@ export function setup(ctx: PluginContext): void {
     customToken: String(ctx.userConfig.customToken ?? '').trim(),
     neteaseApiBaseUrl: String(ctx.userConfig.neteaseApiBaseUrl ?? '').trim().replace(/\/+$/, ''),
     neteaseApiCookie: String(ctx.userConfig.neteaseApiCookie ?? '').trim(),
+    neteaseCookie: String(ctx.userConfig.neteaseCookie ?? '').trim(),
     musicDir: resolve(String(ctx.userConfig.musicDir ?? '').trim() || join(kernelDataDir, 'music')),
   });
 

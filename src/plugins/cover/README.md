@@ -7,7 +7,7 @@
 
 | `source` | 说明 |
 |---|---|
-| `netease`（默认） | 网易云公开搜索/outer 链；VIP/版权曲可能拿不到播放地址 |
+| `netease`（默认） | 网易云公开搜索/outer 链；配 `neteaseCookie`（含 `MUSIC_U`）后走自己的会员权益取流，VIP/版权歌也能拿到 320k |
 | `neteaseApi` | 自部署 NeteaseCloudMusicApi 兼容服务；填 `neteaseApiBaseUrl`（可选 `neteaseApiCookie`）。推荐 [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)（MIT）并开 `ENABLE_GENERAL_UNBLOCK`（全局解灰），VIP/灰色歌自动从酷狗/酷我/咪咕/B站等免费源换流 |
 | `custom` | 你自部署/有授权的第三方库；填 `customBaseUrl`（可选 `customToken`） |
 | `local` | 本地曲库：默认 `data/music`，可用 `musicDir` 改；支持 mp3/wav/flac/m4a/ogg |

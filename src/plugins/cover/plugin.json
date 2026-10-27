@@ -42,10 +42,16 @@
       "default": false,
       "description": "自动接线：parallel 启动时拉起守护进程，107 上没有作业就自动提交，作业起来后自动写地址（需要先填上面的 Cookie；作业最长 3 小时 58 分，排队时间取决于平台）"
     },
+    "neteaseCookie": {
+      "type": "string",
+      "default": "",
+      "description": "网易云账号 Cookie（source=netease 时用；含 MUSIC_U 即可）。有会员账号时填它，VIP/版权歌就能用自己的会员权益取流，音质到 320k。获取：网页版登录 → F12 → Network → 任一请求的 Cookie 整串复制",
+      "secret": true
+    },
     "source": {
       "type": "string",
       "default": "netease",
-      "description": "音源：netease=网易云直连（默认，VIP/版权曲可能没流）；neteaseApi=自部署网易云API服务（推荐开全局解灰的镜像，VIP 歌也能取流）；custom=自定义第三方库（需填 customBaseUrl，契约见 README）；local=本地曲库（data/music 或 musicDir）"
+      "description": "音源：netease=网易云直连（默认，配 neteaseCookie 后 VIP 歌也能取流）；neteaseApi=自部署网易云API服务（推荐开全局解灰的镜像，VIP 歌也能取流）；custom=自定义第三方库（需填 customBaseUrl，契约见 README）；local=本地曲库（data/music 或 musicDir）"
     },
     "neteaseApiBaseUrl": {
       "type": "string",
