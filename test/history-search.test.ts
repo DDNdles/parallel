@@ -162,3 +162,17 @@ test('一轮之内翻旧账有预算：查满就劝它照字面回答，别再�
   const ctx4 = { ...(ctx3 as object), event: { ...((ctx3 as { event: object }).event), id: 'turn-quota-2' } } as never;
   assert.ok(!/别再查/.test(String(hist.handler({ query: '新话题' }, ctx4))), '预算按轮算，不按群累计');
 });
+
+test('工具面：work 带 search_history、不再带 recall_facts（2026-10-27 换的）', () => {
+  const chatRef = { platform: 'qq', type: 'group' as const, chatId: String(GROUP) };
+  const agent = kernel.container.workAgent();
+  const work = kernel.container.workToolsFor(chatRef, 'owner', agent, 0);
+  const names = work.map((t) => t.name);
+  assert.ok(names.includes('search_history'), `work 面要有 search_history：${names.join(',')}`);
+  assert.ok(!names.includes('recall_facts'), 'work 面的 recall_facts 已撤掉');
+  // work 的「可用工具」清单只读 promptSnippet：缺了这一行等于工具没被介绍
+  assert.ok(work.find((t) => t.name === 'search_history')?.promptSnippet, 'search_history 要带 promptSnippet');
+  // chat 面不动：两个记忆类工具都还在
+  const chatNames = kernel.container.toolsForChat(chatRef, 'owner').map((t) => t.name);
+  assert.ok(chatNames.includes('search_history') && chatNames.includes('recall_facts'));
+});

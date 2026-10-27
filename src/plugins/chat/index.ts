@@ -561,6 +561,11 @@ export function setup(ctx: PluginContext): void {
       required: ['query'],
     },
     surface: 'memory',
+    // work 面也用得上（work.md 白名单里有它）：work 的「可用工具」清单只读 promptSnippet，缺了整行不显示
+    promptSnippet: '翻本会话更早的聊天记录原文（上下文之外；关键词字面匹配，命中带图会把图一起给你）',
+    promptGuidelines: [
+      '任务里出现「之前说过 / 上次聊的 / 我们讨论过」这类要翻旧账的话，用 search_history 搜本会话的旧消息；它只做字面关键词匹配，用短词（人名、专有名词、短语），别拿一整句去搜。',
+    ],
     handler: (args, tctx) => {
       const q = String(args.query ?? '').trim();
       if (!q) return '（关键词为空）';
