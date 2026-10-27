@@ -78,6 +78,8 @@ const PATHS: Record<string, string> = {
   bilibili: '<rect x="3" y="7.5" width="18" height="13" rx="3.5"/><path d="M7.5 3.5 10 6.5M16.5 3.5 14 6.5"/><path d="M8.8 12.6h.01M15.2 12.6h.01"/>',
   /** 唱歌：双音符（符杆 + 符头，与 play/pause 同族的实心轮廓） */
   music: '<path d="M9.5 17V5.5l10-2V15"/><circle cx="7" cy="17" r="2.5"/><circle cx="17" cy="15" r="2.5"/>',
+  /** 翻唱：录音话筒（胶囊振膜 + 托架 + 立柱），与 music 区分开 */
+  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21M8.5 21h7"/>',
   /** 生图：图片框（山 + 日）右上角点一颗生成星 */
   image: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M4 16.5l4.4-4.8 3.2 3.4 2.6-2.4 6 6.3"/><circle cx="9" cy="9.8" r="1.6"/><path stroke-width="1.6" d="M17.9 7.4l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z"/>',
   /** 品牌 mark：∥ 平行符入圆角牌（bot 与人类 QQ 平行交错） */

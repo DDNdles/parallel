@@ -25,6 +25,7 @@ import StickersPage from '@/components/pages/StickersPage';
 import BilibiliPage from '@/components/pages/BilibiliPage';
 import ImagegenPage from '@/components/pages/ImagegenPage';
 import SingPage from '@/components/pages/SingPage';
+import CoverPage from '@/components/pages/CoverPage';
 
 export interface AppState {
   adapter: { connected: boolean; selfId?: string; selfNickname?: string; endpoint?: string; mode?: string };
@@ -51,6 +52,7 @@ export const PAGES: { id: string; name: string; nav: string; icon: string }[] = 
   { id: 'bilibili', name: 'b站搜索', nav: 'b站搜索', icon: 'bilibili' },
   { id: 'imagegen', name: '生图', nav: '生图', icon: 'image' },
   { id: 'sing', name: '唱歌', nav: '唱歌', icon: 'music' },
+  { id: 'cover', name: '翻唱', nav: '翻唱', icon: 'mic' },
   { id: 'settings', name: '设置', nav: '设置', icon: 'settings' },
 ];
 const ALL_PAGES = PAGES;
@@ -255,6 +257,7 @@ export default function App() {
       case 'bilibili': return <BilibiliPage />;
       case 'imagegen': return <ImagegenPage />;
       case 'sing': return <SingPage />;
+      case 'cover': return <CoverPage />;
       default: return null;
     }
   })();

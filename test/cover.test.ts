@@ -400,26 +400,67 @@ test('发送被限速整批丢弃：返回失败，不保留额度与冷却', as
   }
 });
 
-test('REST /preview 只落盘不发送；/records 字段、/audio 同字节、/send 补发、热重载', async () => {
+test('REST /preview 异步：提交回 202、在途时 409；/job 轮询到 done 只落盘不发送；/records /audio /send 补发、热重载', async () => {
   const k = await boot({
     apiKey: 'cover-key-123',
     connect: true,
     config: { baseUrl: COVER_BASE, cooldownSeconds: 0, dailyQuota: 5 },
   });
-  const mock = mockFetch((url) => {
+  let coverDelay = 1500;
+  const mock = mockFetch(async (url) => {
     if (url === SEARCH_URL) return jsonResp(SEARCH_OK);
     if (url === OUTER_URL) return new Response(MP3, { status: 200, headers: { 'content-type': 'audio/mpeg' } });
-    if (url === COVER_URL) return audioResp(180);
+    if (url === COVER_URL) {
+      if (coverDelay > 0) await new Promise((r) => setTimeout(r, coverDelay));
+      coverDelay = 0;
+      return audioResp(180);
+    }
     return undefined;
   });
   try {
     const resp = await k.kernel.container.dispatchHttp('cover', 'POST', '/preview', {}, { song: '起风了' });
-    assert.equal(resp!.status, 200);
-    const preview = JSON.parse(String(resp!.body)) as { ok: boolean; id: string; seconds: number; song: string };
-    assert.equal(preview.ok, true);
-    assert.match(preview.id, /^cover_[a-z0-9]+$/);
-    assert.equal(preview.song, '起风了');
-    assert.equal(preview.seconds, 180);
+    assert.equal(resp!.status, 202);
+    const submit = JSON.parse(String(resp!.body)) as { ok: boolean; id: string };
+    assert.equal(submit.ok, true);
+    assert.match(submit.id, /^dj_/);
+
+    // 第一首还在跑：第二首要被 409 拦下
+    const dup = await k.kernel.container.dispatchHttp('cover', 'POST', '/preview', {}, { song: '起风了' });
+    assert.equal(dup!.status, 409);
+
+    let job: any = null;
+    for (let i = 0; i < 160 && job?.status !== 'done'; i++) {
+      const jr = await k.kernel.container.dispatchHttp('cover', 'GET', '/job', { id: submit.id }, {});
+      assert.equal(jr!.status, 200);
+      job = JSON.parse(String(jr!.body));
+      if (job.status === 'done') break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(job.status, 'done', JSON.stringify(job));
+    assert.match(job.id, /^cover_[a-z0-9]+$/);
+    assert.equal(job.song, '起风了');
+    assert.equal(job.seconds, 180);
+
+    const missing = await k.kernel.container.dispatchHttp('cover', 'GET', '/job', { id: 'dj_nope' }, {});
+    assert.equal(missing!.status, 404);
+
+    // 失败路径：搜不到歌时 job 以 failed 收尾、错误是中文
+    const emptyMock = mockFetch((url) => (url === SEARCH_URL ? jsonResp({ result: {} }) : undefined));
+    try {
+      const badSubmit = await k.kernel.container.dispatchHttp('cover', 'POST', '/preview', {}, { song: '没有这首歌' });
+      assert.equal(badSubmit!.status, 202);
+      const badId = (JSON.parse(String(badSubmit!.body)) as { id: string }).id;
+      let bad: any = null;
+      for (let i = 0; i < 100 && bad?.status !== 'failed'; i++) {
+        const jr = await k.kernel.container.dispatchHttp('cover', 'GET', '/job', { id: badId }, {});
+        bad = JSON.parse(String(jr!.body));
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(bad.status, 'failed');
+      assert.match(bad.error, /没搜到|换个歌名/);
+    } finally {
+      emptyMock.restore();
+    }
 
     const sends = k.mock!.actions.filter((a) => a.action === 'send_group_msg' || a.action === 'send_private_msg');
     assert.equal(sends.length, 0, '试翻不应发送任何消息');
@@ -433,18 +474,18 @@ test('REST /preview 只落盘不发送；/records 字段、/audio 同字节、/s
     );
     assert.equal(recBody.records[0].userId, 'desktop');
 
-    const audio = await k.kernel.container.dispatchHttp('cover', 'GET', '/audio', { id: preview.id }, {});
+    const audio = await k.kernel.container.dispatchHttp('cover', 'GET', '/audio', { id: job.id }, {});
     assert.equal(audio!.status, 200);
     assert.deepEqual(audio!.body, MP3);
 
     const bad = await k.kernel.container.dispatchHttp('cover', 'POST', '/send', {}, {
-      id: preview.id, type: 'group', chatId: '8899',
+      id: job.id, type: 'group', chatId: '8899',
     });
     assert.equal(bad!.status, 400);
 
     const from = k.mock!.actions.length;
     const sent = await k.kernel.container.dispatchHttp('cover', 'POST', '/send', {}, {
-      id: preview.id, type: 'group', chatId: '88990', text: '来听翻唱',
+      id: job.id, type: 'group', chatId: '88990', text: '来听翻唱',
     });
     assert.equal(sent!.status, 200);
     const act = await k.mock!.waitForAction('send_group_msg', 5000, from);
@@ -460,6 +501,36 @@ test('REST /preview 只落盘不发送；/records 字段、/audio 同字节、/s
     assert.equal(k.kernel.container.get('cover')!.tools.size, 1);
     const status = await k.kernel.container.dispatchHttp('cover', 'GET', '/status', {}, {});
     assert.equal(status!.status, 200);
+  } finally {
+    mock.restore();
+    await k.cleanup();
+  }
+});
+
+test('首选版本拿不到流：自动换搜索结果里的备选版本再下', async () => {
+  const k = await boot({
+    apiKey: 'cover-key-123',
+    connect: true,
+    config: { baseUrl: COVER_BASE, cooldownSeconds: 0, dailyQuota: 5 },
+  });
+  const mock = mockFetch((url) => {
+    if (url === SEARCH_URL) return jsonResp(SEARCH_OK);
+    if (url === OUTER_URL) {
+      // 首选（1330348068）回非音频页（200 + HTML），备选（222）给真 mp3
+      return new Response('<html>vip</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (url === 'https://music.163.com/song/media/outer/url?id=222.mp3') {
+      return new Response(MP3, { status: 200, headers: { 'content-type': 'audio/mpeg' } });
+    }
+    if (url.startsWith('https://music.163.com/api/song/enhance/player/url')) return jsonResp({ data: [{ url: null }] });
+    if (url === COVER_URL) return audioResp(90);
+    return undefined;
+  });
+  try {
+    const out = await k.call({ song: '起风了' });
+    assert.match(out, /翻唱成语音/, out);
+    assert.ok(mock.calls.some((c) => c.url === 'https://music.163.com/song/media/outer/url?id=222.mp3'), '应尝试备选版本');
+    await k.mock!.waitForAction('send_group_msg', 5000);
   } finally {
     mock.restore();
     await k.cleanup();

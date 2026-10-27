@@ -132,7 +132,7 @@ function sniffAudioMime(buf: Buffer): 'audio/mpeg' | 'audio/wav' | undefined {
 
 /** 网易云搜索：优先匹配歌手；过滤伴奏/纯音乐；取不到就报一句人话 */
 export async function searchNetease(song: string, artist: string, timeoutMs: number): Promise<
-  { ok: true; song: SongInfo } | { ok: false; code: FailCode; error: string }
+  { ok: true; song: SongInfo; alternates: SongInfo[] } | { ok: false; code: FailCode; error: string }
 > {
   const query = `${song}${artist ? ` ${artist}` : ''}`.trim();
   const body = new URLSearchParams({ s: query, type: '1', limit: '12', offset: '0' });
@@ -164,17 +164,28 @@ export async function searchNetease(song: string, artist: string, timeoutMs: num
   });
   const pool = clean.length ? clean : songs;
   const wanted = artist.trim().toLowerCase();
-  const hit = wanted
-    ? pool.find((s) => Array.isArray(s?.artists) && s.artists.some((a: any) => String(a?.name ?? '').toLowerCase().includes(wanted)))
-    : undefined;
-  const picked = hit ?? pool[0];
-  const id = Number(picked?.id);
-  const name = String(picked?.name ?? '').trim();
-  const artists = Array.isArray(picked?.artists) ? picked.artists.map((a: any) => String(a?.name ?? '')).filter(Boolean).join('/') : '';
-  if (!Number.isFinite(id) || id <= 0 || !name) {
+  const isMatch = (s: any) => Array.isArray(s?.artists)
+    && s.artists.some((a: any) => String(a?.name ?? '').toLowerCase().includes(wanted));
+  // 同一歌手常有多个版本（VIP/现场/翻唱），排序还会随请求变：
+  // 歌手匹配的版本全部排在前面，首选拿不到播放地址时按顺序再试后面的
+  const matched = wanted ? pool.filter(isMatch) : [];
+  const ordered = matched.length
+    ? [...matched, ...pool.filter((s) => !matched.includes(s))]
+    : pool;
+  const toInfo = (s: any): SongInfo | null => {
+    const id = Number(s?.id);
+    const name = String(s?.name ?? '').trim();
+    const artists = Array.isArray(s?.artists) ? s.artists.map((a: any) => String(a?.name ?? '')).filter(Boolean).join('/') : '';
+    return Number.isFinite(id) && id > 0 && name ? { id, name, artists } : null;
+  };
+  const infos = ordered.slice(0, 6).map(toInfo).filter((x): x is SongInfo => !!x);
+  if (!infos.length) {
     return { ok: false, code: 'notfound', error: `网易云返回的《${song}》没有可用的歌曲 id。` };
   }
-  return { ok: true, song: { id, name, artists } };
+  const [first, ...rest] = infos;
+  // 备选只收同名版本（VIP/现场/翻唱）：网易云模糊搜索会混进别的歌，宁可报错也不翻错歌
+  const alternates = rest.filter((x) => x.name === first.name);
+  return { ok: true, song: first, alternates };
 }
 
 /** 取原曲音频字节：先走公开 outer 链，失败再问 player/url；VIP/版权歌会明确报错 */
@@ -197,11 +208,17 @@ export async function downloadNetease(id: number, timeoutMs: number, maxBytes: n
     if (!buf.length) return { ok: false, code: 'api', error: '原曲下载回来是空文件。' };
     if (buf.length > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(buf.length / 1024 / 1024)}MB），换一首。` };
     const mime = sniffAudioMime(buf);
-    if (!mime) return { ok: false, code: 'api', error: '网易云回来的不是 mp3/wav 音频（可能是 VIP/版权限制页）。' };
+    if (!mime) return { ok: false, code: 'api', error: `原曲(id=${id})回来的不是 mp3/wav 音频（可能是 VIP/版权限制页）。` };
     return { ok: true, data: buf, contentType: resp.headers.get('content-type') ?? mime };
   };
 
-  const outer = await tryUrl(`${NETEASE_OUTER}?id=${id}.mp3`);
+  let outer = await tryUrl(`${NETEASE_OUTER}?id=${id}.mp3`);
+  // 网易云 CDN 对长连接进程偶发回非音频页（200 + HTML），隔 1.5s 换条连接再试一次
+  if (!outer.ok && outer.code === 'api') {
+    await sleep(1500);
+    const again = await tryUrl(`${NETEASE_OUTER}?id=${id}.mp3`);
+    if (again.ok) outer = again; else if (outer.error.includes('不是 mp3/wav')) outer = again;
+  }
   if (outer.ok) return outer;
   // outer 链对 VIP/版权歌经常 403/404；再试一次 player/url（标准音质，免登录可用时）。
   let resp: Response;
@@ -217,42 +234,63 @@ export async function downloadNetease(id: number, timeoutMs: number, maxBytes: n
   try { data = await resp.json(); } catch { return outer; }
   const url = String(data?.data?.[0]?.url ?? '').trim();
   if (!url || !/^https?:\/\//i.test(url)) {
-    return { ok: false, code: 'notfound', error: '网易云没给这首歌的播放地址（可能是 VIP/版权限制），换一首试试。' };
+    // outer 失败的原因往往才是真相（HTTP 403=版权、网络错=网易云抽风），带出来好排查
+    return { ok: false, code: 'notfound', error: `网易云没给这首歌的播放地址（可能是 VIP/版权限制），换一首试试。[${outer.code === 'api' ? outer.error : 'outer 失败'}]` };
   }
   const second = await tryUrl(url);
   return second.ok ? second : outer;
 }
 
-async function postCover(
+function jobHeaders(cfg: Cfg): Record<string, string> {
+  return {
+    ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
+    // SCOW 门户代理（107 /api/proxy/...）只认会话 Cookie；普通自部署留空
+    ...(cfg.cookie ? { cookie: cfg.cookie } : {}),
+  };
+}
+
+/** 搜歌 → 下载原曲 → POST /cover。异步服务回 202 {id}；老版同步服务直接回音频。 */
+async function submitCoverJob(
   cfg: Cfg,
-  song: SongInfo,
-  audio: Buffer,
+  songQuery: string,
+  artistQuery: string,
   withInstrumental: boolean,
-): Promise<Outcome> {
+): Promise<
+  | { ok: true; song: SongInfo; jobId: string; seconds?: number }
+  | { ok: true; song: SongInfo; direct: { data: Buffer; seconds?: number; contentType?: string } }
+  | { ok: false; code: FailCode; error: string }
+> {
   const label = '翻唱服务';
   if (!cfg.baseUrl) {
     return { ok: false, code: 'config', error: '翻唱服务还没配置：请主人在「插件 → 翻唱」里填 baseUrl（107 的 SCOW 代理地址）。' };
   }
+  const found = await searchNetease(songQuery, artistQuery, cfg.timeoutMs);
+  if (!found.ok) return found;
+  const candidates = [found.song, ...found.alternates];
+  let song = candidates[0];
+  let downloaded = await downloadNetease(song.id, cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
+  // 首选版本可能是 VIP/版权拿不到流，按同名备选逐个再试（绝不跨歌名）
+  for (let i = 1; i < candidates.length && !downloaded.ok; i++) {
+    if (downloaded.code !== 'notfound' && downloaded.code !== 'api') break;
+    song = candidates[i];
+    downloaded = await downloadNetease(song.id, cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
+  }
+  if (!downloaded.ok) return downloaded;
+
   const form = new FormData();
-  form.append('audio', new Blob([new Uint8Array(audio)], { type: 'audio/mpeg' }), `${song.name || 'song'}.mp3`);
+  form.append('audio', new Blob([new Uint8Array(downloaded.data)], { type: 'audio/mpeg' }), `${song.name || 'song'}.mp3`);
   form.append('with_instrumental', withInstrumental ? 'true' : 'false');
   form.append('vocal_gain', '1');
   form.append('instrumental_gain', '1');
   const base = cfg.baseUrl.replace(/\/+$/, '');
-  const headers: Record<string, string> = {
-    ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
-    // SCOW 门户代理（107 /api/proxy/...）只认会话 Cookie；自部署留空
-    ...(cfg.cookie ? { cookie: cfg.cookie } : {}),
-  };
-  const submitTimeout = Math.min(cfg.timeoutMs, 120_000);
   let resp: Response;
   try {
     resp = await fetch(`${base}/cover`, {
       method: 'POST',
-      headers,
+      headers: jobHeaders(cfg),
       body: form as any,
       // 107 的 nginx 代理约 60s 就 504；上传通常远快于这个值
-      signal: AbortSignal.timeout(Math.min(submitTimeout, 55_000)),
+      signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 55_000)),
     });
   } catch (e) {
     if (isTimeoutError(e)) {
@@ -265,7 +303,6 @@ async function postCover(
     return { ok: false, code: 'api', error: httpError(label, resp.status, raw) };
   }
 
-  // 兼容两种服务：老版同步返回音频，新版返回 202 {id} 后轮询。
   const ctype = (resp.headers.get('content-type') ?? '').toLowerCase();
   if (ctype.startsWith('audio/')) {
     let direct: Buffer;
@@ -276,7 +313,13 @@ async function postCover(
     const mime = sniffAudioMime(direct);
     if (!mime) return { ok: false, code: 'api', error: '翻唱服务回来的不是 mp3/wav。' };
     const rawSeconds = Number(resp.headers.get('x-cover-seconds') ?? 0);
-    return { ok: true, data: direct, contentType: ctype, seconds: Number.isFinite(rawSeconds) && rawSeconds > 0 ? Math.round(rawSeconds) : undefined };
+    return {
+      ok: true, song,
+      direct: {
+        data: direct, contentType: ctype,
+        seconds: Number.isFinite(rawSeconds) && rawSeconds > 0 ? Math.round(rawSeconds) : undefined,
+      },
+    };
   }
 
   let submitted: any;
@@ -287,53 +330,59 @@ async function postCover(
   if (!submitted?.ok || !jobId) {
     return { ok: false, code: 'api', error: `${label} 没有返回任务 id。` };
   }
+  const hint = Number(submitted?.seconds ?? 0);
+  return { ok: true, song, jobId, seconds: Number.isFinite(hint) && hint > 0 ? Math.round(hint) : undefined };
+}
 
-  const deadline = Date.now() + cfg.timeoutMs;
-  let seconds: number | undefined;
-  for (;;) {
-    if (Date.now() >= deadline) {
-      return { ok: false, code: 'timeout', error: `翻唱超时了：等了 ${Math.round(cfg.timeoutMs / 1000)} 秒还没处理完，稍后再试。` };
-    }
-    await sleep(4000);
-    let poll: Response;
-    try {
-      poll = await fetch(`${base}/jobs/${encodeURIComponent(jobId)}`, {
-        headers, signal: AbortSignal.timeout(30_000),
-      });
-    } catch {
-      continue; // 单次轮询超时就再等一轮，总超时由 deadline 管
-    }
-    if (!poll.ok) {
-      // 代理偶发 502/503/504 时继续轮询；404 表示任务真的没了
-      if ([429, 502, 503, 504].includes(poll.status)) continue;
-      const raw = await poll.text().catch(() => '');
-      return { ok: false, code: 'api', error: httpError(label, poll.status, raw) };
-    }
-    let st: any;
-    try { st = await poll.json(); } catch { continue; }
-    const status = String(st?.status ?? '');
-    if (status === 'done') {
-      seconds = Number(st?.seconds ?? 0) || undefined;
-      break;
-    }
-    if (status === 'failed') {
-      const detail = String(st?.error ?? '').trim().slice(0, 300);
-      return { ok: false, code: 'api', error: `${label} 处理失败${detail ? `：${detail}` : ''}。` };
-    }
-    // queued / running：继续
+type JobStatus =
+  | { kind: 'wait' }                        // queued/running，或代理瞬时抖动（继续轮询）
+  | { kind: 'done'; seconds?: number }
+  | { kind: 'failed'; error: string };
+
+/** 一次性查任务状态；代理 502/503/504 或单次超时都算 wait，由调用方决定重试还是放弃 */
+async function fetchCoverStatus(cfg: Cfg, jobId: string): Promise<JobStatus> {
+  const base = cfg.baseUrl.replace(/\/+$/, '');
+  let poll: Response;
+  try {
+    poll = await fetch(`${base}/jobs/${encodeURIComponent(jobId)}`, {
+      headers: jobHeaders(cfg), signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    return { kind: 'wait' };
   }
+  if (!poll.ok) {
+    if (poll.status === 404) return { kind: 'failed', error: '找不到这个翻唱任务（服务可能重启过），稍后再试。' };
+    if ([429, 502, 503, 504].includes(poll.status)) return { kind: 'wait' };
+    const raw = await poll.text().catch(() => '');
+    return { kind: 'failed', error: httpError('翻唱服务', poll.status, raw) };
+  }
+  let st: any;
+  try { st = await poll.json(); } catch { return { kind: 'wait' }; }
+  const status = String(st?.status ?? '');
+  if (status === 'done') {
+    const s = Number(st?.seconds ?? 0);
+    return { kind: 'done', seconds: Number.isFinite(s) && s > 0 ? Math.round(s) : undefined };
+  }
+  if (status === 'failed') {
+    return { kind: 'failed', error: String(st?.error ?? '').trim().slice(0, 300) };
+  }
+  return { kind: 'wait' };
+}
 
+/** 下载任务产物（mp3/wav 校验与大小限制都在这） */
+async function fetchCoverAudio(cfg: Cfg, jobId: string, knownSeconds?: number): Promise<Outcome> {
+  const base = cfg.baseUrl.replace(/\/+$/, '');
   let audioResp: Response;
   try {
     audioResp = await fetch(`${base}/jobs/${encodeURIComponent(jobId)}/audio`, {
-      headers, signal: AbortSignal.timeout(60_000),
+      headers: jobHeaders(cfg), signal: AbortSignal.timeout(60_000),
     });
   } catch (e) {
-    return { ok: false, code: 'api', error: `${label} 结果下载失败（${(e as Error).message}）。` };
+    return { ok: false, code: 'api', error: `翻唱服务 结果下载失败（${(e as Error).message}）。` };
   }
   if (!audioResp.ok) {
     const raw = await audioResp.text().catch(() => '');
-    return { ok: false, code: 'api', error: httpError(label, audioResp.status, raw) };
+    return { ok: false, code: 'api', error: httpError('翻唱服务', audioResp.status, raw) };
   }
   let data: Buffer;
   try { data = Buffer.from(await audioResp.arrayBuffer()); } catch (e) {
@@ -344,8 +393,28 @@ async function postCover(
   const mime = sniffAudioMime(data);
   if (!mime) return { ok: false, code: 'api', error: '翻唱服务回来的不是 mp3/wav（可能把错误信息当音频返回了）。' };
   const rawSeconds = Number(audioResp.headers.get('x-cover-seconds') ?? 0);
-  if (!seconds && Number.isFinite(rawSeconds) && rawSeconds > 0) seconds = Math.round(rawSeconds);
+  const seconds = knownSeconds ?? (Number.isFinite(rawSeconds) && rawSeconds > 0 ? Math.round(rawSeconds) : undefined);
   return { ok: true, data, contentType: audioResp.headers.get('content-type') ?? mime, seconds };
+}
+
+/** 会话工具那条路：提交后在插件里阻塞轮询到 done 再取回音频（LLM 调用没有 HTTP 超时问题） */
+async function awaitCoverResult(
+  cfg: Cfg, jobId: string, hintSeconds?: number,
+): Promise<Outcome> {
+  const deadline = Date.now() + cfg.timeoutMs;
+  let seconds = hintSeconds;
+  for (;;) {
+    if (Date.now() >= deadline) {
+      return { ok: false, code: 'timeout', error: `翻唱超时了：等了 ${Math.round(cfg.timeoutMs / 1000)} 秒还没处理完，稍后再试。` };
+    }
+    await sleep(4000);
+    const st = await fetchCoverStatus(cfg, jobId);
+    if (st.kind === 'failed') {
+      return { ok: false, code: 'api', error: `翻唱服务 处理失败${st.error ? `：${st.error}` : ''}。` };
+    }
+    if (st.kind === 'done') { seconds = st.seconds ?? seconds; break; }
+  }
+  return fetchCoverAudio(cfg, jobId, seconds);
 }
 
 export function setup(ctx: PluginContext): void {
@@ -463,7 +532,18 @@ export function setup(ctx: PluginContext): void {
     | { ok: true; id: string; song: string; artist: string; seconds: number; exact: boolean; path: string }
     | { ok: false; code: FailCode; error: string };
 
-  async function coverCore(opts: CoverOpts): Promise<CoverResult> {
+  // ---------- 护栏（额度/冷却/在途锁）+ 落盘交付，供同步工具路与桌面异步路共用 ----------
+
+  type Prepared = {
+    day: string; userId: string;
+    /** 失败/取消：退回额度与冷却、释放本会话在途锁 */
+    rollback: () => void;
+    /** 成功：写盘（deliver 时再发语音）、定冷却、进 records */
+    commit: (out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean) => Promise<CoverResult>;
+  };
+  type PrepareFail = { ok: false; code: FailCode; error: string };
+
+  async function prepare(opts: CoverOpts): Promise<PrepareFail | { ok: true; c: Cfg; p: Prepared; withInstrumental: boolean; songQuery: string; artistQuery: string }> {
     const c = cfg();
     const songQuery = String(opts.song ?? '').trim();
     if (!songQuery) return { ok: false, code: 'config', error: '翻唱失败：歌名是空的。' };
@@ -509,17 +589,9 @@ export function setup(ctx: PluginContext): void {
       releaseSlot();
     };
 
-    try {
-      const found = await searchNetease(songQuery, artistQuery, c.timeoutMs);
-      if (!found.ok) { rollback(); return found; }
-      const song = found.song;
-
-      const downloaded = await downloadNetease(song.id, c.timeoutMs, c.maxSongMb * 1024 * 1024);
-      if (!downloaded.ok) { rollback(); return downloaded; }
-
-      const out = await postCover(c, song, downloaded.data, withInstrumental);
-      if (!out.ok) { rollback(); return out; }
-
+    const commit = async (
+      out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean,
+    ): Promise<CoverResult> => {
       const mime = sniffAudioMime(out.data) ?? 'audio/mpeg';
       const id = newId('cover_');
       const file = `${id}.${mime === 'audio/wav' ? 'wav' : 'mp3'}`;
@@ -529,7 +601,7 @@ export function setup(ctx: PluginContext): void {
         return { ok: false, code: 'storage', error: `翻唱失败：音频写盘出错（${(e as Error).message}）。` };
       }
 
-      if (opts.deliver !== false) {
+      if (deliver) {
         try {
           const receipt = await ctx.chat.sendTracked(opts.chat, [{ type: 'record', data: { file: pathToFileURL(abs).href } }]);
           if (receipt.sent <= 0) {
@@ -558,8 +630,25 @@ export function setup(ctx: PluginContext): void {
       });
       cleanupOld();
       return { ok: true, id, song: song.name, artist: song.artists, seconds, exact, path: abs };
+    };
+
+    return { ok: true, c, withInstrumental, songQuery, artistQuery, p: { day, userId: opts.userId, rollback, commit } };
+  }
+
+  async function coverCore(opts: CoverOpts): Promise<CoverResult> {
+    const prepped = await prepare(opts);
+    if (!prepped.ok) return prepped;
+    const { c, p } = prepped;
+    try {
+      const submitted = await submitCoverJob(c, prepped.songQuery, prepped.artistQuery, prepped.withInstrumental);
+      if (!submitted.ok) { p.rollback(); return submitted; }
+      const out = 'direct' in submitted
+        ? { ok: true as const, ...submitted.direct }
+        : await awaitCoverResult(c, submitted.jobId, submitted.seconds);
+      if (!out.ok) { p.rollback(); return out; }
+      return await p.commit({ data: out.data, seconds: out.seconds }, submitted.song, opts.deliver !== false);
     } catch (e) {
-      rollback();
+      p.rollback();
       return { ok: false, code: 'api', error: `翻唱失败：工具内部出了意外（${(e as Error).message}），稍后再试。` };
     }
   }
@@ -637,7 +726,7 @@ export function setup(ctx: PluginContext): void {
     return req;
   };
 
-  // ---------- REST（桌面端「翻唱」页/补发） ----------
+  // ---------- REST（桌面端「翻唱」页：/status /records /audio /preview+job /send） ----------
   const ownerId = (): string => {
     const ids = (ctx.config as { masterIds?: unknown }).masterIds;
     return Array.isArray(ids) && ids.length ? String(ids[0]) : 'owner';
@@ -685,24 +774,64 @@ export function setup(ctx: PluginContext): void {
     };
   });
 
+  // 桌面端「试翻」是异步任务：HTTP 请求不能挂着等几十分钟（内核 server 5 分钟会掐断），
+  // 提交立刻回 202 + jobId，插件后台跑 coverCore（deliver:false），页面轮询 /job。
+  // 热重载会丢掉在途任务的句柄，但额度/冷却/记录本身都落 plugin_kv，不脏。
+  type DeskJob = {
+    id: string; status: 'running' | 'done' | 'failed';
+    song?: string; artist?: string; seconds?: number; resultId?: string;
+    error?: string; startedAt: number; finishedAt?: number;
+  };
+  const deskJobs = new Map<string, DeskJob>();
+
   ctx.http.on('POST', '/preview', async (req) => {
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
-    try {
-      const r = await cover({
-        chat: desktopChat(),
-        userId: ownerId(),
-        role: 'owner',
-        recordUserId: 'desktop',
-        deliver: false,
-        song: body.song,
-        artist: body.artist,
-        withInstrumental: body.withInstrumental,
-      });
-      if (!r.ok) return { status: 400, body: { ok: false, error: r.error } };
-      return { body: { ok: true, id: r.id, song: r.song, artist: r.artist, seconds: r.seconds } };
-    } catch (e) {
-      return { status: 400, body: { ok: false, error: `试翻失败：${(e as Error).message}` } };
+    for (const j of deskJobs.values()) {
+      if (j.status === 'running') {
+        return { status: 409, body: { ok: false, error: `已经有一首在试翻了${j.song ? `（《${j.song}》）` : ''}，等它完成再点。` } };
+      }
     }
+    for (const [k, j] of deskJobs) {
+      if (j.status !== 'running' && Date.now() - (j.finishedAt ?? j.startedAt) > 3600_000) deskJobs.delete(k);
+    }
+    const jobId = newId('dj_');
+    const job: DeskJob = { id: jobId, status: 'running', startedAt: Date.now() };
+    deskJobs.set(jobId, job);
+    void cover({
+      chat: desktopChat(),
+      userId: ownerId(),
+      role: 'owner',
+      recordUserId: 'desktop',
+      deliver: false,
+      song: body.song,
+      artist: body.artist,
+      withInstrumental: body.withInstrumental,
+    }).then((r) => {
+      job.finishedAt = Date.now();
+      if (r.ok) {
+        job.status = 'done';
+        job.resultId = r.id; job.song = r.song; job.artist = r.artist; job.seconds = r.seconds;
+      } else {
+        job.status = 'failed';
+        job.error = r.error;
+      }
+    });
+    return { status: 202, body: { ok: true, id: jobId, status: 'running' } };
+  });
+
+  ctx.http.on('GET', '/job', (req) => {
+    const id = String(req.query.id ?? '').trim();
+    const job = id ? deskJobs.get(id) : undefined;
+    if (!job) return { status: 404, body: { ok: false, error: '没有这个试翻任务（内核可能重启或重载过）' } };
+    return {
+      body: {
+        ok: true,
+        status: job.status,
+        ...(job.resultId ? { id: job.resultId, song: job.song, artist: job.artist, seconds: job.seconds } : {}),
+        ...(job.error ? { error: job.error } : {}),
+        elapsed: Math.round(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000),
+      },
+    };
   });
 
   ctx.http.on('POST', '/send', async (req) => {
