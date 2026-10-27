@@ -334,7 +334,7 @@ function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
         <span className="mset-dic">{running ? <span className="wd-spin"><Icon name="spinner" size={17} /></span> : <Icon name="work" size={17} />}</span>
         <h2 className="mset-dtitle" title={run.task}>{headTitle}</h2>
         <div className="mset-dright">
-          {metrics && <CtxRing m={metrics} label="" />}
+          {metrics && <CtxRing m={metrics} label="" model={run.model} duration={duration > 0 ? fmtMs(duration) : undefined} />}
           <span className={`tag wk-state ${state[1]}`}>{state[0]}</span>
         </div>
       </div>

@@ -237,7 +237,13 @@ export function metricsOf(events: LoopEvent[], model: string | undefined, ctxByM
   };
 }
 
-export const fmtMs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+/** 工作时长：x h x m x s，秒取整（不足 1s 也显示 1s），前面的 0 单位不占位 */
+export const fmtMs = (ms: number) => {
+  const s = Math.max(1, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h ? `${h}h` : ''}${h || m ? `${m}m` : ''}${s % 60}s`;
+};
 export const fmtClock = (ts: number) => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 
 /** 思考行的收起态摘要：取第一段有内容的行 */
