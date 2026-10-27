@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   CLUSTER, PORTAL, REMOTE_ROOT, USER,
-  buildSubmitBody, findPendingJob, findRunningJob, isManagedBaseUrl, jobNode, maskSecret, proxyBaseUrl, shouldSubmit,
+  buildSubmitBody, findPendingJob, isRunningJob, isManagedBaseUrl, jobNode, maskSecret, proxyBaseUrl, shouldSubmit,
 } from './supervisor-core.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -66,8 +66,9 @@ function refreshSecrets() {
   const s = readSecrets();
   if (s.uiToken) UI_TOKEN = s.uiToken;
   let changed = false;
-  if (!COOKIE_ARG && s.cookie && s.cookie !== COOKIE) { COOKIE = s.cookie; changed = true; }
-  if (!API_ARG && s.apiKey && s.apiKey !== API_KEY) { API_KEY = s.apiKey; changed = true; }
+  // 首次装载（COOKIE 为空）不算「切换」，避免每次启动都刷一条误导日志
+  if (!COOKIE_ARG && s.cookie && s.cookie !== COOKIE) { if (COOKIE) changed = true; COOKIE = s.cookie; }
+  if (!API_ARG && s.apiKey && s.apiKey !== API_KEY) { if (API_KEY) changed = true; API_KEY = s.apiKey; }
   if (changed) log('已读取 secrets.json 里的新凭据（107 登录回写），本轮起生效');
 }
 const KERNEL = arg('kernel', 'http://127.0.0.1:3080').replace(/\/+$/, '');
@@ -290,7 +291,15 @@ async function tick() {
     return { cookieOk: !/Cookie 过期/.test(list.error || '') };
   }
 
-  const running = findRunningJob(list.list);
+  const runningList = list.list.filter(isRunningJob);
+  // 同时有两个 cover 作业在跑（比如手动补了一个）：优先钉在当前接线的节点上，
+  // 否则每轮 finden 到不同的作业，baseUrl 来回换、每次换都触发插件 reload
+  let running = runningList[0] ?? null;
+  if (runningList.length > 1 && cur.baseUrl) {
+    const wiredNode = String(cur.baseUrl).split('/relative/')[1]?.split('/')[0] ?? '';
+    const stick = runningList.find((j) => jobNode(j) === wiredNode);
+    if (stick) running = stick;
+  }
   if (running) {
     const node = jobNode(running);
     if (!/^[A-Za-z0-9._-]+$/.test(node)) {
