@@ -8,8 +8,12 @@
 | `source` | 说明 |
 |---|---|
 | `netease`（默认） | 网易云公开搜索/outer 链；VIP/版权曲可能拿不到播放地址 |
+| `neteaseApi` | 自部署 NeteaseCloudMusicApi 兼容服务；填 `neteaseApiBaseUrl`（可选 `neteaseApiCookie`）。推荐 [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)（MIT）并开 `ENABLE_GENERAL_UNBLOCK`（全局解灰），VIP/灰色歌自动从酷狗/酷我/咪咕/B站等免费源换流 |
 | `custom` | 你自部署/有授权的第三方库；填 `customBaseUrl`（可选 `customToken`） |
 | `local` | 本地曲库：默认 `data/music`，可用 `musicDir` 改；支持 mp3/wav/flac/m4a/ogg |
+
+`neteaseApi` 走标准 NeteaseCloudMusicApi 接口：`/search?keywords=`（type=1）拿歌单，`/song/url/v1?id=&level=exhigh` 拿流。
+没开解灰的自部署服务对 VIP 歌同样回不了 url，行为跟 `netease` 一样会报「没拿到播放地址」。
 
 `custom` 的最小契约：
 

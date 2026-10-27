@@ -44,10 +44,12 @@ interface Cfg {
   ownerUnlimited: boolean;
   timeoutMs: number;
   maxSongMb: number;
-  /** 音源：netease（默认）/ custom（用户自填的第三方库）/ local（data/music 或 musicDir） */
-  source: 'netease' | 'custom' | 'local';
+  /** 音源：netease（默认）/ neteaseApi（自部署 NeteaseCloudMusicApi 兼容服务，可解灰）/ custom（用户自填的第三方库）/ local（data/music 或 musicDir） */
+  source: 'netease' | 'neteaseApi' | 'custom' | 'local';
   customBaseUrl: string;
   customToken: string;
+  neteaseApiBaseUrl: string;
+  neteaseApiCookie: string;
   musicDir: string;
 }
 
@@ -359,7 +361,117 @@ async function downloadCustom(cfg: Cfg, song: SongInfo): Promise<Outcome> {
 }
 
 // ============================================================
-// 音源 3：本地曲库（自己的文件；默认 data/music，可用 musicDir 改）
+// 音源 3：自部署 NeteaseCloudMusicApi 兼容服务
+//
+// 推荐镜像：NeteaseCloudMusicApiEnhanced/api-enhanced（Binaryify 停更后的社区续作，
+//   MIT，自带全局解灰：VIP/灰色歌自动从酷狗/酷我/咪咕/B站/yt-dlp 等免费源换流）。
+// 契约（NeteaseCloudMusicApi 系全部兼容）：
+//   GET {base}/search?keywords=<歌名 歌手>&limit=12&type=1
+//       -> { result: { songs: [{ id, name, artists: [{name}] }] } }
+//   GET {base}/song/url/v1?id=<id>&level=exhigh
+//       -> { data: [{ url, type, ... }] }
+// 可选填网易云 Cookie（neteaseApiCookie，VIP 账号能给更高音质；解灰不依赖它）。
+// ============================================================
+function neteaseApiHeaders(cfg: Cfg): Record<string, string> {
+  return {
+    'user-agent': UA,
+    ...(cfg.neteaseApiCookie ? { cookie: cfg.neteaseApiCookie } : {}),
+  };
+}
+
+async function searchNeteaseApi(cfg: Cfg, song: string, artist: string): Promise<SearchOutcome> {
+  const base = cfg.neteaseApiBaseUrl.replace(/\/+$/, '');
+  if (!base) {
+    return { ok: false, code: 'config', error: '音源选了「网易云API」，但没填服务地址（neteaseApiBaseUrl）；去「插件 → 翻唱」里补上。' };
+  }
+  let url: URL;
+  try { url = new URL(`${base}/search`); } catch {
+    return { ok: false, code: 'config', error: '网易云API服务地址不是合法的 http(s) URL。' };
+  }
+  url.searchParams.set('keywords', `${song}${artist ? ` ${artist}` : ''}`.trim());
+  url.searchParams.set('type', '1');
+  url.searchParams.set('limit', '12');
+  let resp: Response;
+  try {
+    resp = await fetch(url, { headers: neteaseApiHeaders(cfg), signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 20_000)) });
+  } catch (e) {
+    return { ok: false, code: 'api', error: `网易云API连不上（${(e as Error).message}）。` };
+  }
+  if (!resp.ok) return { ok: false, code: 'api', error: `网易云API搜索返回 HTTP ${resp.status}。` };
+  let data: any;
+  try { data = await resp.json(); } catch { return { ok: false, code: 'api', error: '网易云API搜索回了看不懂的内容（要 JSON）。' } as SearchOutcome; }
+  const songs: any[] = Array.isArray(data?.result?.songs) ? data.result.songs : [];
+  if (!songs.length) {
+    return { ok: false, code: 'notfound', error: `网易云API没搜到《${song}》${artist ? `（${artist}）` : ''}，换个歌名或去掉歌手名再试。` };
+  }
+  const clean = songs.filter((s) => !isInstrumentalName(String(s?.name ?? '')));
+  const pool = clean.length ? clean : songs;
+  const wanted = artist.trim().toLowerCase();
+  const isMatch = (s: any) => Array.isArray(s?.artists)
+    && s.artists.some((a: any) => String(a?.name ?? '').toLowerCase().includes(wanted));
+  const matched = wanted ? pool.filter(isMatch) : [];
+  const ordered = matched.length ? [...matched, ...pool.filter((s) => !matched.includes(s))] : pool;
+  const toInfo = (s: any): SongInfo | null => {
+    const id = Number(s?.id);
+    const name = String(s?.name ?? '').trim();
+    const artists = Array.isArray(s?.artists) ? s.artists.map((a: any) => String(a?.name ?? '')).filter(Boolean).join('/') : '';
+    return Number.isFinite(id) && id > 0 && name ? { id, name, artists } : null;
+  };
+  const infos = ordered.slice(0, 6).map(toInfo).filter((x): x is SongInfo => !!x);
+  if (!infos.length) return { ok: false, code: 'notfound', error: `网易云API返回的《${song}》没有可用的歌曲 id。` };
+  const [first, ...rest] = infos;
+  // 与直连网易云同一铁律：备选只收同名版本，宁可报错也不翻错歌
+  const alternates = rest.filter((x) => x.name === first.name);
+  return { ok: true, song: first, alternates };
+}
+
+async function downloadNeteaseApi(cfg: Cfg, song: SongInfo): Promise<Outcome> {
+  const base = cfg.neteaseApiBaseUrl.replace(/\/+$/, '');
+  if (!base) return { ok: false, code: 'config', error: '网易云API服务地址是空的。' };
+  const maxBytes = cfg.maxSongMb * 1024 * 1024;
+  const timeout = Math.min(cfg.timeoutMs, 120_000);
+  // exhigh=320k；解灰服务会拿别的平台顶上，VIP 歌也常有 url；普通自部署（没解灰）VIP 歌回 null
+  let url: URL;
+  try { url = new URL(`${base}/song/url/v1`); } catch {
+    return { ok: false, code: 'config', error: '网易云API服务地址不是合法的 http(s) URL。' };
+  }
+  url.searchParams.set('id', String(song.id));
+  url.searchParams.set('level', 'exhigh');
+  let resp: Response;
+  try {
+    resp = await fetch(url, { headers: neteaseApiHeaders(cfg), signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 20_000)) });
+  } catch (e) {
+    return { ok: false, code: 'api', error: `网易云API取播放地址失败（${(e as Error).message}）。` };
+  }
+  if (!resp.ok) return { ok: false, code: 'api', error: `网易云API取播放地址返回 HTTP ${resp.status}。` };
+  let data: any;
+  try { data = await resp.json(); } catch { return { ok: false, code: 'api', error: '网易云API取播放地址回了看不懂的内容（要 JSON）。' }; }
+  const link = String(data?.data?.[0]?.url ?? '').trim();
+  if (!/^https?:\/\//i.test(link)) {
+    return { ok: false, code: 'notfound', error: `网易云API没给《${song.name}》的播放地址（服务没开解灰时 VIP/版权曲拿不到流，或自部署服务没配好）。` };
+  }
+  let audio: Response;
+  try {
+    audio = await fetch(link, { headers: { 'user-agent': UA }, redirect: 'follow', signal: AbortSignal.timeout(timeout) });
+  } catch (e) {
+    return { ok: false, code: 'api', error: `原曲下载失败（${(e as Error).message}）。` };
+  }
+  if (!audio.ok) return { ok: false, code: 'api', error: `原曲下载返回 HTTP ${audio.status}。` };
+  const len = Number(audio.headers.get('content-length') ?? 0);
+  if (len > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(len / 1024 / 1024)}MB），换一首。` };
+  let buf: Buffer;
+  try { buf = Buffer.from(await audio.arrayBuffer()); } catch (e) {
+    return { ok: false, code: 'api', error: `原曲下载中断（${(e as Error).message}）。` };
+  }
+  if (!buf.length) return { ok: false, code: 'api', error: '原曲下载回来是空文件。' };
+  if (buf.length > maxBytes) return { ok: false, code: 'api', error: `原曲文件太大（${Math.round(buf.length / 1024 / 1024)}MB），换一首。` };
+  const mime = sniffAudioMime(buf);
+  if (!mime) return { ok: false, code: 'api', error: `原曲(id=${song.id})回来的不是音频（可能是鉴权页/错误页）。` };
+  return { ok: true, data: buf, contentType: audio.headers.get('content-type') ?? mime };
+}
+
+// ============================================================
+// 音源 4：本地曲库（自己的文件；默认 data/music，可用 musicDir 改）
 // ============================================================
 const AUDIO_EXT = new Set(['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus']);
 
@@ -419,12 +531,14 @@ async function downloadLocal(cfg: Cfg, song: SongInfo): Promise<Outcome> {
 }
 
 function searchTracks(cfg: Cfg, song: string, artist: string): Promise<SearchOutcome> {
+  if (cfg.source === 'neteaseApi') return searchNeteaseApi(cfg, song, artist);
   if (cfg.source === 'custom') return searchCustom(cfg, song, artist);
   if (cfg.source === 'local') return searchLocal(cfg, song, artist);
   return searchNetease(song, artist, cfg.timeoutMs);
 }
 
 function downloadTrack(cfg: Cfg, song: SongInfo): Promise<Outcome> {
+  if (cfg.source === 'neteaseApi') return downloadNeteaseApi(cfg, song);
   if (cfg.source === 'custom') return downloadCustom(cfg, song);
   if (cfg.source === 'local') return downloadLocal(cfg, song);
   return downloadNetease(Number(song.id), cfg.timeoutMs, cfg.maxSongMb * 1024 * 1024);
@@ -617,7 +731,7 @@ export function setup(ctx: PluginContext): void {
 
   const sourceOf = (v: unknown): Cfg['source'] => {
     const s = String(v ?? 'netease').trim().toLowerCase();
-    return s === 'custom' || s === 'local' ? s : 'netease';
+    return s === 'custom' || s === 'local' || s === 'neteaseapi' || s === 'netease-api' ? s.replace('-api', 'Api') as Cfg['source'] : 'netease';
   };
   const cfg = (): Cfg => ({
     baseUrl: String(ctx.userConfig.baseUrl ?? '').trim().replace(/\/+$/, ''),
@@ -631,6 +745,8 @@ export function setup(ctx: PluginContext): void {
     source: sourceOf(ctx.userConfig.source),
     customBaseUrl: String(ctx.userConfig.customBaseUrl ?? '').trim().replace(/\/+$/, ''),
     customToken: String(ctx.userConfig.customToken ?? '').trim(),
+    neteaseApiBaseUrl: String(ctx.userConfig.neteaseApiBaseUrl ?? '').trim().replace(/\/+$/, ''),
+    neteaseApiCookie: String(ctx.userConfig.neteaseApiCookie ?? '').trim(),
     musicDir: resolve(String(ctx.userConfig.musicDir ?? '').trim() || join(kernelDataDir, 'music')),
   });
 

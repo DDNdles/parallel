@@ -45,7 +45,18 @@
     "source": {
       "type": "string",
       "default": "netease",
-      "description": "音源：netease=网易云（默认）；custom=自定义第三方库（需填 customBaseUrl，契约见 README）；local=本地曲库（data/music 或 musicDir）"
+      "description": "音源：netease=网易云直连（默认，VIP/版权曲可能没流）；neteaseApi=自部署网易云API服务（推荐开全局解灰的镜像，VIP 歌也能取流）；custom=自定义第三方库（需填 customBaseUrl，契约见 README）；local=本地曲库（data/music 或 musicDir）"
+    },
+    "neteaseApiBaseUrl": {
+      "type": "string",
+      "default": "",
+      "description": "自部署 NeteaseCloudMusicApi 兼容服务地址（source=neteaseApi 时用；如 http://127.0.0.1:3000）。推荐 NeteaseCloudMusicApiEnhanced/api-enhanced 并开 ENABLE_GENERAL_UNBLOCK（全局解灰）"
+    },
+    "neteaseApiCookie": {
+      "type": "string",
+      "default": "",
+      "description": "传给网易云API服务的网易云 Cookie（可选；有会员账号时给更高音质，解灰不依赖它）",
+      "secret": true
     },
     "customBaseUrl": {
       "type": "string",
