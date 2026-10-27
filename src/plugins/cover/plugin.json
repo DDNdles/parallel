@@ -37,6 +37,11 @@
       "description": "SCOW 门户代理的会话 Cookie（如中科大一〇七平台：SCOW_USER=ustc-...）。服务部署在 SCOW 代理后面时填；普通自部署留空",
       "secret": true
     },
+    "autoStart": {
+      "type": "boolean",
+      "default": false,
+      "description": "自动接线：parallel 启动时拉起守护进程，107 上没有作业就自动提交，作业起来后自动写地址（需要先填上面的 Cookie；作业最长 3 小时 58 分，排队时间取决于平台）"
+    },
     "cooldownSeconds": {
       "type": "number",
       "default": 120,

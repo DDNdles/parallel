@@ -1,67 +1,136 @@
 #!/usr/bin/env node
 /**
- * 107 翻唱服务自动接线：
- *   轮询 SCOW 作业 API → 发现 sing 作业 RUNNING（RVC 服务用 srun 复用它同一张 A100）
- *   → 经 SCOW 代理探活 8047/health → 把 baseUrl/apiKey/cookie 写进内核 cover 插件
- *   → 作业结束清空 baseUrl。
+ * 107 翻唱服务守护进程（supervisor）：
+ *   轮询 SCOW 作业 API
+ *   ├─ 有 cover/sing 作业 RUNNING → 经 SCOW 代理探活 8047/health → 把 baseUrl/apiKey/cookie
+ *   │  写进内核 cover 插件（服务起来前不写；作业换节点会自动改地址）
+ *   ├─ 没有作业在跑且「自动接线」打开 → 用 /api/job/submitJob 自动提交 cover 作业
+ *   ├─ 有作业在排队 → 只记日志，不重复提交
+ *   └─ 作业结束 → 清空由本进程接上的 baseUrl
  *
  * 用法：
- *   node --use-system-ca scripts/cover/ustc-watch.mjs \
- *     --cookie "SCOW_USER=ustc-..." --api-key <COVER_API_KEY> [--interval 120] [--once]
+ *   node --use-system-ca scripts/cover/ustc-watch.mjs            # 常驻（内核自动拉起时也用这个）
+ *   node --use-system-ca scripts/cover/ustc-watch.mjs --once     # 只跑一轮，排障用
+ *   node --use-system-ca scripts/cover/ustc-watch.mjs --once --dry-run   # 只打印计划，不改任何东西
  *
- * 注意：107 门户证书链缺中间证书，必须带 --use-system-ca；Cookie 从浏览器
- * DevTools 取，不写进任何文件。
+ * 凭据默认从 data/secrets.json 的 pluginSecrets.cover 读（cookie/apiKey），
+ * 也可以用 --cookie / --api-key / 环境变量 SCOW_COOKIE、COVER_API_KEY 覆盖。
+ * Cookie 是 107 的登录会话；过期后只能重新登录再更新（登录页有验证码，没法自动续）。
  */
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  CLUSTER, PORTAL, REMOTE_ROOT, USER,
+  buildSubmitBody, findPendingJob, findRunningJob, isManagedBaseUrl, jobNode, maskSecret, proxyBaseUrl, shouldSubmit,
+} from './supervisor-core.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const LOG = join(ROOT, 'data', 'cover', 'watch.log');
 
 function arg(name, def) {
   const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
+  return i >= 0 && process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[i + 1] : def;
 }
-const COOKIE = arg('cookie', process.env.SCOW_COOKIE ?? '');
-const API_KEY = arg('api-key', process.env.COVER_API_KEY ?? '');
-const INTERVAL = Math.max(30, Number(arg('interval', '120')) | 0);
-const ONCE = process.argv.includes('--once');
+function flag(name) {
+  return process.argv.includes(`--${name}`);
+}
+
+/** 数据目录：内核会显式传 --data-dir（支持 --data-dir 启动的实例）；手动跑默认 ./data */
+const DATA_DIR = join(arg('data-dir', process.env.PARALLEL_DATA_DIR || join(ROOT, 'data')));
+const DATA = join(DATA_DIR, 'cover');
+const LOG = join(DATA, 'watch.log');
+const STATE = join(DATA, 'supervisor-state.json');
+const PID = join(DATA, 'supervisor.pid');
+const BEAT = join(DATA, 'supervisor.beat');
+
+function readSecrets() {
+  try {
+    const s = JSON.parse(readFileSync(join(DATA_DIR, 'secrets.json'), 'utf8'));
+    return { uiToken: s.uiToken ?? '', ...(s.pluginSecrets?.cover ?? {}) };
+  } catch {
+    return { uiToken: '' };
+  }
+}
+const sec = readSecrets();
+const COOKIE = arg('cookie', process.env.SCOW_COOKIE || sec.cookie || '');
+const API_KEY = arg('api-key', process.env.COVER_API_KEY || sec.apiKey || '');
+const UI_TOKEN = sec.uiToken ?? '';
 const KERNEL = arg('kernel', 'http://127.0.0.1:3080').replace(/\/+$/, '');
-const PORTAL = 'https://107.ustc.edu.cn';
-const USER = 'pb25071412';
-const CLUSTER = 'training';
-// 唱歌下线后作业名改为 cover；过渡期同时认旧的 sing 作业
-const JOB_NAMES = new Set(['cover', 'sing']);
-const SERVICE_PORT = 8047;
+const ROOT_REMOTE = arg('root', REMOTE_ROOT);
+const INTERVAL = Math.max(30, Number(arg('interval', '120')) | 0);
+const ONCE = flag('once');
+const DRY = flag('dry-run');
+/** 手动排障时强制允许自动提交（平时只看插件里的 autoStart 开关） */
+const FORCE_SUBMIT = flag('submit');
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   console.log(line);
   try {
-    mkdirSync(dirname(LOG), { recursive: true });
+    mkdirSync(DATA, { recursive: true });
     appendFileSync(LOG, line + '\n');
-  } catch { /* ignore */ }
-}
-
-function uiToken() {
-  try {
-    return JSON.parse(readFileSync(join(ROOT, 'data', 'secrets.json'), 'utf8')).uiToken ?? '';
   } catch {
-    return '';
+    try { mkdirSync(DATA, { recursive: true }); writeFileSync(LOG, line + '\n'); } catch { /* ignore */ }
   }
 }
 
-async function jobs() {
-  const url = `${PORTAL}/api/job/getRunningJobs?userId=${USER}&cluster=${CLUSTER}`;
-  const r = await fetch(url, { headers: { cookie: COOKIE }, signal: AbortSignal.timeout(20000) });
-  if (!r.ok) throw new Error(`作业 API HTTP ${r.status}（Cookie 可能过期，重新登录 107 后换 --cookie）`);
-  const j = await r.json();
-  return Array.isArray(j.results) ? j.results : [];
+/** 同一原因的日志别每轮都刷：默认 30 分钟一条 */
+const lastNote = new Map();
+function note(key, msg, everyMs = 30 * 60 * 1000) {
+  const now = Date.now();
+  if (now - (lastNote.get(key) ?? 0) < everyMs) return;
+  lastNote.set(key, now);
+  log(msg);
 }
 
-async function proxyGet(path, timeoutMs = 10000) {
-  const r = await fetch(path, { headers: { cookie: COOKIE }, signal: AbortSignal.timeout(timeoutMs) });
+function readState() {
+  try { return JSON.parse(readFileSync(STATE, 'utf8')); } catch { return {}; }
+}
+function saveState(patch) {
+  try {
+    mkdirSync(DATA, { recursive: true });
+    const next = { ...readState(), ...patch };
+    const tmp = `${STATE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(next, null, 2));
+    renameSync(tmp, STATE);
+  } catch { /* 状态只用于冷却，写不进去就重启后多试一次，不算错 */ }
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/** 心跳：内核靠它判断「已经有一个 supervisor 在跑」（也能认出内核硬重启后留下的孤儿） */
+function beat() {
+  try { mkdirSync(DATA, { recursive: true }); writeFileSync(BEAT, String(Date.now())); } catch { /* ignore */ }
+}
+
+/** 常驻模式防止内核重复拉起；--once 是排障入口，不抢锁 */
+if (!ONCE) {
+  try {
+    const old = Number(readFileSync(PID, 'utf8').trim());
+    if (old && old !== process.pid && pidAlive(old)) {
+      log(`已有 supervisor 在跑（pid ${old}），本进程退出`);
+      process.exit(0);
+    }
+  } catch { /* 没锁文件 */ }
+  mkdirSync(DATA, { recursive: true });
+  writeFileSync(PID, String(process.pid));
+  beat();
+  const clearPid = () => {
+    try { if (readFileSync(PID, 'utf8').trim() === String(process.pid)) unlinkSync(PID); } catch { /* ignore */ }
+    try { unlinkSync(BEAT); } catch { /* ignore */ }
+  };
+  process.on('exit', clearPid);
+  process.on('SIGINT', () => process.exit(0));
+  process.on('SIGTERM', () => process.exit(0));
+}
+
+async function kernelGet(path, timeoutMs = 10000) {
+  const r = await fetch(`${KERNEL}${path}`, {
+    headers: UI_TOKEN ? { 'x-auth-token': UI_TOKEN } : {},
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   const text = await r.text().catch(() => '');
   return { status: r.status, text };
 }
@@ -69,78 +138,211 @@ async function proxyGet(path, timeoutMs = 10000) {
 async function kernelPost(path, body) {
   const r = await fetch(`${KERNEL}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-auth-token': uiToken() },
+    headers: { 'content-type': 'application/json', ...(UI_TOKEN ? { 'x-auth-token': UI_TOKEN } : {}) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(20000),
   });
   return { status: r.status, text: await r.text().catch(() => '') };
 }
 
-async function wire(node) {
-  const baseUrl = `${PORTAL}/api/proxy/${CLUSTER}/relative/${node}/${SERVICE_PORT}`;
+/** 插件配置（含 secret 回显）；插件不存在/内核没起来时当空配置 */
+async function pluginConfig() {
+  const r = await kernelGet('/api/plugins/cover/config');
+  if (r.status !== 200) return { values: {}, ok: false };
+  try { return { values: JSON.parse(r.text)?.values ?? {}, ok: true }; } catch { return { values: {}, ok: false }; }
+}
+
+async function jobs() {
+  const url = `${PORTAL}/api/job/getRunningJobs?userId=${USER}&cluster=${CLUSTER}`;
+  let r;
+  try {
+    r = await fetch(url, { headers: { cookie: COOKIE }, signal: AbortSignal.timeout(20000) });
+  } catch (e) {
+    return { ok: false, list: [], error: `作业 API 连不上：${e.message}` };
+  }
+  if (r.status === 401 || r.status === 403) {
+    return { ok: false, list: [], error: `作业 API HTTP ${r.status}（Cookie 过期，重新登录 107 后更新插件 Cookie）` };
+  }
+  if (!r.ok) return { ok: false, list: [], error: `作业 API HTTP ${r.status}` };
+  try {
+    const j = await r.json();
+    return { ok: true, list: Array.isArray(j.results) ? j.results : [] };
+  } catch {
+    return { ok: false, list: [], error: '作业 API 回来的不是 JSON' };
+  }
+}
+
+async function proxyGet(url, timeoutMs = 10000) {
+  const r = await fetch(url, { headers: { cookie: COOKIE }, signal: AbortSignal.timeout(timeoutMs) });
+  const text = await r.text().catch(() => '');
+  return { status: r.status, text };
+}
+
+async function wire(node, cur) {
+  const baseUrl = proxyBaseUrl(node);
   const health = await proxyGet(`${baseUrl}/health`).catch((e) => ({ status: 0, text: String(e) }));
-  if (health.status !== 200) {
-    log(`节点 ${node} 的翻唱 /health 还不通（${health.status} ${health.text.slice(0, 120)}），下轮再试`);
+  let healthy = health.status === 200;
+  if (healthy) {
+    // 别把旧的 sing 服务当成 cover 接上去；/health 必须自报 service=cover 且 ok=true
+    try {
+      const h = JSON.parse(health.text);
+      if (h?.service !== 'cover' || h?.ok === false) healthy = false;
+    } catch { healthy = false; }
+  }
+  if (!healthy) {
+    note(`health:${node}`, `作业在 ${node} 上，但翻唱 /health 还不通（${health.status} ${health.text.slice(0, 120)}），下轮再试`, 10 * 60 * 1000);
+    return false;
+  }
+  const need = cur.baseUrl !== baseUrl || (!!API_KEY && cur.apiKey !== API_KEY) || (!!COOKIE && cur.cookie !== COOKIE);
+  if (!need) {
+    note('wired', `已接线 cover：${baseUrl}（health=${health.text.trim()}）`, 6 * 60 * 60 * 1000);
+    return true;
+  }
+  if (DRY) {
+    log(`[dry-run] 将接线 cover：${baseUrl}（health=${health.text.trim()}）`);
     return false;
   }
   const cfg = await kernelPost('/api/plugins/cover/config', {
-    values: { baseUrl, ...(API_KEY ? { apiKey: API_KEY } : {}), cookie: COOKIE },
+    values: { baseUrl, ...(API_KEY ? { apiKey: API_KEY } : {}), ...(COOKIE ? { cookie: COOKIE } : {}) },
   });
   if (cfg.status !== 200) {
     log(`写 cover 插件配置失败：HTTP ${cfg.status} ${cfg.text.slice(0, 200)}`);
     return false;
   }
-  await kernelPost('/api/plugins/cover/reload', {});
   log(`已接线 cover：${baseUrl}（health=${health.text.trim()}）`);
   return true;
 }
 
-async function unwire(reason) {
+async function unwire(cur) {
+  if (!isManagedBaseUrl(cur.baseUrl)) return; // 自己手填的地址不归守护进程管
+  if (DRY) { log(`[dry-run] 将清空 baseUrl（原 ${cur.baseUrl}）`); return; }
   const cfg = await kernelPost('/api/plugins/cover/config', { values: { baseUrl: '' } }).catch(() => null);
-  log(`翻唱服务下线（${reason}），已清空 baseUrl${cfg && cfg.status !== 200 ? `（写配置失败 HTTP ${cfg.status}）` : ''}`);
+  log(`翻唱服务下线（作业不再运行），已清空 baseUrl${cfg && cfg.status !== 200 ? `（写配置失败 HTTP ${cfg.status}）` : ''}`);
 }
 
-async function tick(state) {
-  const list = await jobs();
-  const mine = list.find((j) => JOB_NAMES.has(String(j.name)) && String(j.state).toUpperCase() === 'RUNNING' && j.nodes && j.nodes !== 'None');
-  if (mine) {
-    const node = String(mine.nodesOrReason || '').split(',')[0].trim();
-    if (!/^[A-Za-z0-9._-]+$/.test(node)) {
-      log(`作业 ${mine.jobId} 在跑但节点名看不懂（nodesOrReason=${JSON.stringify(mine.nodesOrReason)}），下轮再试`);
-      return;
-    }
-    if (node !== state.node) {
-      log(`发现作业 ${mine.jobId} 在 ${node} 上运行`);
-      if (await wire(node)) state.node = node;
-    }
-  } else if (state.node) {
-    await unwire('作业不再运行');
-    state.node = '';
+async function submit(now) {
+  const body = buildSubmitBody({ root: ROOT_REMOTE, apiKey: API_KEY });
+  if (DRY) {
+    const shown = { ...body, command: maskSecret(body.command, API_KEY) };
+    log(`[dry-run] 将提交作业：${JSON.stringify(shown)}`);
+    return { ok: false, dry: true };
   }
+  let r;
+  try {
+    r = await fetch(`${PORTAL}/api/job/submitJob`, {
+      method: 'POST',
+      headers: { cookie: COOKIE, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    log(`提交作业失败：${maskSecret(e.message, API_KEY)}`);
+    saveState({ lastFailedAt: now });
+    return { ok: false };
+  }
+  const text = await r.text().catch(() => '');
+  if (!r.ok) {
+    log(`提交作业失败：HTTP ${r.status} ${maskSecret(text.slice(0, 400), API_KEY)}`);
+    saveState({ lastFailedAt: now });
+    return { ok: false };
+  }
+  let jobId = '';
+  try { jobId = String(JSON.parse(text)?.jobId ?? ''); } catch { /* 回包不是 JSON 也照样记原文 */ }
+  log(`已自动提交 cover 作业${jobId ? ` ${jobId}` : ''}（排队/启动情况看下一轮）`);
+  saveState({ lastSubmitAt: now, lastFailedAt: 0 });
+  return { ok: true };
+}
+
+async function tick() {
+  const now = Date.now();
+  const st = readState();
+  const cfg = await pluginConfig();
+  const cur = cfg.values;
+  // 用户自己填了非 SCOW 代理地址（自部署）：这套守护进程不接管，免得把地址改掉
+  if (cur.baseUrl && !isManagedBaseUrl(cur.baseUrl)) {
+    note('self-hosted', 'baseUrl 是自部署地址，107 守护进程不接管（要停掉本进程可关闭「自动接线」）', 6 * 60 * 60 * 1000);
+    return { cookieOk: true };
+  }
+  const list = await jobs();
+
+  if (!list.ok) {
+    note('jobs-fail', list.error, 15 * 60 * 1000);
+    if (cur.baseUrl && isManagedBaseUrl(cur.baseUrl)) {
+      const health = await proxyGet(`${cur.baseUrl.replace(/\/+$/, '')}/health`).catch(() => ({ status: 0 }));
+      if (health.status !== 200) note('stale-base', '107 作业状态拉不到，代理地址也探不通；先保持现状，等 Cookie 更新', 30 * 60 * 1000);
+    }
+    return { cookieOk: !/Cookie 过期/.test(list.error || '') };
+  }
+
+  const running = findRunningJob(list.list);
+  if (running) {
+    const node = jobNode(running);
+    if (!/^[A-Za-z0-9._-]+$/.test(node)) {
+      note('bad-node', `作业 ${running.jobId} 在跑但节点名看不懂（nodesOrReason=${JSON.stringify(running.nodesOrReason)}），下轮再试`, 10 * 60 * 1000);
+      return { cookieOk: true, running: true };
+    }
+    note('found', `发现作业 ${running.jobId} 在 ${node} 上运行`, 6 * 60 * 60 * 1000);
+    await wire(node, cur);
+    return { cookieOk: true, running: true };
+  }
+
+  // 没有 RUNNING：把之前接上的地址撤掉（作业可能刚结束，也可能换节点重排）
+  await unwire(cur);
+
+  const pending = findPendingJob(list.list);
+  if (pending) {
+    note('pending', `作业 ${pending.jobId} 在排队（${pending.state}${pending.nodesOrReason ? `，${pending.nodesOrReason}` : ''}），等它跑起来`, 30 * 60 * 1000);
+    return { cookieOk: true, pending: true };
+  }
+
+  const plan = shouldSubmit({
+    autoStart: FORCE_SUBMIT || cur.autoStart === true,
+    cookieOk: true,
+    jobs: list.list,
+    now,
+    lastSubmitAt: st.lastSubmitAt ?? 0,
+    lastFailedAt: st.lastFailedAt ?? 0,
+  });
+  if (!plan.submit) {
+    note('idle', `没有作业在跑；不自动提交（${plan.reason}）`, 60 * 60 * 1000);
+    return { cookieOk: true, submitted: false };
+  }
+  log(`没有作业在跑，自动提交（${plan.reason}）`);
+  await submit(now);
+  return { cookieOk: true, submitted: true };
 }
 
 async function main() {
   if (!COOKIE) {
-    console.error('缺少 --cookie（浏览器登录 107 后从 DevTools 取 SCOW_USER=ustc-...）');
+    console.error('缺少 Cookie：请在「插件 → 翻唱」里填 SCOW Cookie，或 --cookie "SCOW_USER=ustc-..."');
     process.exit(2);
   }
-  log(`cover watcher 启动：间隔 ${INTERVAL}s，门户 ${PORTAL}，内核 ${KERNEL}${ONCE ? '，单次模式' : ''}`);
+  log(`cover supervisor 启动：间隔 ${INTERVAL}s，门户 ${PORTAL}，内核 ${KERNEL}${ONCE ? '，单次' : ''}${DRY ? '，dry-run' : ''}`);
   if (!process.execArgv.includes('--use-system-ca')) {
     log('提示：107 门户的证书链缺中间证书，请用 node --use-system-ca 启动本脚本');
   }
-  const state = { node: '' };
+  let kernelFails = 0;
   for (;;) {
     try {
-      await tick(state);
+      const r = await tick();
+      kernelFails = 0;
+      if (!r.cookieOk) note('cookie-bad', 'Cookie 已失效：去浏览器重新登录 107，再把新 Cookie 填进插件', 60 * 60 * 1000);
     } catch (e) {
-      log(`轮询失败：${e.message}`);
+      // 内核 API 不通 ≠ 107 出问题：连续 5 轮（约 10 分钟）都不通才认为内核没了，自己退出等下次启动
+      kernelFails++;
+      log(`本轮失败（${kernelFails}/5）：${maskSecret(e.message, API_KEY)}`);
+      if (kernelFails >= 5) {
+        log('内核连续 5 轮不可达，supervisor 退出');
+        process.exit(0);
+      }
     }
     if (ONCE) return;
+    beat();
     await new Promise((r) => setTimeout(r, INTERVAL * 1000));
   }
 }
 
 main().catch((e) => {
-  log(`watcher 崩溃：${e.stack ?? e.message}`);
+  log(`supervisor 崩溃：${maskSecret(e.stack ?? e.message, API_KEY)}`);
   process.exit(1);
 });

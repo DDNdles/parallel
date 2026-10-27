@@ -2,6 +2,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import type { Server } from 'node:http';
 import { createConnection } from 'node:net';
 import { Bus, busEvents } from './bus.ts';
 import { Db } from './db.ts';
@@ -20,6 +21,7 @@ import { bundledFfmpeg } from './services/downloads.ts';
 import { setFfmpegCandidate } from './services/media.ts';
 import { NapCatManager } from './services/napcat.ts';
 import { PluginContainer } from './container.ts';
+import { CoverSupervisor, planCoverSupervisor } from './cover-supervisor.ts';
 import { AgentLoop, HistoryStore } from './agentloop.ts';
 import { Pipeline, roleAtLeastRole } from './pipeline.ts';
 import { HumanlikeService } from './humanlike/index.ts';
@@ -42,6 +44,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 /** 启动后用系统默认浏览器打开桌面端（失败静默，不影响内核） */
 function openBrowser(url: string): void {
+  if (process.env.PARALLEL_NO_BROWSER === '1') return; // 测试/无头自启动：别弹标签页
   try {
     if (process.platform === 'win32') spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
     else if (process.platform === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
@@ -65,6 +68,8 @@ export interface KernelOptions {
   port?: number;
   /** 测试模式：不启动 HTTP/API（部分单测） */
   noApi?: boolean;
+  /** 测试/服务模式：保留桌面端 API，但不托管 LLBot/NapCat（集成测试不碰真 QQ） */
+  noProtocol?: boolean;
 }
 
 /**
@@ -86,6 +91,10 @@ export class Kernel {
   llbot: LLBotManager;
   napcat: NapCatManager;
   container: PluginContainer;
+  coverSupervisor: CoverSupervisor;
+  private coverPlanKey = '';
+  /** 桌面端/API 的 HTTP server（shutdown 时要关，否则测试进程无法退出） */
+  private apiServer?: Server;
   agentLoop: AgentLoop;
   history: HistoryStore;
   humanlike: HumanlikeService;
@@ -169,6 +178,12 @@ export class Kernel {
         groupTitle: (chatId) => this.adapter?.groupName(chatId) || `群${chatId}`,
       },
     );
+    this.coverSupervisor = new CoverSupervisor({
+      root,
+      dataDir: this.dataDir,
+      kernelUrl: `http://127.0.0.1:${this.config.config.ui.port}`,
+      log: makeLogger('cover-supervisor'),
+    });
     this.history = new HistoryStore(this.sessionLog, this.config.config.storage.historyLimit);
     // 圈内黑话（表达学习）：侧端反事实判定走 chat 链，失败就当没这回事
     this.jargon = new JargonService({
@@ -277,7 +292,43 @@ export class Kernel {
 
   /** 托管只在带桌面端的内核里跑：noApi（测试/服务模式）不该在后台下载发行包或拉起注入进程 */
   managesEnd(): boolean {
-    return !this.opts.noApi;
+    return !this.opts.noApi && !this.opts.noProtocol;
+  }
+
+  /** cover supervisor 的启动条件：有桌面端 + 插件已载入 + 设置页开了「自动接线」+ 有 Cookie */
+  private coverPlan() {
+    const lp = this.container.get('cover');
+    let autoStart = false;
+    if (lp) {
+      try { autoStart = this.container.resolveUserConfig(lp).autoStart === true; } catch { /* 配置读坏了按关闭处理 */ }
+    }
+    return planCoverSupervisor({
+      noApi: !!this.opts.noApi,
+      disabledByEnv: process.env.PARALLEL_NO_COVER_SUPERVISOR === '1',
+      pluginLoaded: !!lp && lp.state === 'loaded',
+      autoStart,
+      hasCookie: !!this.config.pluginSecret('cover', 'cookie'),
+      childRunning: this.coverSupervisor.running,
+    });
+  }
+
+  /** 幂等启停 cover supervisor：插件配置保存会触发重载，这里跟着重新评估，不会重复拉起 */
+  ensureCoverSupervisor(trigger: string): void {
+    const plan = this.coverPlan();
+    const key = `${plan.action}:${plan.reason}:${this.coverSupervisor.running}`;
+    if (key === this.coverPlanKey) return;
+    this.coverPlanKey = key;
+    if (plan.action === 'start') {
+      this.coverSupervisor.start();
+      this.log.info(`cover supervisor 已启动（${trigger}：${plan.reason}）`);
+      return;
+    }
+    if (this.coverSupervisor.running) {
+      this.coverSupervisor.stop();
+      this.log.info(`cover supervisor 已停止（${trigger}：${plan.reason}）`);
+      return;
+    }
+    if (plan.reason === '没有 Cookie') this.log.warn(`cover 自动接线已开启，但插件里还没填 Cookie（${trigger}）`);
   }
 
   async boot(): Promise<void> {
@@ -304,7 +355,14 @@ export class Kernel {
       });
     }
     if (!this.opts.noApi) {
-      await startApiServer(this);
+      this.apiServer = await startApiServer(this);
+      // API 起来后再评估：supervisor 的第一轮就要读写插件配置
+      this.ensureCoverSupervisor('内核启动');
+      for (const ev of [busEvents.pluginLoaded, busEvents.pluginStateChanged]) {
+        this.bus.on(ev, (d: { id?: string }) => {
+          if (d?.id === 'cover') this.ensureCoverSupervisor('插件状态变化');
+        });
+      }
       // 免输 token：启动即打开浏览器，uiToken 经 URL 片段交给前端（片段不进服务器日志/Referer）。
       // 必须只在真的起了 API 服务时执行：无头（noApi，如 e2e 测试）内核若也打开浏览器，
       // 会用测试内核的随机 token 覆盖同一端口上真实 UI 的 localStorage，把用户踢成"未登录"。
@@ -420,6 +478,7 @@ export class Kernel {
   }
 
   async shutdown(): Promise<void> {
+    this.coverSupervisor.stop();
     for (const lp of this.container.list()) {
       await this.container.unload(lp.manifest.id).catch(() => {});
     }
@@ -432,6 +491,17 @@ export class Kernel {
     // 会话容器不随内核退出自己消失：不在这里收掉，Docker 里会一直留着 compute/browser
     // 两个容器（下次启动还会同名 rm -f 重建，等于白占内存）
     await this.session.stopAll().catch(() => {});
+    if (this.apiServer) {
+      const server = this.apiServer;
+      this.apiServer = undefined;
+      // keep-alive 连接会让 close() 等很久：先掐断，再兜一个 2 秒上限
+      try { server.closeAllConnections(); } catch { /* 老 Node 没有这个方法 */ }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2000);
+        timer.unref();
+        server.close(() => { clearTimeout(timer); resolve(); });
+      });
+    }
     this.db.close();
   }
 }

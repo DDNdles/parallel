@@ -82,6 +82,20 @@ docker/cover/
 6. 第一次 `/cover` 会下载分离模型并加载 RVC，可能多等几十秒；之后
    `/health` 会显示 `separator_loaded: true`。
 
+## 让 parallel 自动保住 107 作业
+
+上面的依赖和模型装在 `$COVER_ROOT` 里是持久的，作业结束不用重装；会掉的是 Slurm 作业本身。
+在「插件 → 翻唱」里填好 `baseUrl`、`apiKey`、`cookie` 后打开 **自动接线**（`autoStart`）：
+
+- parallel 启动时拉起 `scripts/cover/ustc-watch.mjs`，每 2 分钟看一次 107；
+- 没有 `cover` 作业在跑、也没有在排队时，用平台的 `submitJob` 接口自动提交
+  （资源与 `scripts/cover/cover-107.sbatch` 一致：Students / 1 GPU / 4 CPU / 16G / 3h58m）；
+- 作业 RUNNING 后探活 `/health`，把 SCOW 代理地址写进插件；换节点会自动改；
+- 作业结束清空由它写上的 `baseUrl`，下一轮再自动排。
+
+Cookie 是平台登录会话，过期后只能重新登录 107 再更新（登录页有验证码，不能自动续）。
+不想让它自动占 GPU 时，把「自动接线」关掉即可；所有动作都记在 `data/cover/watch.log`。
+
 ## API
 
 ### `GET /health`
