@@ -940,7 +940,6 @@ tr:hover td { background: var(--row-hover); }
 /* 模型正文：直接铺开，不套思考折叠行 */
 /* 正文紧接上下两行：行首/行尾的空行已在 loopActs 里去掉，这里不再留大段外边距 */
 .wd-text { margin: 2px 0 4px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; word-break: break-word; }
-.wk-spine .wd-text { margin-left: 22px; }
 /* 正文流式光标与会话页 composer 同款：parallel 花押，宽度=字号、按行高对齐 */
 .wd-text .wd-caret { width: 13px; height: 1.75em; vertical-align: top; }
 .wd-text .wd-caret svg { width: 13px; height: 13px; }
@@ -994,7 +993,7 @@ tr:hover td { background: var(--row-hover); }
 .wd-final.err { border-color: color-mix(in srgb, var(--danger, #e5484d) 40%, transparent); }
 .wd-answer { margin-top: 14px; font-size: 13px; line-height: 1.7; color: var(--text); white-space: pre-wrap; word-break: break-word; }
 
-/* ---------------- 工作页（详情照 ZCode workbench：状态头 + 活动脊线 + 结论/产物卡） ---------------- */
+/* ---------------- 工作页（详情照 ZCode workbench：状态头 + 活动流 + 结论/产物卡） ---------------- */
 .wk-detail { padding-bottom: 30px; }
 .wk-meta { margin: -6px 0 14px; flex-wrap: wrap; gap: 6px; }
 .wk-state.run { color: var(--text); border-color: var(--brand); }
@@ -1004,12 +1003,7 @@ tr:hover td { background: var(--row-hover); }
 .wk-task { padding: 12px 14px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .wk-task-t { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; }
 .wk-task-m { margin-top: 6px; font-size: 11.5px; color: var(--faint); }
-/* 活动脊线：一条竖轨从行首图标中间穿过 */
-.wk-spine { position: relative; padding-top: 2px; margin-top: 12px; }
-.wk-spine::before { content: ''; position: absolute; left: 7px; top: 8px; bottom: 8px; width: 1px; background: var(--border-stronger); }
-.wk-spine .wd-act-h .ic { position: relative; z-index: 1; background: var(--surface-2); }
-/* 展开的正文卡片从竖轨右侧起排：否则卡片左缘正好压在竖轨上（截图里像线和框粘在一起） */
-.wk-spine .wd-act-b, .wk-spine .wd-act-t { margin-left: 22px; }
+/* 活动流与会话页 work 抽屉同款：无脊线、图标不带底色、正文不缩进 */
 .wk-wait { padding: 14px 0; font-size: 12.5px; color: var(--faint); }
 .wk-callout { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .wk-callout.ask { border-color: rgba(226, 185, 59, .45); }

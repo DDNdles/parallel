@@ -375,7 +375,7 @@ function RunDetail({ run, running, metrics, duration, expanded, onToggle }: {
             ? <pre className="plg-stack mono">{run.steps.slice(-60).join('\n')}</pre>
             : <div className="wk-wait">（无执行记录）</div>)
       ) : (
-        <div className="wk-spine">
+        <div>
           {timeline.rounds.map((rd, ri) => (
             <Fragment key={ri}>
               {rd.acts.map((a, ai) => {
