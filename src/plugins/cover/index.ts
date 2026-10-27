@@ -1182,7 +1182,6 @@ export function setup(ctx: PluginContext): void {
 
   /** 插件重载后接着盯服务端 job：done 就取音频落记录（额度提交时已扣，失败不退） */
   async function resumeDeskJob(job: DeskJob): Promise<void> {
-    const c = cfg();
     if (!job.serviceJobId) {
       job.status = 'failed';
       job.error = '试翻在提交阶段被插件重载打断，服务端可能没收到；重新点一次。';
@@ -1190,7 +1189,7 @@ export function setup(ctx: PluginContext): void {
       persistJobs();
       return;
     }
-    const deadline = Date.now() + c.timeoutMs;
+    const deadline = Date.now() + cfg().timeoutMs;
     let seconds = job.seconds;
     for (;;) {
       if (Date.now() >= deadline) {
@@ -1199,6 +1198,8 @@ export function setup(ctx: PluginContext): void {
         break;
       }
       await sleep(5000);
+      // 每一轮重读配置：107 换作业时守护进程会改 baseUrl，旧地址上的任务已经没了
+      const c = cfg();
       const st = await fetchCoverStatus(c, job.serviceJobId);
       if (st.kind === 'failed') {
         job.status = 'failed';
