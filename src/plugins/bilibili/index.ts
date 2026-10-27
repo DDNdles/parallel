@@ -842,8 +842,24 @@ export function setup(ctx: PluginContext): void {
       title: 'bilibili-links',
       text: [
         '# 本轮有 B 站视频链接',
-        '用户要总结/看内容时，用 `work_dispatch` 把活派给工作子代理：task 里附上原链接，并说明要它用 `bili_video` 看视频信息与字幕、用 `bili_comments` 看评论后再总结。',
+        '用户要总结/看内容时，用 `work_dispatch` 引用用户那条带链接的消息派给工作子代理（它会用 `bili_video` 看视频信息与字幕、用 `bili_comments` 看评论后再总结；只能逐字引用原话，不要自己写任务正文）。',
         '不要凭标题猜视频内容，也不要说自己已经看过；派出去后这一轮只自然应下。',
+      ].join('\n'),
+    }];
+    return req;
+  };
+
+  // work 轮：任务里有 B 站链接时，提醒子代理用工具看内容而不是猜
+  ctx.hooks.beforeWorkLLM = (req: LLMRequestContext): LLMRequestContext => {
+    const text = (req.messages ?? []).map((m) => String(m.content ?? '')).join('\n');
+    if (!BILI_LINK_RE.test(text)) return req;
+    req.systemSections = [...(req.systemSections ?? []), {
+      order: 476,
+      name: 'bilibili-links-work',
+      title: 'bilibili-links-work',
+      text: [
+        '# 任务里有 B 站视频链接',
+        '用 `bili_video` 看视频信息与字幕、用 `bili_comments` 看评论后再总结；不要凭标题猜内容。',
       ].join('\n'),
     }];
     return req;

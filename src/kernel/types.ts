@@ -142,15 +142,15 @@ export interface ToolContext {
   event: ChatEvent;            // 触发本轮对话的事件（合批轮里只是最后一条 carrier）
   chat: ChatRef;
   role: Role;                  // 调用者角色
-  /** 本轮合并进来的整批消息：work_dispatch 据此判断"这活是谁提的"，而不是默认归给最后说话的人 */
+  /** 本轮合并进来的整批消息：work_dispatch 从命中的消息判定"这活是谁提的"，不默认归给最后说话的人 */
   batch?: ChatEvent[];
-  /** 本会话最近说话的人（昵称 → 身份）：合并轮里 requester 可能是更早某条消息的发言人 */
+  /** 本会话最近说话的人（昵称 → 身份）：群聊正文的「昵称：」前缀据此反查发起人 */
   speakers?: { userId: string; nickname: string; role: Role; ts: number }[];
   /** 上下文窗口起点：search_history 用它把"模型眼前就有的那几条"排除掉（同 LLMRequestContext） */
   historyWindowStartTs?: number;
   /** 模型当前上下文窗口的消息快照（user/assistant，只读；最后一条 user 是本轮合批）。
-   *  work_dispatch 用它核对 chat 侧选录的「原文片段」——chat 模型只能选、不能改：
-   *  对不上的片段（转述/改写/编造）由内核丢弃，带给 work 的上下文保证一字未改。 */
+   *  work_dispatch 用它做纯转发：chat 只能逐字引用这里的用户消息，程序把命中的**整条原文**交给 work；
+   *  对不上的引用（改写/编造）整单拒绝——chat 没有自己写任务正文的入口。 */
   contextMessages?: { role: 'user' | 'assistant'; content: string; ts?: number }[];
   /** work 轮才有：本层的嵌套深度与运行 id（子代理委派工具据此算下一层的深度与父 id） */
   work?: { depth: number; runId?: string; agent?: string };

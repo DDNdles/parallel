@@ -279,10 +279,11 @@ test('任务隔离：新任务各开各的沙箱（跨群也隔离），续接�
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '续接完成' } }] });
     g.mock.script.push({ content: '续接好了。' });
     const ret = String(await dispatch.handler(
-      { task: '接着任务一继续', continue_run: r1.id },
+      { messages: ['接着任务一继续'], continue_run: r1.id },
       {
         event: { platform: chatA.platform, type: chatA.type, chatId: chatA.chatId, userId: '10001', nickname: '群友10001', senderRole: 'owner', segments: [], text: '接着任务一继续', isAtMe: true, isReplyToMe: false, raw: null, ts: Date.now(), role: 'owner' },
         chat: chatA, role: 'owner',
+        contextMessages: [{ role: 'user' as const, content: '群友10001：接着任务一继续', ts: Date.now() }],
       } as any,
     ));
     console.log('RET:', ret);

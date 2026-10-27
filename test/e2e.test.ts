@@ -759,7 +759,7 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   mock.actions.length = 0;
   // 2026-10-25 任务隔离：产物落在本任务的沙箱里（work 自己写），汇报轮的正文与产物合并成一条聊天记录
   // chat 第一轮调 work_dispatch；第二轮应下；work 写产物+收尾；最后一轮是人格化汇报（正文+产物进聊天记录）
-  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '算一下 2**10' } }] });
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { messages: ['帮我算一下 2 的 10 次方'] } }] });
   mockProvider.script.push({ content: '好，我去算一下。' });
   mockProvider.script.push({
     content: '算一下这个。',
@@ -789,8 +789,8 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   assert.ok(kinds.includes('final'), '要有收敛回答事件');
   assert.equal(evs.find((e: any) => e.kind === 'tool').name, 'sandbox_write', '先写产物再收尾');
   assert.ok(evs.some((e: any) => e.kind === 'tool' && e.name === 'work_finish'), '收尾要有 work_finish');
-  // 2026-10-26 起不再由程序用本轮消息覆盖 task：进度条/列表与任务正文直接使用 chat 传入的 task
-  assert.equal(runs[0].task, '算一下 2**10', '展示 chat 传入的 task');
+  // 2026-10-27 起 work_dispatch 只转发被引用的消息原文（群聊正文带昵称前缀）
+  assert.equal(runs[0].task, '主人：帮我算一下 2 的 10 次方', '展示转发的原话');
   assert.ok(runs[0].usage, '要带本次任务的 token 账');
   assert.ok(runs[0].usage.cacheHit > 0 && runs[0].usage.cacheMiss > 0, '缓存命中/未命中要有数');
   assert.ok(runs[0].usage.prompt >= runs[0].usage.cacheHit, '提示词 token 不该少于命中数');
@@ -830,7 +830,7 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   // 第一轮：chat 派活；work 卡在"不知道用哪份文件"，调 work_ask 停下来
   const done1 = waitDone();
   const calls1 = mockProvider.calls.length;
-  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '整理一下那份报表' } }] });
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { messages: ['帮我整理一下那份报表'] } }] });
   mockProvider.script.push({ content: '好，我去整理。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_ask', args: { question: '用哪份文件？', notes: '已把 inbox 列出来' } }] });
   mockProvider.script.push({ content: '用哪份文件呀？inbox 里我看到了几份。' });
@@ -857,7 +857,7 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   // 第二轮：管理员自然回答 → chat 用 work_dispatch 把回答接回 work（拼成"接着上次"）
   const done2 = waitDone();
   const calls2 = mockProvider.calls.length;
-  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '用 inbox/a.csv 那份' } }] });
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { messages: ['用 inbox/a.csv 那份'] } }] });
   mockProvider.script.push({ content: '好，用那份接着弄。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '整理完了，产出 report.md', artifacts: ['report.md'] } }] });
   mockProvider.script.push({ content: '整理好了，report.md 给你。' });
@@ -868,19 +868,20 @@ test('work 停下来提问：chat 转达问题；管理员自然回答后 work_d
   const task2 = mockProvider.calls.slice(calls2).map((c) => c.lastUser ?? '').find((t) => t.includes('接着上次'));
   assert.ok(task2, '第二轮的 work 请求要带上"接着上次"的任务描述');
   assert.ok(task2!.includes('你上次停下来问发起者的：用哪份文件？'), task2);
-  // 发起者的回答由 chat 通过 work_dispatch 的 task 传入
-  assert.ok(task2!.includes('发起者这次说的是：用 inbox/a.csv 那份'), task2);
+  // 发起者的回答由 chat 通过 work_dispatch 的 messages 转发原话传入
+  assert.ok(task2!.includes('发起者这次说的是：主人：用 inbox/a.csv 那份'), task2);
 
   const run2 = kernel.workRunner.list(5, chatKey)[0];
   assert.equal(run2.awaiting, undefined, '这一轮是正常交付，不该再挂着"等回答"');
   assert.equal(run2.summary, '整理完了，产出 report.md');
-  assert.equal(run2.task, '整理一下那份报表（续）', '列表里显示短标题（原任务+续），不是拼接文本');
+  assert.match(run2.task, /（续）$/, '列表里显示短标题（原任务+续）');
+  assert.ok(run2.task.includes('帮我整理一下那份报表'), `续接短标要带原任务：${run2.task}`);
   assert.equal(kernel.workRunner.livePending(String(MASTER)), undefined, '回答后现场要消费掉');
 
   // 待答复已被消费：再派一件新活不该再粘上那段历史
   const done3 = waitDone();
   const calls3 = mockProvider.calls.length;
-  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { task: '看看沙箱里有什么' } }] });
+  mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { messages: ['看看沙箱里有什么'] } }] });
   mockProvider.script.push({ content: '好，我去看看。' });
   mockProvider.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '另一件事做完了' } }] });
   mockProvider.script.push({ content: '看完了，里面没什么东西。' });

@@ -938,7 +938,7 @@ export class Pipeline {
             `# 有一件活停在你这里`,
             `工作子代理 ${Math.max(1, Math.round((Date.now() - pendingAsk.at) / 60_000))} 分钟前停下来问：${pendingAsk.question}`,
             pendingAsk.notes ? `（它已经做到：${pendingAsk.notes}）` : '',
-            `这个问题只有发起人能定，别替他猜。他回答之后，用 work_dispatch 把他的回答原话交回去（task 就写他说的话），它会接着干。`,
+            `这个问题只有发起人能定，别替他猜。他回答之后，用 work_dispatch 把他的回答**原话**交回去（messages 里逐字引用他那条消息），它会接着干。`,
           ].filter(Boolean).join('\n'),
         });
       }

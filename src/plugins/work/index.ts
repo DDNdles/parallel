@@ -36,171 +36,84 @@ const WORK = 'work' as const;
 /** 任务清单的一条（`todo` 工具维护；system 分节与工具返回值共用同一套标记） */
 interface TodoItem { text: string; status: 'pending' | 'in_progress' | 'done' }
 
-const normName = (s: unknown): string => String(s ?? '').trim().replace(/^@/, '').toLowerCase();
-
-/** 昵称/QQ 号 → 身份（先找本批，再找本会话最近说话的人） */
-function matchSpeaker(
-  raw: string,
-  batch: ChatEvent[],
-  speakers: NonNullable<ToolContext['speakers']>,
-): { userId: string; nickname?: string; role?: Role } | undefined {
-  const exact = batch.find((e) => e.userId === raw || normName(e.nickname) === raw)
-    ?? speakers.find((s) => s.userId === raw || normName(s.nickname) === raw);
-  if (exact) {
-    return {
-      userId: exact.userId,
-      nickname: exact.nickname,
-      role: (exact as ChatEvent).role ?? speakers.find((s) => s.userId === exact.userId)?.role,
-    };
-  }
-  const loose = batch.find((e) => {
-    const n = normName(e.nickname);
-    return n.length > 0 && (n.includes(raw) || raw.includes(n));
-  })
-    ?? speakers.find((s) => {
-      const n = normName(s.nickname);
-      return n.length > 0 && (n.includes(raw) || raw.includes(n));
-    });
-  if (loose) return { userId: loose.userId, nickname: loose.nickname, role: loose.role };
-  return undefined;
-}
-
 /**
- * 合批轮里 carrier 只是最后说话的人：派活时按 requester（模型点名）或与原话的字符二元组重合度找正主。
- * 找不到明确的人就退回 carrier（旧行为），宁可不动也不能乱改。
+ * work_dispatch 的纯转发（2026-10-27 用户改定）：chat 只能逐字引用聊天里的消息，
+ * 程序把这些消息的**整条原文**转发给 work；模型自己写的文字没有入口。
+ *
+ * - 引用按「去空白 + 小写」比对，可以是消息里的一小段（截取），命中后转发整条；
+ * - 任何一条对不上原文（改写/脑补/编造）→ 整单拒绝，并告诉模型重新复制原话；
+ * - 归属按命中的消息程序化判定（本轮 batch 事件 / 群聊正文里的「昵称：」前缀），不看模型怎么说。
  */
-export function pickWorkRequester(
-  args: Record<string, unknown>,
-  tctx: Pick<ToolContext, 'event' | 'batch' | 'speakers'>,
-  task: string,
-): { userId: string; nickname?: string; role?: Role } {
-  const batch = tctx.batch?.length ? tctx.batch : [tctx.event];
-  const speakers = tctx.speakers ?? [];
-  const raw = normName(args.requester);
-  if (raw) {
-    const who = matchSpeaker(raw, batch, speakers);
-    if (who) return who;
-  }
-  // 字符二元组：task 通常是在重述某人的原话，重合最高的那条才是正主（并列取更晚的）
-  const taskGrams = bigramSet(task);
-  let best: { e: ChatEvent; score: number } | undefined;
-  if (taskGrams.size) {
-    for (const e of batch) {
-      if (!String(e.text ?? '').trim()) continue;
-      let score = 0;
-      for (const g of bigramSet(String(e.text))) if (taskGrams.has(g)) score++;
-      if (!best || score >= best.score) best = { e, score };
-    }
-  }
-  if (best && best.score > 0) {
-    return {
-      userId: best.e.userId,
-      nickname: best.e.nickname,
-      role: best.e.role ?? speakers.find((s) => s.userId === best!.e.userId)?.role,
-    };
-  }
-  return { userId: tctx.event.userId, nickname: tctx.event.nickname, role: tctx.event.role };
-}
-
-/** 字符二元组集合（中文不分词的相似度探针） */
-function bigramSet(s: string): Set<string> {
-  const out = new Set<string>();
-  const t = s.replace(/\s+/g, '');
-  for (let i = 0; i + 1 < t.length; i++) {
-    const g = t.slice(i, i + 2);
-    if (/[\p{L}\p{N}]/u.test(g[0]) && /[\p{L}\p{N}]/u.test(g[1])) out.add(g);
-  }
-  return out;
-}
-
-/** 原话里去掉唤醒标记（@号码、[回复:id]）——它们不是用户说的话；[图片]/[表情] 占位保留（是信息） */
-export function stripRelayNoise(t: string): string {
-  return t.replace(/ ?@\d+/g, '').replace(/\[回复:[^\]]*\]/g, '').trim();
-}
-
-/**
- * 一字不差传话（2026-10-24 用户定调：chat 不许转述用户的意思）：
- * 任务正文 = 发起人原话原文（程序从本轮消息里代传），chat 模型写的 task 只当相似度探针，
- * 用来在发起人的几条消息里挑出提需求的那条——挑完就丢，一个字都不进任务。
- * 同轮其他人的话按原样附在后面当上下文（也是原文，不算转述）。
- * 返回 task=完整任务正文，label=给进度条看的单行短标。找不到可用原话返回空 task（调用方退回转述并注明）。
- */
-export function verbatimTaskOf(
-  probe: string,
-  tctx: Pick<ToolContext, 'event' | 'batch'>,
-  who: { userId: string; nickname?: string },
-): { task: string; label: string } {
-  const batch = tctx.batch?.length ? tctx.batch : [tctx.event];
-  const mine = batch.filter((e) => e.userId === who.userId && String(e.text ?? '').trim());
-  if (!mine.length) return { task: '', label: '' };
-  const probeGrams = bigramSet(probe);
-  let chosen = mine[0];
-  let bestScore = -1;
-  for (const e of mine) {
-    let score = 0;
-    for (const g of bigramSet(String(e.text))) if (probeGrams.has(g)) score++;
-    if (score >= bestScore) { bestScore = score; chosen = e; }
-  }
-  const original = stripRelayNoise(String(chosen.text ?? ''));
-  if (!original) return { task: '', label: '' };
-  const label = original.replace(/\s+/g, ' ').slice(0, 48);
-  const lines = ['用户原话（一字未改）：', original, '', `——发起人：${who.nickname || who.userId}`];
-  const imgs = (chosen.segments ?? []).filter((s) => s.type === 'image').length;
-  if (imgs) lines.push(`（这条消息带了 ${imgs} 张图，已存在会话沙箱 inbox/ 里，需要就直接取用。）`);
-  const others = batch.filter((e) => e !== chosen && String(e.text ?? '').trim());
-  if (others.length) {
-    lines.push('', '同轮对话原文（上下文，同样一字未改）：');
-    for (const e of others) lines.push(`${e.nickname || e.userId}：${stripRelayNoise(String(e.text ?? ''))}`);
-  }
-  return { task: lines.join('\n'), label };
-}
-
-/**
- * 聊天上下文选录（2026-10-25 用户定）：chat 模型只能给「原文片段」，内核在它眼前的
- * 窗口消息里逐一核对——对得上的把**整条原文**带给 work；对不上的（转述/改写/编造）
- * 一律丢弃。chat 模型选得了内容，改不了内容。
- * 最后一条 user 消息（本轮合批）不参与核对：它已经一字未改地附在任务正文里了。
- */
-export function selectChatContext(
+export function relayQuotedMessages(
   quotes: string[],
-  msgs: { role: 'user' | 'assistant'; content: string; ts?: number }[] | undefined,
-  opts: { maxQuotes?: number; maxMsgs?: number; maxChars?: number } = {},
-): { section: string; matched: number; dropped: number } {
-  const maxQuotes = opts.maxQuotes ?? 8;
-  const maxMsgs = opts.maxMsgs ?? 12;
-  const maxChars = opts.maxChars ?? 6000;
-  if (!quotes.length || !msgs?.length) return { section: '', matched: 0, dropped: 0 };
-  let lastUser = -1;
-  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === 'user') { lastUser = i; break; }
-  const candidates = msgs.filter((_m, i) => i !== lastUser);
-  const norm = (s: string) => String(s ?? '').replace(/\s+/g, '').toLowerCase();
-  const hits: typeof candidates = [];
-  let dropped = 0;
-  for (const q of quotes.slice(0, maxQuotes)) {
+  tctx: {
+    contextMessages?: { role: 'user' | 'assistant'; content: string; ts?: number }[];
+    batch?: ChatEvent[];
+    speakers?: { userId: string; nickname: string; role: Role; ts: number }[];
+    event?: ChatEvent;
+  },
+): { ok: true; text: string; label: string; count: number; trimmed: number; userId?: string; nickname?: string; role?: Role }
+  | { ok: false; error: string } {
+  const norm = (s: unknown) => String(s ?? '').replace(/\s+/g, '').toLowerCase();
+  const normName = (s: unknown) => String(s ?? '').replace(/[\s@]/g, '').toLowerCase();
+  // 本轮气泡数软约束是内核拼在最后一条 user 消息末尾的，不是用户说的话：转发前剥掉
+  const stripInternal = (s: unknown) => String(s ?? '').replace(/\n\n【本轮】闲聊就回 \d+ 条：[\s\S]*$/, '').trim();
+  const sources = (tctx.contextMessages ?? [])
+    .filter((m) => m.role === 'user' && stripInternal(m.content))
+    .map((m) => ({ ...m, content: stripInternal(m.content) }));
+  if (!sources.length) {
+    return { ok: false, error: '（当前聊天窗口里没有可转发的用户消息。先让对方把要求说清楚，再引用他的原话派活。）' };
+  }
+
+  const hitIdx = new Set<number>();
+  const missed: string[] = [];
+  let trimmed = 0;
+  for (const raw of quotes.slice(0, 10)) {
+    const q = String(raw ?? '').trim();
     const nq = norm(q);
-    if (nq.length < 6) { dropped++; continue; }   // 太短的片段会乱命中（「好的」谁都说过）
-    const hit = candidates.find((m) => norm(m.content).includes(nq));
-    if (hit) { if (!hits.includes(hit)) hits.push(hit); } else dropped++;
+    if (!nq) continue;
+    // 太短的片段会乱命中（「好的」谁都说过）；截取至少 4 个有效字符
+    if (nq.length < 4) { missed.push(q); continue; }
+    const idx = sources.findIndex((m) => norm(m.content).includes(nq));
+    if (idx < 0) { missed.push(q); continue; }
+    if (norm(sources[idx].content) !== nq) trimmed++;
+    hitIdx.add(idx);
   }
-  if (!hits.length) return { section: '', matched: 0, dropped };
-  const lines: string[] = [];
-  let chars = 0;
-  for (let i = 0; i < hits.length && i < maxMsgs; i++) {
-    const m = hits[i];
-    const d = m.ts && Number.isFinite(m.ts) ? new Date(m.ts) : undefined;
-    const hhmm = d && !Number.isNaN(d.getTime())
-      ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} ` : '';
-    // user 消息的 content 本身就带「昵称：」前缀（进模型前由内核拼好）——整行原样带过去
-    const body = `${hhmm}${m.role === 'assistant' ? 'bot：' : ''}${m.content}`;
-    if (chars + body.length > maxChars) { lines.push(`（还有 ${hits.length - i} 条没带上：超出字数上限）`); break; }
-    lines.push(body);
-    chars += body.length;
+  if (missed.length) {
+    const shown = missed.slice(0, 3).map((q) => `「${q.slice(0, 40)}${q.length > 40 ? '…' : ''}」`).join('、');
+    return {
+      ok: false,
+      error: `（有 ${missed.length} 条引用在聊天窗口里对不上原文：${shown}。这活没派出去——只能从聊天里逐字复制用户的消息（可以只截一段），不能改写、补充或自己写任务。请重新复制原话再调用。）`,
+    };
   }
-  if (hits.length > maxMsgs) lines.push(`（还有 ${hits.length - maxMsgs} 条没带上：超出条数上限）`);
-  const section = lines.length
-    ? `\n\n聊天上下文（chat 侧选录的原文，程序逐字核对过，一字未改）：\n${lines.join('\n')}`
-    : '';
-  return { section, matched: hits.length, dropped };
+  if (!hitIdx.size) {
+    return { ok: false, error: '（没有引用到任何消息，这活没派出去。从聊天窗口里逐字复制用户的原话放进 messages。）' };
+  }
+
+  const picked = [...hitIdx].map((i) => sources[i]).sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+  const text = picked.map((m) => String(m.content).trim()).join('\n\n');
+  const first = String(picked[0].content).replace(/\s+/g, ' ').trim();
+  const label = first.length > 60 ? `${first.slice(0, 60)}…` : first;
+
+  // 归属：命中的正文里包含哪个本轮发言（按时间取最后一次），否则按群聊「昵称：」前缀反查名册
+  const combined = norm(text);
+  const fromBatch = (tctx.batch ?? [])
+    .filter((e) => e.userId && e.text && combined.includes(norm(e.text)))
+    .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
+  let userId = fromBatch[0]?.userId ?? '';
+  let nickname = fromBatch[0]?.nickname ?? '';
+  let role: Role | undefined = fromBatch[0]?.role;
+  if (!userId) {
+    const m = text.match(/^([^：:\n]{1,24})[：:]/);
+    const sp = m ? (tctx.speakers ?? []).find((s) => normName(s.nickname) === normName(m![1]) || s.userId === m![1]) : undefined;
+    if (sp) { userId = sp.userId; nickname = sp.nickname; role = sp.role; }
+  }
+  if (!userId && tctx.event) {
+    userId = tctx.event.userId;
+    nickname = tctx.event.nickname;
+    role = tctx.event.role;
+  }
+  return { ok: true, text, label, count: picked.length, trimmed, userId, nickname, role };
 }
 
 export function setup(ctx: PluginContext): void {
@@ -329,49 +242,43 @@ export function setup(ctx: PluginContext): void {
     description: '把一件需要实际动手、多步骤完成的事派给工作子代理（独立执行环境：读写文件、Python、浏览器、联网；做完把结果交回来）。用户明确让你去做/整理/分析/生成/查资料时用它；闲聊、解释概念、一句话能答的不要用。同一件事已经派出去还在跑时，别重复派。',
     // 不设 minRole：普通群友的 chat 也要"知道有这个能力、然后拒绝"，而不是工具凭空消失
     surface: 'chat',
-    promptSnippet: '把需要实际动手的活派给工作子代理（task 尽量保留用户原话，自带前因后果）',
+    promptSnippet: '把用户的原话（一条或多条消息原文）转发给工作子代理（只能引用，不能改写）',
     promptGuidelines: [
-      '派活的 task 就是工作子代理真正收到的任务正文（它看不到你们的聊天）：把用户的**原话要求**完整写进 task，不要擅自删改、润色或脑补细节（尤其是画图的画面描述，用户怎么说就怎么传）；如果需求散在前面几轮对话里，把前因后果和用户的原话一并整理进 task。',
-      '合并轮里最后说话的人不一定是提需求的人：requester 要写真正提出这件事的那位（任务是从更早某人的话接过来的，就写那个人）。',
-      '新旧任务由你判断，但**用户对刚做完（或最近）的任务提修改、调整条件、说不满意、要求照着改一版——一律算那个任务的延续**：带 continue_run（任务号看 work_status，或 latest）沿用原沙箱接着做，绝不能新开任务从头重做（对方看得见你重做了几遍）。只有和要求无关的新事情才开新任务。',
-      '这件活要靠更早的聊天内容（之前提过的要求/偏好/来龙去脉）时，除了写进 task，也可以用 context_quotes 附上你看到的消息原文片段。',
+      '你**不能自己写任务正文**：只能用 messages 从当前聊天窗口里逐字引用用户的消息（一条或多条，可以只截一段，但必须一字不差）。程序会把命中的**整条原文**转发给 work，你自己写的任何文字都进不去，引用对不上会直接拒绝。',
+      '用户后来的修改/补充要求也照样转发：引用那条消息的原文即可，不要改写成"把XX改成YY"再交付。危险/含糊的地方宁可先用一句话问清楚，让用户把要求说完整，再引用他的原话派活。',
+      '一轮里用户说了好几条相关的，就一次引用几条（按原顺序转发）；只引用真正和这件活有关的消息。',
+      '新旧任务由你判断，但**用户对刚做完（或最近）的任务提修改、调整条件、说不满意——一律算那个任务的延续**：带 continue_run（任务号看 work_status，或 latest）沿用原沙箱接着做，绝不能新开任务从头重做。只有和旧任务无关的新事情才开新任务。',
       '派出去之后这一轮只用一句自然的话应下（像"好，我去弄"），不要列计划、不要声称已经做完。',
       '活跑完会另外给你一轮汇报：那一轮再讲结论，产物由内核打包成一个合集发出，不要一条条发。',
     ],
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '要交给工作子代理做的事：尽量保留用户的原话要求（不要擅自改写或脑补细节），需要前文背景时一并写清目标、输入和要交回什么' },
-        requester: { type: 'string', description: '这件活是谁提的：群里显示的昵称（或 QQ 号）。不确定就省略，别默认写最后说话的人。' },
-        continue_run: { type: 'string', description: '用户明确要「接着旧任务继续」时填：work_status 列出的任务号，或 latest=他最近一个任务。填了=沿用那个任务的沙箱与文件；不填=全新任务（全新沙箱，看不到旧任务文件）。用户没明确要继续就不要填。' },
-        context_quotes: {
-          type: 'array', maxItems: 8, items: { type: 'string' },
-          description: '这件活相关的更早聊天记录：每段从你看到的消息里一字不差地引用原文片段（程序逐字核对，改写/转述的会被丢弃）。只挑真正相关的，没有就不填。',
+        messages: {
+          type: 'array', minItems: 1, maxItems: 10, items: { type: 'string' },
+          description: '要转给 work 的消息：从聊天窗口里逐字引用（可只截一段，但必须一字不差）。可以一条或多条，按你给的顺序转发；用户后续的修改要求也这样引用。',
         },
+        continue_run: { type: 'string', description: '用户明确要「接着旧任务继续」时填：work_status 列出的任务号，或 latest=他最近一个任务。填了=沿用那个任务的沙箱与文件；不填=全新任务（全新沙箱，看不到旧任务文件）。用户没明确要继续就不要填。' },
       },
-      required: ['task'],
+      required: ['messages'],
     },
     handler: (args, tctx) => {
-      const modelTask = String(args.task ?? '').trim();
-      if (!modelTask) return '（任务为空，没有派出去。先问清对方要做什么。）';
-      // 归属：合批轮里 carrier 只是最后说话的人，按 requester / 原话重合度找真正提需求的人
-      const who = pickWorkRequester(args, tctx, modelTask);
-      const role = String(who.role ?? tctx.role);
+      const quotes = Array.isArray(args.messages)
+        ? (args.messages as unknown[]).map((q) => String(q ?? '')).filter(Boolean)
+        : [];
+      if (!quotes.length) {
+        return '（没有引用任何消息，这活没派出去。从聊天窗口里逐字复制用户的原话放进 messages（可以只截一段），程序会把原文转发给 work。）';
+      }
+      const relayed = relayQuotedMessages(quotes, tctx);
+      if (!relayed.ok) return relayed.error;
+      const role = relayed.role ?? String(tctx.role);
       if (!canWork(role)) {
         return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
       }
       if (ctx.work.modelLabel() === '—') {
         return '（工作模型还没配置，这活派不出去。用你自己的语气告诉对方现在做不了，别提到模型配置这些内部词。）';
       }
-      // 2026-10-26 用户改定：不再由程序强制拿本轮消息覆盖 task（多轮对话后用户催一句"你根本没派"
-      // 会把催促当成任务正文派出去），直接采用 chat 模型写的 task，由提示词约束它保留用户原话与前文背景。
-      let task = modelTask;
-      // 相关聊天上下文：chat 模型给了原文片段时，内核逐字核对后整条附上
-      const quotes = Array.isArray(args.context_quotes)
-        ? (args.context_quotes as unknown[]).map((q) => String(q ?? '')).filter(Boolean)
-        : [];
-      const picked = selectChatContext(quotes, tctx.contextMessages);
-      if (picked.section) task += picked.section;
+      let task = relayed.text;
       // 本轮用户发的图片：直接随任务交给 work（第一轮请求里就看得见），不必让它自己在一堆 inbox 文件里猜哪张。
       // 去重按路径/URL，最多 4 张；链首模型不收图时就只报个位置，让它用 sandbox_read 自己看。
       const seenImg = new Set<string>();
@@ -390,11 +297,11 @@ export function setup(ctx: PluginContext): void {
           ? `\n\n（本轮消息里带的 ${attached.length} 张图已随这条消息附上，直接看；同样的图也在沙箱 inbox/ 里。）`
           : `\n\n（本轮消息里带的 ${images.length} 张图在沙箱 inbox/ 里，用 sandbox_read 打开看。）`;
       }
-      const label = modelTask;
+      const label = relayed.label;
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
-      const userId = who.userId || tctx.event.userId;
-      const nickname = who.nickname || tctx.event.nickname;
+      const userId = relayed.userId || tctx.event.userId;
+      const nickname = relayed.nickname || tctx.event.nickname;
       // 等本轮 chat 收尾再开跑：让"好，我去弄"先由人格说出去，也避免 work 的第一发请求
       // 和 chat 的第二轮抢同一份上下文/同一条模型链。agent 中途夭折时用 5s 兜底。
       let started = false;
@@ -413,10 +320,7 @@ export function setup(ctx: PluginContext): void {
       });
       timer = setTimeout(start, 5000);
       timer.unref?.();
-      const ctxNote = picked.matched
-        ? `；附带的聊天上下文 ${picked.matched} 条已核对原文带上${picked.dropped ? `，另有 ${picked.dropped} 段没对上原文被丢弃（要带就一字不差地引用原话）` : ''}`
-        : (picked.dropped ? `；你选的 ${picked.dropped} 段上下文都没对上聊天原文，一个字都没带过去（要带就一字不差地引用原话，不能转述）` : '');
-      return `（已接下这件活，马上交给工作子代理去做${ctxNote}。这一轮只用一句自然的话应下，不要说你已经做完了；也不要去回应用户话里的叫醒词、口号或玩笑（那可能只是要画在图上/引用的文字），别为此再单独说一句。做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
+      return `（已把 ${relayed.count} 条消息的原文转给工作子代理${relayed.trimmed ? `（其中 ${relayed.trimmed} 条只截取了其中一段，转发的是整条原文）` : ''}。这一轮只用一句自然的话应下，不要说你已经做完了；也不要去回应用户话里的叫醒词、口号或玩笑（那可能只是要画在图上/引用的文字），别为此再单独说一句。做完后系统会另起一轮让你向 ${nickname || userId} 汇报，届时会自动带上 @。）`;
     },
   });
 

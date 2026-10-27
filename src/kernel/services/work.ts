@@ -293,7 +293,8 @@ export class WorkRunner {
     this.runs.set(id, { ...rec, ok: false, summary: '', rounds: 0, toolCalls: 0, durationMs: 0, artifacts: [], phase: 'running' });
     this.bus.emit(busEvents.workStart, {
       // 任务原样下发：chat → work 没有字数上限（2026-10-23 用户明令），桌面端按完整原文显示
-      id, chatKey, task: taskLabel, model, trigger: input.trigger, chat: reportChat,
+      // （列表/侧栏的短标走 rec.task，别拿它顶替全文）
+      id, chatKey, task: input.task, model, trigger: input.trigger, chat: reportChat,
       userId: input.userId, nickname: input.nickname, depth, parentId: input.parentId, agent: agentName,
     });
     this.persist('start', rec, input);

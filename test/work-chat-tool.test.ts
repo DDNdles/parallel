@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { busEvents } from '../src/kernel/bus.ts';
-import { pickWorkRequester, verbatimTaskOf, stripRelayNoise, selectChatContext } from '../src/plugins/work/index.ts';
 
 // ============================================================
 // chat 面的 work 工具（2026-10-21，取代 /work 命令）
@@ -44,14 +43,19 @@ async function boot(group: string) {
   const mock = (kernel.llm as unknown as { providers: Map<string, any> }).providers.get('mock')!;
   const tools = (role: 'owner' | 'admin' | 'member') =>
     kernel.container.toolsForChat(chat, role, 'chat');
-  const tctx = (userId: string, role: string) => ({
-    event: {
+  const tctx = (userId: string, role: string, opts: { messages?: string[]; batch?: any[]; speakers?: any[]; event?: any } = {}) => {
+    const event = opts.event ?? {
       platform: chat.platform, type: chat.type, chatId: chat.chatId,
       userId, nickname: `群友${userId}`, senderRole: role === 'member' ? 'member' : 'owner',
       segments: [], text: '', isAtMe: true, isReplyToMe: false, raw: null, ts: Date.now(), role,
-    },
-    chat, role,
-  });
+    };
+    return {
+      event, chat, role,
+      contextMessages: (opts.messages ?? []).map((t, i) => ({ role: 'user' as const, content: t, ts: Date.now() + i })),
+      ...(opts.batch ? { batch: opts.batch } : {}),
+      ...(opts.speakers ? { speakers: opts.speakers } : {}),
+    };
+  };
   return {
     kernel, chat, chatKey, mock, tools, tctx,
     cleanup: async () => { await kernel.shutdown(); rmSync(dataDir, { recursive: true, force: true }); },
@@ -77,7 +81,10 @@ test('work_dispatch / work_status：普通群友能看到工具，但调用被�
     assert.ok(dispatch, '普通群友的 chat 面也要有 work_dispatch（否则没法人格化拒绝）');
     assert.ok(status, '普通群友的 chat 面也要有 work_status');
 
-    const denied = await dispatch!.handler({ task: '删库跑路' }, g.tctx('20001', 'member') as any);
+    const denied = await dispatch!.handler(
+      { messages: ['删库跑路'] },
+      g.tctx('20001', 'member', { messages: ['删库跑路'] }) as any,
+    );
     assert.match(String(denied), /权限不足/, `普通群友派活要被拒绝：${denied}`);
     assert.equal(g.kernel.workRunner.list(10, g.chatKey).length, 0, '被拒绝时不许偷偷开跑');
 
@@ -145,7 +152,10 @@ test('群管理员（不在 masterIds/extraAdminIds 里）派活：汇报轮沿�
         if (d.chatKey === g.chatKey && d.trigger === 'chat') { off(); resolve(d); }
       });
     });
-    await dispatch.handler({ task: '做个小文件' }, g.tctx('30003', 'admin') as any);
+    await dispatch.handler(
+      { messages: ['做个小文件'] },
+      g.tctx('30003', 'admin', { messages: ['做个小文件'] }) as any,
+    );
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
     await done;
     const reportCall = await until(
@@ -171,8 +181,11 @@ test('work_dispatch：handler 立即返回，本轮 chat 收尾（agent.end）�
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '做完了' } }] });
     g.mock.script.push({ content: '好了，做完了。' });   // 汇报轮
 
-    const result = String(await dispatch.handler({ task: '做个小实验' }, g.tctx('10001', 'owner') as any));
-    assert.match(result, /已接下这件活/, result);
+    const result = String(await dispatch.handler(
+      { messages: ['做个小实验'] },
+      g.tctx('10001', 'owner', { messages: ['做个小实验'] }) as any,
+    ));
+    assert.match(result, /已把 1 条消息的原文转给工作子代理/, result);
     assert.equal(g.kernel.workRunner.list(10, g.chatKey).length, 0, 'chat 还没收尾时不该开跑');
 
     // 模拟本轮 chat 的 agent.end（真实链路由 AgentLoop 发这个事件）
@@ -264,82 +277,27 @@ test('chat 派给 work 的任务不截断：work.start 与列表都保留全文'
     const off = g.kernel.bus.on(busEvents.workStart, (d: any) => { if (d.chatKey === g.chatKey) startEvents.push(d); });
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '完成' } }] });
     g.mock.script.push({ content: '好了' });
-    await dispatch.handler({ task: longTask }, g.tctx('10001', 'owner') as any);
+    await dispatch.handler(
+      { messages: [longTask] },
+      g.tctx('10001', 'owner', { messages: [longTask] }) as any,
+    );
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
-    const run = await until(
-      () => g.kernel.workRunner.list(10, g.chatKey).find((r) => r.task === longTask),
+    const startEv = await until(
+      () => startEvents.find((e) => e.task === longTask),
       8000, '长任务开跑',
     );
     off();
-    assert.equal(run.task.length, longTask.length, '列表里的任务必须是全文');
-    const startEv = startEvents.find((e) => e.id === run.id);
-    assert.equal(startEv?.task, longTask, 'work.start 推给桌面的任务也必须是全文');
+    assert.equal(startEv.task, longTask, 'work.start 推给桌面的任务必须是全文');
+    // list() 里是短标；全文落库，resume/桌面端详情读 work_runs.task
+    const row = (g.kernel as any).db.get('SELECT task FROM work_runs WHERE id=?', startEv.id) as { task: string };
+    assert.equal(row.task, longTask, '落库的任务必须是全文');
+    assert.equal(row.task.length, longTask.length);
   } finally {
     await g.cleanup();
   }
 });
 
-test('work_dispatch 归属：合批轮里按 requester / 原话找正主，不默认归给最后说话的人', () => {
-  const ev = (userId: string, nickname: string, text: string, role?: string) => ({
-    id: `e_${userId}_${text.slice(0, 4)}`, platform: 'qq', type: 'group' as const, chatId: '9500',
-    userId, nickname, senderRole: 'member' as const, segments: [], text,
-    isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: role as any,
-  });
-  const ask = ev('10001', '君にも嘘をつこう', '整理成文档给我吧', 'owner');
-  const chatter = ev('10002', 'Lawrence', '这弹吉他的动图怎么还在疯狂刷屏啊', 'member');
-  const tctx = {
-    event: chatter,
-    batch: [ask, chatter],
-    speakers: [
-      { userId: '10002', nickname: 'Lawrence', role: 'member' as const, ts: Date.now() },
-      { userId: '10001', nickname: '君にも嘘をつこう', role: 'owner' as const, ts: Date.now() },
-    ],
-  };
-
-  // 模型点名 requester（含 @ 前缀）→ 归给点名的人
-  assert.deepEqual(pickWorkRequester({ requester: '@君にも嘘をつこう' }, tctx, '随便'), {
-    userId: '10001', nickname: '君にも嘘をつこう', role: 'owner',
-  });
-  // 没点名：按原话重合度找（任务里有「文档」，只有君君那句话沾边）
-  assert.equal(pickWorkRequester({}, tctx, '整理成一份完整的 IEEE 论文文档').userId, '10001');
-  // 与整批都不沾边 → 退回 carrier（旧行为），不乱改
-  assert.equal(pickWorkRequester({}, tctx, 'zzz').userId, '10002');
-});
-
-test('一字不差传话：verbatimTaskOf 任务正文=发起人原话，chat 转述一个字不进；@/回复标记剥掉', () => {
-  const ev = (userId: string, nickname: string, text: string, segs: any[] = []) => ({
-    id: 'e' + Math.random().toString(36).slice(2), platform: 'qq', type: 'group' as const, chatId: '9501',
-    userId, nickname, senderRole: 'member' as const, segments: segs, text,
-    isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: 'member' as any,
-  });
-  const ask = ev('30003', '小明', '@3893163081 帮我画一张豆包和奶龙对打的图，豆包要占上风', [{ type: 'image', data: {} }]);
-  const mine2 = ev('30003', '小明', '就要之前说的那种风格');
-  const chatter = ev('10002', 'Lawrence', '哈哈这个梗好笑');
-  const tctx = { event: chatter, batch: [ask, mine2, chatter] };
-
-  // chat 的转述只当探针：在发起人的两条里挑重合最高那条（原话），转述本身不进任务
-  const v = verbatimTaskOf('生成一张豆包与奶龙战斗、豆包占上风的趣味插画', tctx, { userId: '30003', nickname: '小明' });
-  assert.ok(v.task.startsWith('用户原话（一字未改）：'));
-  assert.ok(v.task.includes('帮我画一张豆包和奶龙对打的图，豆包要占上风'), '原话一字不差');
-  assert.ok(!v.task.includes('趣味插画'), 'chat 的转述一个字不许进');
-  assert.ok(!v.task.includes('@3893163081'), '@ 是唤醒标记不是用户的话');
-  assert.ok(v.task.includes('——发起人：小明'));
-  assert.ok(v.task.includes('带了 1 张图'), '带的图要在任务里注明');
-  assert.ok(v.task.includes('Lawrence：哈哈这个梗好笑'), '同轮上下文按原文附上');
-  assert.equal(v.label, '帮我画一张豆包和奶龙对打的图，豆包要占上风', '短标=去@后的原话');
-
-  // 发起人只有一条：直接用它，不附「同轮对话」节（没有别的实质消息）
-  const solo = verbatimTaskOf('画图', { event: ask, batch: [ask] }, { userId: '30003', nickname: '小明' });
-  assert.ok(solo.task.includes('豆包要占上风'));
-  assert.ok(!solo.task.includes('同轮对话'));
-
-  // 发起人本轮没说话（只发了图/全是空）：空 task，调用方退回转述并注明
-  assert.equal(verbatimTaskOf('x', { event: chatter, batch: [chatter] }, { userId: '30003' }).task, '');
-
-  assert.equal(stripRelayNoise(' [回复:123] @3893163081 画一张 @all 的图 [图片] '), '画一张 @all 的图 [图片]');
-});
-
-test('work_dispatch 端到端：直接使用 chat 传入的 task（不再由程序强制用本轮消息覆盖，多轮催促也不丢任务）', async () => {
+test('work_dispatch 端到端：只转发被引用的消息原文，chat 自己写的字进不去', async () => {
   const g = await boot('9406');
   g.mock.script.length = 0;
   try {
@@ -350,25 +308,86 @@ test('work_dispatch 端到端：直接使用 chat 传入的 task（不再由程�
       isAtMe: false, isReplyToMe: false, raw: null, ts: Date.now(), role: 'member' as any,
     });
     const nudge = ev('30003', '小明', '你根本没派');
-    nudge.role = 'admin';   // 派活按提需求者的角色判：小明得是管理员这件活才派得出去
     const chatter = ev('10002', 'Lawrence', '哈哈这个梗好笑');
+    const original = '小明：帮我画一张豆包和奶龙对打的图，豆包要占上风';
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '画好了' } }] });
     g.mock.script.push({ content: '好了' });
-    await dispatch.handler(
-      { task: '帮我画一张豆包和奶龙对打的图，豆包要占上风', requester: '小明' },
-      { event: chatter, batch: [nudge, chatter], chat: g.chat, role: 'owner' as const } as any,
-    );
+    const reply = String(await dispatch.handler(
+      { messages: ['帮我画一张豆包和奶龙对打的图'] },   // 只截一段，程序转发整条原文
+      {
+        event: chatter, batch: [nudge, chatter], chat: g.chat, role: 'owner' as const,
+        contextMessages: [{ role: 'user' as const, content: original, ts: 1 }],
+        speakers: [
+          { userId: '30003', nickname: '小明', role: 'admin' as const, ts: 1 },
+          { userId: '10002', nickname: 'Lawrence', role: 'member' as const, ts: 2 },
+        ],
+      } as any,
+    ));
+    assert.match(reply, /已把 1 条消息的原文转给工作子代理/, reply);
+    assert.match(reply, /只截取了其中一段/, reply);
+
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
     const run = await until(() => g.kernel.workRunner.list(10, g.chatKey)[0], 8000, '任务开跑');
-    // 列表/进度条上的 task 与 work 收到的任务正文都直接使用 chat 传入的 task，不会被本轮的「你根本没派」覆盖
-    assert.equal(run.task, '帮我画一张豆包和奶龙对打的图，豆包要占上风');
+    // 任务正文 = 被引用那条消息的原文（含群聊「昵称：」前缀）；催促与闲聊都没进去
+    assert.equal(run.task, original);
     const call = await until(
       () => g.mock.calls.find((c: any) => String(c.usersJoined ?? '').includes('豆包要占上风')),
       8000, 'work 首轮请求',
     );
     const body = String(call.usersJoined);
-    assert.ok(body.includes('帮我画一张豆包和奶龙对打的图，豆包要占上风'), 'chat 传入的 task 进任务正文');
-    assert.ok(!body.includes('你根本没派'), '本轮催促消息不该覆盖任务正文');
+    assert.ok(body.includes(original), '转发的该是整条原文');
+    assert.ok(!body.includes('你根本没派'), '本轮催促消息不在引用里，就不该进任务');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('work_dispatch：引用对不上原文整单拒绝，不会把 chat 的改写派出去', async () => {
+  const g = await boot('9408');
+  g.mock.script.length = 0;
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const reply = String(await dispatch.handler(
+      { messages: ['画一张豆包和奶龙对打的趣味插画'] },   // 用户没这么说过
+      {
+        event: { userId: '10001' }, chat: g.chat, role: 'owner' as const,
+        contextMessages: [{ role: 'user' as const, content: '帮我画一张豆包和奶龙对打的图', ts: 1 }],
+      } as any,
+    ));
+    assert.match(reply, /对不上原文/, reply);
+    assert.match(reply, /没派出去/, reply);
+    assert.equal(g.kernel.workRunner.list(10, g.chatKey).length, 0, '拒绝时不许偷偷开跑');
+  } finally {
+    await g.cleanup();
+  }
+});
+
+test('work_dispatch：多条引用按原顺序转发（含后续修改要求）', async () => {
+  const g = await boot('9409');
+  g.mock.script.length = 0;
+  try {
+    const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
+    const startEvents: any[] = [];
+    const stop = g.kernel.bus.on(busEvents.workStart, (d: any) => { if (d.chatKey === g.chatKey) startEvents.push(d); });
+    g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '改好了' } }] });
+    g.mock.script.push({ content: '好了' });
+    await dispatch.handler(
+      { messages: ['画一只蓝色鲸鱼', '背景换成海洋'] },
+      {
+        event: { userId: '10001' }, chat: g.chat, role: 'owner' as const,
+        contextMessages: [
+          { role: 'user' as const, content: '画一只蓝色鲸鱼', ts: 1 },
+          { role: 'user' as const, content: '背景换成海洋', ts: 2 },
+        ],
+      } as any,
+    );
+    g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
+    const startEv = await until(
+      () => startEvents.find((e) => e.task === '画一只蓝色鲸鱼\n\n背景换成海洋'),
+      8000, '任务开跑',
+    );
+    assert.equal(startEv.task, '画一只蓝色鲸鱼\n\n背景换成海洋');
+    stop();
   } finally {
     await g.cleanup();
   }
@@ -389,9 +408,9 @@ test('work_dispatch：本轮用户发的图片随任务一起交给 work（第�
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '解完了' } }] });
     g.mock.script.push({ content: '好了' });
     const ret = String(await dispatch.handler(
-      { task: '解这道模电题，写出详细推导' },
+      { messages: ['解这道模电题，写出详细推导'] },
       {
-        ...g.tctx('10001', 'owner'),
+        ...g.tctx('10001', 'owner', { messages: ['解这道模电题，写出详细推导'] }),
         vision: true,
         attachments: [
           { kind: 'image' as const, path: pngPath, mime: 'image/png', name: 'task.png' },
@@ -399,7 +418,7 @@ test('work_dispatch：本轮用户发的图片随任务一起交给 work（第�
         ],
       } as any,
     ));
-    assert.match(ret, /已接下这件活/);
+    assert.match(ret, /已把 1 条消息的原文转给工作子代理/);
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
 
     const call = await until(
@@ -425,9 +444,9 @@ test('work_dispatch：链首模型不收图时只把图片位置写进任务，�
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '做完了' } }] });
     g.mock.script.push({ content: '好了' });
     await dispatch.handler(
-      { task: '看看这张图' },
+      { messages: ['看看这张图'] },
       {
-        ...g.tctx('10001', 'owner'),
+        ...g.tctx('10001', 'owner', { messages: ['看看这张图'] }),
         vision: false,
         attachments: [{ kind: 'image' as const, path: join(tmpdir(), 'x.png'), mime: 'image/png' }],
       } as any,
@@ -489,45 +508,10 @@ test('work_status：报出 todo 清单进度（完成数 / 正在做 / 逐条状
 });
 
 // ============================================================
-// 聊天上下文选录（2026-10-25 用户定）：chat 模型只能给原文片段，内核逐字核对——
-// 对得上的整条原文带给 work；转述/改写/编造的一律丢弃。chat 选得了、改不了。
+// 纯转发：引用命中的整条原文进任务；对不上整单拒绝
 // ============================================================
 
-test('selectChatContext：原文片段核对通过带整条、转述与编造丢弃、本轮合批不重复带', () => {
-  const T = Date.now();
-  const msgs = [
-    { role: 'user' as const, content: '张三：那个蓝色要用在海报标题上，别的不要动', ts: T - 3_600_000 },
-    { role: 'user' as const, content: '李四：logo 记得放右下角', ts: T - 1_800_000 },
-    { role: 'assistant' as const, content: '好的，颜色和位置我都记下了', ts: T - 1_700_000 },
-    { role: 'user' as const, content: '王五：就按刚才说的做吧', ts: T },   // 最后一条 user=本轮合批
-  ];
-  const r = selectChatContext(
-    ['那个蓝色要用在海报标题上', 'logo记得放左下角', '就按刚才说的做吧'],
-    msgs,
-  );
-  assert.equal(r.matched, 1, '只有一字不差的片段该命中');
-  assert.equal(r.dropped, 2, '改写的和本轮合批里的都该丢');
-  assert.match(r.section, /聊天上下文（chat 侧选录的原文/);
-  assert.match(r.section, /张三：那个蓝色要用在海报标题上，别的不要动/);
-  assert.ok(!r.section.includes('logo'), '改写过的李四那条不能进');
-  assert.ok(!r.section.includes('王五'), '本轮合批的消息不该重复带');
-});
-
-test('selectChatContext：bot 自己的话也带（标注 bot），同一条被多段引用只带一次，空白差异不影响核对', () => {
-  const T = Date.now();
-  const msgs = [
-    { role: 'user' as const, content: '张三：上次说的字体是思源黑体', ts: T - 900_000 },
-    { role: 'assistant' as const, content: '记下了，海报正文用思源黑体，标题另说', ts: T - 800_000 },
-    { role: 'user' as const, content: '王五：那开始吧', ts: T },   // 最后一条 user=本轮合批
-  ];
-  const r = selectChatContext(['字体是思源黑体', '字体 是  思源黑体', '海报正文用思源黑体'], msgs);
-  assert.equal(r.matched, 2, '两段引用命中同一条消息只算一条，另一段命中 bot 的回复');
-  assert.equal(r.dropped, 0);
-  assert.match(r.section, /bot：记下了，海报正文用思源黑体/);
-  assert.match(r.section, /张三：上次说的字体是思源黑体/);
-});
-
-test('work_dispatch：context_quotes 核对后进任务正文，改写的被丢且在回执里如实报告', async () => {
+test('work_dispatch：引用早前几条消息时按时间顺序转发整条原文（含群聊昵称前缀）', async () => {
   const g = await boot('9405');
   try {
     const dispatch = g.tools('owner').find((t) => t.name === 'work_dispatch')!;
@@ -541,25 +525,25 @@ test('work_dispatch：context_quotes 核对后进任务正文，改写的被丢�
     g.mock.script.push({ toolCalls: [{ name: 'work_finish', args: { summary: '做完了', artifacts: ['out.md'] } }] });
     g.mock.script.push({ content: '做好了。' });
     const ret = String(await dispatch.handler(
-      { task: '做张海报', context_quotes: ['标题用思源黑体', 'logo记得放右下角'] },
+      // 两段都是截取：程序转发各自整条原文，按消息时间排序
+      { messages: ['logo 放右下角', '标题用思源黑体'] },
       {
         ...g.tctx('10001', 'owner'),
         contextMessages: [
           { role: 'user' as const, content: '张三：标题用思源黑体，别用别的', ts: T - 900_000 },
-          { role: 'user' as const, content: '李四：logo 放右下角', ts: T - 600_000 },
+          { role: 'user' as const, content: '李四：logo 放右下角，谢谢', ts: T - 600_000 },
+        ],
+        speakers: [
+          { userId: '30001', nickname: '张三', role: 'admin' as const, ts: T - 900_000 },
+          { userId: '30002', nickname: '李四', role: 'member' as const, ts: T - 600_000 },
         ],
       } as any,
     ));
-    assert.match(ret, /上下文 1 条已核对原文带上/, `回执要说明核对结果：${ret}`);
-    assert.match(ret, /1 段没对上原文被丢弃/, `改写的要在回执里点名：${ret}`);
+    assert.match(ret, /已把 2 条消息的原文转给工作子代理/, `回执要说明转发条数：${ret}`);
     g.kernel.bus.emit('agent.end', { chatKey: g.chatKey, reply: '好', rounds: 2 });
     const d = await done;
-    // list() 里的 task 是短标；全文落 work_runs 表（resume 与桌面端详情都读它）
     const row = (g.kernel as any).db.get('SELECT task FROM work_runs WHERE id=?', d.id) as { task: string };
-    assert.match(row.task, /聊天上下文（chat 侧选录的原文，程序逐字核对过，一字未改）/);
-    assert.match(row.task, /张三：标题用思源黑体，别用别的/);
-    assert.ok(!row.task.includes('logo 放右下角'), '改写过的原文片段不能进任务');
-    assert.ok(!row.task.includes('李四：'), '被丢弃片段所在消息不能整条混进来');
+    assert.equal(row.task, '张三：标题用思源黑体，别用别的\n\n李四：logo 放右下角，谢谢');
   } finally {
     await g.cleanup();
   }

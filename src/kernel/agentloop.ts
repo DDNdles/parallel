@@ -394,7 +394,7 @@ export class AgentLoop {
             work: ctx.workTurn ? { depth: ctx.workDepth ?? 0, runId: ctx.workRunId, agent: ctx.workAgent?.name } : undefined,
             vision,
             attachments: ctx.attachments,
-            // 窗口消息快照（user/assistant）：work_dispatch 核对 chat 侧选录的原文片段用，
+            // 窗口消息快照（user/assistant）：work_dispatch 纯转发的引用源（只能逐字引用，程序转发整条原文）
             // 只读投影——工具拿不到也改不了这份上下文本身
             contextMessages: ctx.messages
               ? ctx.messages
