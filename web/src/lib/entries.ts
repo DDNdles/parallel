@@ -54,6 +54,16 @@ export function splitMcp(name: string): { server: string; tool: string } {
 
 /** 参数里的文件路径/目标（ZCode 那行显示的是文件不是工具名）；取不到返回 null */
 export function argPath(args: string): string | null {
+  // 先按 JSON 解析：query 里带引号时（转义成 \"），下面的兜底正则会截到反斜杠处、只剩一个「\」
+  try {
+    const o = JSON.parse(args || '') as Record<string, unknown>;
+    for (const k of ['path', 'file', 'file_path', 'filePath', 'target', 'url', 'query', 'key', 'fact']) {
+      const v = o?.[k];
+      if (typeof v === 'string' && v.trim()) return v.slice(0, 120);
+    }
+    // web_fetch 这类参数是 urls 数组：取第一条
+    if (Array.isArray(o?.urls) && typeof o.urls[0] === 'string' && o.urls[0].trim()) return o.urls[0].slice(0, 120);
+  } catch { /* 不是合法 JSON 就走正则 */ }
   const m = /"(?:path|file(?:_?path|name)?|target|url|query|key|fact)"\s*:\s*"([^"]{1,120})"/i.exec(args || '');
   return m?.[1] ?? null;
 }
