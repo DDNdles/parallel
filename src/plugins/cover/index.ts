@@ -11,11 +11,9 @@ import { clamp, newId, sleep } from '../../kernel/util/misc.ts';
 //   （UVR/MDX 分离人声与伴奏 → FeiyuVoice-RVC 换音色 → 混回伴奏）
 //   → 产物落盘 → record 段发进当前会话。
 //
-// 与 sing 的分工：
-//  - sing = text2music，给歌词/风格生成一首新歌（ACE-Step / MiniMax）
-//  - cover = 保留原曲旋律，只把原唱人声换成大肥鱼音色（RVC）
+// 2026-10-27 起 sing（生成新歌）已下线，唱歌能力只剩 cover 这一条路。
 //
-// 关键坑（与 sing 相同）：adapter 的 localizeSegment 只把 image 的本地路径转
+// 关键坑：adapter 的 localizeSegment 只把 image 的本地路径转
 // file://，record 必须自己给 pathToFileURL(abs).href；限速时 send 会正常
 // resolve 但整批丢弃，所以必须看 sendTracked 的 sent 回执。
 // ============================================================
@@ -668,11 +666,11 @@ export function setup(ctx: PluginContext): void {
   // ---------- LLM 工具 ----------
   ctx.llm.registerTool({
     name: 'cover',
-    description: '翻唱一首现成的歌：按歌名去网易云找原曲，保留原曲旋律，把原唱人声换成 bot 自己的音色，再混回伴奏发语音。用户说“翻唱XX”“用你的声音唱XX”时用；不要用于“写一首关于XX的歌”（那是 sing）。',
+    description: '翻唱一首现成的歌：按歌名去网易云找原曲，保留原曲旋律，把原唱人声换成 bot 自己的音色，再混回伴奏发语音。用户说“翻唱XX”“用你的声音唱XX”“唱一首XX”时用；写新歌（原创词曲）做不到，别硬编。',
     surface: 'chat',
     promptSnippet: '翻唱现成的歌（保留原曲旋律，换成大肥鱼音色，发语音条）',
     promptGuidelines: [
-      '对方点名要你唱某首已有的歌（“翻唱起风了”“用你的声音唱晴天”“唱一首XX”）时用 cover；对方让你“写一首关于XX的歌”时才用 sing。',
+      '对方点名要你唱某首已有的歌（“翻唱起风了”“用你的声音唱晴天”“唱一首XX”）时用 cover；对方让你“写一首关于XX的歌”（原创新歌）时说明自己只会翻唱现成的歌，不要编歌词糊弄。',
       'song 填歌名，artist 可选（同名歌很多时用它指定歌手）；withInstrumental 默认 true，对方要清唱/纯人声时传 false。',
       '一次只翻一首，别连着点；工具会直接把语音发进会话，正文只写一两句收尾，不要复述歌词。',
       '工具返回失败时如实说为什么（搜不到、VIP/版权没播放地址、服务忙、超时），不要假装唱了。',
@@ -715,7 +713,7 @@ export function setup(ctx: PluginContext): void {
     const lines = [
       '# 翻唱',
       '- 对方点名要你唱一首已有的歌（“翻唱起风了”“用你的声音唱晴天”）时，调用 cover：它保留原曲旋律，只把原唱人声换成大肥鱼音色，再混回伴奏发语音。',
-      '- 对方让你“写一首关于XX的歌”时不要用 cover，用 sing 生成新歌。',
+      '- 对方让你“写一首关于XX的歌”（原创新歌）时做不到：只会翻唱现成的歌，如实说明，别编词曲或假装唱了。',
       '- 调用之后正文只写一两句收尾（例如“翻好啦～”），不要复述歌词全文，也不要让用户再点链接或保存文件。',
       '- 一次只翻一首；刚翻完还在冷却里，别连着调用。',
     ];

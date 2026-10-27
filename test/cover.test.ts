@@ -558,7 +558,8 @@ test('没配 baseUrl：返回配置错误，不发请求；beforeLLM 追加 orde
     assert.ok(sec, 'beforeLLM 要追加翻唱说明节');
     assert.equal(sec.order, 292);
     assert.match(sec.text, /cover/);
-    assert.match(sec.text, /sing/);
+    assert.match(sec.text, /写一首关于XX的歌/);
+    assert.match(sec.text, /只会翻唱现成的歌/);
     assert.match(sec.text, /还没配置翻唱服务地址/);
   } finally {
     mock.restore();

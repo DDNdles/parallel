@@ -1591,30 +1591,30 @@ pre.persona-card { padding: 10px 12px; max-height: 300px; overflow: auto;
 .ig-prompt { font-size: 12px; line-height: 1.5; color: var(--text); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .ig-meta { margin-top: 5px; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* ---------------- 唱歌页 ---------------- */
-/* 左栏装「状态 + 试唱表单」，比标准 210 名单栏宽一档（试唱框太窄没法写歌词） */
-.mset-list.sing-list { width: 268px; }
-.sing-kv { display: flex; align-items: center; gap: 7px; padding: 5px 9px; font-size: 12px; color: var(--faint); }
-.sing-kv > b { flex: 1; min-width: 0; text-align: right; font-weight: 500; color: var(--text);
+/* ---------------- 翻唱页 ---------------- */
+/* 左栏装「状态 + 试翻表单」，比标准 210 名单栏宽一档 */
+.mset-list.cover-list { width: 268px; }
+.cover-kv { display: flex; align-items: center; gap: 7px; padding: 5px 9px; font-size: 12px; color: var(--faint); }
+.cover-kv > b { flex: 1; min-width: 0; text-align: right; font-weight: 500; color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sing-field { margin: 0 2px 10px; }
-.sing-field .mset-flabel { margin-bottom: 5px; }
-.sing-go { width: 100%; margin-top: 2px; }
+.cover-field { margin: 0 2px 10px; }
+.cover-field .mset-flabel { margin-bottom: 5px; }
+.cover-go { width: 100%; margin-top: 2px; }
 /* 一条记录 = 元信息行 + 可选展开行（试听/补发）；分隔线只留在整条的底部 */
-.sing-item { border-bottom: 1px solid var(--row-line); }
-.sing-item .mset-mrow { border-bottom: 0; }
-.sing-user { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sing-prov { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sing-fold { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 2px 11px 9px; }
-.sing-fold .mset-err { width: 100%; margin-top: 0; }
-.sing-fold .bfield { flex: 1; min-width: 120px; }
-.sing-fold .bfield-field { height: 26px; padding: 3px 10px; border-radius: 9px; font-size: 12.5px; }
-.sing-audio { margin-top: 0; }
+.cover-item { border-bottom: 1px solid var(--row-line); }
+.cover-item .mset-mrow { border-bottom: 0; }
+.cover-user { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cover-prov { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cover-fold { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 2px 11px 9px; }
+.cover-fold .mset-err { width: 100%; margin-top: 0; }
+.cover-fold .bfield { flex: 1; min-width: 120px; }
+.cover-fold .bfield-field { height: 26px; padding: 3px 10px; border-radius: 9px; font-size: 12.5px; }
+.cover-audio { margin-top: 0; }
 
 @media (max-width: 900px) {
   .mset-body { flex-direction: column; height: auto; min-height: 0; }
   .mset-list { width: auto; max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--border); }
-  .mset-list.sing-list { width: auto; }
+  .mset-list.cover-list { width: auto; }
   .mset-proto { grid-template-columns: 1fr; }
   .plg-crow { align-items: flex-start; flex-direction: column; gap: 6px; }
 }

@@ -31,7 +31,8 @@ const KERNEL = arg('kernel', 'http://127.0.0.1:3080').replace(/\/+$/, '');
 const PORTAL = 'https://107.ustc.edu.cn';
 const USER = 'pb25071412';
 const CLUSTER = 'training';
-const JOB_NAME = 'sing';
+// 唱歌下线后作业名改为 cover；过渡期同时认旧的 sing 作业
+const JOB_NAMES = new Set(['cover', 'sing']);
 const SERVICE_PORT = 8047;
 
 function log(msg) {
@@ -101,7 +102,7 @@ async function unwire(reason) {
 
 async function tick(state) {
   const list = await jobs();
-  const mine = list.find((j) => j.name === JOB_NAME && String(j.state).toUpperCase() === 'RUNNING' && j.nodes && j.nodes !== 'None');
+  const mine = list.find((j) => JOB_NAMES.has(String(j.name)) && String(j.state).toUpperCase() === 'RUNNING' && j.nodes && j.nodes !== 'None');
   if (mine) {
     const node = String(mine.nodesOrReason || '').split(',')[0].trim();
     if (!/^[A-Za-z0-9._-]+$/.test(node)) {

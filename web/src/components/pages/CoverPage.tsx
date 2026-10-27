@@ -74,7 +74,7 @@ function CoverAudio({ id, autoStart }: { id: string; autoStart?: boolean }) {
 
   if (dead) return <div className="mset-err">{dead}</div>;
   return (
-    <div className="media-audio sing-audio">
+    <div className="media-audio cover-audio">
       <audio ref={audioRef} preload="none" onLoadedMetadata={(e) => setDurSec(e.currentTarget.duration)}
         onTimeUpdate={(e) => setT(e.currentTarget.currentTime)} onEnded={() => setOn(false)} />
       <button type="button" className="media-play" onClick={toggle} aria-label={on ? '暂停' : '播放'}>
@@ -196,24 +196,24 @@ export default function CoverPage() {
   const todayCount = records.filter((r) => r.userId !== 'desktop' && new Date(r.ts).toDateString() === new Date().toDateString()).length;
   return (
     <div className="mset-body">
-      <aside className="mset-list sing-list">
+      <aside className="mset-list cover-list">
         <div className="mset-group">
           <div className="mset-group-t">服务状态</div>
-          <div className="sing-kv">
+          <div className="cover-kv">
             <span>翻唱服务</span>
             <b>{status?.baseUrlSet ? <span className="tag ok">已配</span> : <span className="tag warn">未配</span>}</b>
             <Hint text="baseUrl / apiKey / Cookie 在插件页配" />
           </div>
-          <div className="sing-kv">
+          <div className="cover-kv">
             <span>上次翻唱</span>
             <b className="mono">{status?.lastGenerationAt ? fmtDT(status.lastGenerationAt) : '—'}</b>
           </div>
-          <div className="sing-kv">
+          <div className="cover-kv">
             <span>今日（成员）</span>
             <b>{todayCount} 首</b>
           </div>
           {lastErrors.length > 0 && (
-            <div className="sing-kv" style={{ display: 'block' }}>
+            <div className="cover-kv" style={{ display: 'block' }}>
               <span>最近失败</span>
               {lastErrors.slice(0, 3).map((e, i) => (
                 <div key={i} className="mset-err" style={{ marginTop: 4, whiteSpace: 'normal' }}>
@@ -226,22 +226,22 @@ export default function CoverPage() {
 
         <div className="mset-group">
           <div className="mset-group-t">试翻</div>
-          <div className="sing-field">
+          <div className="cover-field">
             <span className="mset-flabel">歌名 <Hint text="去网易云搜原曲，VIP/版权曲可能没有播放地址" /></span>
             <BrandInput value={song} placeholder="如「起风了」" spellCheck={false}
               onChange={(e) => setSong(String(e.target.value))} />
           </div>
-          <div className="sing-field">
+          <div className="cover-field">
             <span className="mset-flabel">原唱 <Hint text="同名歌多时用歌手名消歧" /></span>
             <BrandInput value={artist} placeholder="可选" spellCheck={false}
               onChange={(e) => setArtist(String(e.target.value))} />
           </div>
-          <div className="sing-field">
+          <div className="cover-field">
             <span className="mset-flabel">伴奏 <Hint text="关掉只发换声后的人声（清唱）" /></span>
             <div className={'switch' + (withInst ? ' on' : '')} role="switch" aria-checked={withInst}
               onClick={() => setWithInst((v) => !v)} />
           </div>
-          <button className="btn primary sing-go" disabled={!song.trim() || !!job} onClick={() => void audition()}>
+          <button className="btn primary cover-go" disabled={!song.trim() || !!job} onClick={() => void audition()}>
             {job ? `翻唱中… ${dur(job.elapsed)}` : '试翻'}
           </button>
           {previewErr && <div className="mset-err">{previewErr}</div>}
@@ -260,11 +260,11 @@ export default function CoverPage() {
 
         {!records.length && <div className="mset-empty">还没有翻唱记录，左边点一首试试。整首歌可能要十几分钟。</div>}
         {records.map((r) => (
-          <div className="sing-item" key={r.id}>
-            <div className="mset-mrow sing-row" title={`${r.userId} @ ${r.chatId}`}>
+          <div className="cover-item" key={r.id}>
+            <div className="mset-mrow cover-row" title={`${r.userId} @ ${r.chatId}`}>
               <span className="mono">{fmtDT(r.ts)}</span>
-              <span className="sing-user" title={r.song}>《{r.song}》</span>
-              <span className="sing-prov">{r.artist}</span>
+              <span className="cover-user" title={r.song}>《{r.song}》</span>
+              <span className="cover-prov">{r.artist}</span>
               <span className="mset-badge">{mmss(r.seconds)}</span>
               <span className="mset-macts">
                 <button className={'mset-ibtn' + (play?.id === r.id ? ' on' : '')} title="试听"
@@ -278,12 +278,12 @@ export default function CoverPage() {
               </span>
             </div>
             {play?.id === r.id && (
-              <div className="sing-fold">
+              <div className="cover-fold">
                 <CoverAudio id={r.id} autoStart={play.auto} />
               </div>
             )}
             {send?.id === r.id && (
-              <div className="sing-fold">
+              <div className="cover-fold">
                 {send.done
                   ? <span className="tag ok">已发到 {send.type === 'group' ? '群' : '私聊'} {send.chatId.trim()}</span>
                   : (<>
