@@ -926,6 +926,24 @@ test('pickBubbleTarget 自定义权重：按权重归一化、0=禁用、缺档�
   assert.equal(pickBubbleTarget(3, 2, { weights: [-5, 999], rand: () => 0.99 }), 2);
 });
 
+test('pickBubbleTarget 自定义权重不吃避重折扣：实际频率就是设置页填的那组百分比', () => {
+  // 上一轮刚发过 1 条：自动分布会把 1 打到 0.45 折，自定义概率不折
+  const weights = [45, 30, 20, 2, 2, 1];
+  const counts = new Array(7).fill(0);
+  const N = 20000;
+  for (let i = 0; i < N; i++) counts[pickBubbleTarget(3, 6, { weights, recentShapes: [1, 1, 1] })]++;
+  // 1 条应稳定在 45% 附近（若被避重打 0.45 折会掉到 ~26%）
+  const one = (counts[1] / N) * 100;
+  assert.ok(Math.abs(one - 45) < 3, `1 条占比应贴近 45%，实际 ${one.toFixed(1)}%`);
+  const two = (counts[2] / N) * 100;
+  assert.ok(Math.abs(two - 30) < 3, `2 条占比应贴近 30%，实际 ${two.toFixed(1)}%`);
+  // 避重在自动分布上仍然生效（回归保护）
+  const autoRepeat = [];
+  for (let i = 0; i < 4000; i++) autoRepeat.push(pickBubbleTarget(3, 6, { recentShapes: [3, 3, 3] }) === 3);
+  const rate = (autoRepeat.filter(Boolean).length / 4000) * 100;
+  assert.ok(rate < 22, `自动分布仍应避重（3 条占比低于无避重时的 ~32%），实际 ${rate.toFixed(1)}%`);
+});
+
 test('气泡条数软约束：440 节跨轮稳定不写每轮目标数，当轮条数与列举/多问突破规则写在 chatTurnBubbleNote', () => {
   const s1 = chatOutputStyleText({ maxChars: 100, targetBubbles: 1, maxBubbles: 6 });
   const s4 = chatOutputStyleText({ maxChars: 100, targetBubbles: 4, maxBubbles: 6 });

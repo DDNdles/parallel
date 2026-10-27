@@ -91,11 +91,13 @@ export function autoBubbleWeights(expected: number, maxBubbles: number): number[
 /**
  * 每轮随机抽一个「目标气泡数」（2026-10-25）：写进当轮提示规定模型说几条，
  * 必要情况允许它突破（程序只兜 maxBubbles 的合并）。固定推荐值会让输出形状定型，
- * 每轮抽签 + 最近形状降权（与 rhythm 反定型同路数）才是活的节奏。
+ * 每轮抽签才是活的节奏。
  *
  * 分布权重：opts.weights（设置页「气泡数概率」，按索引对 1..N 条）非空时优先——
- * 缺档/非法回落地板 0.15，全 0 视为没配走自动分布；否则用 autoBubbleWeights。
- * 最近几轮出现过的粗结构再打折（连着两轮都用同一个数就太刻意）。
+ * 填 0 = 该条数禁用，数组比上限短 = 缺档不抽，全 0 视为没配走自动分布。
+ *
+ * 避重（最近形状打折）只作用在**自动分布**上：设置页填的那组百分比是用户要的实际频率，
+ * 再拿最近几轮去折扣会把 45% 拽成 39%，口径就对不上了（2026-10-27 定）。
  */
 export function pickBubbleTarget(
   expected: number,
@@ -115,11 +117,14 @@ export function pickBubbleTarget(
   const weights: number[] = [];
   for (let i = 1; i <= max; i++) {
     let w = base[i - 1];
-    // 与最近一轮相同的形状降权；最近两轮连续同构的再砍一刀（1 条连发 / 3+ 连发都太刻意）
-    for (let k = 0; k < recent.length; k++) {
-      const shape = recent[recent.length - 1 - k];
-      const same = k === 0 ? shape === i : recent[recent.length - 1 - k] === i && recent[recent.length - k] === i;
-      if (same) w *= k === 0 ? 0.45 : 0.3;
+    // 自定义概率不走避重：用户填的百分比就是实际频率
+    if (!customOk) {
+      // 与最近一轮相同的形状降权；最近两轮连续同构的再砍一刀（1 条连发 / 3+ 连发都太刻意）
+      for (let k = 0; k < recent.length; k++) {
+        const shape = recent[recent.length - 1 - k];
+        const same = k === 0 ? shape === i : recent[recent.length - 1 - k] === i && recent[recent.length - k] === i;
+        if (same) w *= k === 0 ? 0.45 : 0.3;
+      }
     }
     weights.push(w);
   }
