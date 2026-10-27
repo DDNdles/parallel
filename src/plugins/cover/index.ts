@@ -75,6 +75,8 @@ export interface CoverRecord {
   seconds: number;
   file: string;
   mime: string;
+  /** 服务端 job id：插件重载后续跟时用来去重（旧实例可能已经把结果写完） */
+  srcJobId?: string;
 }
 
 interface CoverError {
@@ -562,6 +564,7 @@ async function submitCoverJob(
   songQuery: string,
   artistQuery: string,
   withInstrumental: boolean,
+  onSubmitted?: (info: { jobId: string; song: SongInfo }) => void,
 ): Promise<
   | { ok: true; song: SongInfo; jobId: string; seconds?: number }
   | { ok: true; song: SongInfo; direct: { data: Buffer; seconds?: number; contentType?: string } }
@@ -640,6 +643,7 @@ async function submitCoverJob(
   if (!submitted?.ok || !jobId) {
     return { ok: false, code: 'api', error: `${label} 没有返回任务 id。` };
   }
+  onSubmitted?.({ jobId, song });
   const hint = Number(submitted?.seconds ?? 0);
   return { ok: true, song, jobId, seconds: Number.isFinite(hint) && hint > 0 ? Math.round(hint) : undefined };
 }
@@ -862,7 +866,7 @@ export function setup(ctx: PluginContext): void {
     /** 失败/取消：退回额度与冷却、释放本会话在途锁 */
     rollback: () => void;
     /** 成功：写盘（deliver 时再发语音）、定冷却、进 records */
-    commit: (out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean) => Promise<CoverResult>;
+    commit: (out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean, srcJobId?: string) => Promise<CoverResult>;
   };
   type PrepareFail = { ok: false; code: FailCode; error: string };
 
@@ -913,8 +917,22 @@ export function setup(ctx: PluginContext): void {
     };
 
     const commit = async (
-      out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean,
+      out: { data: Buffer; seconds?: number }, song: SongInfo, deliver: boolean, srcJobId?: string,
     ): Promise<CoverResult> => {
+      // 插件重载时旧实例的后台 promise 可能仍在跑：它已把同一个服务端 job 写成记录，
+      // 续跟的新实例就不要再写一份（按 srcJobId 去重，重复交付也一并跳过）
+      if (srcJobId) {
+        const done = records().find((r) => r.srcJobId === srcJobId);
+        if (done) {
+          reserved = false;
+          undoCooldown = undefined;
+          releaseSlot();
+          return {
+            ok: true, id: done.id, song: done.song, artist: done.artist,
+            seconds: done.seconds, exact: true, path: join(coverDir, done.file),
+          };
+        }
+      }
       const mime = sniffAudioMime(out.data) ?? 'audio/mpeg';
       const id = newId('cover_');
       const file = `${id}.${mime === 'audio/wav' ? 'wav' : 'mp3'}`;
@@ -949,7 +967,7 @@ export function setup(ctx: PluginContext): void {
       const exact = out.seconds !== undefined;
       addRecord({
         id, ts: Date.now(), userId: opts.recordUserId ?? opts.userId, chatId: opts.chat.chatId,
-        song: song.name, artist: song.artists, seconds, file, mime,
+        song: song.name, artist: song.artists, seconds, file, mime, ...(srcJobId ? { srcJobId } : {}),
       });
       cleanupOld();
       return { ok: true, id, song: song.name, artist: song.artists, seconds, exact, path: abs };
@@ -958,27 +976,28 @@ export function setup(ctx: PluginContext): void {
     return { ok: true, c, withInstrumental, songQuery, artistQuery, p: { day, userId: opts.userId, rollback, commit } };
   }
 
-  async function coverCore(opts: CoverOpts): Promise<CoverResult> {
+  async function coverCore(opts: CoverOpts, onSubmitted?: (info: { jobId: string; song: SongInfo }) => void): Promise<CoverResult> {
     const prepped = await prepare(opts);
     if (!prepped.ok) return prepped;
     const { c, p } = prepped;
     try {
-      const submitted = await submitCoverJob(c, prepped.songQuery, prepped.artistQuery, prepped.withInstrumental);
+      const submitted = await submitCoverJob(c, prepped.songQuery, prepped.artistQuery, prepped.withInstrumental, onSubmitted);
       if (!submitted.ok) { p.rollback(); return submitted; }
+      const srcJobId = 'jobId' in submitted ? submitted.jobId : undefined;
       const out = 'direct' in submitted
         ? { ok: true as const, ...submitted.direct }
         : await awaitCoverResult(c, submitted.jobId, submitted.seconds);
       if (!out.ok) { p.rollback(); return out; }
-      return await p.commit({ data: out.data, seconds: out.seconds }, submitted.song, opts.deliver !== false);
+      return await p.commit({ data: out.data, seconds: out.seconds }, submitted.song, opts.deliver !== false, srcJobId);
     } catch (e) {
       p.rollback();
       return { ok: false, code: 'api', error: `翻唱失败：工具内部出了意外（${(e as Error).message}），稍后再试。` };
     }
   }
 
-  async function cover(opts: CoverOpts): Promise<CoverResult> {
+  async function cover(opts: CoverOpts, onSubmitted?: (info: { jobId: string; song: SongInfo }) => void): Promise<CoverResult> {
     try {
-      const r = await coverCore(opts);
+      const r = await coverCore(opts, onSubmitted);
       if (!r.ok) addError(opts.chat.chatId, r.error);
       return r;
     } catch (e) {
@@ -1141,13 +1160,102 @@ export function setup(ctx: PluginContext): void {
 
   // 桌面端「试翻」是异步任务：HTTP 请求不能挂着等几十分钟（内核 server 5 分钟会掐断），
   // 提交立刻回 202 + jobId，插件后台跑 coverCore（deliver:false），页面轮询 /job。
-  // 热重载会丢掉在途任务的句柄，但额度/冷却/记录本身都落 plugin_kv，不脏。
+  // 任务表落 plugin_kv：插件配置写入（107 登录回写、守护进程接线）都会 reload 插件，
+  // 内存句柄会丢，但服务端 job 还在跑——重载后按 serviceJobId 续跟，完成照样落记录。
   type DeskJob = {
     id: string; status: 'running' | 'done' | 'failed';
     song?: string; artist?: string; seconds?: number; resultId?: string;
     error?: string; startedAt: number; finishedAt?: number;
+    /** 服务端 job id（拿到 202 时写入）；重载后续跟靠它 */
+    serviceJobId?: string;
+    /** 提交时填的歌名/歌手，续跟时兜底展示用 */
+    songQuery?: string; artistQuery?: string;
   };
+  const DESK_JOBS_KEY = 'deskJobs';
   const deskJobs = new Map<string, DeskJob>();
+  const persistJobs = (): void => {
+    const list = [...deskJobs.values()]
+      .filter((j) => j.status === 'running' || Date.now() - (j.finishedAt ?? j.startedAt) < 3600_000)
+      .slice(0, 20);
+    ctx.state.set(DESK_JOBS_KEY, list);
+  };
+
+  /** 插件重载后接着盯服务端 job：done 就取音频落记录（额度提交时已扣，失败不退） */
+  async function resumeDeskJob(job: DeskJob): Promise<void> {
+    const c = cfg();
+    if (!job.serviceJobId) {
+      job.status = 'failed';
+      job.error = '试翻在提交阶段被插件重载打断，服务端可能没收到；重新点一次。';
+      job.finishedAt = Date.now();
+      persistJobs();
+      return;
+    }
+    const deadline = Date.now() + c.timeoutMs;
+    let seconds = job.seconds;
+    for (;;) {
+      if (Date.now() >= deadline) {
+        job.status = 'failed';
+        job.error = '续跟超时：服务端任务还没完成，完成与否去记录页看，或重新点一次。';
+        break;
+      }
+      await sleep(5000);
+      const st = await fetchCoverStatus(c, job.serviceJobId);
+      if (st.kind === 'failed') {
+        job.status = 'failed';
+        job.error = `续跟失败：${st.error}`;
+        break;
+      }
+      if (st.kind === 'done') {
+        seconds = st.seconds ?? seconds;
+        // 重载前那个实例的后台 promise 可能已经把结果写完：按 srcJobId 去重
+        const dup = records().find((r) => r.srcJobId === job.serviceJobId);
+        if (dup) {
+          job.status = 'done';
+          job.resultId = dup.id; job.song = dup.song; job.artist = dup.artist; job.seconds = dup.seconds;
+          break;
+        }
+        const out = await fetchCoverAudio(c, job.serviceJobId, seconds);
+        if (!out.ok) { job.status = 'failed'; job.error = out.error; break; }
+        try {
+          const mime = sniffAudioMime(out.data) ?? 'audio/mpeg';
+          const id = newId('cover_');
+          const file = `${id}.${mime === 'audio/wav' ? 'wav' : 'mp3'}`;
+          writeFileSync(join(coverDir, file), out.data);
+          const realSeconds = out.seconds ?? Math.max(1, Math.round((out.data.length * 8) / 320_000));
+          addRecord({
+            id, ts: Date.now(), userId: 'desktop', chatId: 'desktop',
+            song: job.song ?? job.songQuery ?? '', artist: job.artist ?? job.artistQuery ?? '',
+            seconds: realSeconds, file, mime, srcJobId: job.serviceJobId,
+          });
+          ctx.state.set(LAST_AT_KEY, Date.now());
+          if (c.cooldownSeconds > 0) setCooldown('ui:private:desktop', Date.now());
+          cleanupOld();
+          job.status = 'done';
+          job.resultId = id; job.seconds = realSeconds;
+          job.song = job.song ?? job.songQuery; job.artist = job.artist ?? job.artistQuery;
+        } catch (e) {
+          job.status = 'failed';
+          job.error = `续跟结果写盘失败：${(e as Error).message}`;
+        }
+        break;
+      }
+    }
+    job.finishedAt = Date.now();
+    persistJobs();
+  }
+
+  {
+    // 载入上次落盘的任务（插件重载/内核重启前提交的）；在途的接着盯
+    const saved = ctx.state.get<DeskJob[]>(DESK_JOBS_KEY, []);
+    if (Array.isArray(saved)) {
+      for (const j of saved) {
+        if (j && typeof j.id === 'string' && j.status) {
+          deskJobs.set(j.id, j);
+          if (j.status === 'running') void resumeDeskJob(j);
+        }
+      }
+    }
+  }
 
   ctx.http.on('POST', '/preview', async (req) => {
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
@@ -1160,8 +1268,12 @@ export function setup(ctx: PluginContext): void {
       if (j.status !== 'running' && Date.now() - (j.finishedAt ?? j.startedAt) > 3600_000) deskJobs.delete(k);
     }
     const jobId = newId('dj_');
-    const job: DeskJob = { id: jobId, status: 'running', startedAt: Date.now() };
+    const job: DeskJob = {
+      id: jobId, status: 'running', startedAt: Date.now(),
+      songQuery: String(body.song ?? '').trim(), artistQuery: String(body.artist ?? '').trim(),
+    };
     deskJobs.set(jobId, job);
+    persistJobs();
     void cover({
       chat: desktopChat(),
       userId: ownerId(),
@@ -1171,6 +1283,12 @@ export function setup(ctx: PluginContext): void {
       song: body.song,
       artist: body.artist,
       withInstrumental: body.withInstrumental,
+    }, (info) => {
+      // 202 拿到服务端 id：即使紧接着插件被重载，也能续跟
+      job.serviceJobId = info.jobId;
+      job.song = info.song.name;
+      job.artist = info.song.artists;
+      persistJobs();
     }).then((r) => {
       job.finishedAt = Date.now();
       if (r.ok) {
@@ -1180,6 +1298,7 @@ export function setup(ctx: PluginContext): void {
         job.status = 'failed';
         job.error = r.error;
       }
+      persistJobs();
     });
     return { status: 202, body: { ok: true, id: jobId, status: 'running' } };
   });
@@ -1187,7 +1306,7 @@ export function setup(ctx: PluginContext): void {
   ctx.http.on('GET', '/job', (req) => {
     const id = String(req.query.id ?? '').trim();
     const job = id ? deskJobs.get(id) : undefined;
-    if (!job) return { status: 404, body: { ok: false, error: '没有这个试翻任务（内核可能重启或重载过）' } };
+    if (!job) return { status: 404, body: { ok: false, error: '没有这个试翻任务（记录可能已被清理）' } };
     return {
       body: {
         ok: true,
