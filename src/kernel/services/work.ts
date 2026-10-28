@@ -116,6 +116,9 @@ interface RunRecord extends WorkRunResult {
 /** 「停下来提问」等回答的有效期：超过这么久，旧问题不再自动接续 */
 const PENDING_WORK_TTL_MS = 30 * 60_000;
 
+/** 内存里最多保留多少条**已结束**的任务记录（全量 events 很占内存）；更老的从 work_runs 表回放 */
+const MAX_FINISHED_RUNS_IN_MEMORY = 20;
+
 /**
  * work 会话的作用域键：同一个群里每位发起人各有一套 work 现场。
  *
@@ -233,6 +236,14 @@ export class WorkRunner {
     const n = (this.slotBusy.get(slot) ?? 0) - 1;
     if (n > 0) this.slotBusy.set(slot, n);
     else this.slotBusy.delete(slot);
+  }
+
+  /** 已结束的任务只留最近 N 条在内存：events 全量常驻，长期跑会一直涨；表里仍有完整快照 */
+  private pruneFinishedRuns(): void {
+    const finished = [...this.runs.entries()]
+      .filter(([, r]) => r.phase !== 'running')
+      .sort((a, b) => (b[1].finishedAt ?? b[1].startedAt) - (a[1].finishedAt ?? a[1].startedAt));
+    for (const [id] of finished.slice(MAX_FINISHED_RUNS_IN_MEMORY)) this.runs.delete(id);
   }
 
   // 2026-10-25 任务隔离改版：任务空间跟人走（无群聊层），提问现场也只按人记——
@@ -460,6 +471,7 @@ export class WorkRunner {
           userId: input.userId, nickname: input.nickname, role: input.role, task: taskLabel, result,
         });
         this.persist('error', rec, input, result);
+        this.pruneFinishedRuns();
         return result;
       }
       const result: WorkRunResult = {
@@ -487,6 +499,7 @@ export class WorkRunner {
         role: input.role, task: taskLabel, result,
       });
       this.persist(ask ? 'await' : 'done', rec, input, result);
+      this.pruneFinishedRuns();
       return result;
     } catch (e) {
       const err = (e as Error).message;
@@ -507,6 +520,7 @@ export class WorkRunner {
         userId: input.userId, nickname: input.nickname, role: input.role, task: taskLabel, result,
       });
       this.persist('error', rec, input, result);
+      this.pruneFinishedRuns();
       return result;
     }
     } finally {

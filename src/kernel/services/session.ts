@@ -1,4 +1,4 @@
-import { spawn, spawnSync as nodeSpawnSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { existsSync } from 'node:fs';
 import type { ErrorCenter } from '../errors.ts';
@@ -53,44 +53,55 @@ export class SessionContainers {
     return { ...process.env, PATH: `${extra};${process.env.PATH ?? ''}` };
   }
 
-  /** docker 可用性（带缓存；失败后下次调用会重新探测） */
-  private ensureDocker(): string | null {
-    if (this.dockerReady === false) this.dockerReady = null; // 允许重试
-    if (this.dockerReady === null) {
+  /** docker 可用性（异步探测 + 并发去重 + 30s 负缓存）。
+   *  以前是 spawnSync：Docker Desktop 没起来时 `docker info` 会挂满 10s×2，
+   *  每分钟的 sweep 直接把整个内核冻结二十秒。 */
+  private dockerProbe: Promise<string | null> | null = null;
+  private dockerFailAt = 0;
+  private async ensureDocker(): Promise<string | null> {
+    if (this.dockerReady === true) return this.dockerBin;
+    if (this.dockerReady === false) {
+      if (nowMs() - this.dockerFailAt < 30_000) return null; // 刚失败过：别每个 sweep 都重打十分钟
+      this.dockerReady = null;
+    }
+    if (this.dockerProbe) return this.dockerProbe;
+    this.dockerProbe = (async () => {
       const candidates = process.platform === 'win32'
         ? ['docker', join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin', 'docker.exe')]
         : ['docker'];
       this.dockerReady = false;
       for (const bin of candidates) {
         try {
-          const r = spawnSync(bin, ['info', '--format', 'ok'], 10_000, this.dockerEnv());
-          if (r.ok) { this.dockerBin = bin; this.dockerReady = true; break; }
+          const r = await dockerExec(bin, ['info', '--format', 'ok'], 10_000, this.dockerEnv());
+          if (r.ok) { this.dockerBin = bin; this.dockerReady = true; return bin; }
         } catch { /* 下一个候选 */ }
       }
-    }
-    return this.dockerReady ? this.dockerBin : null;
+      this.dockerFailAt = nowMs();
+      return null;
+    })().finally(() => { this.dockerProbe = null; });
+    return this.dockerProbe;
   }
 
-  available(): boolean {
-    return this.ensureDocker() !== null;
+  async available(): Promise<boolean> {
+    return (await this.ensureDocker()) !== null;
   }
 
   /** 镜像是否已在本地（docker image inspect 现场探测；60s 缓存，桌面端 8s 轮询别每次都打 docker） */
   private imageCache = new Map<string, { ok: boolean; at: number }>();
 
-  imagesAvailable(): {
+  async imagesAvailable(): Promise<{
     python: boolean; browser: boolean;
     build?: { python?: 'building' | 'failed'; browser?: 'building' | 'failed' };
-  } {
-    const bin = this.ensureDocker();
+  }> {
+    const bin = await this.ensureDocker();
     if (!bin) return { python: false, browser: false };
-    const probe = (kind: 'compute' | 'browser'): boolean => {
+    const probe = async (kind: 'compute' | 'browser'): Promise<boolean> => {
       const image = this.imageOf(kind);
       const hit = this.imageCache.get(image);
       if (hit && nowMs() - hit.at < 60_000) return hit.ok;
-      const ok = spawnSync(bin, ['image', 'inspect', image], 15_000, this.dockerEnv()).ok;
+      const ok = (await dockerExec(bin, ['image', 'inspect', image], 15_000, this.dockerEnv())).ok;
       this.imageCache.set(image, { ok, at: nowMs() });
-      if (!ok) this.maybeAutoBuild(kind, bin);
+      if (!ok) void this.maybeAutoBuild(kind, bin);
       return ok;
     };
     const build: { python?: 'building' | 'failed'; browser?: 'building' | 'failed' } = {};
@@ -98,7 +109,7 @@ export class SessionContainers {
     if (pc) build.python = pc.status;
     const pb = this.builds.get('browser');
     if (pb) build.browser = pb.status;
-    return { python: probe('compute'), browser: probe('browser'), build: Object.keys(build).length ? build : undefined };
+    return { python: await probe('compute'), browser: await probe('browser'), build: Object.keys(build).length ? build : undefined };
   }
 
   /**
@@ -106,11 +117,11 @@ export class SessionContainers {
    * 新用户不用手工 build——首次探测不到就后台构建，工作页显示「构建中」，
    * 完成后镜像可用；失败进报错中心并冷却 10 分钟（轮询不会反复重试）。
    */
-  maybeAutoBuild(kind: 'compute' | 'browser', bin?: string): void {
+  async maybeAutoBuild(kind: 'compute' | 'browser', bin?: string): Promise<void> {
     const prev = this.builds.get(kind);
     if (prev?.status === 'building') return;
     if (prev?.status === 'failed' && nowMs() - prev.startedAt < SessionContainers.BUILD_RETRY_MS) return;
-    const docker = bin ?? this.ensureDocker();
+    const docker = bin ?? (await this.ensureDocker());
     if (!docker) return;
     const dir = join(process.cwd(), 'docker', kind === 'compute' ? 'sandbox-python' : 'sandbox-browser');
     if (!existsSync(join(dir, 'Dockerfile'))) return;   // 发布环境没有 docker/ 目录：静默跳过
@@ -141,7 +152,7 @@ export class SessionContainers {
   /** 按镜像名请求构建（SandboxService 执行前发现镜像缺失时回调进来） */
   requestBuildForImage(image: string): void {
     const kind: 'compute' | 'browser' = image.includes('browser') ? 'browser' : 'compute';
-    this.maybeAutoBuild(kind);
+    void this.maybeAutoBuild(kind);
   }
 
   /** 容器/挂载的唯一键：work 轮按发起人再分一层（与 SandboxService.chatKey 同口径） */
@@ -157,12 +168,12 @@ export class SessionContainers {
   // ---------------- 容器生命周期 ----------------
 
   private async startContainer(kind: 'compute' | 'browser', chat: ChatRef): Promise<string> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用（会话容器需要 Docker Desktop 运行中）');
     const image = this.imageOf(kind);
     const name = this.containerName(kind, chat);
     // 先清理同名残留（可能是异常退出留下的）
-    spawnSync(bin, ['rm', '-f', name], 20_000, this.dockerEnv());
+    await dockerExec(bin, ['rm', '-f', name], 20_000, this.dockerEnv());
     const args = [
       'run', '-d', '--name', name,
       // 与一次性容器同一套硬化：丢 capability、禁提权、限进程数。
@@ -178,13 +189,13 @@ export class SessionContainers {
     // compute 容器也共享 pip 下载缓存（容器被 LRU 回收重建后 install 不用重新下载）
     if (kind === 'compute') args.push('-v', 'parallel-pip-cache:/root/.cache/pip');
     args.push(image);
-    const r = spawnSync(bin, args, 60_000, this.dockerEnv());
+    const r = await dockerExec(bin, args, 60_000, this.dockerEnv());
     if (!r.ok) throw new Error(`启动 ${kind} 容器失败：${r.stderr || r.stdout}`.slice(0, 400));
     const id = r.stdout.trim();
     // 等桥就绪（compute 需要起 kernel，给足时间）
     const ready = await this.waitBridge(bin, name, kind, kind === 'compute' ? 60_000 : 30_000);
     if (!ready) {
-      spawnSync(bin, ['rm', '-f', name], 20_000, this.dockerEnv());
+      await dockerExec(bin, ['rm', '-f', name], 20_000, this.dockerEnv());
       throw new Error(`${kind} 容器桥未就绪（超时）`);
     }
     return id;
@@ -198,7 +209,7 @@ export class SessionContainers {
       : ['exec', name, 'node', '-e', `fetch("http://127.0.0.1:${port}/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))`];
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const r = spawnSync(bin, probe, 15_000, this.dockerEnv());
+      const r = await dockerExec(bin, probe, 15_000, this.dockerEnv());
       if (r.ok) return true;
       await new Promise((res) => setTimeout(res, 1200));
     }
@@ -213,13 +224,13 @@ export class SessionContainers {
 
   /** 确保容器在跑（惰性拉起 + LRU 回收） */
   private async ensure(kind: 'compute' | 'browser', chat: ChatRef): Promise<string> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用（会话容器需要 Docker Desktop 运行中）');
     const reg = kind === 'compute' ? this.compute : this.browse;
     const key = this.keyOf(chat);
     const entry = reg.get(key);
     if (entry) {
-      const st = spawnSync(bin, ['inspect', '-f', '{{.State.Running}}', entry.id], 15_000, this.dockerEnv());
+      const st = await dockerExec(bin, ['inspect', '-f', '{{.State.Running}}', entry.id], 15_000, this.dockerEnv());
       if (st.ok && st.stdout.trim() === 'true') {
         entry.lastUse = nowMs();
         return entry.id;
@@ -246,15 +257,15 @@ export class SessionContainers {
   }
 
   private async kill(kind: 'compute' | 'browser', idOrName: string): Promise<void> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) return;
-    spawnSync(bin, ['rm', '-f', idOrName], 30_000, this.dockerEnv());
+    await dockerExec(bin, ['rm', '-f', idOrName], 30_000, this.dockerEnv());
     void kind;
   }
 
   /** 空闲回收（容器内 bridge 也有自杀死守；这里是宿主侧兜底） */
   async sweep(): Promise<void> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) return;
     const now = nowMs();
     for (const [kind, reg] of [['compute', this.compute], ['browser', this.browse]] as const) {
@@ -299,7 +310,7 @@ export class SessionContainers {
 
   /** 在常驻 Python 会话容器里执行代码（变量跨调用保留） */
   async runPython(chat: ChatRef, code: string, timeoutMs: number, restart = false): Promise<{ status: string; outputs: any[]; executionCount?: number }> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用');
     const id = await this.ensure('compute', chat);
     // 超时必须是个正数：调用方漏传时 Math.ceil(undefined/1000) 会变成 NaN，
@@ -321,7 +332,7 @@ export class SessionContainers {
 
   /** 浏览器动作（页面/登录态跨调用保留） */
   async browserAction(chat: ChatRef, action: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<{ ok: boolean; text?: string; image?: string; error?: string }> {
-    const bin = this.ensureDocker();
+    const bin = await this.ensureDocker();
     if (!bin) throw new Error('Docker 不可用');
     const id = await this.ensure('browser', chat);
     // 工具面叫 browser_open，桥（/opt/bridge/client.mjs）的动作名是 goto：
@@ -375,25 +386,36 @@ export class SessionContainers {
   }
 }
 
-// ---------------- 低层进程工具（同步短命令 / 异步带 stdin） ----------------
+// ---------------- 低层进程工具（异步短命令 / 异步带 stdin） ----------------
 
 interface SyncResult { ok: boolean; stdout: string; stderr: string }
 
-function spawnSync(bin: string, args: string[], timeoutMs: number, env: NodeJS.ProcessEnv): SyncResult {
-  // 用 spawnSync 的同步语义做短命令（inspect/rm/probe），避免异步竞态
-  const r = nodeSpawnSync(bin, args, { timeout: timeoutMs, windowsHide: true, env, encoding: 'utf-8' });
-  return { ok: r.status === 0, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? r.error?.message ?? '') };
+/** 短 docker 命令一律异步：同步版会在 Docker 卡顿时冻结整个事件循环 */
+function dockerExec(bin: string, args: string[], timeoutMs: number, env: NodeJS.ProcessEnv): Promise<SyncResult> {
+  return new Promise((resolveP) => {
+    execFile(bin, args, { timeout: timeoutMs, windowsHide: true, env, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolveP({
+        ok: !err,
+        stdout: String(stdout ?? ''),
+        stderr: String(stderr ?? (err as Error | null)?.message ?? ''),
+      });
+    });
+  });
 }
 
 function spawnWithStdin(bin: string, args: string[], stdin: string, timeoutMs: number, env: NodeJS.ProcessEnv): Promise<SyncResult> {
   return new Promise((resolveP) => {
     const child = spawn(bin, args, { windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
+    const CAP = 8 * 1024 * 1024; // 输出上限：别让一个失控的桥把内核内存吃满
     const timer = setTimeout(() => {
-      try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }); } catch { /* ignore */ }
+      try {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+        else child.kill('SIGKILL');
+      } catch { /* ignore */ }
     }, timeoutMs);
-    child.stdout!.on('data', (c: Buffer) => { stdout += c.toString('utf-8'); });
-    child.stderr!.on('data', (c: Buffer) => { stderr += c.toString('utf-8'); });
+    child.stdout!.on('data', (c: Buffer) => { if (stdout.length < CAP) stdout += c.toString('utf-8'); });
+    child.stderr!.on('data', (c: Buffer) => { if (stderr.length < CAP) stderr += c.toString('utf-8'); });
     child.on('error', (e) => {
       clearTimeout(timer);
       resolveP({ ok: false, stdout, stderr: `${stderr}\n${e.message}` });

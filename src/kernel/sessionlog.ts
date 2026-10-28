@@ -76,6 +76,26 @@ const DAY_COUNTED = new Set(['message_in', 'message_out']);
  *  会把主线程卡住几百毫秒；检索语义是「最近的 N 条命中」，从尾部限窗倒着找，收满就停。 */
 const SEARCH_SCAN_MAX_BYTES = 5 * 1024 * 1024;
 
+/** 会话列表只要最后一行的 ts：从文件尾读一小段，别为一行把整份日志读进内存 */
+const LAST_LINE_MAX_BYTES = 1024 * 1024;
+
+/** 读取文件末尾并返回最后一条完整行（跨窗口截断时丢弃半行） */
+function readLastLine(file: string, size: number): string {
+  const len = Math.min(size, LAST_LINE_MAX_BYTES);
+  if (len <= 0) return '';
+  const buf = Buffer.alloc(len);
+  const fd = openSync(file, 'r');
+  try { readSync(fd, buf, 0, len, size - len); } finally { closeSync(fd); }
+  let text = buf.toString('utf-8');
+  if (size > len) {
+    // 窗口起点可能截在半行：丢掉第一段残行（\n 在 utf-8 里是单字节，不会劈开中文）
+    const nl = text.indexOf('\n');
+    text = nl >= 0 ? text.slice(nl + 1) : '';
+  }
+  const lines = text.split('\n').filter((l) => l.trim());
+  return lines.length ? lines[lines.length - 1] : '';
+}
+
 /** 按扩展名猜媒体类型；猜不出来返回 undefined，由线格式按 kind 兜底。
  *  与 `pipeline.ts` 顶部是同一张表——这里**复制**一份而不是 import pipeline：
  *  pipeline 反过来 import 本模块，引过去就是环依赖。改表时两边一起改。 */
@@ -418,11 +438,12 @@ export class SessionLog {
         const chatKey = f.replace(/\.jsonl$/, '');
         const m = chatKey.match(/^(group|private)_(.+)$/);
         if (!m) continue;
-        const st = statSync(join(this.dir, f));
+        const file = join(this.dir, f);
+        const st = statSync(file);
         let lastTs = Math.floor(st.mtimeMs);
         let lines = 0;
         try {
-          const tail = readFileSync(join(this.dir, f), 'utf-8').trim().split('\n').slice(-1)[0];
+          const tail = readLastLine(file, st.size).trim();
           if (tail) { lastTs = JSON.parse(tail).ts ?? lastTs; lines = 1; }
         } catch { /* ignore */ }
         out.push({ chatKey, chatId: m[2], chatType: m[1], lastTs, size: st.size, lines });

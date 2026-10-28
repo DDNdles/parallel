@@ -690,8 +690,8 @@ export interface GatedSandbox {
 }
 
 export interface GatedSession {
-  /** 常驻 Python 会话是否可用（Docker 就绪） */
-  available(): boolean;
+  /** 常驻 Python 会话是否可用（Docker 就绪）；探测已异步化，不要用它做同步判断 */
+  available(): Promise<boolean>;
   /** 在常驻会话容器里执行 Python（变量跨调用保留；restart 重置内核） */
   runPython(chat: ChatRef, code: string, timeoutMs?: number, restart?: boolean): Promise<{ status: string; outputs: SandboxOutput[]; executionCount?: number }>;
   /** 浏览器动作（有网、页面/登录态跨调用保留） */

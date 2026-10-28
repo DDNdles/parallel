@@ -1,20 +1,18 @@
 'use client';
 import { FadeName } from '@/components/FadeName';
 /** 插件管理：左列表（按归属分组，行内只放图标 + 名字 + 状态点）+ 右详情页
- *  （简介 / 归属与权限 / 能力 / 分群开关 / 可配置项）。外壳与「模型」页共用 mset-* 一套类。 */
+ *  （归属与权限 / 能力 / 分群开关）。可配置项已整体挪到「设置」页各分节（2026-10-28 用户定），
+ *  简介也不再展示。外壳与「模型」页共用 mset-* 一套类。 */
 import { useCallback, useEffect, useState } from 'react';
 import { get, post, del } from '@/lib/api';
 import { Icon } from '@/components/Icon';
-import { BrandInput } from '@/components/BrandInput';
-import { Modal, Field, Switch } from '@/components/Modal';
+import { Modal, Switch } from '@/components/Modal';
 import { usePageCmd, type PageCmd } from '@/lib/pageCmd';
 
-interface CfgField { type: string; description: string; secret?: boolean; default?: unknown }
 interface PluginInfo {
   id: string; name: string; version: string; description: string; category: string; trust: string;
   permissions: string[]; core: boolean; locked: boolean; state: string; source: string;
   tools: string[]; groupStates: { chatId: string; enabled: boolean }[];
-  userConfigSchema: Record<string, CfgField>;
   defaultGroupState: string; globalDefault: boolean; globalDefaultOverridden: boolean; hasMcp: boolean;
 }
 interface ChatInfo { chatKey: string; chatId: string; chatType: string; lastTs: number }
@@ -89,26 +87,13 @@ export default function PluginsPage({ cmd }: { cmd?: PageCmd }) {
 
 function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[]; onChanged: () => void }) {
   const [menu, setMenu] = useState(false);
-  const [cfg, setCfg] = useState<Record<string, unknown> | null>(null);
   /** 本页写入失败就地报红（全站不用 toast） */
   const [saveErr, setSaveErr] = useState('');
-  const keys = Object.keys(p.userConfigSchema ?? {});
-
-  useEffect(() => {
-    if (!keys.length) { setCfg({}); return; }
-    let alive = true;
-    get(`/api/plugins/${p.id}/config`)
-      .then((r: { values?: Record<string, unknown> }) => { if (alive) setCfg({ ...(r.values ?? {}) }); })
-      .catch(() => { if (alive) setCfg({}); });
-    return () => { alive = false; };
-  }, [p.id, keys.length]);
 
   const run = (fn: () => Promise<unknown>) => async () => {
     try { await fn(); setSaveErr(''); setTimeout(onChanged, 300); }
     catch (e) { setSaveErr(`未保存：${(e as Error)?.message ?? String(e)}`); }
   };
-  /** 单项写入：内核落库后会自己重载插件 */
-  const saveOne = (k: string, v: unknown) => run(() => post(`/api/plugins/${p.id}/config`, { values: { [k]: v } }));
 
   const loaded = p.state === 'loaded';
   const err = p.state === 'error';
@@ -154,8 +139,6 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
       </div>
 
       {saveErr && <div className="mset-err">{saveErr}</div>}
-
-      {p.description && <p className="plg-desc">{p.description}</p>}
 
       <div className="mset-meta">
         <span className="tag accent">{p.category}</span>
@@ -203,59 +186,6 @@ function PluginDetail({ p, chats, onChanged }: { p: PluginInfo; chats: string[];
           );
         })}
       </div>
-
-      <div className="mset-sec-h"><span>可配置项</span></div>
-      {!keys.length ? (
-        <div className="mset-group-e">本插件无可配置项</div>
-      ) : !cfg ? (
-        <div className="mset-group-e">读取配置…</div>
-      ) : (
-        <div className="plg-cfg">
-          {keys.map((k) => {
-            const f = p.userConfigSchema[k];
-            const raw = cfg[k];
-            if (f.type === 'boolean') {
-              return (
-                <div key={k} className="plg-crow">
-                  <div className="plg-ctext">
-                    <span className="mset-flabel">{k}</span>
-                    {f.description && <span className="plg-chint">{f.description}</span>}
-                  </div>
-                  <Switch on={!!raw} onChange={() => void saveOne(k, !raw)} />
-                </div>
-              );
-            }
-            const val = raw === undefined || raw === null ? '' : String(raw);
-            const shown = f.secret ? '' : val;
-            return (
-              <Field key={k} label={k}>
-                {f.description && <span className="plg-chint">{f.description}</span>}
-                {f.type === 'text' ? (
-                  <BrandInput multiline rows={4} spellCheck={false} value={shown}
-                    onChange={(e) => setCfg((c) => ({ ...(c ?? {}), [k]: e.target.value }))} />
-                ) : (
-                  <BrandInput type={(f.secret ? 'password' : f.type === 'number' ? 'number' : 'text') as 'text' | 'password'} value={shown}
-                    spellCheck={false}
-                    onChange={(e) => setCfg((c) => ({ ...(c ?? {}), [k]: e.target.value }))} />
-                )}
-              </Field>
-            );
-          })}
-          <div className="plg-cfg-foot">
-            <button className="btn primary" onClick={() => {
-              const values: Record<string, unknown> = {};
-              for (const k of keys) {
-                const f = p.userConfigSchema[k];
-                const v = cfg[k];
-                if (f.secret && (v === '' || v === undefined || String(v).includes('•'))) continue;   // 没改就不回写
-                values[k] = f.type === 'number' ? Number(v ?? 0) : f.type === 'boolean' ? !!v : v;
-              }
-              void run(() => post(`/api/plugins/${p.id}/config`, { values }))();
-            }}>保存并重载</button>
-            <span className="plg-hint">敏感项存 secrets.json，留空表示不改动</span>
-          </div>
-        </div>
-      )}
     </section>
   );
 }

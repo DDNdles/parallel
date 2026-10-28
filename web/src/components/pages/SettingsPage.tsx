@@ -92,7 +92,8 @@ interface EndStatus {
 }
 
 /** GET /api/plugins/:id/config 的返回 */
-interface PlugCfg { values: Record<string, unknown>; globalDefault: boolean }
+interface PlugCfgField { type: string; description?: string; secret?: boolean; default?: unknown }
+interface PlugCfg { values: Record<string, unknown>; globalDefault: boolean; schema?: Record<string, PlugCfgField> }
 
 const RHYTHM_MODES: PillOpt[] = [
   { v: 'gentle', t: '温和（仅完全同构才判定）' },
@@ -113,6 +114,7 @@ const SECTIONS: { v: string; t: string; icon: string }[] = [
   { v: 'sticker', t: '表情包', icon: 'sticker' },
   { v: 'bilibili', t: 'b站搜索', icon: 'bilibili' },
   { v: 'imagegen', t: '生图', icon: 'image' },
+  { v: 'cover', t: '翻唱', icon: 'mic' },
 ];
 
 export default function SettingsPage() {
@@ -126,15 +128,18 @@ export default function SettingsPage() {
   const [tavily, setTavily] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [maxRes, setMaxRes] = useState(3);
-  /** 已从插件页挪走的能力：联网搜索（web-search）+ 三个插件页的配置分节；读不到的插件为 null（分节给「未启用」空态） */
-  const [plug, setPlug] = useState<{ web: PlugCfg; sticker: PlugCfg | null; bilibili: PlugCfg | null; imagegen: PlugCfg | null } | null>(null);
+  /** 已从插件页挪走的能力：联网搜索（web-search）+ 四个插件页的配置分节；读不到的插件为 null（分节给「未启用」空态） */
+  const [plug, setPlug] = useState<{ web: PlugCfg; sticker: PlugCfg | null; bilibili: PlugCfg | null; imagegen: PlugCfg | null; cover: PlugCfg | null } | null>(null);
   /** 插件配置的可编辑镜像：本地先行，写入走 autoSavePlug 防抖（密钥不进这份、不随普通字段回写） */
-  const [pv, setPv] = useState<{ sticker: Record<string, unknown>; bilibili: Record<string, unknown>; imagegen: Record<string, unknown> } | null>(null);
+  const [pv, setPv] = useState<{ sticker: Record<string, unknown>; bilibili: Record<string, unknown>; imagegen: Record<string, unknown>; cover: Record<string, unknown> } | null>(null);
   const [showBili, setShowBili] = useState(false);
   const [showGen, setShowGen] = useState(false);
   /** sessdata / apiKey 这类密钥的本地输入：null = 没动过，跟着服务端回显 */
   const [biliKey, setBiliKey] = useState<string | null>(null);
   const [genKey, setGenKey] = useState<string | null>(null);
+  /** 翻唱页有五个密钥字段（服务 key / 门户与网易云 Cookie / 自定义源 token），统一按 key 管本地输入与显隐 */
+  const [coverKeys, setCoverKeys] = useState<Record<string, string | null>>({});
+  const [coverShown, setCoverShown] = useState<Record<string, boolean>>({});
   /** 本页所有写入失败都在这里就地报红 */
   const { err, setErr, save, run, fail } = useSave();
   /** 即时保存的防抖句柄：同一节的连续修改只发最后一拍 */
@@ -151,14 +156,21 @@ export default function SettingsPage() {
       get('/api/plugins/sticker/config').catch(() => null),
       get('/api/plugins/bilibili/config').catch(() => null),
       get('/api/plugins/imagegen/config').catch(() => null),
-    ] as const).then(([web, sticker, bilibili, imagegen]: (PlugCfg | null)[]) => {
+      get('/api/plugins/cover/config').catch(() => null),
+    ] as const).then(([web, sticker, bilibili, imagegen, cover]: (PlugCfg | null)[]) => {
       if (seq !== plugSeq.current) return;
-      // 四个全读不通多半是内核没起来，维持「读取中」而不是满屏「未启用」
-      if (!web && !sticker && !bilibili && !imagegen) return;
-      setPlug({ web: web ?? { values: {}, globalDefault: true }, sticker, bilibili, imagegen });
+      // 五个全读不通多半是内核没起来，维持「读取中」而不是满屏「未启用」
+      if (!web && !sticker && !bilibili && !imagegen && !cover) return;
+      setPlug({ web: web ?? { values: {}, globalDefault: true }, sticker, bilibili, imagegen, cover });
       setMaxRes(Number(web?.values.maxResults ?? 3));
-      const rec = (p: PlugCfg | null) => { const { apiKey: _a, sessdata: _s, ...rest } = p?.values ?? {}; return rest; };
-      setPv({ sticker: rec(sticker), bilibili: rec(bilibili), imagegen: rec(imagegen) });
+      // 密钥字段不进可编辑镜像（schema 标 secret 的 + 老路径的两个）：整包回写带不走密钥
+      const rec = (p: PlugCfg | null) => {
+        const out: Record<string, unknown> = { ...(p?.values ?? {}) };
+        for (const [k, f] of Object.entries(p?.schema ?? {})) if (f.secret) delete out[k];
+        delete out.apiKey; delete out.sessdata;
+        return out;
+      };
+      setPv({ sticker: rec(sticker), bilibili: rec(bilibili), imagegen: rec(imagegen), cover: rec(cover) });
     });
   }, []);
   const savePlug = (id: string, values: Record<string, unknown>) =>
@@ -263,13 +275,13 @@ export default function SettingsPage() {
   };
 
   /** 插件页配置分节的字段写入：本地镜像先行，开关 0ms 即发、数字/文本 600ms 防抖（镜像不含密钥，整包回写也带不走密钥） */
-  const setPlugVal = (id: 'sticker' | 'bilibili' | 'imagegen', part: Record<string, unknown>, delay = 600) => {
+  const setPlugVal = (id: 'sticker' | 'bilibili' | 'imagegen' | 'cover', part: Record<string, unknown>, delay = 600) => {
     if (!pv) return;
     setPv({ ...pv, [id]: { ...pv[id], ...part } });
     autoSavePlug(id, delay, part);
   };
   /** 密钥落库（空串 = 真删）：与 Tavily key 同一口径——先本地认账再刷新，删掉的不许当场"复活" */
-  const savePlugKey = (id: 'bilibili' | 'imagegen', key: string, val: string, cleared: () => void) => {
+  const savePlugKey = (id: 'bilibili' | 'imagegen' | 'cover', key: string, val: string, cleared: () => void) => {
     run(() => post(`/api/plugins/${id}/config`, { values: { [key]: val } }), () => {
       setPlug((p) => (p && p[id] ? { ...p, [id]: { ...p[id]!, values: { ...p[id]!.values, [key]: val } } } : p));
       cleared();
@@ -838,6 +850,121 @@ export default function SettingsPage() {
               </>
             );
           })())}
+
+          {sec === 'cover' && (!plug || !pv ? <div className="mset-empty">读取中…</div> : !plug.cover ? <div className="mset-empty">插件未启用，可在插件页开启。</div> : (() => {
+            const cc = pv.cover;
+            const cv = plug.cover.values;
+            const autoStart = cc.autoStart === true;
+            const ownerUnlimited = cc.ownerUnlimited !== false;
+            const src = String(cc.source ?? 'netease');
+            return (
+              <>
+                <div className="mset-sec-h"><span>翻唱服务</span></div>
+                <div className="mset-field">
+                  <label className="mset-flabel">服务地址<Hint text="自部署 RVC 服务的 http(s) 地址；部署在 SCOW 门户代理后面时填代理 URL" /></label>
+                  <BrandInput value={String(cc.baseUrl ?? '')} spellCheck={false} placeholder="http://127.0.0.1:8047"
+                    onChange={(e) => setPlugVal('cover', { baseUrl: e.target.value })} />
+                </div>
+                <CoverKeyField label="服务 Key" stored={String(cv.apiKey ?? '')}
+                  hint="翻唱服务的 Bearer Key（服务端 COVER_API_KEY；留空 = 服务端没开鉴权）"
+                  local={coverKeys.apiKey} shown={!!coverShown.apiKey}
+                  onShow={() => setCoverShown((s) => ({ ...s, apiKey: !s.apiKey }))}
+                  onInput={(v) => setCoverKeys((s) => ({ ...s, apiKey: v }))}
+                  onSave={(val, done) => savePlugKey('cover', 'apiKey', val, done)}
+                  clearLocal={() => setCoverKeys((s) => ({ ...s, apiKey: null }))} />
+                <CoverKeyField label="门户 Cookie" stored={String(cv.cookie ?? '')}
+                  hint="SCOW 门户代理的会话 Cookie（如 SCOW_USER=ustc-…）；服务在门户代理后面才填，普通自部署留空"
+                  local={coverKeys.cookie} shown={!!coverShown.cookie}
+                  onShow={() => setCoverShown((s) => ({ ...s, cookie: !s.cookie }))}
+                  onInput={(v) => setCoverKeys((s) => ({ ...s, cookie: v }))}
+                  onSave={(val, done) => savePlugKey('cover', 'cookie', val, done)}
+                  clearLocal={() => setCoverKeys((s) => ({ ...s, cookie: null }))} />
+                <div className="mset-models" style={{ marginTop: 14 }}>
+                  <div className="mset-mrow">
+                    <span className="plg-v">自动接线<Hint text="parallel 启动时拉起守护进程；门户上没有作业就自动提交，作业起来后自动写服务地址。需要先填上面的门户 Cookie" /></span>
+                    <span className="mset-macts"><Switch on={autoStart}
+                      onChange={() => setPlugVal('cover', { autoStart: !autoStart }, 0)} /></span>
+                  </div>
+                </div>
+
+                <div className="mset-sec-h" style={{ marginTop: 18 }}><span>点歌音源</span></div>
+                <div className="mset-field">
+                  <label className="mset-flabel">音源</label>
+                  <PillSelect align="left" value={src} label="音源"
+                    options={[
+                      { v: 'netease', t: '网易云直连' },
+                      { v: 'neteaseApi', t: '自部署网易云API' },
+                      { v: 'custom', t: '自定义源' },
+                      { v: 'local', t: '本地曲库' },
+                    ]}
+                    onChange={(v) => setPlugVal('cover', { source: v }, 0)} />
+                </div>
+                {(src === 'netease' || src === 'neteaseApi') && (
+                  <CoverKeyField label="网易云 Cookie" stored={String(cv.neteaseCookie ?? '')}
+                    hint="含 MUSIC_U 即可。有会员账号时填它，VIP/版权歌用自己的会员权益取流，音质到 320k。获取：网页版登录 → F12 → Network → 任一请求的 Cookie 整串复制"
+                    local={coverKeys.neteaseCookie} shown={!!coverShown.neteaseCookie}
+                    onShow={() => setCoverShown((s) => ({ ...s, neteaseCookie: !s.neteaseCookie }))}
+                    onInput={(v) => setCoverKeys((s) => ({ ...s, neteaseCookie: v }))}
+                    onSave={(val, done) => savePlugKey('cover', 'neteaseCookie', val, done)}
+                    clearLocal={() => setCoverKeys((s) => ({ ...s, neteaseCookie: null }))} />
+                )}
+                {src === 'neteaseApi' && (<>
+                  <div className="mset-field">
+                    <label className="mset-flabel">API 服务地址<Hint text="自部署 NeteaseCloudMusicApi 兼容服务（推荐 api-enhanced 开全局解灰）；如 http://127.0.0.1:3000" /></label>
+                    <BrandInput value={String(cc.neteaseApiBaseUrl ?? '')} spellCheck={false} placeholder="http://127.0.0.1:3000"
+                      onChange={(e) => setPlugVal('cover', { neteaseApiBaseUrl: e.target.value })} />
+                  </div>
+                  <CoverKeyField label="API 侧 Cookie" stored={String(cv.neteaseApiCookie ?? '')}
+                    hint="传给网易云API服务的网易云 Cookie（可选；有会员账号时音质更高，解灰不依赖它）"
+                    local={coverKeys.neteaseApiCookie} shown={!!coverShown.neteaseApiCookie}
+                    onShow={() => setCoverShown((s) => ({ ...s, neteaseApiCookie: !s.neteaseApiCookie }))}
+                    onInput={(v) => setCoverKeys((s) => ({ ...s, neteaseApiCookie: v }))}
+                    onSave={(val, done) => savePlugKey('cover', 'neteaseApiCookie', val, done)}
+                    clearLocal={() => setCoverKeys((s) => ({ ...s, neteaseApiCookie: null }))} />
+                </>)}
+                {src === 'custom' && (<>
+                  <div className="mset-field">
+                    <label className="mset-flabel">自定义源地址<Hint text={'GET /search?q=… 回 {"songs":[{"id","name","artist"}]}；GET /download?id=… 回音频字节或 {"url"}。仓库不内置任何第三方源，地址和使用授权由填的人负责'} /></label>
+                    <BrandInput value={String(cc.customBaseUrl ?? '')} spellCheck={false}
+                      onChange={(e) => setPlugVal('cover', { customBaseUrl: e.target.value })} />
+                  </div>
+                  <CoverKeyField label="源 Token" stored={String(cv.customToken ?? '')}
+                    hint="自定义音源的 Bearer Token（可选；以 Authorization: Bearer 发送）"
+                    local={coverKeys.customToken} shown={!!coverShown.customToken}
+                    onShow={() => setCoverShown((s) => ({ ...s, customToken: !s.customToken }))}
+                    onInput={(v) => setCoverKeys((s) => ({ ...s, customToken: v }))}
+                    onSave={(val, done) => savePlugKey('cover', 'customToken', val, done)}
+                    clearLocal={() => setCoverKeys((s) => ({ ...s, customToken: null }))} />
+                </>)}
+                {src === 'local' && (
+                  <div className="mset-field">
+                    <label className="mset-flabel">本地曲库目录<Hint text="留空 = data/music；支持 mp3 / wav / flac / m4a / ogg" /></label>
+                    <BrandInput value={String(cc.musicDir ?? '')} spellCheck={false} placeholder="data/music"
+                      onChange={(e) => setPlugVal('cover', { musicDir: e.target.value })} />
+                  </div>
+                )}
+
+                <div className="mset-sec-h" style={{ marginTop: 18 }}><span>额度与限制</span></div>
+                <div className="set-grid">
+                  <Num label="同会话间隔（秒）" hint="两次成功翻唱的最小间隔，防止连着点歌" value={Number(cc.cooldownSeconds ?? 0)}
+                    onChange={(v) => setPlugVal('cover', { cooldownSeconds: v })} />
+                  <Num label="每人每日次数" value={Number(cc.dailyQuota ?? 0)}
+                    onChange={(v) => setPlugVal('cover', { dailyQuota: v })} />
+                  <Num label="单条超时（毫秒）" hint="含搜歌、下载、分离、换声、混音、发送；CPU 分离约 5~6 倍音频时长" value={Number(cc.timeoutMs ?? 0)}
+                    onChange={(v) => setPlugVal('cover', { timeoutMs: v })} />
+                  <Num label="原曲大小上限（MB）" hint="超过就换一首" value={Number(cc.maxSongMb ?? 0)}
+                    onChange={(v) => setPlugVal('cover', { maxSongMb: v })} />
+                </div>
+                <div className="mset-models" style={{ marginTop: 14 }}>
+                  <div className="mset-mrow">
+                    <span className="plg-v">主人不限次数</span>
+                    <span className="mset-macts"><Switch on={ownerUnlimited}
+                      onChange={() => setPlugVal('cover', { ownerUnlimited: !ownerUnlimited }, 0)} /></span>
+                  </div>
+                </div>
+              </>
+            );
+          })())}
         </section>
       </div>
     </div>
@@ -945,8 +1072,36 @@ function BubbleSlider({ h, patchH }: {
   );
 }
 
-function Num({ label, hint, value, onChange, decimal = false }: { label: string; hint?: string; value: number; onChange: (v: number) => void; decimal?: boolean }) {
+/** 翻唱页的密钥输入：与 Tavily/SESSDATA 同一口径——本地输入先行，失焦才落库，
+ *  写成功才放弃本地值（删掉的当场不许"复活"），失败就地红字。 */
+function CoverKeyField({ label, hint, stored, local, shown, onShow, onInput, onSave, clearLocal }: {
+  label: string; hint: string; stored: string;
+  local: string | null; shown: boolean;
+  onShow: () => void; onInput: (v: string) => void;
+  onSave: (val: string, done: () => void) => void; clearLocal: () => void;
+}) {
+  const val = local ?? stored;
   return (
+    <div className="mset-field">
+      <label className="mset-flabel">{label}<Hint text={hint} /></label>
+      <div className="mset-keywrap">
+        <BrandInput type={shown ? 'text' : 'password'} value={val} spellCheck={false}
+          autoComplete="new-password"
+          onChange={(e) => onInput(e.target.value)}
+          onBlur={() => {
+            const k = val.trim();
+            if (k === stored) { clearLocal(); return; }
+            onSave(k, clearLocal);
+          }} />
+        <button className="mset-ibtn in" title={shown ? '隐藏密钥' : '显示密钥'} onClick={onShow}>
+          <Icon name={shown ? 'eyeOff' : 'eye'} size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Num({ label, hint, value, onChange, decimal = false }: { label: string; hint?: string; value: number; onChange: (v: number) => void; decimal?: boolean }) {  return (
     <div className="mset-field">
       <label className="mset-flabel">{label}
         {hint && (

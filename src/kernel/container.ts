@@ -143,6 +143,7 @@ export class PluginContainer {
   async load(dir: string, source: PluginSource): Promise<LoadedPlugin> {
     const manifest = this.validateManifest(readJson<any>(join(dir, 'plugin.json'), {}), source);
     if (this.plugins.has(manifest.id)) await this.unload(manifest.id);
+    this.enabledCache.clear();
 
     const lp: LoadedPlugin = {
       manifest, dir, source,
@@ -187,6 +188,7 @@ export class PluginContainer {
   async unload(id: string): Promise<void> {
     const lp = this.plugins.get(id);
     if (!lp) return;
+    this.enabledCache.clear();
     try {
       await lp.hooks.onUnload?.();
     } catch (e) {
@@ -256,25 +258,38 @@ export class PluginContainer {
     if (!lp) throw new Error(`插件 ${id} 未载入`);
     if (lp.manifest.core && !enabled) throw new Error(`core 插件 ${id} 不可停用`);
     lp.state = enabled ? 'loaded' : 'disabled';
+    this.enabledCache.clear();
     if (enabled) lp.errStreak.clear();
     this.deps.bus.emit(busEvents.pluginStateChanged, { id, state: lp.state });
   }
 
   // =============== 分群开关（红线 §2.4） ===============
 
+  /** 分群开关的读缓存：消息热路径每轮每插件查 1~2 条同步 SQL，而开关变更极低频。
+   *  所有写入口与插件启停都清空；上限 5000 条（会话数无界，防长期缓涨）。 */
+  private enabledCache = new Map<string, boolean>();
+
   /** 生效规则：群覆盖 ?? 全局默认(设置覆盖 ?? manifest.defaultGroupState) */
   effectiveEnabled(pluginId: string, chatId: string): boolean {
     const lp = this.plugins.get(pluginId);
     if (!lp || lp.state !== 'loaded') return false;
+    const key = `${pluginId}\u0000${chatId}`;
+    const hit = this.enabledCache.get(key);
+    if (hit !== undefined) return hit;
     const override = this.deps.db.get<{ enabled: number }>(
       'SELECT enabled FROM plugin_states WHERE plugin_id=? AND chat_id=?', pluginId, chatId,
     );
-    if (override) return !!override.enabled;
-    const globalOverride = this.deps.db.get<{ value: string }>(
-      "SELECT value FROM settings_kv WHERE key=?", `global_default:${pluginId}`,
-    );
-    if (globalOverride) return globalOverride.value === 'on';
-    return lp.manifest.defaultGroupState === 'on';
+    let value: boolean;
+    if (override) value = !!override.enabled;
+    else {
+      const globalOverride = this.deps.db.get<{ value: string }>(
+        "SELECT value FROM settings_kv WHERE key=?", `global_default:${pluginId}`,
+      );
+      value = globalOverride ? globalOverride.value === 'on' : lp.manifest.defaultGroupState === 'on';
+    }
+    if (this.enabledCache.size > 5000) this.enabledCache.clear();
+    this.enabledCache.set(key, value);
+    return value;
   }
 
   setGroupState(pluginId: string, chatId: string, enabled: boolean, updatedBy: string): void {
@@ -283,11 +298,13 @@ export class PluginContainer {
        ON CONFLICT(plugin_id, chat_id) DO UPDATE SET enabled=excluded.enabled, updated_by=excluded.updated_by, updated_at=excluded.updated_at`,
       pluginId, chatId, enabled ? 1 : 0, updatedBy, nowMs(),
     );
+    this.enabledCache.clear();
     this.deps.bus.emit(busEvents.pluginStateChanged, { id: pluginId, chatId, enabled });
   }
 
   clearGroupState(pluginId: string, chatId: string): void {
     this.deps.db.run('DELETE FROM plugin_states WHERE plugin_id=? AND chat_id=?', pluginId, chatId);
+    this.enabledCache.clear();
   }
 
   setGlobalDefault(pluginId: string, on: boolean): void {
@@ -296,6 +313,7 @@ export class PluginContainer {
        ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       `global_default:${pluginId}`, on ? 'on' : 'off',
     );
+    this.enabledCache.clear();
     this.deps.bus.emit(busEvents.pluginStateChanged, { id: pluginId, globalDefault: on });
   }
 
@@ -663,6 +681,7 @@ export class PluginContainer {
     return out;
   }
 
+  /** 只落库，不重载：一次保存多个键时由 saveUserConfig 统一重载一次 */
   setUserConfigValue(pluginId: string, key: string, value: unknown): void {
     const lp = this.plugins.get(pluginId);
     if (!lp) throw new Error(`插件 ${pluginId} 未载入`);
@@ -681,8 +700,12 @@ export class PluginContainer {
         pluginId, key, JSON.stringify(value ?? null), nowMs(),
       );
     }
-    // 重载插件使配置生效
-    this.reload(pluginId).catch((e) => this.log.error(`配置保存后重载 ${pluginId} 失败: ${(e as Error).message}`));
+  }
+
+  /** 批量保存插件配置：全部落库后**只重载一次**（以前每个键 reload 一次且不 await） */
+  async saveUserConfig(pluginId: string, values: Record<string, unknown>): Promise<void> {
+    for (const [k, v] of Object.entries(values ?? {})) this.setUserConfigValue(pluginId, k, v);
+    await this.reload(pluginId);
   }
 
   private async startMcpServers(lp: LoadedPlugin, ctx: PluginContext): Promise<void> {

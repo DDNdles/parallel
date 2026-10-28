@@ -1,5 +1,5 @@
 'use client';
-/** 翻唱：左「服务状态 + 试翻」+ 右翻唱记录（行内试听 / 补发）。设置表单在插件页，这里不重复；
+/** 翻唱：左「服务状态 + 试翻」+ 右翻唱记录（行内试听 / 补发）。配置表单在「设置 → 翻唱」，这里不重复；
  *  试翻是异步任务：POST /preview 回 202 后轮询 /job，完成即刷新记录并自动试听；
  *  整首歌 CPU 分离可能要十几分钟，按钮全程显示等待秒数。失败一律就地红字（全站不用 toast）。 */
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -248,7 +248,7 @@ export default function CoverPage() {
           <div className="cover-kv">
             <span>翻唱服务</span>
             <b>{status?.baseUrlSet ? <span className="tag ok">已配</span> : <span className="tag warn">未配</span>}</b>
-            <Hint text="baseUrl / apiKey / Cookie 在插件页配" />
+            <Hint text="服务地址 / Key / Cookie 在设置 → 翻唱配" />
           </div>
           <div className="cover-kv">
             <span>上次翻唱</span>

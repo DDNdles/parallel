@@ -394,7 +394,7 @@ export class Kernel {
     if (masterHint) this.log.warn(masterHint);
     // 分发方案1：启动后探测一次沙箱镜像，缺就后台自动构建（工作页会显示「构建中」）
     const buildProbe = setTimeout(() => {
-      try { this.session.imagesAvailable(); } catch { /* 探测失败不影响启动 */ }
+      void this.session.imagesAvailable().catch(() => { /* 探测失败不影响启动 */ });
     }, 5_000);
     buildProbe.unref();
   }

@@ -398,19 +398,20 @@ export class Pipeline {
     if (!carrier) return;
     const key = `${carrier.type}_${carrier.chatId}`;
     const prev = this.queues.get(key) ?? Promise.resolve();
-    if (this.activeTurns.get(key) ?? 0) {
-      // 已有轮次在跑：入队（队列长度受限防堆积）
-      if (this.queueLen(key) > 5) {
-        this.sessionLog.append(carrier.chatId, carrier.type, { type: 'system', role: 'system', text: '消息积压，已丢弃' });
-        return;
-      }
+    // 每个会话最多 5 个在途/待处理批次：慢模型 + 刷屏时 Promise 链与事件数组不能无界堆积，
+    // 过期消息也不该逐条起轮烧模型（queueLens 以前只读不写，这条保护从未生效）。
+    if (this.queueLen(key) >= 5) {
+      this.sessionLog.append(carrier.chatId, carrier.type, { type: 'system', role: 'system', text: '消息积压，已丢弃' });
+      return;
     }
+    this.bumpQueue(key, 1);
     const job = prev
       .then(() => this.process(events, opts))
       .catch((e) => {
         this.errors.record('error', 'kernel', `pipeline 处理异常: ${(e as Error).message}`, { chatId: carrier.chatId, stack: (e as Error).stack });
       })
       .finally(() => {
+        this.bumpQueue(key, -1);
         if (this.queues.get(key) === job) this.queues.delete(key);
       });
     this.queues.set(key, job as Promise<void>);
@@ -522,6 +523,12 @@ export class Pipeline {
 
   private queueLen(key: string): number {
     return this.queueLens.get(key) ?? 0;
+  }
+
+  private bumpQueue(key: string, delta: number): void {
+    const n = Math.max(0, this.queueLen(key) + delta);
+    if (n === 0) this.queueLens.delete(key);
+    else this.queueLens.set(key, n);
   }
 
   /**

@@ -458,13 +458,15 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           });
         }
         if (req.method === 'POST') {
+          const values: Record<string, unknown> = {};
           for (const [k, v] of Object.entries(body.values ?? {})) {
             const schemaField = lp.manifest.userConfig?.[k];
             if (!schemaField) continue;
             // 含 • 的是旧标签页回传的脱敏值，忽略；空串是用户主动清空，要真删
             if (schemaField.secret && typeof v === 'string' && v.includes('•')) continue;
-            kernel.container.setUserConfigValue(b, k, v);
+            values[k] = v;
           }
+          await kernel.container.saveUserConfig(b, values);
           return send({ ok: true });
         }
       }
@@ -894,8 +896,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           runs: userId ? runs.filter((r: any) => String(r.userId ?? '') === userId) : runs,
           models: { chat: kernel.llm.servingLabel('chat'), work: kernel.llm.servingLabel('work') },
           containers: kernel.session.status(),
-          images: kernel.session.imagesAvailable(),
-          docker: kernel.session.available(),
+          images: await kernel.session.imagesAvailable(),
+          docker: await kernel.session.available(),
         });
       }
       if (b === 'resume' && req.method === 'POST') {

@@ -69,6 +69,12 @@ def run_code(code: str, timeout: int) -> dict:
             remaining = deadline - time.time()
             if remaining <= 0:
                 status = "timeout"
+                # 只返回 timeout 不够：死循环 cell 会让 kernel 一直忙，后续调用全部排在锁后等死。
+                # 发一次中断（KeyboardInterrupt），让下一个 cell 还能跑；中断失败只能靠 reset 兜底。
+                try:
+                    km.interrupt_kernel()
+                except Exception:
+                    pass
                 break
             try:
                 msg = kc.get_iopub_msg(timeout=min(remaining, 1.0))

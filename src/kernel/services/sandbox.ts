@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { join, resolve, sep, normalize, dirname, relative, isAbsolute } from 'node:path';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync, rmSync, existsSync, unlinkSync, copyFileSync } from 'node:fs';
 import type { Db } from '../db.ts';
@@ -8,6 +8,16 @@ import type { ChatRef, SandboxEntry, SandboxRunResult, SandboxStat, SandboxWrite
 import { SlidingWindowCounter } from '../ratelimit.ts';
 import { newId, nowMs, truncate, safeKeyPart } from '../util/misc.ts';
 import { dockerBinCandidates } from './deps.ts';
+
+/** 异步跑一条 docker 短命令：调用方只关心成功/失败（同步版会冻结事件循环） */
+function dockerCmd(bin: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolveP, reject) => {
+    execFile(bin, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024, encoding: 'utf-8' }, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolveP({ stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
+    });
+  });
+}
 
 /** 覆盖写的行增减：整行做多重集比对（够 UI 显示 +N -M，不做逐行 diff）；含 NUL 的二进制不计算 */
 function lineDiff(oldText: string, newText: string): { added: number; removed: number } | null {
@@ -100,7 +110,13 @@ export class SandboxService {
   onMissingImage?: (image: string) => void;
   private imageCheckCache = new Map<string, { ok: boolean; at: number }>();
   private runningCount = new Map<string, number>();
+  /** 全宿主并发执行上限：每会话 1 之外的总帽，超出排队（不是拒绝） */
+  private globalRunning = 0;
+  private static MAX_GLOBAL_RUNNING = 8;
+  private globalWaiters: (() => void)[] = [];
   private dockerOk: boolean | null = null;   // null=未探测；探测结果缓存
+  private dockerCheckedAt = 0;               // false 结果带时间：Docker 后启动的要在 60s 后重新探测
+  private static DOCKER_RECHECK_MS = 60_000;
   private dockerWarned = false;
   private dockerBin: string | null = null;   // docker.exe 绝对路径（PATH 没有 Docker 时用默认安装位置）
 
@@ -440,6 +456,9 @@ export class SandboxService {
   async runAny(chat: ChatRef, opts: { language: 'python' | 'javascript' | 'bash'; code: string; timeoutMs?: number; work?: boolean }): Promise<SandboxRunResult> {
     const cfg = this.config.config.sandbox;
     const key = this.chatKey(chat);
+    // 全局并发帽：不同会话各自 1 并发，但几十个群同时跑仍能打穿宿主内存
+    await this.acquireGlobalSlot();
+    try {
     // 配额：并发 1；每分钟频率按档位（work 档更宽）
     if ((this.runningCount.get(key) ?? 0) >= 1) {
       throw new SandboxError('当前会话已有脚本在运行，请稍候');
@@ -472,17 +491,17 @@ export class SandboxService {
       if (opts.language === 'bash') {
         // shell 一律容器内跑：宿主机 shell 能看到桌面、能启动本机程序，
         // 作为 work 工具的落地就是隔离漏口（容器不可用 → 报错，不回落）。
-        const runtime = opts.work ? this.requireDocker('shell 执行') : this.resolveRuntime();
+        const runtime = opts.work ? await this.requireDocker('shell 执行') : await this.resolveRuntime();
         if (runtime === 'docker') {
-          if (opts.work) this.requireWorkImage((this.config.config.sandbox as { dockerImageBash?: string }).dockerImageBash || 'parallel-sandbox-python:latest');
+          if (opts.work) await this.requireWorkImage((this.config.config.sandbox as { dockerImageBash?: string }).dockerImageBash || 'parallel-sandbox-python:latest');
           return attach(await this.execDockerShell(chat, opts.code, timeoutMs));
         }
         return attach(await this.execSubprocessShell(chat, opts.code, timeoutMs));
       }
       // python/javascript：work 档同样强制容器（见方法注释）；chat 档维持 auto 回落
-      const runtime = opts.work ? this.requireDocker('脚本执行') : this.resolveRuntime();
+      const runtime = opts.work ? await this.requireDocker('脚本执行') : await this.resolveRuntime();
       if (runtime === 'docker') {
-        if (opts.work) this.requireWorkImage(opts.language === 'python'
+        if (opts.work) await this.requireWorkImage(opts.language === 'python'
           ? (cfg as { dockerImagePythonWork?: string }).dockerImagePythonWork || 'parallel-sandbox-python:latest'
           : (cfg as { dockerImageNodeWork?: string }).dockerImageNodeWork || 'parallel-sandbox-python:latest');
         return attach(await this.execDocker(chat, opts.language, opts.code, timeoutMs, !!opts.work));
@@ -491,6 +510,21 @@ export class SandboxService {
     } finally {
       this.runningCount.set(key, Math.max(0, (this.runningCount.get(key) ?? 1) - 1));
     }
+    } finally {
+      this.releaseGlobalSlot();
+    }
+  }
+
+  private async acquireGlobalSlot(): Promise<void> {
+    while (this.globalRunning >= SandboxService.MAX_GLOBAL_RUNNING) {
+      await new Promise<void>((res) => this.globalWaiters.push(res));
+    }
+    this.globalRunning++;
+  }
+
+  private releaseGlobalSlot(): void {
+    this.globalRunning = Math.max(0, this.globalRunning - 1);
+    this.globalWaiters.shift()?.();
   }
 
   /** 沙箱内文本文件的快照（相对路径 → 内容）；二进制/超大文件直接跳过，别把一次执行拖成整树读盘 */
@@ -536,12 +570,12 @@ export class SandboxService {
    * work 档执行前确认镜像在本地（60s 缓存）：不在就触发自动构建并明确报错——
    * 首次使用的用户在这里得到「正在构建」而不是 docker run 的找不到镜像原文。
    */
-  private requireWorkImage(image: string): void {
+  private async requireWorkImage(image: string): Promise<void> {
     const hit = this.imageCheckCache.get(image);
     if (hit && nowMs() - hit.at < 60_000) { if (hit.ok) return; }
     let ok = false;
     for (const bin of dockerBinCandidates()) {
-      try { execFileSync(bin, ['image', 'inspect', image], { timeout: 10_000, windowsHide: true, stdio: 'pipe' }); ok = true; break; } catch { /* 下一个候选 */ }
+      try { await dockerCmd(bin, ['image', 'inspect', image], 10_000); ok = true; break; } catch { /* 下一个候选 */ }
     }
     this.imageCheckCache.set(image, { ok, at: nowMs() });
     if (!ok) {
@@ -556,9 +590,8 @@ export class SandboxService {
   }
 
   /** work 档的执行必须走容器：不可用就抛（隔离没生效时宁可做不了，也不悄悄降级到宿主） */
-  private requireDocker(what: string): 'docker' {
-    if (this.dockerOk === null) this.dockerOk = this.probeDocker();
-    if (!this.dockerOk) {
+  private async requireDocker(what: string): Promise<'docker'> {
+    if (!(await this.ensureDockerOk())) {
       throw new SandboxError(
         `Docker 不可用，${what}被拒绝：work 的执行只在容器沙箱里跑（宿主机子进程能看到本机桌面与网络，等于隔离失效）。请启动 Docker Desktop 后重试。`,
       );
@@ -567,12 +600,11 @@ export class SandboxService {
   }
 
   /** 决定本次执行的运行时：docker / subprocess（配置 + 可用性探测，探测失败回落并只告警一次） */
-  private resolveRuntime(): 'docker' | 'subprocess' {
+  private async resolveRuntime(): Promise<'docker' | 'subprocess'> {
     const cfg = this.config.config.sandbox as { runtime?: string; dockerImagePython?: string };
     const want = cfg.runtime ?? 'auto';
     if (want === 'subprocess') return 'subprocess';
-    if (this.dockerOk === null) this.dockerOk = this.probeDocker();
-    if (this.dockerOk) return 'docker';
+    if (await this.ensureDockerOk()) return 'docker';
     if (want === 'docker') {
       // 显式要求 docker 但不可用：报错而不是静默降级（管理员需要知道隔离没生效）
       throw new SandboxError('sandbox.runtime=docker 但 Docker 不可用（未安装或 daemon 未启动）。请启动 Docker Desktop，或将 runtime 改为 auto/subprocess。');
@@ -584,11 +616,21 @@ export class SandboxService {
     return 'subprocess';
   }
 
-  /** 探测 docker CLI + daemon 是否可用（10s 预算，结果缓存）。PATH 找不到时尝试 Docker Desktop 默认安装位置。 */
-  private probeDocker(): boolean {
+  /** 可用性缓存：成功一直用（docker 执行失败会把 dockerOk 清成 null）；
+   *  失败 60s 后才重探——用户中途启动 Docker Desktop 不该等到重启内核才恢复强隔离。 */
+  private async ensureDockerOk(): Promise<boolean> {
+    if (this.dockerOk === true) return true;
+    if (this.dockerOk === false && nowMs() - this.dockerCheckedAt < SandboxService.DOCKER_RECHECK_MS) return false;
+    this.dockerOk = await this.probeDocker();
+    this.dockerCheckedAt = nowMs();
+    return this.dockerOk;
+  }
+
+  /** 探测 docker CLI + daemon 是否可用（异步，10s 预算）。PATH 找不到时尝试 Docker Desktop 默认安装位置。 */
+  private async probeDocker(): Promise<boolean> {
     for (const bin of dockerBinCandidates()) {
       try {
-        execFileSync(bin, ['info', '--format', 'ok'], { timeout: 10_000, windowsHide: true, stdio: 'pipe' });
+        await dockerCmd(bin, ['info', '--format', 'ok'], 10_000);
         this.dockerBin = bin;
         return true;
       } catch { /* 尝试下一个候选 */ }
@@ -865,9 +907,28 @@ export class SandboxService {
     );
   }
 
+  /** 会话目录的真实占用：容器直写/run_bash 产生的文件不进 sandbox_files，按表求和会低估配额 */
   sessionBytes(chatKey: string): number {
-    const row = this.db.get<{ total: number | null }>('SELECT SUM(size) as total FROM sandbox_files WHERE chat_key=?', chatKey);
-    return row?.total ?? 0;
+    let total = 0;
+    let files = 0;
+    const walk = (d: string, depth: number): void => {
+      if (depth > 12 || files > 5000) return;
+      let names: string[];
+      try { names = readdirSync(d); } catch { return; }
+      for (const n of names) {
+        if (files > 5000) return;
+        const p = join(d, n);
+        let st;
+        try { st = lstatSync(p); } catch { continue; }
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) { walk(p, depth + 1); continue; }
+        if (!st.isFile()) continue;
+        total += st.size;
+        files++;
+      }
+    };
+    walk(join(this.rootDir, safeKeyPart(chatKey)), 0);
+    return total;
   }
 
   stats(): SandboxStat[] {
@@ -933,6 +994,43 @@ export class SandboxService {
         }
       }
     }
+    // 未登记的文件（容器直写 / run_bash 产物不会进 sandbox_files）按 mtime 走同一套 TTL：
+    // 不扫目录的话，work 产物可能永远不被回收，磁盘只增不减。
+    const known = new Set(rows.map((r) => `${r.chat_key}\u0000${r.rel_path.replace(/\\/g, '/')}`));
+    try {
+      for (const chatKey of readdirSync(this.rootDir)) {
+        const base = join(this.rootDir, chatKey);
+        let isDir = false;
+        try {
+          const st = lstatSync(base);
+          isDir = st.isDirectory() && !st.isSymbolicLink();
+        } catch { /* 不存在 */ }
+        if (!isDir) continue;
+        const isWork = workChats.has(chatKey);
+        const walk = (d: string, rel: string, depth: number): void => {
+          if (depth > 12) return;
+          let names: string[];
+          try { names = readdirSync(d); } catch { return; }
+          for (const n of names) {
+            const p = join(d, n);
+            const rp = rel ? `${rel}/${n}` : n;
+            let st;
+            try { st = lstatSync(p); } catch { continue; }
+            if (st.isSymbolicLink()) continue;
+            if (st.isDirectory()) { walk(p, rp, depth + 1); continue; }
+            if (!st.isFile()) continue;
+            if (known.has(`${chatKey}\u0000${rp}`)) continue;
+            const ttl = rp.startsWith('inbox/')
+              ? (isWork ? (cfg.workInboxTtlHours ?? cfg.inboxTtlHours) : cfg.inboxTtlHours)
+              : (isWork ? (cfg.workTtlHours ?? cfg.ttlHours) : cfg.ttlHours);
+            if (now - st.mtimeMs > ttl * 3_600_000) {
+              try { unlinkSync(p); } catch { /* 下一轮再试 */ }
+            }
+          }
+        };
+        walk(base, '', 0);
+      }
+    } catch { /* 目录被并发删除等，不影响已登记文件的清理 */ }
     // 清理空目录
     try {
       for (const d of readdirSync(this.rootDir)) {
