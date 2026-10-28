@@ -29,3 +29,4 @@ __pycache__/
 
 # 一次性部署草稿（含密钥/临时配置），不入库
 .tmp-ustc/
+release/

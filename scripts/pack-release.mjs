@@ -19,8 +19,8 @@ const slim = process.argv.includes('--slim');
 const allowDirty = process.argv.includes('--allow-dirty');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 const name = `parallel-v${pkg.version}`;
-const dist = join(root, 'dist');
-const stage = join(dist, 'stage', name);
+const release = join(root, 'release');
+const stage = join(release, 'stage', name);
 
 // ---------- 干净树闸门：发布包必须能由仓库复现 ----------
 // 以前直接 cpSync 工作区，未提交的改动（含只有本机才有的插件/私人人格）会静默进包。
@@ -73,7 +73,7 @@ if (!existsSync(join(root, 'ui', 'index.html'))) {
   process.exit(1);
 }
 
-rmSync(dist, { recursive: true, force: true });
+rmSync(release, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 
 let files = 0;
@@ -168,13 +168,13 @@ if (hits.length) {
 }
 
 // ---------- 压缩 ----------
-const zip = join(dist, `${name}.zip`);
+const zip = join(release, `${name}.zip`);
 try {
-  execSync(`tar -a -c -f "${zip}" -C "${join(dist, 'stage')}" "${name}"`, { stdio: 'pipe' });
+  execSync(`tar -a -c -f "${zip}" -C "${join(release, 'stage')}" "${name}"`, { stdio: 'pipe' });
 } catch {
-  execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(dist, 'stage', name)}\\*' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
+  execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(release, 'stage', name)}\\*' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
 }
-rmSync(join(dist, 'stage'), { recursive: true, force: true });
+rmSync(join(release, 'stage'), { recursive: true, force: true });
 
 const size = statSync(zip).size;
 console.log(`[pack] 完成: ${relative(root, zip)}`);
