@@ -418,21 +418,31 @@ test('沙箱：写入/读取/配额/TTL 字段', () => {
 });
 
 test('沙箱：真实执行 python（超时/输出截断机制）', async (t) => {
-  // 需要宿主 python 满足**沙箱子进程的调用形态**（-I 隔离模式 + 极简环境变量）：
-  // 普通 python 能跑不代表沙箱形态能跑（CI runner 实测踩过）。不满足就跳过——
-  // 超时/截断逻辑另有纯逻辑用例覆盖，这里只验真执行。
-  const probeEnv = {
-    PATH: process.env.PATH ?? '',
-    SYSTEMROOT: process.env.SYSTEMROOT ?? '',
-    COMSPEC: process.env.COMSPEC ?? '',
-    PYTHONIOENCODING: 'utf-8',
-  };
-  const probe = spawnSync(process.env.PARALLEL_PYTHON || 'python', ['-I', '-u', '-c', 'print(1)'], {
-    timeout: 15_000, windowsHide: true, env: probeEnv,
-  });
-  if (probe.status !== 0 || !String(probe.stdout ?? '').includes('1')) {
-    t.skip(`宿主 python 不满足沙箱执行形态（exit=${probe.status}，stderr=${String(probe.stderr ?? '').slice(0, 140)}）`);
-    return;
+  // 本用例验证「这台机器实际会走的那条执行分支」：
+  //  - docker daemon 在 → 走容器分支，需要本地已有 parallel-sandbox-python 镜像（CI runner 没有 → 跳过；
+  //    另注：Windows 容器模式不支持 --pids-limit，容器分支在那种 daemon 上天然起不来，也是跳过）；
+  //  - docker 不在 → 走 python 子进程分支，要求 python 满足沙箱调用形态（-I + 极简 env）。
+  const dockerInfo = spawnSync('docker', ['info', '--format', 'ok'], { timeout: 20_000, windowsHide: true });
+  if (dockerInfo.status === 0) {
+    const img = spawnSync('docker', ['image', 'inspect', 'parallel-sandbox-python:latest'], { timeout: 20_000, windowsHide: true });
+    if (img.status !== 0) {
+      t.skip('docker 在但本地没有沙箱镜像：容器分支在此环境无法验证（镜像会由工作页触发构建）');
+      return;
+    }
+  } else {
+    const probeEnv = {
+      PATH: process.env.PATH ?? '',
+      SYSTEMROOT: process.env.SYSTEMROOT ?? '',
+      COMSPEC: process.env.COMSPEC ?? '',
+      PYTHONIOENCODING: 'utf-8',
+    };
+    const probe = spawnSync(process.env.PARALLEL_PYTHON || 'python', ['-I', '-u', '-c', 'print(1)'], {
+      timeout: 15_000, windowsHide: true, env: probeEnv,
+    });
+    if (probe.status !== 0 || !String(probe.stdout ?? '').includes('1')) {
+      t.skip(`宿主 python 不满足沙箱执行形态（exit=${probe.status}，stderr=${String(probe.stderr ?? '').slice(0, 140)}）`);
+      return;
+    }
   }
   const sb = kernel.sandbox;
   const chat = { platform: 'qq', type: 'private' as const, chatId: '777' };
