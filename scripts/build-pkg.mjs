@@ -15,7 +15,15 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, 'dist');
 
 rmSync(outDir, { recursive: true, force: true });
-const r = spawnSync('npx tsc -p tsconfig.build.json', { stdio: 'inherit', shell: process.platform === 'win32' });
+// 直接用 node 跑 typescript 的 tsc 启动器（TS7 = Node 脚本 + 平台原生二进制）：
+// 不走 npx——CI 的 ubuntu 上 npx 静默失败过，也没有 Windows shell 的转义/弃用问题
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+let tscBin;
+try { tscBin = require.resolve('typescript/bin/tsc'); } catch {
+  tscBin = join(root, 'node_modules', 'typescript', 'bin', 'tsc');
+}
+const r = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.build.json'], { stdio: 'inherit' });
 if (r.status !== 0) {
   console.error('[build:pkg] tsc 编译失败');
   process.exit(r.status ?? 1);
