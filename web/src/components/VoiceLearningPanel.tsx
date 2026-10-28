@@ -143,20 +143,24 @@ export function VoiceLearningPanel() {
       {err && <div className="mset-err">{err}</div>}
 
       <div className="mset-sec-h"><span>已学 {entries.length} 条</span></div>
-      <div className="mset-models">
-        {entries.map((e, i) => (
-          <div className="mset-mrow" key={`${e.at ?? 0}-${e.style}-${i}`}>
-            <span className="plg-v">{e.style}</span>
-            <span className="mset-macts">
-              <button className="mset-ibtn" title="删除" aria-label={`删除 ${e.style}`}
-                disabled={busy} onClick={() => void remove(e)}>
-                <Icon name="trash" size={14} />
-              </button>
-            </span>
-          </div>
-        ))}
-        {!entries.length && <div className="mset-empty">这个群还没学到说法</div>}
-      </div>
+      {entries.length ? (
+        <div className="mset-models">
+          {entries.map((e, i) => (
+            <div className="mset-mrow" key={`${e.at ?? 0}-${e.style}-${i}`}>
+              <span className="plg-v">{e.style}</span>
+              <span className="mset-macts">
+                <button className="mset-ibtn" title="删除" aria-label={`删除 ${e.style}`}
+                  disabled={busy} onClick={() => void remove(e)}>
+                  <Icon name="trash" size={14} />
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        /* 空态不套带边框的列表容器：一条短句撑满整栏会变成一张巨大的空卡片 */
+        <div className="mset-empty">这个群还没学到说法</div>
+      )}
     </>
   );
 }
