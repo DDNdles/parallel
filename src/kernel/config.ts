@@ -530,6 +530,13 @@ export class ConfigStore {
     this.saveSecrets();
   }
 
+  /** 卸载插件时清空该插件的**全部**密钥字段（只删字面 '*' 会留下 cookie/apiKey 等真实密钥） */
+  clearPluginSecrets(pluginId: string): void {
+    if (!this.secrets.pluginSecrets[pluginId]) return;
+    delete this.secrets.pluginSecrets[pluginId];
+    this.saveSecrets();
+  }
+
   /** 内核数据目录（config.json 所在目录） */
   get dataDir(): string {
     return join(this.configFile, '..');

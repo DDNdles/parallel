@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { appendFileSync, readFileSync, existsSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { ensureDir } from './util/fsutil.ts';
-import { newId, nowMs } from './util/misc.ts';
+import { newId, nowMs, safeKeyPart } from './util/misc.ts';
 import { inboundModelText } from './util/modeltext.ts';
 import type { ChatEvent, ForwardRecord, MessageAttachment } from './types.ts';
 import type { Bus } from './bus.ts';
@@ -157,7 +157,9 @@ export class SessionLog {
   }
 
   chatKey(chatId: string, chatType: string): string {
-    return `${chatType}_${chatId}`;
+    // 会话号/类型会拼进 data/sessions/<key>.jsonl：`..` 与分隔符必须消掉，
+    // 否则 /api/chats/group_../../x 这类请求能读到数据目录外的文件。
+    return `${safeKeyPart(chatType)}_${safeKeyPart(chatId)}`;
   }
 
   append(chatId: string, chatType: string, entry: Omit<SessionLogEntry, 'id' | 'ts' | 'chatId' | 'chatType' | 'seq'>): SessionLogEntry {

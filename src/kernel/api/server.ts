@@ -179,10 +179,20 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
   // ---- 鉴权 ----
   // 免 uiToken 的两组：登录页接口（浏览器还没拿到 token 时就要用 status/qrcode/avatar），
   // 以及初始环境检查页（它排在登录之前，且只报本机装了哪些软件/在哪，不含会话与配置）。
-  // 两者都只在 127.0.0.1 上提供，其余 /api/* 一律要求 token。
+  //
+  // 豁免的边界是「真的从本机本页面发起」：
+  //  - remoteAddress 必须是回环：挡 DNS rebinding（攻击页域名解析到 127.0.0.1 时，
+  //    socket 源地址仍是攻击者 IP，所以这一条就是 rebinding 的硬闸）；
+  //  - Host 头必须是回环名：挡「Host: evil.com」的代理/重绑定变体；
+  //  - Origin / Sec-Fetch-Site 不能是跨站：挡 text/plain 简单请求 CSRF（浏览器必带其一）。
+  // 不满足就回落到 token 校验——局域网共享 UI 时带上 #token 仍可正常用。
   const pathIsLoginApi = path.startsWith('/api/login/') || path.startsWith('/api/setup/');
   const token = req.headers['x-auth-token'] ?? url.searchParams.get('token') ?? '';
-  if (!pathIsLoginApi && token !== kernel.config.secrets.uiToken) {
+  const sameLocalOrigin = isLoopbackAddr(req.socket.remoteAddress)
+    && isLoopbackHost(req.headers.host)
+    && isLocalOrigin(req.headers.origin)
+    && !isCrossSite(req.headers['sec-fetch-site']);
+  if (!(pathIsLoginApi && sameLocalOrigin) && token !== kernel.config.secrets.uiToken) {
     res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return;
@@ -190,12 +200,20 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
   // 插件端点（/api/plugin/...）要能收原始字节（表情包上传这类二进制）；
   // JSON 请求照旧解析，其余内核接口保持「空 body / 坏 body = {}」的原口径。
-  const rawBody = await readBody(req).catch(() => Buffer.alloc(0));
+  let rawBody: Buffer;
+  try {
+    rawBody = await readBody(req);
+  } catch (e) {
+    const tooLarge = (e as Error).message === 'body-too-large';
+    res.writeHead(tooLarge ? 413 : 400, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: tooLarge ? '请求体过大' : '读取请求体失败' }));
+    return;
+  }
   const body = path.startsWith('/api/plugin/')
     && rawBody.length > 0
     && !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))
     ? rawBody
-    : parseJsonBody(rawBody);
+    : parseJsonBody(rawBody, req.headers['content-type'] as string | undefined);
   const segments = path.split('/').filter(Boolean); // ['api', ...]
   const send = (data: unknown, status = 200) => {
     // API 一律 no-store：清掉的 key / 改完的配置不许被浏览器缓存端回来（静态资源在 serveStatic 另有缓存头）
@@ -471,7 +489,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       return send(chats.map((c) => ({ ...c, title: kernel.adapter.chatTitle(c.chatType, c.chatId) })));
     }
     if (area === 'api' && a === 'chats' && b) {
-      const m = b.match(/^(group|private)_(.+)$/);
+      const m = b.match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
       if (!m) return send({ error: 'bad chatKey' }, 400);
       const chat = { platform: 'ui', type: m[1] as 'group' | 'private', chatId: m[2] };
       if (!c || c === 'tail') {
@@ -908,7 +926,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       }
       if (b === 'reset' && req.method === 'POST') {
         // 重置某会话的常驻容器（状态化 Python / 浏览器）
-        const m = String(body.chatKey ?? '').match(/^(group|private)_(.+)$/);
+        const m = String(body.chatKey ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
         if (m) await kernel.session.reset({ platform: 'qq', type: m[1] as 'group', chatId: m[2] });
         return send({ ok: true });
       }
@@ -922,7 +940,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           ts: number; duration_ms: number; artifacts: string | null; ok: number; error: string | null;
         }>('SELECT id, chat_key, sandbox_key, task, user_id, nickname, ts, duration_ms, artifacts, ok, error FROM work_runs WHERE id=?', runId);
         if (!row) return send({ error: `没有运行 ${runId}` }, 404);
-        const m = String(row.chat_key ?? '').match(/^(group|private)_(.+)$/);
+        const m = String(row.chat_key ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
         if (!m) return send({ error: '这次运行没有可投递的会话' }, 400);
         const userId = String(row.user_id ?? '').trim();
         if (!userId) return send({ error: '这次运行没有发起人，无法定位沙箱' }, 400);
@@ -957,7 +975,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
     if (area === 'api' && a === 'sandbox') {
       const ref = (key: unknown): ChatRef | null => {
-        const m = String(key ?? '').match(/^(group|private)_(.+)$/);
+        const m = String(key ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
         return m ? { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] } : null;
       };
       if (!b) return send({ stats: kernel.sandbox.stats(), config: kernel.config.config.sandbox });
@@ -1194,7 +1212,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
     // ================= 拟人层状态（排障：这个群现在为什么不出声） =================
     if (area === 'api' && a === 'humanlike' && b === 'status' && req.method === 'GET') {
-      const m = String(url.searchParams.get('chatKey') ?? '').match(/^(group|private)_(.+)$/);
+      const m = String(url.searchParams.get('chatKey') ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
       if (!m) return send({ error: 'chatKey 不合法' }, 400);
       const chat = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };
       return send({
@@ -1206,7 +1224,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
     // ================= 适配器动作 =================
     if (area === 'api' && a === 'adapter' && b === 'refresh-groups' && req.method === 'POST') {
-      await kernel.adapter.refreshGroupNames().catch((e) => send({ error: (e as Error).message }, 500));
+      // 失败必须先返回：以前 .catch(send 500) 之后仍会走到下面的 200，
+      // 第二次 writeHead 抛 ERR_HTTP_HEADERS_SENT，外层 catch 再写一次就是未处理拒绝。
+      try {
+        await kernel.adapter.refreshGroupNames();
+      } catch (e) {
+        return send({ error: (e as Error).message }, 500);
+      }
       return send({ groups: Object.fromEntries([...(kernel.adapter as any).groupNames?.entries?.() ?? []]) });
     }
 
@@ -1421,9 +1445,13 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
   return undefined;
 }
 
-function serveStatic(root: string, path: string, res: ServerResponse): void {  let rel = path === '/' ? '/index.html' : path;
-  const file = normalize(join(root, rel));
-  if (!file.startsWith(normalize(root))) {
+function serveStatic(root: string, path: string, res: ServerResponse): void {
+  const rel = path === '/' ? '/index.html' : path;
+  const base = normalize(root);
+  const file = normalize(join(base, rel));
+  // 用 relative 判界而不是 startsWith：后者会把兄弟目录（ui → ui-legacy）也放过去
+  const inside = relative(base, file);
+  if (inside.startsWith('..') || isAbsolute(inside)) {
     res.writeHead(403); res.end(); return;
   }
   if (!existsSync(file) || statSync(file).isDirectory()) {
@@ -1450,18 +1478,71 @@ function sendHtml(res: ServerResponse, file: string): void {
   res.end(html.includes('__UI_BUILD__') ? html : tag + html);
 }
 
+/** 请求体上限：表情包/图片上传够用；再大一律拒，避免任意网页把内核内存灌爆 */
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolveP, reject) => {
+    const declared = Number(req.headers['content-length'] ?? 0);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      req.resume();
+      reject(new Error('body-too-large'));
+      return;
+    }
     const chunks: Buffer[] = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0;
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        req.removeAllListeners('data');
+        req.resume(); // 排空剩余字节，别把连接吊死
+        reject(new Error('body-too-large'));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolveP(Buffer.concat(chunks)));
     req.on('error', reject);
+    req.on('aborted', () => reject(new Error('body-aborted')));
   });
 }
 
-/** JSON body 的旧口径：空 body / 解析失败都当 {} */
-function parseJsonBody(raw: Buffer): any {
+/** 规范化来源地址：IPv4-mapped（::ffff:127.0.0.1）按 IPv4 判 */
+function isLoopbackAddr(addr: string | undefined): boolean {
+  const a = String(addr ?? '').replace(/^::ffff:/i, '').toLowerCase();
+  return a === '127.0.0.1' || a === '::1' || a.startsWith('127.');
+}
+
+/** Host 头必须是回环名（可带端口）：DNS rebinding 的请求 Host 是攻击者域名 */
+function isLoopbackHost(host: string | string[] | undefined): boolean {
+  const h = String(Array.isArray(host) ? host[0] : host ?? '').trim().toLowerCase();
+  if (!h) return false;
+  const name = h.startsWith('[') ? h.slice(1, h.indexOf(']')) : h.split(':')[0];
+  return name === 'localhost' || name === '127.0.0.1' || name === '::1' || name.startsWith('127.');
+}
+
+/** 浏览器跨站请求一定带 Origin；没有 Origin 的是 curl/测试这类非浏览器客户端 */
+function isLocalOrigin(origin: string | string[] | undefined): boolean {
+  const o = String(Array.isArray(origin) ? origin[0] : origin ?? '').trim();
+  if (!o) return true;
+  try {
+    const u = new URL(o);
+    return (u.protocol === 'http:' || u.protocol === 'https:') && isLoopbackHost(u.host);
+  } catch {
+    return false;
+  }
+}
+
+/** 新版浏览器附带的 Sec-Fetch-Site：cross-site 直接判伪 */
+function isCrossSite(site: string | string[] | undefined): boolean {
+  return String(Array.isArray(site) ? site[0] : site ?? '').trim().toLowerCase() === 'cross-site';
+}
+
+/** JSON body 的旧口径：空 body / 解析失败都当 {}。
+ *  Content-Type 明确不是 JSON 时也不解析：跨站 text/plain 简单请求正是 CSRF 的经典载体。 */
+function parseJsonBody(raw: Buffer, contentType?: string): any {
   if (!raw.length) return {};
+  if (contentType && !/^application\/json\b/i.test(contentType)) return {};
   try { return JSON.parse(raw.toString('utf-8')); } catch { return {}; }
 }
 

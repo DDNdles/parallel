@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
 
 import { Bus } from '../src/kernel/bus.ts';
 import { ConfigStore } from '../src/kernel/config.ts';
@@ -49,4 +50,32 @@ test('预览与打开都拦住越界路径和不存在的文件', () => {
   assert.throws(() => sb.handOff(chat, '../..'), SandboxError);
   assert.throws(() => sb.preview(chat, 'nope.txt'), SandboxError);
   assert.throws(() => sb.handOff(chat, 'nope.txt'), SandboxError);
+});
+
+test('沙箱里的符号链接不能把读写带出根目录', () => {
+  const sb = mk();
+  const outside = mkdtempSync(tmpdir() + '/pout-');
+  writeFileSync(join(outside, 'secret.txt'), 'TOP-SECRET');
+  try {
+    // Windows 下目录 junction 不需要管理员/开发者模式；Linux 用普通目录链接
+    symlinkSync(outside, join(sb.root(chat), 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    return; // 环境不允许建链接（无权限）：跳过，不把测试做成假绿
+  }
+  assert.throws(() => sb.read(chat, 'escape/secret.txt'), SandboxError);
+  assert.throws(() => sb.write(chat, 'escape/pwn.txt', 'x'), SandboxError);
+  assert.equal(sb.list(chat).some((e) => e.name === 'escape'), false);
+});
+
+test('chatKey 消毒：chatId/scope 带 ../ 也只会落成一个目录名', () => {
+  const sb = mk();
+  const evil = { platform: 'qq', type: 'group' as const, chatId: '../../..', scope: '../u1' };
+  const key = sb.chatKey(evil);
+  assert.match(key, /^[A-Za-z0-9._-]+$/);
+  assert.equal(key.includes('/'), false);
+  assert.equal(key.includes('\\'), false);
+  const root = sb.root(evil);
+  const rel = relative(join(sb.root(chat), '..'), root);
+  assert.equal(rel.startsWith('..'), false, `沙箱根跑出了 sandbox/：${root}`);
+  assert.equal(sb.chatKey(chat), 'group_77');
 });

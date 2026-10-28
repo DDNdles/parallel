@@ -347,7 +347,8 @@ export class Kernel {
       const ui = this.config.config.ui;
       if (await portBusy(ui.host, ui.port)) {
         const url = `http://127.0.0.1:${ui.port}/#token=${this.config.secrets.uiToken}`;
-        this.log.warn(`端口 ${ui.port} 上已有内核在跑，不再重复启动：直接打开桌面端 ${url}`);
+        // 日志只打脱敏地址：stdout 会落 boot.log/console-all.log，贴日志求助等于交出全部写权限
+        this.log.warn(`端口 ${ui.port} 上已有内核在跑，不再重复启动：直接打开桌面端 http://127.0.0.1:${ui.port}/#token=***`);
         openBrowser(url);
         process.exit(0);
       }
@@ -380,7 +381,8 @@ export class Kernel {
       // 会用测试内核的随机 token 覆盖同一端口上真实 UI 的 localStorage，把用户踢成"未登录"。
       const uiPort = this.config.config.ui.port;
       const uiUrl = `http://127.0.0.1:${uiPort}/#token=${this.config.secrets.uiToken}`;
-      this.log.info(`parallel 内核已启动。桌面端: ${uiUrl}（已自动打开浏览器）`);
+      // 只给日志脱敏版：uiToken 出现在日志里等于桌面端被接管（浏览器照常拿真 URL）
+      this.log.info(`parallel 内核已启动。桌面端: http://127.0.0.1:${uiPort}/#token=***（已自动打开浏览器）`);
       openBrowser(uiUrl);
     } else {
       this.log.info('parallel 内核已启动（noApi 模式：不提供桌面端，不打开浏览器）');

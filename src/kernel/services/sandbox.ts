@@ -1,12 +1,12 @@
 import { spawn, execFileSync } from 'node:child_process';
-import { join, resolve, sep, normalize, dirname } from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, rmSync, existsSync, unlinkSync, copyFileSync } from 'node:fs';
+import { join, resolve, sep, normalize, dirname, relative, isAbsolute } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync, rmSync, existsSync, unlinkSync, copyFileSync } from 'node:fs';
 import type { Db } from '../db.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ChatRef, SandboxEntry, SandboxRunResult, SandboxStat, SandboxWriteResult } from '../types.ts';
 import { SlidingWindowCounter } from '../ratelimit.ts';
-import { newId, nowMs, truncate } from '../util/misc.ts';
+import { newId, nowMs, truncate, safeKeyPart } from '../util/misc.ts';
 import { dockerBinCandidates } from './deps.ts';
 
 /** 覆盖写的行增减：整行做多重集比对（够 UI 显示 +N -M，不做逐行 diff）；含 NUL 的二进制不计算 */
@@ -120,8 +120,9 @@ export class SandboxService {
   // ---------------- 路径与边界 ----------------
 
   chatKey(chat: ChatRef): string {
-    // scope = 同一聊天里按发起人再分一层（work 轮）；不带 scope 的就是聊天本身
-    return `${chat.type}_${chat.chatId}${chat.scope ? `__${chat.scope}` : ''}`;
+    // scope = 同一聊天里按发起人再分一层（work 轮）；不带 scope 的就是聊天本身。
+    // 三段都会变成目录名：chatId/scope 来自协议端与 API 参数，必须消毒，`..` 不能参与。
+    return `${safeKeyPart(chat.type)}_${safeKeyPart(chat.chatId)}${chat.scope ? `__${safeKeyPart(chat.scope)}` : ''}`;
   }
 
   /**
@@ -137,7 +138,13 @@ export class SandboxService {
     const src = join(this.rootDir, `${from.type}_${from.chatId}`, 'inbox');
     const dest = join(this.root(to), 'inbox');
     if (!existsSync(src)) return 0;
-    mkdirSync(dest, { recursive: true });
+    // dest 也可能是容器种下的符号链接：跟着写会把文件落到沙箱外
+    try {
+      const dst = lstatSync(dest);
+      if (dst.isSymbolicLink() || !dst.isDirectory()) return 0;
+    } catch {
+      mkdirSync(dest, { recursive: true });
+    }
     let names: string[];
     try { names = readdirSync(src); } catch { return 0; }
     let copied = 0;
@@ -145,9 +152,13 @@ export class SandboxService {
       const s = join(src, name);
       const d = join(dest, name);
       try {
-        const st = statSync(s);
-        if (!st.isFile()) continue;
-        if (existsSync(d) && statSync(d).mtimeMs >= st.mtimeMs) continue;
+        const st = lstatSync(s);
+        if (!st.isFile() || st.isSymbolicLink()) continue;
+        try {
+          const ds = lstatSync(d);
+          if (ds.isSymbolicLink() || !ds.isFile()) continue;
+          if (ds.mtimeMs >= st.mtimeMs) continue;
+        } catch { /* 目标不存在：照常拷 */ }
         copyFileSync(s, d);
         this.touchFile(to, `inbox/${name.replace(/\\/g, '/')}`, st.size);
         copied++;
@@ -159,7 +170,13 @@ export class SandboxService {
   root(chat: ChatRef): string {
     const dir = join(this.rootDir, this.chatKey(chat));
     mkdirSync(dir, { recursive: true });
-    mkdirSync(join(dir, 'inbox'), { recursive: true });
+    const inbox = join(dir, 'inbox');
+    // inbox 被容器换成符号链接时先拆掉再建：否则后续 saveInbox 的写入会落到链接目标
+    try {
+      const st = lstatSync(inbox);
+      if (st.isSymbolicLink() || !st.isDirectory()) rmSync(inbox, { recursive: true, force: true });
+    } catch { /* 不存在：下面创建 */ }
+    mkdirSync(inbox, { recursive: true });
     return dir;
   }
 
@@ -179,7 +196,34 @@ export class SandboxService {
     if (normAbs !== normRoot && !normAbs.startsWith(normRoot + sep)) {
       throw new SandboxError(`路径越界：只允许访问当前会话沙箱目录内的文件（${this.chatKey(chat)}）`);
     }
+    // 字面校验不够：容器/子进程能在挂载卷里种符号链接（`ln -s / /ws/escape`），
+    // 后面的 readFileSync/writeFileSync 会跟着它出沙箱。真实路径也必须落在根内。
+    this.assertRealInside(normRoot, normAbs, relPath);
     return normAbs;
+  }
+
+  /** 解开符号链接后再比对一次；目标还不存在时向上找第一个存在的祖先（write 新建文件） */
+  private assertRealInside(root: string, abs: string, relPath: string): void {
+    const realRoot = realpathSync(root);
+    let probe = abs;
+    for (;;) {
+      try {
+        const real = realpathSync(probe);
+        const inside = relative(realRoot, real);
+        if (inside.startsWith('..') || isAbsolute(inside)) {
+          throw new SandboxError(`路径越界：符号链接指向沙箱外（${relPath}）`);
+        }
+        return;
+      } catch (e) {
+        if (e instanceof SandboxError) throw e;
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new SandboxError(`无法校验路径（${relPath}）：${(e as Error).message}`);
+        }
+        const parent = dirname(probe);
+        if (parent === probe) throw new SandboxError(`路径越界（${relPath}）`);
+        probe = parent;
+      }
+    }
   }
 
   // ---------------- 文件工具 ----------------
@@ -192,7 +236,10 @@ export class SandboxService {
     const out: SandboxEntry[] = [];
     for (const name of readdirSync(abs)) {
       const p = join(abs, name);
-      const s = statSync(p);
+      let s;
+      try { s = lstatSync(p); } catch { continue; }
+      // 与 walkFiles 同口径：符号链接一律不列（可能指到沙箱外，点开就是越界读）
+      if (s.isSymbolicLink()) continue;
       const rel = join(relPath, name).replace(/\\/g, '/');
       out.push({ name, relPath: rel, type: s.isDirectory() ? 'dir' : 'file', size: s.size, mtime: s.mtimeMs });
       if (s.isFile()) this.touchFile(chat, rel, s.size);

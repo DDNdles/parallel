@@ -237,7 +237,7 @@ export class PluginContainer {
     this.deps.db.run('DELETE FROM plugin_states WHERE plugin_id=?', id);
     this.deps.db.run('DELETE FROM plugin_kv WHERE plugin_id=?', id);
     this.deps.db.run('DELETE FROM plugin_user_config WHERE plugin_id=?', id);
-    this.deps.config.setPluginSecret(id, '*', '');
+    this.deps.config.clearPluginSecrets(id);
     this.deps.bus.emit(busEvents.pluginStateChanged, { id, state: 'uninstalled' });
   }
 
@@ -406,7 +406,8 @@ export class PluginContainer {
     role: Role;
     trigger?: 'chat' | 'subagent';
   }): Promise<{ ok: boolean; reason?: string }> {
-    const m = String(input.chatKey ?? '').match(/^(group|private)_(.+)$/);
+    // chatId 会参与沙箱/会话目录名：只收安全字符，`..`、分隔符一律判非法
+    const m = String(input.chatKey ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
     if (!m) return { ok: false, reason: 'chatKey 不合法' };
     if (this.deps.work.workModelLabel() === '—') return { ok: false, reason: '工作模型还没配置' };
     const chat: ChatRef = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };

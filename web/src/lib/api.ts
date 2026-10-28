@@ -111,7 +111,14 @@ export function toast(msg: string, type = '') {
 
 /** 极简 Markdown：代码块/行内代码/粗体/链接（与旧版 mdLite 行为一致） */
 export function mdLite(text: string): string {
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // 引号必须一起转义：链接是拼进 href="..." 的属性值，只转 & < > 时
+  // `[x](https://a"onmouseover="alert(1)//)` 可以闭合属性注入事件处理器。
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
   const blocks: string[] = [];
   let out = esc(text).replace(/```(\w*)\n([\s\S]*?)```/g, (_, _lang, code) => {
     blocks.push(`<div class="md-code">${code.replace(/\n$/, '')}</div>`);
@@ -120,7 +127,8 @@ export function mdLite(text: string): string {
   out = out
     .replace(/`([^`\n]+)`/g, '<code class="mono" style="background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:.92em">$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    // URL 捕获组排除引号/尖括号：esc 已把原文引号转成实体，这里再挡一道，防止日后改 esc 时回退
+    .replace(/\[([^\]]+)\]\((https?:[^)\s"'<>]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     // 标题：work 的交付摘要常用 `## 完成` / `## 产物` 这类行。只去掉井号，按普通正文行排；
     // 用内联 span 而不是 div，避免 pre-wrap 下多出一整行空白。
     .replace(/^#{1,6}\s+(.+)$/gm, '<span class="md-h">$1</span>');

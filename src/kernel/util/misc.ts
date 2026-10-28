@@ -27,6 +27,15 @@ export function clip(s: string, max: number): string {
   return t.length <= max ? t : t.slice(0, max) + '…';
 }
 
+/**
+ * 聊天标识拼进目录/文件名前的消毒：只留字母数字与 `. _ -`。
+ * chatId/scope 来自协议端事件与 API 参数，直接参与 `join()` 时 `..` 与 `/` 会越出数据目录。
+ */
+export function safeKeyPart(v: unknown): string {
+  const s = String(v ?? '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128);
+  return s === '' || s === '.' || s === '..' ? '_' : s;
+}
+
 /** 深合并 target ← source（仅普通对象；source 值为 null 时直接赋值），返回 target */
 export function deepMerge<T extends Record<string, unknown>>(target: T, source: Record<string, unknown>): T {
   for (const [k, v] of Object.entries(source)) {

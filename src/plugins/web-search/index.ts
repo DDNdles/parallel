@@ -1,4 +1,5 @@
 import type { PluginContext } from '../../kernel/types.ts';
+import { lookup } from 'node:dns/promises';
 
 // ============================================================
 // web-search —— Tavily 搜索
@@ -31,17 +32,73 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+/** 内网/本机/元数据地址：群成员能经提示注入驱动 web_fetch，这些目标一律拒。
+ *  含 IPv4 私有段、环回、链路本地（169.254，含云元数据 169.254.169.254）、CGNAT、
+ *  保留段与组播；IPv6 覆盖 ::1 / ULA / 链路本地 / 组播，以及 IPv4-mapped 写法。 */
+function isBlockedIp(raw: string): boolean {
+  const ip = raw.toLowerCase().replace(/^\[|\]$/g, '');
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (mapped) return isBlockedIp(mapped[1]);
+  if (ip.includes(':')) {
+    return ip === '::1' || ip === '::'
+      || ip.startsWith('fc') || ip.startsWith('fd')
+      || ip.startsWith('fe80') || ip.startsWith('ff');
+  }
+  const p = ip.split('.').map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b] = p;
+  return a === 0 || a === 10 || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 192 && b === 0)
+    || (a === 198 && (b === 18 || b === 19))
+    || a >= 224;
+}
+
+/** URL 必须是 http(s)，且解析结果全部是公网地址；字面 IP 直接判，域名先解析再判 */
+async function assertPublicUrl(raw: string): Promise<URL> {
+  const u = new URL(raw);
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('只支持 http/https');
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) {
+    if (isBlockedIp(host)) throw new Error('拒绝访问内网/本机地址');
+    return u;
+  }
+  const addrs = await lookup(host, { all: true, verbatim: true });
+  if (!addrs.length) throw new Error('域名解析失败');
+  if (addrs.some((a) => isBlockedIp(a.address))) throw new Error('拒绝访问内网/本机地址');
+  return u;
+}
+
+/** 手动跟随重定向：每一跳都重新做公网校验，防止 302 到 127.0.0.1/内网 */
+async function fetchPublic(url: string, timeoutMs: number, headers: Record<string, string>): Promise<Response> {
+  const deadline = Date.now() + timeoutMs;
+  let cur = await assertPublicUrl(url);
+  for (let hop = 0; hop < 5; hop++) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error('抓取超时');
+    const resp = await fetch(cur, {
+      headers,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(left),
+    });
+    if (![301, 302, 303, 307, 308].includes(resp.status)) return resp;
+    const loc = resp.headers.get('location');
+    if (!loc) return resp;
+    cur = await assertPublicUrl(new URL(loc, cur).toString());
+  }
+  throw new Error('重定向次数过多');
+}
+
 /** 抓取一个 URL 并抽取正文；HTML 走正文抽取，纯文本/JSON 直接返回 */
 async function fetchPage(url: string, timeoutMs: number): Promise<string> {
-  const resp = await fetch(url, {
-    headers: {
-      // 一些站点（如 B 站）对无 UA 请求返回 403
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-      'accept': 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8',
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.6',
-    },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
+  const resp = await fetchPublic(url, timeoutMs, {
+    // 一些站点（如 B 站）对无 UA 请求返回 403
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'accept': 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8',
+    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.6',
   });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const ct = resp.headers.get('content-type') ?? '';
