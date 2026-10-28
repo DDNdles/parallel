@@ -56,7 +56,7 @@ const GENERIC = [
 // ---------- 入包清单（白名单式，新增顶层内容要显式加进来） ----------
 // logos/ 是 3MB 设计过程稿、运行时零引用，不再随包（仓库里保留）。
 const INCLUDE_DIRS = ['bin', 'src', 'examples', 'docker', 'ui', 'scripts', 'test'];
-const INCLUDE_FILES = ['package.json', 'package-lock.json', 'tsconfig.json', 'parallel.cmd', 'parallel.sh', 'README.md', 'THIRD-PARTY-NOTICES.md'];
+const INCLUDE_FILES = ['LICENSE', 'THIRD-PARTY-NOTICES.md', 'package.json', 'package-lock.json', 'tsconfig.json', 'parallel.cmd', 'parallel.sh', 'README.md'];
 const SKIP_IN_MODULES = new Set(['.cache', '.package-lock.json']);
 // 无论清单怎么改都绝不入包（第二道保险，白名单之外理论上根本不会被复制）
 // ref/ 是个人的参考音色音频；__pycache__/pyc 是 docker 里跑出来的字节码。
@@ -64,6 +64,8 @@ const FORBIDDEN = [
   /^data(\/|\\|$)/, /\.bak/, /\.log$/, /\.tmp$/, /(^|\/|\\)\.env/,
   /^docker[\\/][^\\/]+[\\/]ref([\\/]|$)/,
   /[\\/]__pycache__([\\/]|$)/, /\.pyc$/,
+  // QQ 表情美术版权归腾讯：不随仓库/发布包走，运行时从本机协议端发行包生成到 data/face
+  /^ui[\\/]face([\\/]|$)/,
 ];
 
 if (!existsSync(join(root, 'ui', 'index.html'))) {

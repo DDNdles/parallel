@@ -113,3 +113,11 @@ scripts/              运维/验收脚本：`pack-release.mjs` 打发布包（�
                      `serve-ui.mjs` 起临时内核预览桌面端、`smoke-work-tools.ts` 工作工具冒烟
 data/                 运行时数据（config.json / secrets.json / parallel.db / sandbox/ / sessions/ / plugins/ / personas/），不入库
 ```
+
+## 许可
+
+本项目以 [AGPL-3.0](LICENSE)（GNU Affero General Public License v3.0）许可发布：自行使用与修改不受限；
+若把修改后的版本作为网络服务提供或对外分发，需按 AGPL-3.0 提供对应源码。选择该许可证的直接原因：
+拟人化层 `agency.ts` 的行动容量判定移植自 HDS-Interlude（AGPL-3.0）。随包第三方组件与借鉴来源见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)；QQ 表情美术图不随仓库/发布包分发，运行时由内核
+从本机协议端发行包转码生成到 `data/face/`。

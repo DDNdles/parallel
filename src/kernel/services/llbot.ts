@@ -10,6 +10,7 @@ import { busEvents } from '../bus.ts';
 import type { EndCheck, Logger, ProtocolEnd } from '../types.ts';
 import { LlbotIdentity, parseLlbotLine } from './llbot-identity.ts';
 import { sha256File } from './integrity.ts';
+import { ensureFaces } from './faces.ts';
 
 /**
  * 有头模式前置检查的判定（纯函数，便于测试）。
@@ -569,6 +570,8 @@ export class LLBotManager implements ProtocolEnd {
       renameSync(found, this.exePath());
     }
     this.log.info('LLBot 发行包就绪');
+    // 表情美术图不随仓库/发布包分发：发行包落好就地把 webui/face 转成 data/face（版权图只留本机）
+    void ensureFaces(this.config.dataDir, this.log).catch(() => {});
   }
 
   private findExe(dir: string, depth: number): string | null {

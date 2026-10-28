@@ -22,5 +22,6 @@
       "description": "返回结果条数上限"
     }
   },
-  "hidden": true
+  "hidden": true,
+  "license": "AGPL-3.0-only"
 }

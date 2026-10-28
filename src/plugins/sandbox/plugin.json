@@ -18,5 +18,6 @@
       "description": "脚本默认超时（毫秒）"
     }
   },
-  "hidden": true
+  "hidden": true,
+  "license": "AGPL-3.0-only"
 }

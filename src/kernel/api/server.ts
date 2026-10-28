@@ -171,6 +171,11 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
 
   // ---- 静态 UI ----
   if (!path.startsWith('/api/') && !path.startsWith('/ws')) {
+    // QQ 表情：运行时生成的 data/face（版权图不进仓库/发布包；缺图由前端回落中文名）
+    if (path.startsWith('/face/')) {
+      serveFaceFile(kernel.dataDir, path, res);
+      return;
+    }
     serveStatic(uiRoot, path, res);
     return;
   }
@@ -1445,6 +1450,20 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     const e = applyNum(t, proactive, 'idleSeconds', 60, 86_400, '主动发言静默时长'); if (e) return e;
   }
   return undefined;
+}
+
+/** QQ 表情：只认 /face/<数字id>.webp，从 data/face 伺服；不存在就 404（前端有中文名兜底） */
+function serveFaceFile(dataDir: string, path: string, res: ServerResponse): void {
+  const m = /^\/face\/(\d{1,4})\.webp$/.exec(path);
+  if (!m) { res.writeHead(404); res.end(); return; }
+  const file = join(dataDir, 'face', `${m[1]}.webp`);
+  if (!existsSync(file) || !statSync(file).isFile()) { res.writeHead(404); res.end(); return; }
+  res.writeHead(200, {
+    'content-type': 'image/webp',
+    'cache-control': 'public, max-age=86400',
+    'x-content-type-options': 'nosniff',
+  });
+  createReadStream(file).pipe(res);
 }
 
 function serveStatic(root: string, path: string, res: ServerResponse): void {

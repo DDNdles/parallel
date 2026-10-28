@@ -3,16 +3,32 @@
   "name": "你好插件（示例）",
   "version": "0.1.0",
   "description": "用户自建插件的完整模板：演示 tools / commands / userConfig / mcpServers 四贡献面 + 好感度读取 + 沙箱计算。复制本目录到 data/plugins/<你的插件名>/ 即成为用户插件。",
-  "author": { "name": "parallel" },
-  "license": "MIT",
+  "author": {
+    "name": "parallel"
+  },
+  "license": "AGPL-3.0-only",
   "category": "fun",
   "trust": "example",
-  "permissions": ["memory.read", "fs.sandbox", "sandbox.exec", "network"],
+  "permissions": [
+    "memory.read",
+    "fs.sandbox",
+    "sandbox.exec",
+    "network"
+  ],
   "defaultGroupState": "off",
   "userConfig": {
-    "greetingWord": { "type": "string", "default": "哈喽", "description": "打招呼用词" }
+    "greetingWord": {
+      "type": "string",
+      "default": "哈喽",
+      "description": "打招呼用词"
+    }
   },
   "mcpServers": {
-    "demo-echo": { "command": "node", "args": ["mcp-echo-server.mjs"] }
+    "demo-echo": {
+      "command": "node",
+      "args": [
+        "mcp-echo-server.mjs"
+      ]
+    }
   }
 }

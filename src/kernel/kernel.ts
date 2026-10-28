@@ -21,6 +21,7 @@ import { LLBotManager } from './services/llbot.ts';
 import { bundledFfmpeg } from './services/downloads.ts';
 import { setFfmpegCandidate } from './services/media.ts';
 import { NapCatManager } from './services/napcat.ts';
+import { ensureFaces } from './services/faces.ts';
 import { PluginContainer } from './container.ts';
 import { CoverSupervisor, planCoverSupervisor } from './cover-supervisor.ts';
 import { AgentLoop, HistoryStore } from './agentloop.ts';
@@ -388,6 +389,8 @@ export class Kernel {
     mkdirSync(join(this.dataDir, 'plugins'), { recursive: true });
     await this.container.scanAndLoadAll();
     await this.adapter.start();
+    // QQ 表情资源：发行包在、ffmpeg 在就后台现转（不阻塞启动；缺图由前端回落中文名）
+    void ensureFaces(this.dataDir, this.log).catch(() => {});
     // 群名/好友昵称在协议端连入时自动拉取（onebot11 handleConnection 内）
     // 内嵌托管常驻开启：桌面内核一起来就把选定的协议端下载/拉起/守好。
     // noApi（无头跑测试或服务模式）不托管：那种场景不该在后台拉百 MB 发行包，协议端由 Mock/外部顶替。

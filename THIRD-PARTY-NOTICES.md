@@ -1,7 +1,18 @@
 # 第三方组件与来源声明
 
-本项目自身尚在决定分发许可（仓库根暂无 LICENSE）。下面列出随包运行时组件与已明确标注的借鉴来源；
-更细的逐文件来源说明保留在对应源码注释里。
+本项目以 **GNU Affero General Public License v3.0（AGPL-3.0-only）** 发布（见根目录 `LICENSE`）。
+
+为什么是 AGPL：拟人化层里有一处（`src/kernel/humanlike/agency.ts` 的行动容量判定，含其
+reason 标记词）是与 HDS-Interlude（AGPL-3.0）`src/agency.ts` 的 `evaluateAgencyCapacity`
+逐行级对应的移植——判定顺序、分支结构与标记字符串沿用上游。AGPL-3.0 的作品不能以
+GPL-3.0-only 再发布，因此整体采用 AGPL-3.0（它同时覆盖 MaiBot 的 GPL-3.0 义务：
+GPLv3 代码可以并入 AGPL-3.0 作品）。人格化聊天其余部分（frequency/jargon/repetition/
+rhythm/schedule/delivery 等）为独立实现，仅机制与参数口径参考上游。
+
+AGPL 对你的实际影响：自己用、改了自己用不需要做任何事；**如果你把修改后的版本作为
+网络服务提供给他人使用，或对外分发，需要按 AGPL-3.0 提供对应源码**（保留 LICENSE 与
+本文件、注明修改）。QQ 表情美术图不属于本项目代码，不随仓库/发布包分发（运行时从
+用户本机协议端发行包生成，见下）。
 
 ## 运行时依赖（随发布包）
 
@@ -23,20 +34,19 @@
 
 ## 设计与思想借鉴
 
-- **pi / Pi Agent Harness**：agent loop 与压缩语义、工具面组织方式（依赖使用，非代码拷贝）。
+- **pi / Pi Agent Harness**（MIT）：agent loop 与压缩语义、工具面组织方式（依赖使用）。
 - **ZCode**（Apache-2.0）：工作页活动流与抽屉的交互形态（自行实现，非逐行拷贝）。
 - **AstrBot / dsh**：分层与插件组织方式的类比。
-- **MaiBot**（GPL-3.0）：拟人化的部分参数、判定逻辑与理由字符串有移植/对齐痕迹
-  （见 `src/kernel/humanlike/*.ts` 的头注）。**相关 copyleft 义务尚未完成决策**；
-  在所有者明确许可方案前，请勿再分发本项目。
-- **HDSI / HDS-Interlude**：节奏反定型、行动窗口、日程的判据顺序与理由字符串参考
-  （见 `agency.ts` / `rhythm.ts` / `schedule.ts` 的头注），上游许可待核。
+- **MaiBot**（GPL-3.0）：发言频率、空窗补偿、退避、黑话学习等机制与参数口径参考
+  （见 `src/kernel/humanlike/*.ts` 头注；无源码级复制）。
+- **HDS-Interlude**（AGPL-3.0）：节奏反定型、行动窗口、日程的思路参考；
+  其中 `agency.ts` 的判定函数为逐行级移植（见顶部说明）。
 
 ## 素材
 
 - `web/public/assets/login-mesh.jpg`：来自 Unsplash，按 Unsplash License 使用；
   原署名记录在 `ui-legacy/assets/CREDITS.md`（历史存档目录，不入发布包）。
-- QQ 表情图片（`web/public/face/*.webp`）：美术版权归腾讯所有，见
-  `web/public/face/README.md`；**不单独再分发**。其随仓库/发布包存在的合规性
-  待项目所有者决策。
+- QQ 表情图片：美术版权归腾讯所有，**不随本仓库或发布包分发**。运行时所需的表情图由
+  内核在首次需要时从用户本机已安装的协议端发行包里转码生成（`ensureFaces` /
+  `scripts/build-qq-faces.mjs`），只落在本机 `data/face/`。
 - `logos/`、`gemini/` 为自产/生成的设计过程稿，运行时零引用，不随发布包。
