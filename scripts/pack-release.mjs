@@ -66,6 +66,9 @@ const FORBIDDEN = [
   /[\\/]__pycache__([\\/]|$)/, /\.pyc$/,
   // QQ 表情美术版权归腾讯：不随仓库/发布包走，运行时从本机协议端发行包生成到 data/face
   /^ui[\\/]face([\\/]|$)/,
+  // dist 里只允许编译产物：历史残留的 stage/tgz 绝不能进包
+  /^dist[\\/]stage([\\/]|$)/,
+  /\.tgz$/,
 ];
 
 if (!existsSync(join(root, 'ui', 'index.html'))) {

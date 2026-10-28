@@ -24,8 +24,8 @@ jobs:
       - run: npm run build
       # 编译运行时到 dist/（npm 包在 node_modules 里必须跑 JS）
       - run: npm run build:pkg
-      # npm 包：tarball 丢进 dist/（避免弄脏工作区，pack-release 有干净树闸门）
-      - run: mkdir -p dist && npm pack --pack-destination dist
+      # 发行物统一进 release/（dist/ 只放编译产物）
+      - run: mkdir -p release && npm pack --pack-destination release
       # zip：双击 parallel.cmd 的路线（slim，不带 node_modules）
       - run: node scripts/pack-release.mjs --slim
       - name: Create GitHub Release
@@ -34,6 +34,6 @@ jobs:
         run: |
           TAG="$GITHUB_REF_NAME"
           # 不用 shell 通配：runner shell 的 glob 行为不可控，find 枚举最稳
-          FILES=$(find dist -maxdepth 1 -type f -printf '%f\n' | tr '\n' ' ')
+          FILES=$(find release -maxdepth 1 -type f -printf '%f\n' | tr '\n' ' ')
           echo "assets: $FILES"
           gh release create "$TAG" --title "parallel $TAG" --generate-notes $FILES
