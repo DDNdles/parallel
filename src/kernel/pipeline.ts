@@ -177,7 +177,7 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
       `任务：${report.task}`,
       `它要问的：${r.awaiting.question}`,
       r.awaiting.notes ? `（它已经做到：${r.awaiting.notes}）` : '',
-      `请用你自己的语气把这个问题转达给发起人（@ 已经带上了）：说清要他定什么、为什么非他定不可，并告诉他直接把答案说出来就行，你会接着让活往下干。`,
+      `请用你自己的语气把这个问题转达给发起人（@ 由程序带上，正文里不要再写 @ 或 @昵称）：说清要他定什么、为什么非他定不可，并告诉他直接把答案说出来就行，你会接着让活往下干。`,
       `不要提"子代理""模型""系统提示"，也别把这件事说成"做完了"。`,
     ].filter(Boolean).join('\n');
   }
@@ -186,7 +186,7 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
       `【你派出去的活没做成】`,
       `任务：${report.task}`,
       `失败原因：${r.error || '未知原因'}`,
-      `请用你自己的语气如实告诉发起人这次没办成（@ 已经带上了），别编造结果；能给出下一步怎么做就顺带说一句。`,
+      `请用你自己的语气如实告诉发起人这次没办成（@ 由程序带上，正文里不要再写 @ 或 @昵称），别编造结果；能给出下一步怎么做就顺带说一句。`,
       `不要提"子代理""模型""系统提示"这些词。`,
     ].join('\n');
   }
@@ -199,8 +199,27 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
     r.artifacts?.length
       ? `产物会由系统直接发出（正文一条，每份产物一条文件消息）：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
       : '',
-    `请用你自己的语气向发起人汇报（@ 已经带上了），像你自己干完活回话一样；不要提"子代理""模型""系统提示"。`,
+    `请用你自己的语气向发起人汇报（@ 由程序带上，正文里不要再写 @ 或 @昵称），像你自己干完活回话一样；不要提"子代理""模型""系统提示"。`,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * 汇报轮程序已经在正文最前面挂了 at 段，模型有时还会在正文里再写一遍「@昵称」，
+ * 群里看上去就是 @ 了两遍。这里把重复的 @ 剥掉：
+ *  - QQ 号形态（@3095966025）出现在哪都剥——正文里写号码本来就不是人话；
+ *  - 昵称形态只在开头剥（正文中间再叫一次名字可能是有意的）。
+ */
+export function stripMentionEcho(text: string, mention: { userId: string; nickname?: string }): string {
+  const src = String(text ?? '');
+  const esc = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let out = src;
+  const qq = String(mention.userId ?? '').trim();
+  if (/^\d{4,}$/.test(qq)) out = out.replace(new RegExp(`[@＠]\\s*${qq}`, 'gu'), '');
+  const nick = String(mention.nickname ?? '').trim();
+  if (nick) out = out.replace(new RegExp(`^\\s*[@＠]\\s*${esc(nick)}`, 'u'), '');
+  // 剥掉残留的分隔符（"@昵称，汇报…" → "汇报…"）
+  if (out !== src) out = out.replace(/^[\s,，、:：;；]+/, '');
+  return out;
 }
 
 /**
@@ -1162,10 +1181,12 @@ export class Pipeline {
     /** 派活确认轮：只发一条气泡（"接活"和"回应叫醒词/梗"不该各占一条） */
     singleBubble = false,
   ): Promise<void> {
+    // 程序已经挂了 at 段：模型再在正文里写一遍 @昵称，群里就是 @ 两遍（2026-10-28 用户报）
+    const body = mention ? stripMentionEcho(raw, mention) : raw;
     if (forward) {
       // 交付直接发：正文一条（不切气泡），产物一份一条文件消息（2026-10-28 用户定，
       // 不再合并成「聊天记录」合集，也不再打 zip 包）
-      const text = this.humanlike.reportText(raw);
+      const text = this.humanlike.reportText(body);
       if (!text && !forward.artifacts.length) { this.humanlike.noteSilent(chat); return; }
       try {
         // 2026-10-25 任务隔离：发送目标还是聊天本身；产物从任务沙箱读（老运行回退旧式按人沙箱）
@@ -1186,7 +1207,7 @@ export class Pipeline {
         this.errors.record('warn', 'work', `交付发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
       }
     }
-    const { plans } = await this.humanlike.composeScene(raw, singleBubble ? { maxBubbles: 1 } : undefined);
+    const { plans } = await this.humanlike.composeScene(body, singleBubble ? { maxBubbles: 1 } : undefined);
     if (!plans.length) {
       this.humanlike.noteSilent(chat);
       return;

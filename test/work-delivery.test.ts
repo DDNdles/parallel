@@ -170,3 +170,22 @@ test('产物路径口径：技能/收件/缓存/隐藏/越界都不算交付物'
     assert.equal(isDeliverableArtifact(p), false, `${p} 不该被当成交付物`);
   }
 });
+
+test('汇报正文里重复写的 @ 会剥掉（程序已经挂了 at 段，别再 @ 两遍）', async () => {
+  const { stripMentionEcho } = await import('../src/kernel/pipeline.ts');
+  const m = { userId: '3095966025', nickname: '君にも嘘をつこう' };
+  // 线上真实形态：at 段 + 正文开头又写了一遍 @昵称
+  assert.equal(stripMentionEcho('@君にも嘘をつこう \n本鱼去瞅啦！', m), '本鱼去瞅啦！');
+  assert.equal(stripMentionEcho('＠君にも嘘をつこう，搞定了', m), '搞定了');
+  assert.equal(stripMentionEcho('  @君にも嘘をつこう 做完了', m), '做完了');
+  // 号码形态在正文任何位置都算重复
+  assert.equal(stripMentionEcho('@3095966025 做完了', m), '做完了');
+  assert.equal(stripMentionEcho('做完了，细节在 @3095966025 那里', m), '做完了，细节在  那里');
+  // 没写 @ 就不动；正文中间叫名字可能是有意的，只在开头剥昵称
+  assert.equal(stripMentionEcho('做完了', m), '做完了');
+  assert.equal(stripMentionEcho('搞定了，君にも嘘をつこう 你看下', m), '搞定了，君にも嘘をつこう 你看下');
+  // 昵称里的正则元字符不能把替换搞崩
+  assert.equal(stripMentionEcho('@a.b(c)+d 好了', { userId: '12345678', nickname: 'a.b(c)+d' }), '好了');
+  // 没有昵称时只按号码剥
+  assert.equal(stripMentionEcho('@3095966025 好了', { userId: '3095966025' }), '好了');
+});
