@@ -418,17 +418,26 @@ test('沙箱：写入/读取/配额/TTL 字段', () => {
 });
 
 test('沙箱：真实执行 python（超时/输出截断机制）', async (t) => {
-  // 需要宿主有真 python：CI runner / 新机器可能没有（商店占位符也算失败）。
-  // 没有就跳过——沙箱执行链的超时/截断逻辑另有纯逻辑用例覆盖，这里只验真执行。
-  const probe = spawnSync('python', ['-c', 'print(1)'], { timeout: 15_000, windowsHide: true });
+  // 需要宿主 python 满足**沙箱子进程的调用形态**（-I 隔离模式 + 极简环境变量）：
+  // 普通 python 能跑不代表沙箱形态能跑（CI runner 实测踩过）。不满足就跳过——
+  // 超时/截断逻辑另有纯逻辑用例覆盖，这里只验真执行。
+  const probeEnv = {
+    PATH: process.env.PATH ?? '',
+    SYSTEMROOT: process.env.SYSTEMROOT ?? '',
+    COMSPEC: process.env.COMSPEC ?? '',
+    PYTHONIOENCODING: 'utf-8',
+  };
+  const probe = spawnSync(process.env.PARALLEL_PYTHON || 'python', ['-I', '-u', '-c', 'print(1)'], {
+    timeout: 15_000, windowsHide: true, env: probeEnv,
+  });
   if (probe.status !== 0 || !String(probe.stdout ?? '').includes('1')) {
-    t.skip('宿主没有可用的 python');
+    t.skip(`宿主 python 不满足沙箱执行形态（exit=${probe.status}，stderr=${String(probe.stderr ?? '').slice(0, 140)}）`);
     return;
   }
   const sb = kernel.sandbox;
   const chat = { platform: 'qq', type: 'private' as const, chatId: '777' };
   const r = await sb.run(chat, { language: 'python', code: 'print("calc:", 6*7)' });
-  assert.equal(r.ok, true);
+  assert.equal(r.ok, true, `stdout=${r.stdout} stderr=${r.stderr}`);
   assert.match(r.stdout, /calc: 42/);
   // 超时被杀
   const r2 = await sb.run(chat, { language: 'python', code: 'import time\ntime.sleep(30)', timeoutMs: 1500 });
