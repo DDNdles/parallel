@@ -76,7 +76,9 @@ if (!existsSync(join(root, 'ui', 'index.html'))) {
   process.exit(1);
 }
 
-rmSync(release, { recursive: true, force: true });
+// 只清自己的 stage：release/ 里可能已经有 npm pack 先放进来的 tgz，不能整目录清掉
+rmSync(join(release, 'stage'), { recursive: true, force: true });
+mkdirSync(join(release, 'stage'), { recursive: true });
 mkdirSync(stage, { recursive: true });
 
 let files = 0;

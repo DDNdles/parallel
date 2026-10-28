@@ -34,6 +34,6 @@ jobs:
         run: |
           TAG="$GITHUB_REF_NAME"
           # 不用 shell 通配：runner shell 的 glob 行为不可控，find 枚举最稳
-          FILES=$(find release -maxdepth 1 -type f -printf '%f\n' | tr '\n' ' ')
+          FILES=$(find release -maxdepth 1 -type f | tr '\n' ' ')
           echo "assets: $FILES"
           gh release create "$TAG" --title "parallel $TAG" --generate-notes $FILES
