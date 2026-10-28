@@ -23,7 +23,7 @@ jobs:
       # 构建桌面端到 ui/（npm pack 与 zip 都要它）
       - run: npm run build
       # npm 包：tarball 丢进 dist/（避免弄脏工作区，pack-release 有干净树闸门）
-      - run: npm pack --pack-destination dist
+      - run: mkdir -p dist && npm pack --pack-destination dist
       # zip：双击 parallel.cmd 的路线（slim，不带 node_modules）
       - run: node scripts/pack-release.mjs --slim
       - name: Create GitHub Release
