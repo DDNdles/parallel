@@ -55,6 +55,8 @@ export class OneBot11Adapter implements TransportAdapter {
     private bus: Bus,
     private sandbox: SandboxService,
     private onEvent: (e: ChatEvent) => void,
+    /** 拉黑判定：被拉黑的用户连附件都不下、事件也不进内核（与隐藏会话同一处收口） */
+    private isBlocked: (userId: string) => boolean,
     loggerFactory: (name: string) => Logger,
   ) {
     this.log = loggerFactory('onebot11');
@@ -187,6 +189,8 @@ export class OneBot11Adapter implements TransportAdapter {
     const userId = String(msg.user_id);
     // 已隐藏的会话：在下载之前就收口——图片/文件不进沙箱，消息也不进内核（解除隐藏后不补历史）。
     if (this.config.chatHidden(this.selfId, type, chatId)) return;
+    // 拉黑的用户：同样在下载之前收口，连"忽略"的会话条目都不留 —— 当这条消息没出现过。
+    if (this.isBlocked(userId)) return;
     const segments = normalizeSegments(msg.message);
     const rendered = segmentsToText(segments, this.selfId, String(msg.source?.user_id ?? ''));
     const text = rendered.text;
@@ -388,6 +392,7 @@ export class OneBot11Adapter implements TransportAdapter {
     const file = msg.file ?? {};
     const chat: ChatRef = { platform: 'qq', type: 'group', chatId };
     if (this.config.chatHidden(this.selfId, 'group', chatId)) return;
+    if (this.isBlocked(String(msg.user_id))) return;
     try {
       let buf: Buffer | null = null;
       let name = String(file.name ?? 'file');
@@ -410,6 +415,7 @@ export class OneBot11Adapter implements TransportAdapter {
     const chatId = String(msg.user_id);
     const chat: ChatRef = { platform: 'qq', type: 'private', chatId };
     if (this.config.chatHidden(this.selfId, 'private', chatId)) return;
+    if (this.isBlocked(chatId)) return;
     try {
       const file = msg.file ?? {};
       let buf: Buffer | null = null;

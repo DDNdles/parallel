@@ -294,6 +294,10 @@ export class Pipeline {
     // 隐藏会话（桌面端「已隐藏」）：当成没说过——不落账、不记用量、不进拟人层。
     // 附件的下载也在适配器那头就挡掉了；解除隐藏后只恢复"此后的"入站，不补历史。
     if (this.chatHidden(event)) return;
+    // 拉黑 = 完全不收（2026-10-28 用户定）：不落账、不记用量、不进名册/黑话/拟人层，
+    // 也不触发"她正在发气泡"的打断 —— 跟没出现过一样。适配器那头还会先挡一次，
+    // 让这类消息的图片/语音连下载都不发生；这里兜住 UI 注入与测试等其它入口。
+    if (this.isBlocked(event.userId)) return;
     // 说话人名册要在门控之前记：被拟人层攒着/放过的消息，同样可能是之后那件活的正主
     this.rememberSpeaker(event);
     const chat = { platform: event.platform, type: event.type, chatId: event.chatId };
@@ -466,6 +470,13 @@ export class Pipeline {
     return this.config.chatHidden(this.selfId(), event.type, event.chatId);
   }
 
+  /** 被拉黑的用户 = bot 完全不收他的消息（users.blocked；主动发言/汇报里的空 userId 不算） */
+  private isBlocked(userId: string): boolean {
+    const id = String(userId ?? '');
+    if (!id) return false;
+    try { return this.memory.getProfile(id).blocked; } catch { return false; }
+  }
+
   /** 引用一条消息：协议端给的 reply 段里只有原消息号，把它查回原文存成快照。
    *  只查本会话的内存尾（引用基本都是刚刚那几条），查不到就留着 [回复:id] 占位，不编内容。
    *  bot 自己的出站消息也存了 messageId：群里很常见「引用她上一句 + 这个」，不能漏。 */
@@ -524,7 +535,7 @@ export class Pipeline {
 
   private async process(events: ChatEvent[], opts: { proactive?: string } = {}): Promise<void> {
     if (!events.length) return;
-    const event = events[events.length - 1];
+    let event = events[events.length - 1];
     const chatKey = `${event.type}_${event.chatId}`;
 
     // 隐藏会话兜底：主动发言轮不经过 submit()，隐藏之前攒下的批次也会流到这里。
@@ -554,12 +565,13 @@ export class Pipeline {
 
     // ---- 入站早已在 submit() 落账（拟人层不回也要留在会话流里），这里只做过滤 ----
 
-    // 黑名单：整批都被拉黑才静默（不能因为一个人刷屏就让整批沉掉）
-    const allowed = events.filter((e) => !this.memory.getProfile(e.userId).blocked);
-    if (!allowed.length) {
-      this.sessionLog.append(event.chatId, event.type, { type: 'system', role: 'system', text: `黑名单用户 ${event.userId}，忽略` });
-      return;
-    }
+    // 黑名单兜底：批次是拉黑**之前**攒下的（拉黑那一刻已经进了缓冲），这里把这些人剔掉。
+    // 全被拉黑就静默丢弃，不写「忽略」条目 —— 拉黑口径是"没收到"。
+    const allowed = events.filter((e) => !this.isBlocked(e.userId));
+    if (!allowed.length) return;
+    // 承载本轮的消息（@ 谁、以谁的角色回）也要换成过滤后的最后一条：
+    // 批次末尾恰好是被拉黑的人时，不能拿他当正主
+    event = allowed[allowed.length - 1];
 
     // 圈内黑话（表达学习）：上面 submit() 已在门控之前观察过，这里不再重复记账；
     // 只有真正走到对话轮的群消息才需要把"本群词表"拼进 system。

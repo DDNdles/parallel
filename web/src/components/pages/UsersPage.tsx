@@ -1,7 +1,7 @@
 'use client';
 import { FadeName } from '@/components/FadeName';
 /** 用户：左列表（按角色分组）+ 右详情（档案 / 记忆事实 / 操作审计 / 拉黑 / 忘记我）
- *  顶栏四颗圆钮：重新读取、导出记忆、导入记忆、权限名单 */
+ *  顶栏五颗圆钮：搜索用户、重新读取、导出记忆、导入记忆、权限名单 */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, post, fmtDT } from '@/lib/api';
 import { Icon } from '@/components/Icon';
@@ -32,6 +32,7 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
   const [data, setData] = useState<UsersApi | null>(null);
   const [sel, setSel] = useState('');
   const [roles, setRoles] = useState(false);
+  const [search, setSearch] = useState(false);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [ops, setOps] = useState<{ user: string; rows: Op[] }>({ user: '', rows: [] });
   const [q, setQ] = useState('');
@@ -75,7 +76,8 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
   }, [reload, loadDetail, sel, q, setErr, fail]);
 
   usePageCmd('users', cmd, (kind) => {
-    if (kind === 'roles') setRoles((v) => !v);
+    if (kind === 'search') setSearch(true);
+    else if (kind === 'roles') setRoles((v) => !v);
     else if (kind === 'export') void exportJson();
     else if (kind === 'import') fileRef.current?.click();
     else { reload(); loadDetail(sel, q); }
@@ -120,9 +122,46 @@ export default function UsersPage({ cmd }: { cmd?: PageCmd }) {
       </div>
 
       {roles && data && <RolesModal data={data} onClose={() => setRoles(false)} onChanged={reload} />}
+      {search && data && (
+        <SearchUsersModal users={data.users}
+          onPick={(id) => { setQ(''); setSel(id); setSearch(false); }}
+          onClose={() => setSearch(false)} />
+      )}
       <input type="file" ref={fileRef} className="hidden" accept=".json"
         onChange={(e) => { const f = e.target.files?.[0]; if (f) void importJson(f); e.target.value = ''; }} />
     </div>
+  );
+}
+
+/** 顶栏「搜索用户」：按昵称 / 备注 / QQ 号筛全量用户（含已拉黑），点一条直接跳到详情 */
+function SearchUsersModal({ users, onPick, onClose }: {
+  users: U[]; onPick: (userId: string) => void; onClose: () => void;
+}) {
+  const [q, setQ] = useState('');
+  const key = q.trim().toLowerCase();
+  const list = (key
+    ? users.filter((u) => `${u.nickname ?? ''} ${u.remark ?? ''} ${u.userId}`.toLowerCase().includes(key))
+    : users
+  ).slice(0, 30);
+  return (
+    <Modal title="搜索用户" onClose={onClose}>
+      <div className="perm-search">
+        <BrandInput value={q} autoFocus placeholder="名字或 QQ 号" spellCheck={false}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && list[0]) onPick(list[0].userId); }} />
+      </div>
+      <div className="mset-models perm-results">
+        {list.length ? list.map((u) => (
+          <button key={u.userId} className="mset-mrow perm-row" onClick={() => onPick(u.userId)}
+            title={`${u.nickname || ''} ${u.userId}`}>
+            <span className="ic"><Icon name={u.blocked ? 'block' : 'personas'} size={14} /></span>
+            <FadeName className="perm-row-nm" text={u.nickname || u.remark || u.userId} />
+            <span className="perm-row-qq mono">{u.userId}</span>
+            {u.blocked && <span className="mset-badge">拉黑</span>}
+          </button>
+        )) : <div className="mset-group-e">{key ? '没有匹配的用户' : '还没有用户记录'}</div>}
+      </div>
+    </Modal>
   );
 }
 

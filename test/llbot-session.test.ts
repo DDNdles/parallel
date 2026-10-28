@@ -385,7 +385,7 @@ test('OneBot11Adapter: 账号守卫 —— 登录号与预期 bot 账号不符�
     };
     const seen: unknown[] = [];
     const adapter = new OneBot11Adapter(
-      config as never, errors, bus, {} as never, (e) => seen.push(e),
+      config as never, errors, bus, {} as never, (e) => seen.push(e), () => false,
       () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }),
     );
     const a = adapter as unknown as Record<string, any>;
@@ -436,7 +436,7 @@ test('OneBot11Adapter: 已隐藏的会话在下载之前就收口（不产生事
     const seen: unknown[] = [];
     const sandbox = { saveInbox: (_c: unknown, name: string) => { saved.push(name); return 'inbox/' + name; } };
     const adapter = new OneBot11Adapter(
-      config as never, errors, bus, sandbox as never, (e) => seen.push(e),
+      config as never, errors, bus, sandbox as never, (e) => seen.push(e), () => false,
       () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }),
     );
     const a = adapter as unknown as Record<string, any>;

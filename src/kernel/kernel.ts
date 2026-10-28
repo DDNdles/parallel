@@ -245,6 +245,7 @@ export class Kernel {
     this.adapter = new OneBot11Adapter(
       this.config, this.errors, this.bus, this.sandbox,
       (e) => this.pipeline.submit(e),
+      (userId) => this.memory.getProfile(userId).blocked,
       makeLogger,
     );
     this.chat.attachAdapter(this.adapter);

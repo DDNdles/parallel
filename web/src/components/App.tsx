@@ -71,6 +71,7 @@ const PAGE_TOOLS: Record<string, { id: string; icon: string; title: string; kind
     { id: 'btn-models-add', icon: 'plus', title: '添加供应商', kind: 'add' },
   ],
   users: [
+    { id: 'btn-users-search', icon: 'search', title: '搜索用户', kind: 'search' },
     { id: 'btn-users-reload', icon: 'refresh', title: '重新读取用户', kind: 'reload' },
     { id: 'btn-users-export', icon: 'download', title: '导出全部记忆为 JSON', kind: 'export' },
     { id: 'btn-users-import', icon: 'upload', title: '从 JSON 导入记忆', kind: 'import' },
