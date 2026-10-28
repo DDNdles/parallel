@@ -170,7 +170,8 @@ export class SessionContainers {
       '--init', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', kind === 'browser' ? '512' : '256',
       '-v', `${this.hostMount(chat)}:/ws`, '-w', '/ws',
       '--cpus', kind === 'browser' ? '2' : '1',
-      '--memory', kind === 'browser' ? '1g' : '512m',
+      // compute 提到 1g（2026-10-28）：512m 下排大文档时容器实测已用到 380MB 左右，留点余量
+      '--memory', '1g',
     ];
     // compute 是 work 专用容器：默认联网（workNetworkOn），关了才 --network none
     if (kind === 'compute' && this.sandboxCfg.workNetwork === false) args.push('--network', 'none');
