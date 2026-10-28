@@ -55,7 +55,7 @@ const GENERIC = [
 
 // ---------- 入包清单（白名单式，新增顶层内容要显式加进来） ----------
 // logos/ 是 3MB 设计过程稿、运行时零引用，不再随包（仓库里保留）。
-const INCLUDE_DIRS = ['bin', 'src', 'examples', 'docker', 'ui', 'scripts', 'test'];
+const INCLUDE_DIRS = ['bin', 'dist', 'src', 'examples', 'docker', 'ui', 'scripts', 'test'];
 const INCLUDE_FILES = ['LICENSE', 'THIRD-PARTY-NOTICES.md', 'package.json', 'package-lock.json', 'tsconfig.json', 'parallel.cmd', 'parallel.sh', 'README.md'];
 const SKIP_IN_MODULES = new Set(['.cache', '.package-lock.json']);
 // 无论清单怎么改都绝不入包（第二道保险，白名单之外理论上根本不会被复制）

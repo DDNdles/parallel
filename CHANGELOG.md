@@ -9,7 +9,7 @@
 - **业务/前端**：work 汇报轮结构化标记；派活归属取实际说话人；桌面端打断按钮、发送失败反馈、会话页竞态守卫；人格写入 `data/personas`（不再改源码树）；内核身份节不再写死人格；core 插件不受分群开关约束（修复新装实例 chat 不生效）；环境检查走过一次不再重复拦截。
 - **分发**：协议端发行包官方源优先 + SHA256 校验；发布脚本干净树闸门；`logos/`、`ref/`、`__pycache__` 不入发布物。
 - **许可与素材**：许可证定为 **AGPL-3.0-only**（`agency.ts` 行动容量判定为 HDS-Interlude 逐行移植，见 `THIRD-PARTY-NOTICES.md`）；258 张腾讯版权 QQ 表情移出仓库与发布包，运行时由内核从本机协议端发行包转码生成到 `data/face/`。
-- **打包**：npm 化（`bin`/`files`/`engines`/prepack 检查），GitHub Actions CI 与 tag→Release 自动出 `.tgz` + `.zip`；全局安装时数据目录落在用户工作目录。
+- **打包**：npm 化（`bin`/`files`/`engines`/prepack 检查），GitHub Actions CI 与 tag→Release 自动出 `.tgz` + `.zip`；全局安装时数据目录落在用户工作目录；npm 包内带编译产物 `dist/`（Node 拒绝对 node_modules 里的 TS 做类型剥离，安装版必须跑编译 JS，开发/zip 仍直跑 TS 源码）。
 
 ## 0.1.0 (2026-10-28)
 

@@ -1,6 +1,6 @@
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import type { Server } from 'node:http';
 import { request as httpRequest } from 'node:http';
@@ -40,7 +40,7 @@ import { RepeatWatcher } from './humanlike/repeat.ts';
 import type { HumanlikeConfig } from './humanlike/types.ts';
 import { OneBot11Adapter } from './adapters/onebot11.ts';
 import { startApiServer } from './api/server.ts';
-import { PACKAGE_ROOT } from './paths.ts';
+import { PACKAGE_ROOT, ACTIVE_ROOT } from './paths.ts';
 import type { ChatEvent, Logger, ProtocolEnd, Role } from './types.ts';
 
 // （数据目录默认取 process.cwd()，见构造函数；包内资源定位统一走 src/kernel/paths.ts 的 PACKAGE_ROOT）
@@ -141,7 +141,8 @@ export class Kernel {
     // 数据目录默认「启动命令时所在的目录」：npm -g 安装后包目录在 node_modules 里（对用户只读），
     // data 必须落在用户的工作目录。zip/开发场景 cwd 就是包根，行为与以前一致；测试与 serve-ui 都显式传 --data-dir。
     this.dataDir = opts.dataDir ?? join(process.cwd(), 'data');
-    // 随包资源（内置插件/examples/docker）按模块路径定位，与 cwd 无关
+    // 随包资源（内置插件/examples/docker）按模块路径定位，与 cwd 无关；
+    // 内置插件从 ACTIVE_ROOT 取：npm 包是编译产物 dist/src，开发/zip 是 src 本体
     const root = PACKAGE_ROOT;
     mkdirSync(this.dataDir, { recursive: true });
     this.log = makeLogger('kernel');
@@ -194,8 +195,8 @@ export class Kernel {
     this.workRunner = new WorkRunner(this.agentLoop, this.llm, this.bus, this.db, this.config, this.errors, this.sandbox);
     this.container = new PluginContainer(
       {
-        builtin: join(root, 'src', 'plugins'),
-        example: join(root, 'examples'),
+        builtin: join(ACTIVE_ROOT, 'plugins'),
+        example: existsSync(join(PACKAGE_ROOT, 'examples')) ? join(PACKAGE_ROOT, 'examples') : join(ACTIVE_ROOT, 'examples'),
         user: join(this.dataDir, 'plugins'),
         dataDir: this.dataDir,
       },

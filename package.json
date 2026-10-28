@@ -13,7 +13,8 @@
     "test": "node --experimental-transform-types --no-warnings --test --test-concurrency=2 \"test/*.test.ts\"",
     "pack": "node scripts/pack-release.mjs",
     "typecheck": "tsc -p .",
-    "prepack": "node scripts/check-pack.mjs"
+    "prepack": "node scripts/check-pack.mjs",
+    "build:pkg": "node scripts/build-pkg.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.87.1",
@@ -31,15 +32,12 @@
   },
   "files": [
     "bin",
-    "src",
+    "dist",
     "ui",
     "docker",
-    "examples",
     "scripts",
-    "test",
     "parallel.cmd",
     "parallel.sh",
-    "tsconfig.json",
     "THIRD-PARTY-NOTICES.md"
   ],
   "repository": {

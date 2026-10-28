@@ -17,6 +17,7 @@ import { LLBotManager } from '../services/llbot.ts';
 import { busEvents } from '../bus.ts';
 import type { ChatEvent, ChatRef, Role } from '../types.ts';
 import { findSkill, scanSkills, skillStateKey, SKILL_PLUGIN_ID } from '../skills.ts';
+import { ACTIVE_ROOT } from '../paths.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -854,7 +855,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
     // 目录扫描与插件共用 kernel/skills.ts；开关落在 plugin_kv（plugin_id=skills），
     // 插件侧 beforeWorkLLM 每次现读，改完立即生效（扫描元数据另有 3s 缓存）。
     if (area === 'api' && a === 'skills') {
-      const builtinDir = join(PROJECT_ROOT, 'src', 'plugins', 'skills', 'builtin');
+      // ACTIVE_ROOT：npm 包里取编译产物 dist/src，开发/zip 取 src 本体
+      const builtinDir = join(ACTIVE_ROOT, 'plugins', 'skills', 'builtin');
       const userDir = join(kernel.dataDir, 'plugin-data', 'skills');
       const stateOf = (id: string): boolean => {
         const row = kernel.db.get<{ value: string }>(

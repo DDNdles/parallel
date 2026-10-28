@@ -170,7 +170,8 @@ export class PluginContainer {
         this.requirePermission(manifest, 'network', 'mcpServers');
         await this.startMcpServers(lp, ctx);
       }
-      const entry = join(dir, 'index.ts');
+      // 插件入口：编译产物是 index.js（npm 包），开发态是 index.ts。哪个在用哪个
+      const entry = existsSync(join(dir, 'index.js')) ? join(dir, 'index.js') : join(dir, 'index.ts');
       if (existsSync(entry)) {
         // 时间戳查询参数破缓存实现热重载（ESM 新实例）
         const mod = await import(pathToFileURL(entry).href + `?t=${Date.now()}`);
