@@ -244,7 +244,7 @@ test('内置 work.md 存在且声明了白名单（改了名字要同步更新�
   for (const must of ['work_finish', 'work_ask', 'python_session', 'sandbox_write', 'web_fetch']) {
     assert.ok(def.tools!.includes(must), `白名单缺少 ${must}`);
   }
-  // 2026-10-23 用户定：work 不自己发文件，产物统一由内核打包成一个合集发出
+  // 2026-10-23 用户定：work 不自己发文件，产物统一由内核逐条发出
   assert.ok(!def.tools!.includes('send_file'), 'work 白名单不该再有 send_file');
   assert.ok(def.instructions.includes('work_finish'), '正文要交代收尾方式');
   assert.ok(def.instructions.includes('work_ask'), '正文要交代"停下来问"的用法（白名单里有这个工具）');

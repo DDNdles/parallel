@@ -4,10 +4,9 @@ import type { ChatRef, ChatSendService, MsgSegment } from '../types.ts';
 import type { SendPlan } from '../humanlike/index.ts';
 import { RateLimiter } from '../ratelimit.ts';
 import { faceTokensToSegments, qqFaceId, qqFaceName } from '../util/qqface.ts';
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { join, resolve, sep, normalize } from 'node:path';
-import { createZipFile } from '../zip.ts';
 import { isDeliverableArtifact } from './artifacts.ts';
 
 export interface TransportAdapter {
@@ -209,140 +208,66 @@ export class ChatService implements ChatSendService {
   }
 
   /**
-   * 合并转发一条「工作交付」聊天记录：正文 + 产物都塞进同一个 forward。
-   *
-   * 产物多于一个时**先打包成一个 zip 合集**再放进聊天记录（2026-10-23 用户明令）：
-   * QQ 的合并转发对 node 里的文件段支持并不一致，逐个文件节点很容易被协议端展开成
-   * 一串独立文件消息——看起来就是"一堆产物单独发了"。只留一个包，既是一次投递，
-   * 也保证正文和文件在同一条聊天记录里。
-   *
-   * 协议端不支持 forward（或 node 里不收 file）时退回普通分开发送，正文和文件都不丢。
+   * 交付：正文直接发一条，产物逐个单独发（2026-10-28 用户定：不再合并成「聊天记录」合集，
+   * 也不再打 zip 包）。正文不按气泡切，只按平台单条上限兜底切分；每份产物一条普通文件消息，
+   * 沙箱校验按产物所在的 sandboxChat 算（任务沙箱 ≠ 发送目标聊天）。
    */
-  async sendForward(chat: ChatRef, opts: {
+  async sendDelivery(chat: ChatRef, opts: {
     text: string;
     artifacts?: string[];
     mention?: { userId: string };
-    selfId?: string;
-    selfNickname?: string;
     /** 产物所在的沙箱（2026-10-25 任务隔离：任务沙箱 ≠ 发送目标聊天）；缺省用 chat 自己的 */
     sandboxChat?: ChatRef;
   }): Promise<void> {
     const text = String(opts.text ?? '').trim();
     const root = normalize(this.opts.sandboxRoot(opts.sandboxChat ?? chat));
-    const files: { rel: string; name: string; abs: string; size: number }[] = [];
+    const files: { rel: string; name: string; abs: string }[] = [];
     for (const rel of opts.artifacts ?? []) {
       try {
         const p = String(rel ?? '').trim().replace(/\\/g, '/');
         if (!isDeliverableArtifact(p)) continue;
         const abs = normalize(resolve(root, p));
         if ((abs !== root && !abs.startsWith(root + sep)) || !existsSync(abs) || !statSync(abs).isFile()) continue;
-        files.push({ rel: p, name: p.split('/').pop() || p, abs, size: statSync(abs).size });
-      } catch { /* 单个文件解析失败不拖垮整条记录 */ }
+        files.push({ rel: p, name: p.split('/').pop() || p, abs });
+      } catch { /* 单个文件解析失败不拖垮整次交付 */ }
     }
     if (!text && !files.length) return;
-    // 限速按条计费：一条聊天记录算一条
-    const rl = this.limiter.tryTake(`${chat.platform}:${chat.type}:${chat.chatId}`, 1);
-    if (rl.granted <= 0) {
-      this.opts.sessionLog.append(chat.chatId, chat.type, {
-        type: 'gate', role: 'system', text: `聊天记录被限速丢弃（等待 ${rl.waitMs}ms 超过上限）`,
-        data: { decision: 'rate_limited', waitMs: rl.waitMs, dropped: 1 },
-      });
-      return;
+    if (chat.platform !== 'ui' && !this.adapter?.connected()) throw new Error('协议端未连接，消息未能发出');
+    if (text) {
+      const segments: MsgSegment[] = [];
+      if (opts.mention && chat.type === 'group') segments.push({ type: 'at', data: { qq: opts.mention.userId } });
+      segments.push({ type: 'text', data: { text } });
+      await this.send(chat, segments);
     }
-
-    // 多份产物 → 一个合集包；单份保持原样（一张图/一个文件再包一层反而添麻烦）
-    const pack = files.length > 1 ? this.packArtifacts(root, files) : undefined;
-    const delivery = pack ? [pack.file] : files;
-    const shownText = pack
-      ? `${text}${text ? '\n\n' : ''}—— 合集：${files.length} 个产物已打包进「${pack.file.name}」`
-      : text;
-
-    const content: MsgSegment[] = [];
-    if (opts.mention && chat.type === 'group') content.push({ type: 'at', data: { qq: opts.mention.userId } });
-    if (shownText) content.push({ type: 'text', data: { text: shownText } });
-    const nodes: { userId?: string; nickname?: string; content: MsgSegment[] }[] = [];
-    if (content.length) nodes.push({ userId: opts.selfId, nickname: opts.selfNickname, content });
-    for (const f of delivery) {
-      nodes.push({
-        userId: opts.selfId, nickname: opts.selfNickname,
-        content: [{ type: 'file', data: { file: pathToFileURL(f.abs).href, name: f.name } }],
-      });
-    }
-
-    const record = {
-      title: '工作交付',
-      dropped: 0,
-      failed: false,
-      nodes: [
-        ...(shownText ? [{ userId: opts.selfId ?? '', nickname: opts.selfNickname ?? '', text: shownText, ts: Date.now() }] : []),
-        ...delivery.map((f) => ({
-          userId: opts.selfId ?? '', nickname: opts.selfNickname ?? '',
-          text: '', ts: Date.now(),
-          files: [{ name: f.name, rel: f.rel, sandboxPath: f.abs, size: f.size }],
-        })),
-      ],
-    };
-
     if (chat.platform === 'ui') {
-      this.opts.onUsage('out');
-      this.opts.sessionLog.append(chat.chatId, chat.type, {
-        type: 'message_out', role: 'assistant', text: shownText,
-        data: { forward: record, artifacts: files.map((f) => f.rel), package: pack ? { name: pack.file.name, count: files.length } : undefined, simulated: true },
-      });
-      this.bus.emit(busEvents.chatOut, { chat, segments: [], text: shownText, ts: Date.now(), simulated: true });
+      // 桌面端注入的会话没有协议端：文件只落日志与事件流，跟正文一样按普通消息展示
+      for (const f of files) {
+        this.opts.onUsage('out');
+        this.opts.sessionLog.append(chat.chatId, chat.type, {
+          type: 'message_out', role: 'assistant', text: `[文件] ${f.rel}`, data: { file: f.abs, simulated: true },
+        });
+        this.bus.emit(busEvents.chatOut, {
+          chat, segments: [{ type: 'file', data: { file: pathToFileURL(f.abs).href, name: f.name } }],
+          text: `[文件] ${f.name}`, ts: Date.now(), simulated: true,
+        });
+      }
       return;
     }
-    if (!this.adapter?.connected()) throw new Error('协议端未连接，消息未能发出');
-    let id: string | undefined;
-    try {
-      id = await this.adapter.sendForward(chat, nodes);
-    } catch {
-      // 老协议端/不支持 forward 的线格式：退回正文一条 + 文件逐条，至少不丢交付
-      // 文件在任务沙箱里时校验要按 sandboxChat 算，否则会被「只允许发当前会话沙箱」挡下
-      await this.send(chat, content.length ? content : [{ type: 'text', data: { text: shownText } }]);
-      for (const f of delivery) await this.sendFile(chat, f.abs, { sandboxChat: opts.sandboxChat ?? chat });
-      return;
+    // 每份产物一条独立文件消息。单个文件失败不拖累后面：正文已经发出去了，
+    // 整批抛错会让上层退回普通发送、把正文再发一遍；失败改落一条 gate 留在会话里。
+    let failed: Error | undefined;
+    for (const f of files) {
+      try {
+        await this.sendFile(chat, f.abs, { sandboxChat: opts.sandboxChat ?? chat });
+      } catch (e) {
+        failed ??= e as Error;
+        this.opts.sessionLog.append(chat.chatId, chat.type, {
+          type: 'gate', role: 'system', text: `产物发送失败（${f.rel}）：${(e as Error).message}`,
+          data: { decision: 'deliver_file_failed', path: f.rel },
+        });
+      }
     }
-    this.opts.onUsage('out');
-    this.opts.sessionLog.append(chat.chatId, chat.type, {
-      type: 'message_out', role: 'assistant', text: shownText,
-      data: {
-        forward: record,
-        // 清单仍记原始产物（桌面端抽屉/补发要按它们找），合集只影响实际发出的节点
-        artifacts: files.map((f) => f.rel),
-        package: pack ? { name: pack.file.name, count: files.length } : undefined,
-        messageId: id,
-      },
-    });
-    this.bus.emit(busEvents.chatOut, { chat, segments: [{ type: 'forward', data: { id: id ?? '' } }], text: shownText, ts: Date.now() });
-  }
-
-  /** 把多份产物打成一个 zip 合集（沙箱内 deliver/，并顺手清掉旧的包）；失败返回 undefined */
-  private packArtifacts(
-    root: string,
-    files: { rel: string; name: string; abs: string; size: number }[],
-  ): { file: { rel: string; name: string; abs: string; size: number } } | undefined {
-    const dir = join(root, 'deliver');
-    try { mkdirSync(dir, { recursive: true }); } catch { return undefined; }
-    const d = new Date();
-    const pad = (n: number): string => String(n).padStart(2, '0');
-    const name = `工作交付_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.zip`;
-    const abs = join(dir, name);
-    const r = createZipFile(abs, files.map((f) => ({ name: f.rel, abs: f.abs })));
-    // 有文件因预算/读取失败被跳过时不发残缺包：退回逐个文件，至少内容齐全
-    if (!r.files || r.skipped > 0) {
-      try { unlinkSync(abs); } catch { /* 没写成就不用删 */ }
-      return undefined;
-    }
-    // 只留最近 10 个合集，避免沙箱里堆满历史包
-    try {
-      const olds = readdirSync(dir)
-        .filter((n) => n.toLowerCase().endsWith('.zip'))
-        .map((n) => ({ n, t: statSync(join(dir, n)).mtimeMs }))
-        .sort((a, b) => b.t - a.t);
-      for (const o of olds.slice(10)) { try { unlinkSync(join(dir, o.n)); } catch { /* 被占用就下次再清 */ } }
-    } catch { /* 清理失败不影响本次投递 */ }
-    return { file: { rel: `deliver/${name}`, name, abs, size: statSync(abs).size } };
+    if (failed && !text) throw failed;   // 一个字都没送出去时仍让调用方知道失败
   }
 
   async sendFile(chat: ChatRef, sandboxPath: string, opts?: { sandboxChat?: ChatRef }): Promise<void> {

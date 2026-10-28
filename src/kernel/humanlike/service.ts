@@ -707,7 +707,7 @@ export class HumanlikeService {
   }
 
   /** 汇报轮正文：不进聊天气泡那套「按句切、50 字截断」，也不设字数上限
-   *  （2026-10-25 用户定：聊天合集里的正文全文送出），只做可见化清洗。 */
+   *  （2026-10-25 用户定：交付正文全文送出），只做可见化清洗。 */
   reportText(raw: string): string {
     const scene = String(raw ?? '');
     if (isSilentScene(scene)) return '';

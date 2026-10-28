@@ -359,7 +359,7 @@ export class AgentLoop {
       }
       // 空输出不再编一句"没答好"的托词：模型没接、额度耗尽、链全挂时群里必须一个字都没有。
       // 沉默由 pipeline 落 gate 条目，错误细节走报错中心；work 链靠 WorkRunner 把空回复判成失败。
-      // 2026-10-25 用户定：work 的交付正文不设上限（聊天合集里全文送出）；chat 轮保留防抽风切片
+      // 2026-10-25 用户定：work 的交付正文不设上限（交付时整段直接送出）；chat 轮保留防抽风切片
       if (!ctx.workTurn) reply = reply.slice(0, 3500);
       event({ kind: 'final', text: reply });
 

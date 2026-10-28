@@ -197,7 +197,7 @@ function workReportNote(report: { task: string; result: WorkRunResult }): string
     r.artifacts?.length ? `产物（会话沙箱内）：${r.artifacts.join('、')}` : '',
     r.notes ? `需要他知道的备注：${r.notes}` : '',
     r.artifacts?.length
-      ? `产物和你的结论会由系统合并成一条「聊天记录」发出（多份产物已打包成一个合集）：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
+      ? `产物会由系统直接发出（正文一条，每份产物一条文件消息）：不要再调用 deliver_file，也不要把路径单独发一遍；你只写给自己人看的结论/说明。`
       : '',
     `请用你自己的语气向发起人汇报（@ 已经带上了），像你自己干完活回话一样；不要提"子代理""模型""系统提示"。`,
   ].filter(Boolean).join('\n');
@@ -1143,7 +1143,7 @@ export class Pipeline {
     quoteTarget?: string,
     /** 汇报轮 @ 发起人：程序带上 at 段（不靠模型在正文里写 @号码） */
     mention?: { userId: string; nickname?: string },
-    /** 汇报轮：正文 + 产物合并成一条聊天记录；普通轮不传 */
+    /** 汇报轮：正文一条、产物逐条直接发；普通轮不传 */
     forward?: { artifacts: string[]; userId: string; nickname?: string; sandboxKey?: string },
     /** 这轮的气泡是否允许被插话砍掉；@ 轮与汇报轮传 false */
     interruptible = true,
@@ -1151,19 +1151,18 @@ export class Pipeline {
     singleBubble = false,
   ): Promise<void> {
     if (forward) {
-      // 一条聊天记录：汇报正文整段进首节点（不按聊天气泡切/50 字截断），产物文件各占一个节点
+      // 交付直接发：正文一条（不切气泡），产物一份一条文件消息（2026-10-28 用户定，
+      // 不再合并成「聊天记录」合集，也不再打 zip 包）
       const text = this.humanlike.reportText(raw);
       if (!text && !forward.artifacts.length) { this.humanlike.noteSilent(chat); return; }
       try {
         // 2026-10-25 任务隔离：发送目标还是聊天本身；产物从任务沙箱读（老运行回退旧式按人沙箱）
         const sandboxChat = (forward.sandboxKey ? sandboxRefOfKey(forward.sandboxKey) : undefined)
           ?? { ...chat, scope: workScopeOf(forward.userId) };
-        await this.chat.sendForward(chat, {
+        await this.chat.sendDelivery(chat, {
           text,
           artifacts: forward.artifacts,
           mention: mention ? { userId: mention.userId } : undefined,
-          selfId: this.selfId(),
-          selfNickname: this.selfNickname(),
           sandboxChat,
         });
         this.humanlike.noteSpoke(chat, 1, text ? [text] : []);
@@ -1171,9 +1170,8 @@ export class Pipeline {
         this.markTurnSpoke(chat);
         return;
       } catch (e) {
-        // 协议端不支持 forward 时 sendForward 内部已经退回过分开发送；走到这里多半是没连上，
-        // 继续走普通发送，至少把文字说出去
-        this.errors.record('warn', 'work', `聊天记录发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
+        // 多半是协议端没连上；继续走普通发送，至少把文字说出去
+        this.errors.record('warn', 'work', `交付发送失败，退回普通发送：${(e as Error).message}`, { chatId: chat.chatId });
       }
     }
     const { plans } = await this.humanlike.composeScene(raw, singleBubble ? { maxBubbles: 1 } : undefined);

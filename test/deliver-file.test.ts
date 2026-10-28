@@ -156,13 +156,13 @@ test('汇报轮模型空输出：登记的产物照样发出去（不跟着沉�
     const workChat = { platform: 'qq' as const, type: 'group' as const, chatId: g.chat.chatId, scope: taskId };
     g.kernel.sandbox.write(workChat, 'imagegen/poster.jpg', Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
 
-    const forwards: any[] = [];
+    const sentFiles: string[] = [];
     g.kernel.chat.attachAdapter({
       send: async () => 'mid',
-      sendForward: async (_c: any, nodes: any) => { forwards.push(nodes); return 'fid'; },
+      sendForward: async () => 'fid',
       sendPoke: async () => {},
       sendReaction: async () => {},
-      sendFile: async () => 'fid',
+      sendFile: async (_c: any, abs: string) => { sentFiles.push(abs); return 'fid'; },
       connected: () => true,
       status: () => ({ connected: true }),
     });
@@ -186,8 +186,8 @@ test('汇报轮模型空输出：登记的产物照样发出去（不跟着沉�
       },
     );
 
-    assert.equal(forwards.length, 1, '空文本也不能把产物丢了');
-    assert.ok(JSON.stringify(forwards[0]).includes('poster.jpg'), '产物文件没进交付节点');
+    assert.equal(sentFiles.length, 1, '空文本也不能把产物丢了');
+    assert.ok(sentFiles[0].includes('poster.jpg'), '产物要作为独立文件消息发出');
   } finally {
     await g.cleanup();
   }

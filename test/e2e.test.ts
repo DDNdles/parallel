@@ -716,8 +716,8 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
     if (p.chat?.type === 'group' && String(p.chat?.chatId) === WORK_GROUP) outs.push(p);
   });
   mock.actions.length = 0;
-  // 2026-10-25 任务隔离：产物落在本任务的沙箱里（work 自己写），汇报轮的正文与产物合并成一条聊天记录
-  // chat 第一轮调 work_dispatch；第二轮应下；work 写产物+收尾；最后一轮是人格化汇报（正文+产物进聊天记录）
+  // 2026-10-25 任务隔离：产物落在本任务的沙箱里（work 自己写）；汇报轮正文一条、产物逐条直接发
+  // chat 第一轮调 work_dispatch；第二轮应下；work 写产物+收尾；最后一轮是人格化汇报（正文 + 产物分别发）
   mockProvider.script.push({ toolCalls: [{ name: 'work_dispatch', args: { messages: ['帮我算一下 2 的 10 次方'] } }] });
   mockProvider.script.push({ content: '好，我去算一下。' });
   mockProvider.script.push({
@@ -754,15 +754,14 @@ test('work 由 chat 工具派发：先应下，跑完另起一轮带 @ 汇报（
   assert.ok(runs[0].usage.cacheHit > 0 && runs[0].usage.cacheMiss > 0, '缓存命中/未命中要有数');
   assert.ok(runs[0].usage.prompt >= runs[0].usage.cacheHit, '提示词 token 不该少于命中数');
 
-  // 汇报轮：一条聊天记录（正文 + 文件节点），不是多条气泡/单独文件
-  const report = await until(() => kernel.sessionLog.tail(WORK_GROUP, 'group')
-    .find((e) => e.type === 'message_out' && (e.data as any)?.forward), 12000, '聊天记录汇报');
-  const fwd = (report!.data as any).forward;
-  assert.equal(fwd.title, '工作交付');
-  assert.ok(String(fwd.nodes?.[0]?.text ?? '').includes('1024'), `汇报要讲结论：${fwd.nodes?.[0]?.text}`);
-  assert.equal(String(fwd.nodes?.[1]?.files?.[0]?.name ?? ''), 'out.md', '产物要在同一个聊天记录里');
+  // 汇报轮：正文一条 + 产物一条普通文件消息（2026-10-28 起不再发「聊天记录」合集）
+  const fileOut = await until(() => kernel.sessionLog.tail(WORK_GROUP, 'group')
+    .find((e) => e.type === 'message_out' && String((e.data as any)?.file ?? '').includes('out.md')), 12000, '产物文件消息');
+  assert.ok(String(fileOut!.text ?? '').startsWith('[文件]'), '产物按普通文件消息落账');
+  const report = await until(() => outs.find((o) => String(o.text ?? '').includes('1024')), 12000, '汇报正文');
+  assert.ok(report, '汇报要讲结论（1024）');
+  assert.ok(!outs.some((o) => (o.segments ?? []).some((s: any) => s.type === 'forward')), '不再发合并转发');
   assert.ok(outs.some((o) => (o.text ?? '').includes('好，我去算一下')), '派活后要先由 chat 应下');
-  assert.ok(!mock.actions.some((a) => a.action === 'upload_group_file'), '平台模拟轮不应该再单独上传文件');
 
   // 别的会话取不到这条（抽屉只认当前会话）
   assert.equal(kernel.workRunner.list(10, 'group_999999').length, 0);

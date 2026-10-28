@@ -914,7 +914,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       }
       if (b === 'deliver' && req.method === 'POST') {
         // 补发一次 work 的产物（运行失败/中断也能发）：不重跑模型，直接从发起人沙箱把已写出的文件
-        // 重新打包成一条「工作交付」。run_bash/Python 写的文件不进 artifacts，这里再扫一遍。
+        // 再发一遍（正文一条 + 每份一条文件消息）。run_bash/Python 写的文件不进 artifacts，这里再扫一遍。
         const runId = String(body.runId ?? '').trim();
         if (!runId) return send({ error: 'runId 不能为空' }, 400);
         const row = kernel.db.get<{
@@ -942,15 +942,13 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         const scanned = collectRecentArtifacts(kernel.sandbox.root(chat), scanFrom);
         const artifacts = [...new Set([...known, ...scanned])].filter(isDeliverableArtifact).slice(0, 60);
         if (!artifacts.length) return send({ error: '这次运行在沙箱里没有找到可发送的文件' }, 400);
-        const st = kernel.adapter?.status() as { selfId?: string; selfNickname?: string; connected?: boolean } | undefined;
+        const st = kernel.adapter?.status() as { connected?: boolean } | undefined;
         if (!st?.connected) return send({ error: '协议端未连接，稍后再补发' }, 503);
-        await kernel.chat.sendForward(chat, {
+        await kernel.chat.sendDelivery(chat, {
           // 任务原样带出：chat 派给 work 的任务没有字数上限，这里不能截断（用户 2026-10-23 明令）
           text: `补发上次未跑完任务的产物（${artifacts.length} 个）：${row.task}`,
           artifacts,
           mention: chat.type === 'group' ? { userId } : undefined,
-          selfId: st.selfId,
-          selfNickname: st.selfNickname,
         });
         return send({ ok: true, sent: artifacts.length, artifacts });
       }
