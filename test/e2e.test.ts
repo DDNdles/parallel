@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, before, after, beforeEach } from 'node:test';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -416,7 +417,14 @@ test('沙箱：写入/读取/配额/TTL 字段', () => {
   sb.clear(chat);
 });
 
-test('沙箱：真实执行 python（超时/输出截断机制）', async () => {
+test('沙箱：真实执行 python（超时/输出截断机制）', async (t) => {
+  // 需要宿主有真 python：CI runner / 新机器可能没有（商店占位符也算失败）。
+  // 没有就跳过——沙箱执行链的超时/截断逻辑另有纯逻辑用例覆盖，这里只验真执行。
+  const probe = spawnSync('python', ['-c', 'print(1)'], { timeout: 15_000, windowsHide: true });
+  if (probe.status !== 0 || !String(probe.stdout ?? '').includes('1')) {
+    t.skip('宿主没有可用的 python');
+    return;
+  }
   const sb = kernel.sandbox;
   const chat = { platform: 'qq', type: 'private' as const, chatId: '777' };
   const r = await sb.run(chat, { language: 'python', code: 'print("calc:", 6*7)' });
