@@ -810,7 +810,7 @@ export class Pipeline {
       let turnBubbleNote = '';
       if (!isReport) {
         const out = this.humanlike.config.outgoing;
-        const targetBubbles = pickBubbleTarget(out.expectedBubbles ?? 3, out.maxBubbles ?? 6, {
+        const targetBubbles = pickBubbleTarget(out.maxBubbles ?? 6, {
           recentShapes: this.humanlike.recentBubbleShapes(chat),
           weights: out.bubbleWeights,
         });

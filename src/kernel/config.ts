@@ -132,7 +132,6 @@ export const DEFAULT_CONFIG = {
       replyMaxCharacters: 100,            // 回复总长硬上限（提示里推荐 50）：超了在最后一个句末标点处截断
       maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
       bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
-      expectedBubbles: 3,                 // 预期气泡数：提示里的推荐条数（必要时可突破）
       maxBubbles: 6,                      // 最大气泡数：程序分条的硬上限（超出会被合并）
       bubbleWeights: [] as number[],      // 气泡数概率自定义权重（索引对 1..N 条；空 = 自动三角分布）
       typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）
@@ -390,6 +389,9 @@ export class ConfigStore {
     delete (this.config.humanlike as any).script;
     delete (this.config.humanlike as any).alter;
     delete ((this.config.humanlike as any).outgoing ?? {}).messageSeparator;
+    // 「预期气泡数」已删（2026-10-28 用户定）：每轮目标条数只由「气泡数概率」抽签，
+    // 自动兜底的峰值固定 3 条；老配置里的值没人读了，一并清掉
+    delete ((this.config.humanlike as any).outgoing ?? {}).expectedBubbles;
     delete (this.config.llm as any).maxToolRounds;
     const hlTiming = (this.config.humanlike as any).timing;
     if (hlTiming && typeof hlTiming === 'object') {

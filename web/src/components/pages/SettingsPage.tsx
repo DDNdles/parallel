@@ -16,7 +16,7 @@ interface Humanlike {
   /** 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限 */
   outgoing: {
     splitReplyMessages: boolean; replyMaxCharacters: number; maxReplyTokens: number;
-    bubbleSoftMaxCharacters: number; expectedBubbles?: number; maxBubbles?: number; bubbleWeights?: number[];
+    bubbleSoftMaxCharacters: number; maxBubbles?: number; bubbleWeights?: number[];
     typingEnabled?: boolean;
     typingBaseDelaySeconds: number; typingCharactersPerSecond: number;
     typingMaxDelaySeconds: number; typingJitterRatio: number; maxMessageCharacters: number;
@@ -529,8 +529,6 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, replyMaxCharacters: v } })} />
                 <Num label="回复 token 上限" value={h.outgoing.maxReplyTokens}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
-                <Num label="预期气泡数（提示推荐）" hint="写进提示词的推荐条数，模型尽量照着来；必要时可突破" value={h.outgoing.expectedBubbles ?? 3}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, expectedBubbles: Math.max(1, Math.round(v)) } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
                 <BubbleSlider h={h} patchH={patchH} />
@@ -846,22 +844,26 @@ export default function SettingsPage() {
   );
 }
 
+/** 自动分布的峰值条数（与内核 delivery.AUTO_PEAK_BUBBLES 一致） */
+const AUTO_PEAK_BUBBLES = 3;
+
 /** 气泡数概率条（2026-10-25 第二版）：一条横向轨道按概率切成 N 段（每段=一种气泡条数），
  *  **段本身可拖动**——左右拖改变这一档的占比，其余段按比例让位（旧版拖边界一次牵动两档，
  *  被否）。拖没（占比 0）= 停用该档，下方数字标签仍可抓住拖回来。数据仍是 bubbleWeights
  *  权重数组（内核 pickBubbleTarget 逐档取权），段宽 = 权重/总和 的归一化占比。
- *  空 bubbleWeights = 自动三角分布（峰值=预期气泡数）预览，动一段即写入自定义。 */
+ *  空 bubbleWeights = 自动三角分布（峰值固定 3 条）预览，动一段即写入自定义。
+ *  2026-10-28：设置页「预期气泡数」已删，自动分布只是没配概率时的兜底。 */
 function BubbleSlider({ h, patchH }: {
   h: Humanlike;
   patchH: (p: Partial<Humanlike>, immediate?: boolean) => void;
 }) {
   const max = Math.max(1, Math.min(20, Math.round(h.outgoing.maxBubbles ?? 6)));
-  const expected = Math.max(1, Math.min(max, Math.round(h.outgoing.expectedBubbles ?? 3)));
   const custom = h.outgoing.bubbleWeights ?? [];
   const isAuto = !custom.some((w) => Number.isFinite(w) && w > 0);
-  // 自动三角分布（同 delivery.autoBubbleWeights）作预览与首次拖动的种子；自定义直接用存储权重
+  // 自动三角分布（同 delivery.autoBubbleWeights）作预览与首次拖动的种子；峰值 = AUTO_PEAK_BUBBLES
+  const peak = Math.min(max, AUTO_PEAK_BUBBLES);
   const base = isAuto
-    ? Array.from({ length: max }, (_v, i) => Math.max(0.15, 1 - Math.abs(i + 1 - expected) * 0.45))
+    ? Array.from({ length: max }, (_v, i) => Math.max(0.15, 1 - Math.abs(i + 1 - peak) * 0.45))
     : Array.from({ length: max }, (_v, i) => {
       const w = custom[i];
       return Number.isFinite(w) ? Math.max(0, Math.min(100, w as number)) : 0;
@@ -872,6 +874,8 @@ function BubbleSlider({ h, patchH }: {
   const [drag, setDrag] = useState<{ idx: number; startX: number; trackW: number; start: number[]; next: number[] } | null>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const shown = drag ? drag.next : shares;
+  // 加粗标当前最可能抽中的一档：自动分布下是峰值 3 条，自定义下跟着最大权重走
+  const topIdx = shown.indexOf(Math.max(...shown));
 
   const commit = (s: number[]) => {
     const clean = s.slice(0, max).map((x) => Math.max(0, Math.min(100, Math.round(x))));
@@ -933,13 +937,13 @@ function BubbleSlider({ h, patchH }: {
       </div>
       <div className="bbs-labels">
         {shown.map((s, i) => (
-          <span key={i} className={`bbs-lb${i + 1 === expected ? ' bbs-peak' : ''}`}
+          <span key={i} className={`bbs-lb${i === topIdx ? ' bbs-peak' : ''}`}
             style={{ flexGrow: Math.max(s, 0.0001), flexBasis: 0 }} onPointerDown={start(i)}>{i + 1}</span>
         ))}
       </div>
       <div className="plg-hint" style={{ marginTop: 8 }}>
         {isAuto
-          ? '自动分布：峰值=预期气泡数，拖动任意一段即进入自定义'
+          ? '自动分布：峰值 3 条，拖动任意一段即进入自定义'
           : `自定义 ${shown.filter((x) => x >= 0.5).length}/${max} 档参与抽取，每轮按段宽抽签`}
       </div>
     </div>

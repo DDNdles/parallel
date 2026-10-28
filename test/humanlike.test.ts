@@ -866,36 +866,36 @@ test('服务：仅 @ 后才回复——名字提及与叫醒词都不直通', ()
 
 // ============================================================
 // 随机气泡数（2026-10-25）：每轮抽一个目标条数写进提示——固定推荐值会让
-// 输出形状定型；分布以 expected 为峰三角衰减、远处留地板，最近同形降权。
+// 输出形状定型；自动分布以 3 条为峰三角衰减、远处留地板，最近同形降权。
+// 2026-10-28：设置页「预期气泡数」已删，自动分布的峰值固定 AUTO_PEAK_BUBBLES。
 // ============================================================
 
-test('pickBubbleTarget：范围夹紧、众数落在预期附近、最近同形被降权', () => {
+test('pickBubbleTarget：范围夹紧、众数落在 3 条附近、最近同形被降权', () => {
   // 确定性 rand：≈0 抽中第一格（i=1；权重数组从 1 开始顺序累计）
-  assert.equal(pickBubbleTarget(3, 6, { rand: () => 0.0001 }), 1);
+  assert.equal(pickBubbleTarget(6, { rand: () => 0.0001 }), 1);
+  assert.equal(pickBubbleTarget(1, { rand: () => 0.0001 }), 1, 'max=1 时只能 1');
 
-  // expected 超界时夹紧到 max：peak=6 时 6 是最高频
-  const hi = new Map<number, number>();
-  for (let i = 0; i < 1000; i++) {
-    const v = pickBubbleTarget(99, 6);
-    hi.set(v, (hi.get(v) ?? 0) + 1);
+  // max 小于自动峰值时把峰夹到 max：max=2 只会出 1/2
+  for (let i = 0; i < 200; i++) {
+    const v = pickBubbleTarget(2);
+    assert.ok(v === 1 || v === 2, `越界：${v}`);
   }
-  const top = [...hi.entries()].sort((a, b) => b[1] - a[1])[0][0];
-  assert.equal(top, 6, 'expected 超界要夹到 max 作峰');
-  assert.equal(pickBubbleTarget(3, 1, { rand: () => 0.0001 }), 1, 'max=1 时只能 1');
 
   // 统计：1000 次抽样，峰值附近（±1）占多数，且所有值都在范围内
   const counts = new Map<number, number>();
   for (let i = 0; i < 1000; i++) {
-    const v = pickBubbleTarget(3, 6);
+    const v = pickBubbleTarget(6);
     assert.ok(v >= 1 && v <= 6, `越界：${v}`);
     counts.set(v, (counts.get(v) ?? 0) + 1);
   }
+  const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  assert.equal(top, 3, '自动分布的众数固定落在 3 条');
   const near = (counts.get(2) ?? 0) + (counts.get(3) ?? 0) + (counts.get(4) ?? 0);
   assert.ok(near > 600, `峰值附近应占多数，实际 ${near}/1000：${JSON.stringify([...counts])}`);
 
   // 避重：最近都是 3 → 这次抽 3 的占比显著低于无避重基线
   let repeat = 0;
-  for (let i = 0; i < 1000; i++) if (pickBubbleTarget(3, 6, { recentShapes: [4, 4, 3] }) === 3) repeat++;
+  for (let i = 0; i < 1000; i++) if (pickBubbleTarget(6, { recentShapes: [4, 4, 3] }) === 3) repeat++;
   const base = counts.get(3) ?? 0;
   assert.ok(repeat < base, `近形应降权：避重后抽 3 = ${repeat}，基线 ${base}`);
 });
@@ -903,26 +903,26 @@ test('pickBubbleTarget：范围夹紧、众数落在预期附近、最近同形�
 test('pickBubbleTarget 自定义权重：按权重归一化、0=禁用、缺档不抽、全 0 回自动', () => {
   // 确定性：权重 [1,0,0,0,0,0]（只许 1 条）无论 rand 都返回 1
   for (const r of [0.01, 0.5, 0.99]) {
-    assert.equal(pickBubbleTarget(3, 6, { weights: [1, 0, 0, 0, 0, 0], rand: () => r }), 1, '被禁用的条数绝不抽出');
+    assert.equal(pickBubbleTarget(6, { weights: [1, 0, 0, 0, 0, 0], rand: () => r }), 1, '被禁用的条数绝不抽出');
   }
   // [0,0,5,0,0,0] 只抽 3
   for (const r of [0.01, 0.5, 0.99]) {
-    assert.equal(pickBubbleTarget(3, 6, { weights: [0, 0, 5, 0, 0, 0], rand: () => r }), 3);
+    assert.equal(pickBubbleTarget(6, { weights: [0, 0, 5, 0, 0, 0], rand: () => r }), 3);
   }
   // 缺档不抽：[1,1] 只会出 1/2
   for (let i = 0; i < 200; i++) {
-    const v = pickBubbleTarget(3, 6, { weights: [1, 1] });
+    const v = pickBubbleTarget(6, { weights: [1, 1] });
     assert.ok(v === 1 || v === 2, `缺档应不抽：${v}`);
   }
-  // 全 0 = 回自动分布（峰值在 expected）
+  // 全 0 = 回自动分布（峰固定 3 条）
   const autoCounts = new Map<number, number>();
   for (let i = 0; i < 800; i++) {
-    const v = pickBubbleTarget(3, 6, { weights: [0, 0, 0, 0, 0, 0] });
+    const v = pickBubbleTarget(6, { weights: [0, 0, 0, 0, 0, 0] });
     autoCounts.set(v, (autoCounts.get(v) ?? 0) + 1);
   }
   assert.ok((autoCounts.get(3) ?? 0) > 200, `全 0 应回自动分布，峰在 3：${JSON.stringify([...autoCounts])}`);
   // 负数/超 100 夹紧 [0,100]
-  assert.equal(pickBubbleTarget(3, 2, { weights: [-5, 999], rand: () => 0.99 }), 2);
+  assert.equal(pickBubbleTarget(2, { weights: [-5, 999], rand: () => 0.99 }), 2);
 });
 
 test('pickBubbleTarget 自定义权重不吃避重折扣：实际频率就是设置页填的那组百分比', () => {
@@ -930,7 +930,7 @@ test('pickBubbleTarget 自定义权重不吃避重折扣：实际频率就是设
   const weights = [45, 30, 20, 2, 2, 1];
   const counts = new Array(7).fill(0);
   const N = 20000;
-  for (let i = 0; i < N; i++) counts[pickBubbleTarget(3, 6, { weights, recentShapes: [1, 1, 1] })]++;
+  for (let i = 0; i < N; i++) counts[pickBubbleTarget(6, { weights, recentShapes: [1, 1, 1] })]++;
   // 1 条应稳定在 45% 附近（若被避重打 0.45 折会掉到 ~26%）
   const one = (counts[1] / N) * 100;
   assert.ok(Math.abs(one - 45) < 3, `1 条占比应贴近 45%，实际 ${one.toFixed(1)}%`);
@@ -938,7 +938,7 @@ test('pickBubbleTarget 自定义权重不吃避重折扣：实际频率就是设
   assert.ok(Math.abs(two - 30) < 3, `2 条占比应贴近 30%，实际 ${two.toFixed(1)}%`);
   // 避重在自动分布上仍然生效（回归保护）
   const autoRepeat = [];
-  for (let i = 0; i < 4000; i++) autoRepeat.push(pickBubbleTarget(3, 6, { recentShapes: [3, 3, 3] }) === 3);
+  for (let i = 0; i < 4000; i++) autoRepeat.push(pickBubbleTarget(6, { recentShapes: [3, 3, 3] }) === 3);
   const rate = (autoRepeat.filter(Boolean).length / 4000) * 100;
   assert.ok(rate < 22, `自动分布仍应避重（3 条占比低于无避重时的 ~32%），实际 ${rate.toFixed(1)}%`);
 });

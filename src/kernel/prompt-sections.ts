@@ -39,7 +39,6 @@ export function chatOutputStyleText(opts: {
   maxChars: number;
   /** @deprecated 每轮目标条数已挪到 chatTurnBubbleNote，保留可选字段兼容旧调用 */
   targetBubbles?: number;
-  expectedBubbles?: number;
   maxBubbles?: number;
 }): string {
   const n = Math.max(20, Math.round(opts.maxChars));

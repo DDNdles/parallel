@@ -21,8 +21,6 @@ export interface OutgoingConfig {
   maxReplyTokens: number;
   /** 单条气泡目标字数：超过后在逗号/顿号处补切（0 = 用默认 24） */
   bubbleSoftMaxCharacters: number;
-  /** 预期气泡数：提示里的推荐条数（2026-10-25 起设置页可调） */
-  expectedBubbles?: number;
   /** 最大气泡数：程序分条硬上限（超出合并） */
   maxBubbles?: number;
   /** 气泡数概率的自定义权重（索引对 1..N 条；空 = 自动三角分布；某档 0 = 禁用该条数） */
@@ -46,7 +44,6 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   replyMaxCharacters: 100,
   maxReplyTokens: 400,
   bubbleSoftMaxCharacters: 24,
-  expectedBubbles: 3,
   maxBubbles: 6,
   bubbleWeights: [],
   typingEnabled: false,
@@ -61,8 +58,8 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
 export const MAX_BUBBLES = 6;
 /** 提示里的推荐总长（字）：硬上限由设置页 replyMaxCharacters 决定，必要情况可以突破推荐值 */
 export const RECOMMENDED_REPLY_CHARS = 50;
-/** 提示里推荐气泡数的缺省值（设置页「预期气泡数」没配时的回落） */
-export const RECOMMENDED_BUBBLES = 3;
+/** 自动分布的峰值条数（2026-10-28 定死 3：设置页「预期气泡数」已删，自动分布只作没配概率时的兜底） */
+export const AUTO_PEAK_BUBBLES = 3;
 
 /** 句末标点（切分与句边截断共用） */
 const ENDERS = new Set([...'。！？!?…；;']);
@@ -77,14 +74,15 @@ const SOFT_BREAKS = new Set([...'，,、：:']);
 const HARD_BUBBLE_CHARS = 40;
 
 /**
- * 自动分布：以 expected 为峰的三角权重向两边线性衰减，远处留 ~15% 地板——
- * 偶尔抽到 1 条或接近上限，形状才活得起来。设置页「气泡数概率」没自定义时用它。
+ * 自动分布：以 `peak` 为峰的三角权重向两边线性衰减，远处留 ~15% 地板——
+ * 偶尔抽到 1 条或接近上限，形状才活得起来。设置页「气泡数概率」没自定义时用它，
+ * 峰值固定 AUTO_PEAK_BUBBLES（3 条）。
  */
-export function autoBubbleWeights(expected: number, maxBubbles: number): number[] {
+export function autoBubbleWeights(peak: number, maxBubbles: number): number[] {
   const max = Math.max(1, Math.round(maxBubbles));
-  const peak = Math.min(max, Math.max(1, Math.round(expected)));
+  const p = Math.min(max, Math.max(1, Math.round(peak)));
   const out: number[] = [];
-  for (let i = 1; i <= max; i++) out.push(Math.max(0.15, 1 - Math.abs(i - peak) * 0.45));
+  for (let i = 1; i <= max; i++) out.push(Math.max(0.15, 1 - Math.abs(i - p) * 0.45));
   return out;
 }
 
@@ -94,18 +92,17 @@ export function autoBubbleWeights(expected: number, maxBubbles: number): number[
  * 每轮抽签才是活的节奏。
  *
  * 分布权重：opts.weights（设置页「气泡数概率」，按索引对 1..N 条）非空时优先——
- * 填 0 = 该条数禁用，数组比上限短 = 缺档不抽，全 0 视为没配走自动分布。
+ * 填 0 = 该条数禁用，数组比上限短 = 缺档不抽，全 0 视为没配走自动分布（峰固定 3 条）。
  *
  * 避重（最近形状打折）只作用在**自动分布**上：设置页填的那组百分比是用户要的实际频率，
  * 再拿最近几轮去折扣会把 45% 拽成 39%，口径就对不上了（2026-10-27 定）。
  */
 export function pickBubbleTarget(
-  expected: number,
   maxBubbles: number,
   opts: { recentShapes?: number[]; rand?: () => number; weights?: number[] } = {},
 ): number {
   const max = Math.max(1, Math.round(maxBubbles));
-  const peak = Math.min(max, Math.max(1, Math.round(expected)));
+  const peak = Math.min(max, AUTO_PEAK_BUBBLES);
   // 自定义权重（设置页「气泡数概率」）：有任一档 >0 就用自定义——填 0 = 该条数禁用、
   // 数组比上限短 = 缺档不抽；全是 0 / 没配 = 走自动分布
   const raw = (opts.weights ?? []).map((w) => (Number.isFinite(w) ? Math.max(0, Math.min(100, w as number)) : NaN));

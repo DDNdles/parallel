@@ -35,7 +35,10 @@ export class MockOneBot {
       });
       const timer = setTimeout(() => {
         if (!settled) { settled = true; reject(new Error('connect timeout')); }
-      }, 5000);
+      // 15s：本机同时跑着真内核/QQ/浏览器时，同一个文件里连开十几个内核后反向 WS 握手
+      // 会拖到 5~10s；原来 5s 的窗口让 cover 的自定义音源测试偶发超时，还会漏掉半开 socket
+      // 把整个测试进程挂住（2026-10-28 实测：放宽后 13/13 且进程正常退出）
+      }, 15000);
       const ok = () => {
         if (settled) return;
         settled = true;
