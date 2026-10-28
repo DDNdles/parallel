@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import type { Server } from 'node:http';
+import { request as httpRequest } from 'node:http';
 import { createConnection } from 'node:net';
 import { Bus, busEvents } from './bus.ts';
 import { Db } from './db.ts';
@@ -60,6 +61,30 @@ function portBusy(host: string, port: number): Promise<boolean> {
     s.setTimeout(800, () => done(false));
     s.once('connect', () => done(true));
     s.once('error', () => done(false));
+  });
+}
+
+/** 端口上的应答者是不是**本内核**：拿本机 uiToken 请求 /api/state，对得上响应形状才算。
+ *  只看 TCP 能不能连会被任意占用该端口的程序骗过去（以前会打开浏览器后 exit(0)）。 */
+function isOurKernel(host: string, port: number, uiToken: string): Promise<boolean> {
+  return new Promise((resolveP) => {
+    const req = httpRequest({
+      host, port, path: '/api/state', method: 'GET', timeout: 1500,
+      headers: { 'x-auth-token': uiToken },
+    }, (res) => {
+      let buf = '';
+      res.setEncoding('utf-8');
+      res.on('data', (c: string) => { if (buf.length < 64_000) buf += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(buf) as { uptimeMs?: unknown; adapter?: unknown };
+          resolveP(res.statusCode === 200 && typeof j.uptimeMs === 'number' && j.adapter !== undefined);
+        } catch { resolveP(false); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolveP(false); });
+    req.on('error', () => resolveP(false));
+    req.end();
   });
 }
 
@@ -347,10 +372,17 @@ export class Kernel {
       const ui = this.config.config.ui;
       if (await portBusy(ui.host, ui.port)) {
         const url = `http://127.0.0.1:${ui.port}/#token=${this.config.secrets.uiToken}`;
-        // 日志只打脱敏地址：stdout 会落 boot.log/console-all.log，贴日志求助等于交出全部写权限
-        this.log.warn(`端口 ${ui.port} 上已有内核在跑，不再重复启动：直接打开桌面端 http://127.0.0.1:${ui.port}/#token=***`);
-        openBrowser(url);
-        process.exit(0);
+        // 只有确认端口上是本内核才「打开桌面端并退出」；别的程序占着端口时不能假成功
+        if (await isOurKernel(ui.host, ui.port, this.config.secrets.uiToken)) {
+          // 日志只打脱敏地址：stdout 会落 boot.log/console-all.log，贴日志求助等于交出全部写权限
+          this.log.warn(`端口 ${ui.port} 上已有内核在跑，不再重复启动：直接打开桌面端 http://127.0.0.1:${ui.port}/#token=***`);
+          openBrowser(url);
+          process.exit(0);
+        }
+        const msg = `端口 ${ui.port} 已被其他程序占用（不是本内核）。请关掉占用该端口的程序，或在 config.json 里改 ui.port 后重启。`;
+        this.log.error(msg);
+        this.errors.record('error', 'kernel', msg);
+        process.exit(1);
       }
     }
     mkdirSync(join(this.dataDir, 'plugins'), { recursive: true });

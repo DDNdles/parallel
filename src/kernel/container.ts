@@ -103,10 +103,17 @@ export class PluginContainer {
     if (m.defaultGroupState !== 'on' && m.defaultGroupState !== 'off') {
       throw new Error('manifest.defaultGroupState 必须是 on/off（本系统默认全部关闭）');
     }
-    // 红线 §3.7：敏感信息不允许写进清单
+    // 红线 §3.7：敏感信息不允许写进清单——secret 字段的 default 必须为空，
+    // 任何字段的默认值出现密钥形态一律拒绝加载（面向大众分发，密钥只能由用户自己填）。
     for (const [k, v] of Object.entries(m.userConfig ?? {})) {
-      void k;
-      if ((v as any)?.secret) continue;
+      const f = v as { secret?: boolean; default?: unknown };
+      if (f?.secret && f.default !== undefined && f.default !== null && String(f.default) !== '') {
+        throw new Error(`manifest.userConfig.${k} 是敏感字段，default 必须为空（不能预置密钥）`);
+      }
+      const s = typeof f?.default === 'string' ? f.default : '';
+      if (/^(sk-|tvly-|AIza)[A-Za-z0-9_-]{10,}/.test(s)) {
+        throw new Error(`manifest.userConfig.${k}.default 疑似包含密钥，请清空`);
+      }
     }
     return m;
   }
@@ -428,6 +435,7 @@ export class PluginContainer {
     const m = String(input.chatKey ?? '').match(/^(group|private)_([A-Za-z0-9._-]{1,128})$/);
     if (!m) return { ok: false, reason: 'chatKey 不合法' };
     if (this.deps.work.workModelLabel() === '—') return { ok: false, reason: '工作模型还没配置' };
+    if (this.deps.work.runningTopLevel() >= 4) return { ok: false, reason: '同时运行的工作任务已达上限（4 个），等其中一件收尾再派。' };
     const chat: ChatRef = { platform: 'qq', type: m[1] as 'group' | 'private', chatId: m[2] };
     const agent = this.workAgent();
     const all = this.listWorkAgents();
@@ -962,6 +970,8 @@ function makeGatedWork(
       can();
       // 没有 work 链就别装作派出去了：让 chat 如实说现在做不了
       if (deps.work.workModelLabel() === '—') return { ok: false, reason: '工作模型还没配置' };
+      // 程序并发帽：work 轮无轮次上限、每层还能并行 delegate，光靠提示词劝不住资源消耗
+      if (deps.work.runningTopLevel() >= 4) return { ok: false, reason: '同时运行的工作任务已达上限（4 个），等其中一件收尾再派。' };
       const agent = plugins.workAgent();
       const chat = input.chat;
       const role = input.role as Role;

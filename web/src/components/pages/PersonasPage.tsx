@@ -195,7 +195,12 @@ function PersonaDetail({ persona, isDefault, onSaved }: {
 }) {
   /** 文件本身不是合法 JSON 时（手改坏了），只允许在原始 JSON 模式里修 */
   const broken = !persona.canon;
-  const initial = serialize(normalize(persona.canon));
+  // 损坏时草稿必须是**磁盘原文**：以前给 normalize(null) 的空骨架，
+  // 用户按提示「修好再保存」等于把原文件覆盖成骨架，原文再也回不来。
+  const rawCanon = persona.raw?.['canon.json'];
+  const initial = broken && typeof rawCanon === 'string' && rawCanon.trim()
+    ? rawCanon
+    : serialize(normalize(persona.canon));
   const [draft, setDraft] = useState<CanonFile>(() => normalize(persona.canon));
   const [text, setText] = useState(initial);
   const [orig, setOrig] = useState(initial);
@@ -255,9 +260,15 @@ function PersonaDetail({ persona, isDefault, onSaved }: {
   };
 
   const reset = () => {
-    const d = normalize(JSON.parse(orig));
-    draftRef.current = d;
-    setDraft(d); setText(orig); setErr('');
+    try {
+      const d = normalize(JSON.parse(orig));
+      draftRef.current = d;
+      setDraft(d);
+    } catch {
+      // 原文本身就是坏 JSON（broken 场景）：只把文本还原，别在重置时再抛一次
+    }
+    setText(orig);
+    setErr('');
   };
 
   return (

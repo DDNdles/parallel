@@ -431,11 +431,11 @@ export class Pipeline {
     }
   }
 
-  /** 中断当前轮（桌面端按钮） */
-  abortChat(chatId: string): void {
-    const meta = this.turnMeta.get(chatId);
+  /** 中断当前轮（桌面端按钮）：key 是完整 chatKey（group_/private_ 前缀，避免群号与 QQ 号撞键） */
+  abortChat(chatKey: string): void {
+    const meta = this.turnMeta.get(chatKey);
     if (meta) meta.abortReason = 'user';
-    this.aborts.get(chatId)?.abort();
+    this.aborts.get(chatKey)?.abort();
   }
 
   /**
@@ -456,12 +456,13 @@ export class Pipeline {
     // ① 模型还在生成：新消息直接 abort 这一轮，已经想了一半的回复整段作废。
     //    "对面发完立刻生效"只能走 abort；等模型吐完再丢弃，人已经看到延迟了。
     //    转述轮（work 结果回讲）不登记 interruptible：那是必须说完、也不该被闲聊插掉的话。
-    const turn = this.turnMeta.get(chat.chatId);
+    const key = `${chat.type}_${chat.chatId}`;
+    const turn = this.turnMeta.get(key);
     if (turn && turn.phase === 'generating' && turn.interruptible) {
       const d = shouldInterrupt({ remaining: 1, probability: cfg.probability });
       if (d.interrupt) {
         turn.abortReason = 'generation';
-        this.aborts.get(chat.chatId)?.abort();
+        this.aborts.get(key)?.abort();
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system',
           text: `生成期被打断：这一轮回复作废（${d.reason}）`,
@@ -763,8 +764,8 @@ export class Pipeline {
     }
 
     const ac = new AbortController();
-    this.aborts.set(event.chatId, ac);
-    this.turnMeta.set(event.chatId, {
+    this.aborts.set(chatKey, ac);
+    this.turnMeta.set(chatKey, {
       chatKey,
       phase: 'generating',
       // 汇报轮不参与生成期打断：work 的结论必须讲完；@ 轮同样不可打断（@ 必回）；
@@ -930,6 +931,9 @@ export class Pipeline {
       let ctx: LLMRequestContext = {
         chat, event, system, systemSections, messages, tools,
         attachments: turnAttachments,
+        // 结构化标记：转述轮（work 汇报）不该注入画像/回想/表达学习。以前插件靠中文文案匹配，
+        // 文案一改就静默失效（『【工作子代理』与实际三种开头全部对不上）。
+        reportTurn: !!opts?.report,
         // 合批轮里 carrier 只是最后一条：工具面判断"这活是谁提的"要看整批与说话人名册
         batch: batch.length ? batch : [event],
         speakers: [...(this.speakers.get(`${event.type}_${event.chatId}`)?.values() ?? [])]
@@ -975,7 +979,7 @@ export class Pipeline {
 
       // 生成期被新消息打断：模型即使把结果吐完了也整段作废（新消息会成为下一轮的输入）。
       // abort 是否被 pi-agent-core 立刻兑现因供应商而异，所以这里再兜一层。
-      const turn = this.turnMeta.get(event.chatId);
+      const turn = this.turnMeta.get(chatKey);
       if (turn?.abortReason === 'generation') {
         this.sessionLog.append(event.chatId, event.type, {
           type: 'gate', role: 'system',
@@ -1025,7 +1029,7 @@ export class Pipeline {
         const hit = this.humanlike.repetitionHit(chat, finalReply);
         if (hit) {
           const retried = await this.rewriteRepetition(ctx, finalReply, hit.phrase, event, ac.signal);
-          if (ac.signal.aborted || this.turnMeta.get(event.chatId)?.abortReason === 'generation') {
+          if (ac.signal.aborted || this.turnMeta.get(chatKey)?.abortReason === 'generation') {
             return;
           }
           if (retried && !isSilentScene(retried)) {
@@ -1073,7 +1077,7 @@ export class Pipeline {
       if (opts?.proactive) this.humanlike.noteProactive(chat);
     } catch (e) {
       const msg = (e as Error).message;
-      const turn = this.turnMeta.get(event.chatId);
+      const turn = this.turnMeta.get(chatKey);
       // 生成期打断是预期内的事件，不是模型故障：静默收尾，别往报错中心写
       if (ac.signal.aborted && turn?.abortReason === 'generation') return;
       // 模型请求失败（没接模型/额度不足/链全挂）等异常一律不在群里出声：
@@ -1087,8 +1091,8 @@ export class Pipeline {
       }
     } finally {
       this.activeTurns.set(chatKey, Math.max(0, (this.activeTurns.get(chatKey) ?? 1) - 1));
-      this.aborts.delete(event.chatId);
-      this.turnMeta.delete(event.chatId);
+      this.aborts.delete(chatKey);
+      this.turnMeta.delete(chatKey);
       // 重新武装主动发言计时器：这一轮不管说没说话，都从"现在"重新起算静默时长
       this.humanlike.afterTurn(chat);
     }

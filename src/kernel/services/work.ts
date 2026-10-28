@@ -267,6 +267,11 @@ export class WorkRunner {
     return p && Date.now() - p.at <= PENDING_WORK_TTL_MS ? p : undefined;
   }
 
+  /** 正在跑的入口任务数（depth=0；子代理不算）：派活前的程序并发上限用 */
+  runningTopLevel(): number {
+    return [...this.runs.values()].filter((r) => r.phase === 'running' && (r.depth ?? 0) === 0).length;
+  }
+
   /** 正在跑的入口任务 → 插话句柄（agents.steer 排进 pi 的 steeringQueue） */
   private steerers = new Map<string, { steer: (text: string) => boolean; record: (text: string) => void }>();
 

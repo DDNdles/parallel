@@ -42,6 +42,20 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
   /** 限额弹窗里的写入失败就地报红（弹窗盖着页面，用 err 看不见） */
   const [limitsErr, setLimitsErr] = useState('');
 
+  /** 开关即时保存（全站口径：拨完就落库）；失败回滚开关并就地报红。
+   *  以前只改本地 state，必须点「保存」才生效，点蒙层关掉就静默丢失。 */
+  const saveQuick = async (kind: 'workNetwork' | 'sandboxGlobal', value: boolean) => {
+    try {
+      if (kind === 'workNetwork') await post('/api/sandbox/config', { ...cfg, workNetwork: value });
+      else await post('/api/plugins/sandbox/global-default', { enabled: value });
+      setLimitsErr('');
+    } catch (e) {
+      if (kind === 'workNetwork') setWorkNet(!value);
+      else setSbGlobal(!value);
+      setLimitsErr(`未保存：${(e as Error)?.message ?? String(e)}`);
+    }
+  };
+
   const reload = useCallback(() => {
     get('/api/sandbox')
       .then((d: { stats?: Stat[]; config?: Record<string, unknown> }) => {
@@ -195,13 +209,15 @@ export default function SandboxPage({ cmd }: { cmd?: PageCmd }) {
           <div className="mset-mrow" style={{ border: '1px solid var(--border)', borderRadius: 11, marginTop: 4 }}>
             <span className="plg-v">work 容器联网</span>
             <span className="mset-macts">
-              <Switch on={workNet} title="work 的执行容器可出网（requests/pip/npm）；聊天沙箱不受影响，始终断网" onChange={() => setWorkNet((v) => !v)} />
+              <Switch on={workNet} title="work 的执行容器可出网（requests/pip/npm）；聊天沙箱不受影响，始终断网"
+                onChange={() => { const v = !workNet; setWorkNet(v); void saveQuick('workNetwork', v); }} />
             </span>
           </div>
           <div className="mset-mrow" style={{ border: '1px solid var(--border)', borderRadius: 11, marginTop: 4 }}>
             <span className="plg-v">沙箱工具（新群默认开启）</span>
             <span className="mset-macts">
-              <Switch on={sbGlobal} title="按群开关在「插件」页的开关矩阵里设置" onChange={() => setSbGlobal((v) => !v)} />
+              <Switch on={sbGlobal} title="按群开关在「插件」页的开关矩阵里设置"
+                onChange={() => { const v = !sbGlobal; setSbGlobal(v); void saveQuick('sandboxGlobal', v); }} />
             </span>
           </div>
           <div className="mset-mfoot">

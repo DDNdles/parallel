@@ -63,14 +63,13 @@ export function startApiServer(kernel: Kernel): Promise<ReturnType<typeof create
       ws.close(1008, 'unauthorized');
       return;
     }
+    // 只广播前端真正消费的事件（逐条 grep 过 web/src 的 onEvent）：
+    // llmDelta 这类逐 token 事件以前每连都在白推，长回复时是纯带宽/序列化浪费。
     const events = [
-      'session.log', busEvents.toolCall, busEvents.toolResult, busEvents.llmDelta,
-      busEvents.agentStart, busEvents.agentEnd, busEvents.adapterStatus,
-      busEvents.pluginLoaded, busEvents.pluginUnloaded, busEvents.pluginStateChanged,
-      busEvents.errorRecorded, busEvents.configChanged, busEvents.chatOut,
-      busEvents.memoryChanged, busEvents.providerChanged, busEvents.modelFailover,
+      'session.log', busEvents.errorRecorded, busEvents.chatOut,
+      busEvents.providerChanged,
       // 会话页右侧「工作」抽屉的实时 loop
-      busEvents.workStart, busEvents.workEvent, busEvents.workStep,
+      busEvents.workStart, busEvents.workEvent,
       busEvents.workDone, busEvents.workError,
     ];
     const offs = events.map((ev) => kernel.bus.on(ev, (data: unknown) => {
@@ -543,7 +542,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
         return send({ ok: true, eventId: ev.id });
       }
       if (c === 'abort' && req.method === 'POST') {
-        kernel.pipeline.abortChat(m[2]);
+        kernel.pipeline.abortChat(b);
         return send({ ok: true });
       }
     }

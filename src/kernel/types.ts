@@ -293,6 +293,8 @@ export interface LLMRequestContext {
   historyWindowStartTs?: number;
   /** 本轮由 work 子代理执行（workTurn）：插件可据此接管 system；仅本轮有效 */
   workTurn?: boolean;
+  /** 本轮是 work 结果的转述/汇报轮（内核构造的输入）：插件据此跳过画像、回想、表达学习这类闲聊注入 */
+  reportTurn?: boolean;
   /** 派活时携带的任务原文（workTurn 时存在） */
   workTask?: string;
   /** 本轮的 work 子代理定义（workTurn 时存在；内核按它筛工具面、插件按它写身份节） */

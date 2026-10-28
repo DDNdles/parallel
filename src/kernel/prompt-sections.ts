@@ -90,7 +90,9 @@ export function chatIdentitySystem(opts: {
   role: Role;
 }): string {
   return [
-    `你是蓝色大肥鱼，运行在 parallel（一个 harness 形态的 QQ 机器人内核）上。`,
+    // 人格（名字/性格）由 chat 插件的 canon 分节提供，内核不写死具体人格：
+    // 用户切换/新建人格后，这里再宣称某个名字就会与插件节互相打架。
+    `你是一个 QQ 聊天机器人，运行在 parallel（一个 harness 形态的 QQ 机器人内核）上；你的身份与性格以人格设定为准。`,
     `当前会话：${chatLabelOf(opts.type, opts.chatId, opts.groupTitle)}。`,
     CHAT_STYLE_TEXT,
   ].join('\n');

@@ -103,20 +103,27 @@ export function setup(ctx: PluginContext): void {
 
   function loadPersonas(): void {
     personas.clear();
-    const root = join(here, 'personas');
-    if (!existsSync(root)) return;
-    for (const id of readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)) {
-      const dir = join(root, id);
-      try {
-        const canon = JSON.parse(readFileSync(join(dir, 'canon.json'), 'utf-8')) as PersonaCanon;
-        if (!canon?.canon || !Array.isArray(canon.canon.protagonist)) throw new Error('canon.json 缺少 canon.protagonist');
-        canon.lore = Array.isArray(canon.lore) ? canon.lore : [];
-        canon.voice = canon.voice ?? { examples: [] };
-        personas.set(id, { id, canon, dir });
-      } catch (e) {
-        ctx.log.error(`人格 ${id} 加载失败: ${(e as Error).message}`);
+    // 内置人格：随源码/发布包走，只读；用户人格：data/personas 下，同名覆盖内置。
+    // 运行期新建/编辑只写用户层——不再改写源码树（只读安装会 EACCES、升级会覆盖、私人设定会入包）。
+    const builtinRoot = join(here, 'personas');
+    const userRoot = join(ctx.dataDir, 'personas');
+    const loadRoot = (root: string): void => {
+      if (!existsSync(root)) return;
+      for (const id of readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)) {
+        const dir = join(root, id);
+        try {
+          const canon = JSON.parse(readFileSync(join(dir, 'canon.json'), 'utf-8')) as PersonaCanon;
+          if (!canon?.canon || !Array.isArray(canon.canon.protagonist)) throw new Error('canon.json 缺少 canon.protagonist');
+          canon.lore = Array.isArray(canon.lore) ? canon.lore : [];
+          canon.voice = canon.voice ?? { examples: [] };
+          personas.set(id, { id, canon, dir });
+        } catch (e) {
+          ctx.log.error(`人格 ${id} 加载失败: ${(e as Error).message}`);
+        }
       }
-    }
+    };
+    loadRoot(builtinRoot);
+    loadRoot(userRoot);
   }
   loadPersonas();
 
@@ -267,12 +274,15 @@ export function setup(ctx: PluginContext): void {
     return out;
   }
 
-  /** 转述轮（work 结果回讲）不注入"本群说法 / 画像 / 回想"：那轮要讲清楚事，不是闲聊 */
+  /** 转述轮（work 结果回讲）不注入"本群说法 / 画像 / 回想"：那轮要讲清楚事，不是闲聊。
+   *  以内核给的 reportTurn 标志为准；中文文案只作旧版兜底（三种汇报开头都认）。 */
   function isRelayTurn(req: LLMRequestContext): boolean {
+    if (req.reportTurn === true) return true;
     for (let i = req.messages.length - 1; i >= 0; i--) {
       const m = req.messages[i];
       if (m.role !== 'user') continue;
-      return String(m.content ?? '').includes('【工作子代理');
+      const text = String(m.content ?? '');
+      return text.includes('【工作子代理') || text.includes('【你派出去的活');
     }
     return false;
   }
@@ -1062,7 +1072,10 @@ export function setup(ctx: PluginContext): void {
       if (!parsed?.canon || !Array.isArray(parsed.canon.protagonist)) {
         return done(false, 'canon.json 缺少 canon.protagonist（主角记号那一段）');
       }
-      writeFileSync(join(p.dir, payload.file), content, 'utf-8');
+      // 写用户层（内置人格的编辑也落到 data/personas，靠同名覆盖生效）
+      const dir = join(ctx.dataDir, 'personas', payload.personaId);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, payload.file), content, 'utf-8');
       loadPersonas();
       publishAliases();   // 叫醒词改了就换，不用等重启
       ctx.log.info(`人格 ${payload.personaId}/${payload.file} 已更新并热加载`);
@@ -1081,11 +1094,11 @@ export function setup(ctx: PluginContext): void {
     if (payload.requesterRole !== 'owner') return done(false, '仅主人可新建人格');
     const id = String(payload.personaId ?? '').trim();
     if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(id)) return done(false, '人格 id 需为小写字母/数字/连字符（2~31 位）');
-    const dir = join(here, 'personas', id);
+    const dir = join(ctx.dataDir, 'personas', id);
     if (existsSync(dir)) return done(false, `人格 ${id} 已存在`);
     const name = String(payload.name ?? '').trim().slice(0, 40) || id;
     try {
-      mkdirSync(dir);
+      mkdirSync(dir, { recursive: true });
       const write = (f: string, obj: unknown) => writeFileSync(join(dir, f), JSON.stringify(obj, null, 2) + '\n', 'utf-8');
       write('canon.json', {
         name,

@@ -15,6 +15,7 @@ import { Modal } from '@/components/Modal';
 
 interface ChatInfo { chatKey: string; chatId: string; chatType: string; lastTs: number; title?: string }
 interface Entry {
+  id?: string;
   type: string; chatId?: string; chatType?: string; ts?: number; text?: string;
   userId?: string; nickname?: string; data?: any;
 }
@@ -280,14 +281,18 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
     entries.filter((e) => e.data?.messageId).map((e) => [String(e.data.messageId), e]));
   const findQuoted = useCallback((id: string) => quoteIndexRef.current.get(id), []);
 
+  /** 消息行的稳定键：列表会从头部裁掉（MAX_TURNS），索引会变，所以不能用索引当键。
+   *  优先用服务端条目 id（同毫秒、同类型的多行也能区分）；老数据回落到字段组合。 */
+  const rowKeyOf = (e: Entry) => e.id ?? `${e.type}|${e.ts}|${e.userId ?? ''}|${(e.text ?? '').slice(0, 24)}`;
+
+  /** 切会话/翻天的请求序号：慢响应回来时如果已经不是当前视图，整包丢弃 */
+  const loadSeqRef = useRef(0);
+
   // 消息流是页面里最重的子树（几百行 + markdown 渲染）：只在 entries 变化时重建，
   // 打字/移动光标/开关菜单都不会碰它——否则每敲一个字整屏重排一次。
   const stream = useMemo(
-    () => entries.map((e, i) => <EntryRow key={i} e={e} preview={preview} botId={botId} srcOf={srcOf} findQuoted={findQuoted} onZoom={setZoom} />),
+    () => entries.map((e) => <EntryRow key={rowKeyOf(e)} e={e} preview={preview} botId={botId} srcOf={srcOf} findQuoted={findQuoted} onZoom={setZoom} />),
     [entries, preview, botId, srcOf, findQuoted]);
-
-  /** 消息行的稳定键：列表会从头部裁掉（MAX_TURNS），索引会变，所以不能用索引当键 */
-  const rowKeyOf = (e: Entry) => `${e.type}|${e.ts}|${e.userId ?? ''}`;
 
   /** 把屏幕外的消息行标成"跳过布局/绘制"，用**该行自己上次实测的高度**占位。
    *  滚动几何因此是准的（实测只差 0.3%，而用固定估值会差 49%）。没有实测高度的行先不跳过，
@@ -423,8 +428,9 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
       const locked = Date.now() < edgeLockRef.current;
       if (!locked && dir < 0 && sc.scrollTop <= 40 && w.from > 0) void loadEdge(-1);
       else if (!locked && dir > 0 && distBottom <= 40 && w.to < daysRef.current.length - 1) void loadEdge(1);
-      // 窗口已经含到最新一天、又翻到底 = 眼前的就是最新消息，那颗「回到实时」的钮没有存在意义了
-      if (distBottom <= 24 && w.to >= daysRef.current.length - 1) { setReview(''); setWin(null); }
+      // 回看态滚到最新一天、又贴到底 = 想回实时。必须重拉 tail：
+      // 以前只把窗口标成空，回看期间的新消息永远缺一段，而「回到实时」按钮此时已经消失。
+      if (distBottom <= 24 && w.to >= daysRef.current.length - 1 && viewDayRef.current) void backToLive();
     }
   };
 
@@ -468,9 +474,10 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   const railTopClamped = Math.min(railTop, railMax);
 
   /** 日轨数据：扫的是整份 jsonl，所以能看到 300 条窗口之外的日子 */
-  const loadDays = useCallback(async (chatKey: string) => {
+  const loadDays = useCallback(async (chatKey: string, seq = loadSeqRef.current) => {
     try {
       const d = await get(`/api/chats/${chatKey}/days`);
+      if (seq !== loadSeqRef.current) return [];
       const list: ChatDay[] = d.days ?? [];
       setDays(list);
       daysRef.current = list;
@@ -486,8 +493,10 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
    *  同时把"已加载窗口"标成这一天，之后往上/往下滑会连着并前后天（见 loadEdge）。 */
   const gotoDay = async (day: string) => {
     if (!current) return;
+    const seq = ++loadSeqRef.current;
     const idx = daysRef.current.findIndex((d) => d.day === day);
     const d = await get(`/api/chats/${current.key}/day?day=${day}`);
+    if (seq !== loadSeqRef.current) return;
     setReview(day);
     setWin(idx < 0 ? null : { from: idx, to: idx });
     setEntries((d.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
@@ -512,8 +521,10 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
     const idx = dir < 0 ? w.from - 1 : w.to + 1;
     if (idx < 0 || idx >= list.length) return;
     edgeBusyRef.current = true;
+    const seq = loadSeqRef.current;
     try {
       const d = await get(`/api/chats/${current.key}/day?day=${list[idx].day}`);
+      if (seq !== loadSeqRef.current) return;
       const add: Entry[] = (d.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type));
       if (dir < 0) {
         const sc = streamRef.current;
@@ -528,13 +539,20 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
 
   /** 回到实时：重取 tail 窗口（顺带补上回看期间漏掉的新消息） */
   const backToLive = async () => {
-    if (!current) return;
-    setReview('');
-    setWin(null);
-    const data = await get(`/api/chats/${current.key}/tail?limit=300`);
-    setEntries((data.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
-    void loadDays(current.key);
-    setTimeout(() => scrollBottom(true), 50);
+    if (!current || edgeBusyRef.current) return;
+    const seq = ++loadSeqRef.current;
+    edgeBusyRef.current = true;
+    try {
+      setReview('');
+      setWin(null);
+      const data = await get(`/api/chats/${current.key}/tail?limit=300`);
+      if (seq !== loadSeqRef.current) return;
+      setEntries((data.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
+      void loadDays(current.key, seq);
+      setTimeout(() => scrollBottom(true), 50);
+    } finally {
+      edgeBusyRef.current = false;
+    }
   };
 
   // 「回到实时」那颗钮做在顶栏与主题切换同排：钮的显隐报给上层，点击动作走页指令通道回来。
@@ -543,14 +561,17 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   useEffect(() => () => onReview?.(''), []);   // 离开会话页时收掉那颗钮，别让它悬在别的页上
 
   const openChat = async (c: ChatInfo) => {
+    const seq = ++loadSeqRef.current;
     setCurrent({ key: c.chatKey, type: c.chatType, id: c.chatId });
     if (narrow) onCloseList?.();   // 窄屏选完就把抽屉收起来，别让它压在对话上
     setReview('');
     setWin(null);
     setDays([]);
     daysRef.current = [];
-    void loadDays(c.chatKey);
+    setEntries([]);                // 先清掉上一个会话的流，慢响应回来也不会把 A 的消息画进 B
+    void loadDays(c.chatKey, seq);
     const data = await get(`/api/chats/${c.chatKey}/tail?limit=300`);
+    if (seq !== loadSeqRef.current) return;
     setEntries((data.entries ?? []).filter((e: Entry) => !isWorkEntry(e.type)));
     setTimeout(() => scrollBottom(true), 50);
     inputRef.current?.focus();
@@ -558,12 +579,34 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
 
   // 发送 = 以 bot 身份发言（限速与会话日志照常，历史里也是它自己的回合）。
   // 测试用户注入（/inject）保留在后端作调试接口，页面不再用。
+  const [sendErr, setSendErr] = useState('');
+  const [abortNote, setAbortNote] = useState('');
   const send = async () => {
     const text = input.trim();
     if (!text || !current) return;
+    setSendErr('');
     setInput('');
-    await post(`/api/chats/${current.key}/send`, { text })
-      .catch(() => {});
+    try {
+      await post(`/api/chats/${current.key}/send`, { text });
+    } catch (e) {
+      // 失败必须有反馈：以前 catch 吞掉、输入已清空，QQ 掉线时打字如泥牛入海
+      setSendErr(`发送失败：${(e as Error).message}`);
+      // 恢复草稿，但不覆盖用户失败后新敲的内容
+      setInput((cur) => (cur ? cur : text));
+    }
+  };
+
+  /** 桌面端打断：后端 /abort 一直在，缺的就是这个入口 */
+  const abortTurn = async () => {
+    if (!current) return;
+    setAbortNote('');
+    try {
+      await post(`/api/chats/${current.key}/abort`);
+      setAbortNote('已请求打断本轮回复');
+    } catch (e) {
+      setAbortNote(`打断失败：${(e as Error).message}`);
+    }
+    setTimeout(() => setAbortNote(''), 4000);
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -710,6 +753,9 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
               <div className="conv-fade" aria-hidden />
             </div>
             <div className="composer-wrap">
+              {(sendErr || abortNote) && (
+                <div className={'composer-err' + (sendErr ? ' bad' : '')}>{sendErr || abortNote}</div>
+              )}
               <div className="composer-inner">
                 <div className="composer-box">
                   <div className="composer-input">
@@ -738,6 +784,10 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
                   </div>
                   <div className="composer-bar">
                     <span className="flex" />
+                    <button className="send-btn stop" aria-label="打断当前回复" title="打断当前回复"
+                      disabled={!current} onClick={abortTurn}>
+                      <Icon name="stop" />
+                    </button>
                     <button className="send-btn" aria-label="发送消息" onClick={send}>
                       <Icon name="send" />
                     </button>

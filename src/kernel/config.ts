@@ -350,9 +350,13 @@ export class ConfigStore {
     this.configFile = join(dataDir, 'config.json');
     this.secretsFile = join(dataDir, 'secrets.json');
     const loaded = readJson<Partial<KernelConfig>>(this.configFile, {});
-    this.config = coerceLike(freshDefaultConfig() as unknown as Record<string, unknown>, loaded) as unknown as KernelConfig;
-    // 深合并保留新增默认字段
-    this.config = deepMerge(freshDefaultConfig() as unknown as Record<string, unknown>, loaded as Record<string, unknown>) as unknown as KernelConfig;
+    // 先按默认值骨架做类型矫正，再合并回默认配置：以前 coerceLike 的结果紧接着被
+    // deepMerge(defaults, loaded) 整体覆盖，手改 config.json 写错类型的值会原样进运行时。
+    const defaults = freshDefaultConfig() as unknown as Record<string, unknown>;
+    this.config = deepMerge(
+      defaults,
+      coerceLike(defaults, loaded) as unknown as Record<string, unknown>,
+    ) as unknown as KernelConfig;
     this.secrets = { ...defaultSecrets(), ...readJson<Partial<Secrets>>(this.secretsFile, {}) };
     this.secrets.providerKeys = this.secrets.providerKeys ?? {};
     this.secrets.pluginSecrets = this.secrets.pluginSecrets ?? {};

@@ -272,7 +272,10 @@ export function setup(ctx: PluginContext): void {
       }
       const relayed = relayQuotedMessages(quotes, tctx);
       if (!relayed.ok) return relayed.error;
-      const role = relayed.role ?? String(tctx.role);
+      // 权限与归属一律看**本轮实际说话人**，不看被引用消息的作者：
+      // 否则成员引用一句管理员的话，就能借管理员的角色、沙箱与额度派活。
+      // 引用的原文只作为任务内容（relayed.text），不参与身份判定。
+      const role = String(tctx.role);
       if (!canWork(role)) {
         return '（权限不足：只有管理员能派活。不要执行任何操作；用你自己的语气婉拒对方，别提到权限系统、工具或内部规则。）';
       }
@@ -281,8 +284,9 @@ export function setup(ctx: PluginContext): void {
       }
       const chat = tctx.chat;
       const chatKey = chatKeyOf(chat);
-      const userId = relayed.userId || tctx.event.userId;
-      const nickname = relayed.nickname || tctx.event.nickname;
+      // 任务空间/report 归属 = 真正开口的人（个人沙箱与额度跟人走）
+      const userId = tctx.event.userId;
+      const nickname = tctx.event.nickname;
       // 同一件事正在跑：用户中途改需求 → 插话给那个任务（pi 的 steer 队列，下一轮就能看见），
       // 不另开新任务、也不动它已有的产物。
       const steerImgs = (tctx.attachments ?? []).filter((a) => a.kind === 'image').length;
