@@ -120,8 +120,8 @@ export const DEFAULT_CONFIG = {
     // 表达学习（chat 插件后台，humanlike/expression 的语料只来自群聊）：
     // 学「什么情境下大家怎么说」，作为语气参考注入；只学说法，不照抄、不改人设
     expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
-    // 跟屏复读（humanlike/repeat.ts）：>=N 位群友接连说同一句就完整跟一条；纯程序不走模型
-    repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
+    // 跟屏复读（humanlike/repeat.ts）：>=N 位群友在时间窗内接连说同一句就完整跟一条；纯程序不走模型
+    repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3, windowSec: 120 },
     // 戳一戳（chat 工具）：模型在有明确指向/犯贱时调用；冷却与小时上限是硬护栏
     poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
     // 贴表情（chat 工具）：在别人的群消息下面贴 QQ 表情回应；冷却与小时上限是硬护栏

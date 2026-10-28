@@ -1296,16 +1296,17 @@ function applyHumanlikeConfig(target: Record<string, any>, body: Record<string, 
     if (t.minMessages > t.windowMessages) t.minMessages = t.windowMessages;
   }
 
-  // 跟屏复读（纯程序段）：开关 + 条数/秒数/冷却逐键收，范围在服务端也成立
+  // 跟屏复读（纯程序段）：开关 + 条数/秒数/冷却/时间窗逐键收，范围在服务端也成立
   const repeat = body.repeat as Record<string, unknown> | undefined;
   if (repeat && typeof repeat === 'object') {
     const t = target.repeat as {
-      enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number;
+      enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number; windowSec: number;
     };
     applyBool(t, repeat, 'enable');
     if ('minPeople' in repeat) t.minPeople = Math.min(20, Math.max(2, Math.round(Number(repeat.minPeople) || 4)));
     if ('delayMaxSec' in repeat) t.delayMaxSec = Math.min(30, Math.max(1, Math.round(Number(repeat.delayMaxSec) || 4)));
     if ('cooldownMin' in repeat) t.cooldownMin = Math.min(120, Math.max(0, Math.round(Number(repeat.cooldownMin) || 3)));
+    if ('windowSec' in repeat) t.windowSec = Math.min(1800, Math.max(10, Math.round(Number(repeat.windowSec) || 120)));
   }
 
   // 戳一戳（chat 工具）：开关 + 最小间隔/小时上限

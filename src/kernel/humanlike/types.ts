@@ -124,7 +124,7 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
     maxStrikes: 3,
   },
   expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
-  repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3 },
+  repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3, windowSec: 120 },
   poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   reaction: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
   timing: {

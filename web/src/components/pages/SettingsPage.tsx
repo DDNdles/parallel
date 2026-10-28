@@ -43,8 +43,8 @@ interface Humanlike {
     enable: boolean; windowMessages: number; minMessages: number; cooldownMinutes: number;
     maxPhrases: number; retry: boolean; maxStrikes: number;
   };
-  /** 跟屏复读：>=N 位群友接连说同一句，bot 完整跟一条（纯程序，不走模型） */
-  repeat?: { enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number };
+  /** 跟屏复读：>=N 位群友在时间窗内接连说同一句，bot 完整跟一条（纯程序，不走模型） */
+  repeat?: { enable: boolean; minPeople: number; delayMaxSec: number; cooldownMin: number; windowSec: number };
   proactive: { enable: boolean; idleSeconds: number };
   /** 聊天节奏反定型（HDSI ChatRhythm） */
   rhythm: { enable: boolean; mode: 'gentle' | 'balanced' | 'aggressive'; historyLimit: number; collapseMinSamples: number; exhaustLimit: number };
@@ -371,8 +371,9 @@ export default function SettingsPage() {
                 )}
                 {rp && (
                   <div className="set-grid">
-                    <Num label="复读触发人数" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
-                    <Num label="复读延迟秒数" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
+                    <Num label="复读触发人数" hint="多少个不同的人接连说同一句就跟一条；同一个人刷几遍只算一位" value={rp.minPeople} onChange={(v) => setRp({ minPeople: v })} />
+                    <Num label="复读窗口秒数" hint="同文消息间隔超过这个秒数就算新一段；隔了老半天的同句不续旧账" value={rp.windowSec ?? 120} onChange={(v) => setRp({ windowSec: v })} />
+                    <Num label="复读延迟秒数" hint="凑齐后随机等 0.6~N 秒再发，显得不机械" value={rp.delayMaxSec} onChange={(v) => setRp({ delayMaxSec: v })} />
                     <Num label="复读冷却分钟" value={rp.cooldownMin} onChange={(v) => setRp({ cooldownMin: v })} />
                   </div>
                 )}

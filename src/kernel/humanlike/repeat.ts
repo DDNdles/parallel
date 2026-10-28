@@ -1,9 +1,12 @@
 /**
  * 跟屏复读 —— 纯程序段，不走模型。
  *
- * 群里 >=N 位群友接连说了同一句话时，完整跟一条同样的；N 与发送前的等待都带随机量，
- * 显得不机械。**发送那一刻链子断了就不发**：等待期间有人说了句不一样的话，
- * 这一轮就作废（run 整体重置，那句不一样的成了新一段的开头）。
+ * 群里 >=N 位群友**在时间窗内**接连说了同一句话时，完整跟一条同样的；发送前带随机等待，
+ * 显得不机械。三个会让它"看起来没实现"的坑（2026-10-28 修）：
+ *  - 段有时间窗（humanlike.repeat.windowSec）：窗外的同文消息算新一段。否则「哈哈哈」这类
+ *    高频句隔几小时也在续同一段，凑够人数就在错误的时机突然冒出来；
+ *  - 发射后整段作废：旧实现 fired 挂在段上，只要没人说一句不同的话，这句话永远不再触发；
+ *  - 冷却期内攒满不再直接丢：定时器推迟到冷却结束后发射（fire 时再校验一次冷却）。
  *
  * 与开口侧的差别：这里不判"要不要说"，只判"跟不跟屏"；正文原样照抄，
  * 不过出站侧的任何塑形。发送后按 role=model 回灌历史（内核的 onSent 回调负责），
@@ -15,12 +18,14 @@ import type { ChatEvent, ChatRef } from '../types.ts';
 /** 跟屏复读的配置（humanlike.repeat） */
 export interface RepeatConfig {
   enable: boolean;
-  /** 触发条数基准（实际在 minPeople ~ minPeople+2 之间现抽，显得不机械） */
+  /** 触发条数：不同的人数（同一个人刷几遍只算一位），到点就发 */
   minPeople: number;
   /** 发送前的随机等待上限（秒），下限固定 0.6 秒 */
   delayMaxSec: number;
   /** 同会话两次复读之间的最小间隔（分钟） */
   cooldownMin: number;
+  /** 段的时间窗（秒）：同文消息距段内上一条超过这个间隔就算新一段 */
+  windowSec: number;
 }
 
 /** 复读发生的记账口（内核接：历史回灌 + 拟人层开口统计） */
@@ -39,17 +44,14 @@ export interface RepeatWatcherOptions {
 
 interface RepeatRun {
   text: string;
-  /** 说这句话的群友（去重，同一个人刷几遍只算一位） */
+  /** 说这句话的群友（去重，同一个人再说一遍不加计数） */
   users: Set<string>;
-  /** 达标条数（进 run 时现抽一次） */
-  required: number;
+  /** 本段内最后一条消息的时刻（ms），配合 windowSec 判段是否还连着 */
+  lastAt: number;
   timer?: NodeJS.Timeout;
-  fired?: boolean;
 }
 
 const DELAY_MIN_MS = 600;
-/** 触发条数的随机浮动范围：required = minPeople + randInt(0, 2) */
-const REQUIRED_JITTER = 2;
 
 export class RepeatWatcher {
   private states = new Map<string, { run?: RepeatRun; lastFireAt: number }>();
@@ -86,52 +88,53 @@ export class RepeatWatcher {
     if (!text) return;
     if (String(event.userId) === this.opts.selfId()) return;
 
+    const now = this.now();
     const chatKey = `${event.type}_${event.chatId}`;
     const st = this.stateOf(chatKey);
+    const windowMs = Math.max(10, Number(cfg.windowSec) || 120) * 1000;
 
-    // 同一句话：接着攒（同一个人再说一遍不加计数）；换话：整段作废，那句新的起新段
-    if (st.run && st.run.text === text) {
+    // 同一句话且还连着窗：接着攒（同一个人再说一遍不加计数）；
+    // 换话，或距离段内上一条已超出时间窗：整段作废，这句起新段
+    if (st.run && st.run.text === text && now - st.run.lastAt <= windowMs) {
       st.run.users.add(String(event.userId));
+      st.run.lastAt = now;
     } else {
       if (st.run?.timer) clearTimeout(st.run.timer);
-      st.run = {
-        text,
-        users: new Set([String(event.userId)]),
-        required: Math.max(1, Math.round(Number(cfg.minPeople) || 4)) + this.randInt(0, REQUIRED_JITTER),
-      };
+      st.run = { text, users: new Set([String(event.userId)]), lastAt: now };
     }
     const run = st.run;
-    if (run.fired || run.timer) return;
-    if (run.users.size < run.required) return;
-    if (this.now() - st.lastFireAt < Math.max(0, Number(cfg.cooldownMin) || 0) * 60_000) return;
+    if (run.timer) return;   // 已经在等发射：后面的人只是把段续着，不动定时器
 
+    const required = Math.max(1, Math.round(Number(cfg.minPeople) || 4));
+    if (run.users.size < required) return;
+
+    // 攒够了：发送前随机等一下；若还在冷却期，推迟到冷却结束之后再发
+    const cooldownMs = Math.max(0, Number(cfg.cooldownMin) || 0) * 60_000;
+    const cooldownRemain = Math.max(0, st.lastFireAt + cooldownMs - now);
     const maxMs = Math.max(0, Number(cfg.delayMaxSec) || 0) * 1000;
-    const delay = Math.round(DELAY_MIN_MS + this.random() * (maxMs - DELAY_MIN_MS));
+    const jitter = Math.round(DELAY_MIN_MS + this.random() * (maxMs - DELAY_MIN_MS));
+    const delay = Math.max(jitter, cooldownRemain);
     run.timer = setTimeout(() => {
       run.timer = undefined;
       this.fire(chatKey, run);
-    }, Math.max(0, delay));
+    }, delay);
     run.timer.unref?.();
   }
 
-  /** 到点发射：链子是否还连着在 observe 里已经保证了（换话即整段作废），这里只查该段还没发过 */
+  /** 到点发射：段可能在等待期间被换话/超窗替换（st.run !== run），那种就不发了 */
   private fire(chatKey: string, run: RepeatRun): void {
-    if (this.disposed || run.fired) return;
+    if (this.disposed) return;
     const st = this.states.get(chatKey);
     if (!st || st.run !== run) return;
-    run.fired = true;
+    // 等待期间功能被关掉：这轮放弃，段作废（冷却不用再查——定定时器时已经推迟到冷却之后了）
+    if (!this.opts.config()?.enable) { st.run = undefined; return; }
     st.lastFireAt = this.now();
+    st.run = undefined;   // 发完即段终：同一句话之后想再复读，重新攒一段（受冷却约束）
     const chat: ChatRef = { platform: 'qq', type: 'group', chatId: chatKey.slice('group_'.length) };
     Promise.resolve()
       .then(() => this.opts.send(chat, run.text))
       .then(() => this.opts.onSent(chat, run.text))
       .catch((e) => this.opts.log?.warn(`跟屏复读发送失败: ${(e as Error).message}`, { chatId: chat.chatId }));
-  }
-
-  /** 0~n 的随机整数（含两端） */
-  private randInt(min: number, max: number): number {
-    if (max <= min) return min;
-    return min + Math.floor(this.random() * (max - min + 1));
   }
 
   dispose(): void {
