@@ -531,9 +531,11 @@ export default function SettingsPage() {
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxReplyTokens: v } })} />
                 <Num label="最大气泡数（硬上限）" hint="程序分条的条数上限：超出的气泡会被合并成一条" value={h.outgoing.maxBubbles ?? 6}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxBubbles: Math.max(1, Math.round(v)) } })} />
-                <BubbleSlider h={h} patchH={patchH} />
                 <Num label="单条气泡目标字数" value={h.outgoing.bubbleSoftMaxCharacters}
                   onChange={(v) => patchH({ outgoing: { ...h.outgoing, bubbleSoftMaxCharacters: v } })} />
+                <Num label="单条最大字符数" value={h.outgoing.maxMessageCharacters}
+                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxMessageCharacters: v } })} />
+                <BubbleSlider h={h} patchH={patchH} />
                 {h.outgoing.typingEnabled === true && (<>
                   <Num label="打字基础延迟（秒）" value={h.outgoing.typingBaseDelaySeconds}
                     onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingBaseDelaySeconds: v } })} />
@@ -544,8 +546,6 @@ export default function SettingsPage() {
                   <Num label="打字抖动比例（%）" value={Math.round(h.outgoing.typingJitterRatio * 100)}
                     onChange={(v) => patchH({ outgoing: { ...h.outgoing, typingJitterRatio: Math.min(50, Math.max(0, v)) / 100 } })} />
                 </>)}
-                <Num label="单条最大字符数" value={h.outgoing.maxMessageCharacters}
-                  onChange={(v) => patchH({ outgoing: { ...h.outgoing, maxMessageCharacters: v } })} />
               </div>
               <div className="mset-models" style={{ marginTop: 14 }}>
                 <div className="mset-mrow">
@@ -940,11 +940,6 @@ function BubbleSlider({ h, patchH }: {
           <span key={i} className={`bbs-lb${i === topIdx ? ' bbs-peak' : ''}`}
             style={{ flexGrow: Math.max(s, 0.0001), flexBasis: 0 }} onPointerDown={start(i)}>{i + 1}</span>
         ))}
-      </div>
-      <div className="plg-hint" style={{ marginTop: 8 }}>
-        {isAuto
-          ? '自动分布：峰值 3 条，拖动任意一段即进入自定义'
-          : `自定义 ${shown.filter((x) => x >= 0.5).length}/${max} 档参与抽取，每轮按段宽抽签`}
       </div>
     </div>
   );
