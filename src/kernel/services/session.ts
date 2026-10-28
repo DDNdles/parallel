@@ -5,6 +5,7 @@ import type { ErrorCenter } from '../errors.ts';
 import type { ConfigStore } from '../config.ts';
 import type { ChatRef } from '../types.ts';
 import { nowMs } from '../util/misc.ts';
+import { PACKAGE_ROOT } from '../paths.ts';
 
 /**
  * 会话容器管理器：为每个会话维持两类常驻容器。
@@ -123,7 +124,7 @@ export class SessionContainers {
     if (prev?.status === 'failed' && nowMs() - prev.startedAt < SessionContainers.BUILD_RETRY_MS) return;
     const docker = bin ?? (await this.ensureDocker());
     if (!docker) return;
-    const dir = join(process.cwd(), 'docker', kind === 'compute' ? 'sandbox-python' : 'sandbox-browser');
+    const dir = join(PACKAGE_ROOT, 'docker', kind === 'compute' ? 'sandbox-python' : 'sandbox-browser');
     if (!existsSync(join(dir, 'Dockerfile'))) return;   // 发布环境没有 docker/ 目录：静默跳过
     const image = this.imageOf(kind);
     this.builds.set(kind, { status: 'building', startedAt: nowMs(), log: '' });

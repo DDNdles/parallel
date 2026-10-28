@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ChatRef, PluginContext, Role } from '../../kernel/types.ts';
+import { PACKAGE_ROOT } from '../../kernel/paths.ts';
 import { clamp, newId, sleep } from '../../kernel/util/misc.ts';
 
 // ============================================================
@@ -1145,7 +1146,8 @@ export function setup(ctx: PluginContext): void {
     }
     try {
       const child = spawn(process.execPath, ['--use-system-ca', loginScript, '--data-dir', kernelDataDir], {
-        cwd: process.cwd(),
+        // 随包资源按包根定位：npm -g 安装后 cwd 是用户工作目录，不是包目录
+        cwd: PACKAGE_ROOT,
         detached: true,
         stdio: 'ignore',
         windowsHide: false,

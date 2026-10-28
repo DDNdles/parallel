@@ -40,9 +40,10 @@ import { RepeatWatcher } from './humanlike/repeat.ts';
 import type { HumanlikeConfig } from './humanlike/types.ts';
 import { OneBot11Adapter } from './adapters/onebot11.ts';
 import { startApiServer } from './api/server.ts';
+import { PACKAGE_ROOT } from './paths.ts';
 import type { ChatEvent, Logger, ProtocolEnd, Role } from './types.ts';
 
-const here = dirname(fileURLToPath(import.meta.url));
+// （数据目录默认取 process.cwd()，见构造函数；包内资源定位统一走 src/kernel/paths.ts 的 PACKAGE_ROOT）
 
 /** 启动后用系统默认浏览器打开桌面端（失败静默，不影响内核） */
 function openBrowser(url: string): void {
@@ -137,8 +138,11 @@ export class Kernel {
 
   constructor(opts: KernelOptions = {}) {
     this.opts = opts;
-    const root = join(here, '..', '..');
-    this.dataDir = opts.dataDir ?? join(root, 'data');
+    // 数据目录默认「启动命令时所在的目录」：npm -g 安装后包目录在 node_modules 里（对用户只读），
+    // data 必须落在用户的工作目录。zip/开发场景 cwd 就是包根，行为与以前一致；测试与 serve-ui 都显式传 --data-dir。
+    this.dataDir = opts.dataDir ?? join(process.cwd(), 'data');
+    // 随包资源（内置插件/examples/docker）按模块路径定位，与 cwd 无关
+    const root = PACKAGE_ROOT;
     mkdirSync(this.dataDir, { recursive: true });
     this.log = makeLogger('kernel');
     // 环境检查页替用户下过的 ffmpeg 落在 data/bin：语音转码那头要先认它（没有就照旧找 PATH）

@@ -23,9 +23,21 @@
 
 ## 快速开始
 
+三种安装路线，任选其一（npm 包与 zip 自带构建好的桌面端，装完即用；克隆开发才需要自己 build）：
+
 ```bash
+# ── 方式一：npm 包（推荐）──────────────────────────────
+# 从 GitHub Releases 下载 .tgz（如 ddnoodles-parallel-0.2.0.tgz）后：
+npm install -g ddnoodles-parallel-0.2.0.tgz   # 依赖（ws / pi agent runtime）自动装
+parallel                                       # 在任意目录启动；数据落在当前目录 ./data
+
+# ── 方式二：zip（不熟 npm 的话）────────────────────────
+# 从 Releases 下载 parallel-vX.Y.Z.zip，解压后双击 parallel.cmd
+
+# ── 方式三：克隆开发 ───────────────────────────────────
 # 要求 Node ≥ 24（内核直接运行 TS 源码，不编译）
 # work 模式还需要 Docker、Python 3、Bash；只聊天可以先不装（环境检查页可跳过）
+git clone <本仓库> && cd parallel
 npm install        # 运行时依赖：ws + pi 的 agent runtime
                    #   @earendil-works/pi-ai —— 模型层唯一引擎（三种连接方式全交给它）
                    #   @earendil-works/pi-agent-core —— agent loop（轮次/工具调度/事件流）

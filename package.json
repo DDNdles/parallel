@@ -1,6 +1,6 @@
 {
-  "name": "parallel",
-  "version": "0.1.0",
+  "name": "@ddnoodles/parallel",
+  "version": "0.2.0",
   "description": "通用 harness 形态的 QQ 机器人 —— pi（Pi Agent Harness）的 agent runtime + 一切皆插件 + 桌面端管控 UI",
   "type": "module",
   "private": true,
@@ -12,7 +12,8 @@
     "start": "node bin/parallel.js",
     "test": "node --experimental-transform-types --no-warnings --test --test-concurrency=2 \"test/*.test.ts\"",
     "pack": "node scripts/pack-release.mjs",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "prepack": "node scripts/check-pack.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.87.1",
@@ -24,5 +25,38 @@
     "@types/ws": "^8.18.2",
     "typescript": "^7.0.2"
   },
-  "license": "AGPL-3.0-only"
+  "license": "AGPL-3.0-only",
+  "bin": {
+    "parallel": "bin/parallel.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "ui",
+    "docker",
+    "examples",
+    "scripts",
+    "test",
+    "parallel.cmd",
+    "parallel.sh",
+    "tsconfig.json",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DDNdles/parallel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DDNdles/parallel/issues"
+  },
+  "homepage": "https://github.com/DDNdles/parallel#readme",
+  "author": "DDNoodles",
+  "keywords": [
+    "qq",
+    "qq-bot",
+    "onebot",
+    "agent",
+    "llm",
+    "harness"
+  ]
 }
