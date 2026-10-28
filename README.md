@@ -45,7 +45,7 @@ npm start           # = node bin/parallel.js
 
 ### 接入真机
 
-1. 选协议端：目前只认手改 `data/config.json` 的 `onebot.flavor`（`llbot` / `napcat`），改完重启内核。两端都由内核内嵌托管——自动下载发行包、预写反向 WS 配置（token 自动注入）、拉起并守护，QQ 路径自动探测
+1. 选协议端：目前只认手改 `data/config.json` 的 `onebot.flavor`（`llbot` / `napcat`），改完重启内核。**内嵌托管只支持 Windows**（发行包是 win-x64，NapCat 还要注入本机 QQNT）；macOS/Linux 上内核本身可跑，但请自行运行 OneBot 11 协议端并指向内核。Windows 上两端都由内核托管——自动下载发行包、预写反向 WS 配置（token 自动注入）、拉起并守护，QQ 路径自动探测
 2. 在弹出的 QQ 窗口扫码登录**专用小号**。LLBot 有头模式要先填「账号」（bot 的 QQ 号），否则拒绝启动，免得顶掉你本机登录的号
 3. 用你自己起的协议端也行：在其 WebUI 添加反向 WS 客户端 `ws://127.0.0.1:3001/onebot` + accessToken（见上）
 4. 在桌面端「用户」页的权限名单里配置主人 QQ（`masterIds`）；`chat` 是 core 插件、默认生效，其余插件默认按群开启，可在「插件」页的开关矩阵里逐群调整

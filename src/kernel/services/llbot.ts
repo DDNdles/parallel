@@ -229,6 +229,12 @@ export class LLBotManager implements ProtocolEnd {
   /** 启动托管：准备目录/配置/token/发行包后拉起。幂等。 */
   async start(): Promise<void> {
     if (this.running()) return;
+    // 发行包只有 win-x64：非 Windows 上先下 89MB 再解压失败，报错还会落在更晚的一步
+    if (process.platform !== 'win32') {
+      this.lastError = 'LLBot 内嵌托管目前只支持 Windows（发行包只有 win-x64）；其它平台请自行运行 OneBot 11 协议端，并把反向 WS 指向内核。';
+      this.errors.record('warn', 'adapter', this.lastError);
+      return;
+    }
     this.stopping = false;
     this.sawOnlineThisRun = false;
     this.qrExhausted = false;
