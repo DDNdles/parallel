@@ -16,10 +16,23 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const slim = process.argv.includes('--slim');
+const allowDirty = process.argv.includes('--allow-dirty');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 const name = `parallel-v${pkg.version}`;
 const dist = join(root, 'dist');
 const stage = join(dist, 'stage', name);
+
+// ---------- 干净树闸门：发布包必须能由仓库复现 ----------
+// 以前直接 cpSync 工作区，未提交的改动（含只有本机才有的插件/私人人格）会静默进包。
+// 非 git 环境（用户解压 zip 后自己再打包）没有可校验的基准，跳过。
+try {
+  const dirty = execSync('git status --porcelain', { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  if (dirty && !allowDirty) {
+    console.error('[pack] 工作区有未提交改动，发布包必须与仓库一致。先提交，或显式加 --allow-dirty：');
+    console.error(dirty.split('\n').slice(0, 20).join('\n'));
+    process.exit(1);
+  }
+} catch { /* 不是 git 仓库：跳过 */ }
 
 // ---------- 收集本机已知密钥值（data/secrets.json 若存在） ----------
 const known = [];
@@ -41,11 +54,17 @@ const GENERIC = [
 ];
 
 // ---------- 入包清单（白名单式，新增顶层内容要显式加进来） ----------
-const INCLUDE_DIRS = ['bin', 'src', 'examples', 'docker', 'logos', 'ui'];
+// logos/ 是 3MB 设计过程稿、运行时零引用，不再随包（仓库里保留）。
+const INCLUDE_DIRS = ['bin', 'src', 'examples', 'docker', 'ui', 'scripts', 'test'];
 const INCLUDE_FILES = ['package.json', 'package-lock.json', 'tsconfig.json', 'parallel.cmd', 'parallel.sh', 'README.md'];
 const SKIP_IN_MODULES = new Set(['.cache', '.package-lock.json']);
-// 无论清单怎么改都绝不入包的（第二道保险，白名单之外理论上根本不会被复制）
-const FORBIDDEN = [/^data(\/|\\|$)/, /\.bak/, /\.log$/, /\.tmp$/, /(^|\/|\\)\.env/];
+// 无论清单怎么改都绝不入包（第二道保险，白名单之外理论上根本不会被复制）
+// ref/ 是个人的参考音色音频；__pycache__/pyc 是 docker 里跑出来的字节码。
+const FORBIDDEN = [
+  /^data(\/|\\|$)/, /\.bak/, /\.log$/, /\.tmp$/, /(^|\/|\\)\.env/,
+  /^docker[\\/][^\\/]+[\\/]ref([\\/]|$)/,
+  /[\\/]__pycache__([\\/]|$)/, /\.pyc$/,
+];
 
 if (!existsSync(join(root, 'ui', 'index.html'))) {
   console.error('[pack] ui/ 还没有构建产物：先在 web/ 里 npm run build，再打包。');
@@ -84,6 +103,30 @@ for (const f of INCLUDE_FILES) {
   files++;
 }
 if (!slim && existsSync(join(root, 'node_modules'))) copyTop('node_modules');
+
+// ---------- 发布包瘦身 + 脚本对齐 ----------
+// devDependencies（typescript 几十 MB）不必随包；随包 package.json 里的 build/typecheck
+// 依赖 web/ 源码与 tsc（都不在包里），留着只会让人一敲就报错。
+if (!slim) {
+  for (const dep of Object.keys(pkg.devDependencies ?? {})) {
+    rmSync(join(stage, 'node_modules', dep), { recursive: true, force: true });
+  }
+  for (const dep of Object.keys(pkg.devDependencies ?? {})) {
+    if (!dep.startsWith('@')) continue;
+    const scopeDir = join(stage, 'node_modules', dep.split('/')[0]);
+    if (existsSync(scopeDir) && readdirSync(scopeDir).length === 0) rmSync(scopeDir, { recursive: true, force: true });
+  }
+}
+const stagedPkgPath = join(stage, 'package.json');
+if (existsSync(stagedPkgPath)) {
+  const sp = JSON.parse(readFileSync(stagedPkgPath, 'utf8'));
+  delete sp.devDependencies;
+  if (sp.scripts) {
+    delete sp.scripts.build;
+    delete sp.scripts.typecheck;
+  }
+  writeFileSync(stagedPkgPath, JSON.stringify(sp, null, 2) + '\n');
+}
 
 // ---------- 私钥自检：逐文件扫已知值 + 通用形态 ----------
 const scanTargets = [];

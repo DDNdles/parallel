@@ -60,8 +60,9 @@ export default function SetupGate({ onPass, onToggleTheme }: {
       const d = (await get(`/api/setup/deps${fresh ? '?fresh=1' : ''}`)) as DepsResp;
       setData(d);
       setErr('');
-      // 已经走过这页、环境又没问题：不拦路，直接进登录门
-      if (!fresh && d.setupDoneAt > 0 && d.ready) pass();
+      // 已经走过这一页：不再重复拦截。以前还要求「当前环境全绿」，于是某次开机
+      // Docker Desktop 没先起来就又把人挡回去——环境问题在控制台/报错中心可见，不该堵登录。
+      if (!fresh && d.setupDoneAt > 0) pass();
       return d;
     } catch (e) {
       setErr(`读不到环境状态：${(e as Error).message}`);

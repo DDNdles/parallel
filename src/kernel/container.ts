@@ -276,10 +276,13 @@ export class PluginContainer {
    *  所有写入口与插件启停都清空；上限 5000 条（会话数无界，防长期缓涨）。 */
   private enabledCache = new Map<string, boolean>();
 
-  /** 生效规则：群覆盖 ?? 全局默认(设置覆盖 ?? manifest.defaultGroupState) */
+  /** 生效规则：core 插件永远生效；其余 群覆盖 ?? 全局默认(设置覆盖 ?? manifest.defaultGroupState) */
   effectiveEnabled(pluginId: string, chatId: string): boolean {
     const lp = this.plugins.get(pluginId);
     if (!lp || lp.state !== 'loaded') return false;
+    // core = bot 的立身之本（chat 的人格/记忆钩子、sandbox 能力面）：不可停用、也不该被分群开关关掉。
+    // 它们又都是 hidden，插件页看不到开关——再走分群门控，新装实例就永远没有生效路径。
+    if (lp.manifest.core) return true;
     const key = `${pluginId}\u0000${chatId}`;
     const hit = this.enabledCache.get(key);
     if (hit !== undefined) return hit;

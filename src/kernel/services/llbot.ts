@@ -9,6 +9,7 @@ import type { Bus } from '../bus.ts';
 import { busEvents } from '../bus.ts';
 import type { EndCheck, Logger, ProtocolEnd } from '../types.ts';
 import { LlbotIdentity, parseLlbotLine } from './llbot-identity.ts';
+import { sha256File } from './integrity.ts';
 
 /**
  * 有头模式前置检查的判定（纯函数，便于测试）。
@@ -505,11 +506,14 @@ export class LLBotManager implements ProtocolEnd {
   private async downloadAndExtract(home: string): Promise<void> {
     const version = 'v8.2.0'; // 锁定已验证版本；升级改这里
     const asset = `LLBot-CLI-win-x64.zip`;
+    // 官方 Release API 的 asset digest：升级版本必须同时更新它（sha256sum 形态见发布页）
+    const expectedSha256 = 'e05186e1cfc2c49d5cb8d577cdfd1a48d46dee020094e8424a1ddf8c78144a16';
     const rel = `https://github.com/LLOneBot/LuckyLilliaBot/releases/download/${version}/${asset}`;
+    // 官方源优先；镜像只作备用（第三方镜像被投毒是真实威胁，不能放第一位）
     const mirrors = [
+      rel,
       `https://gh-proxy.com/${rel}`,
       `https://ghfast.top/${rel}`,
-      rel,
     ];
     const zipPath = join(home, 'llbot.zip');
     let lastErr = '';
@@ -524,18 +528,24 @@ export class LLBotManager implements ProtocolEnd {
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           // 流式落盘：整体 arrayBuffer/writeFileSync 会一次性占内存并在慢盘上卡事件循环
           await pipeline(Readable.fromWeb(resp.body as any), createWriteStream(zipPath));
-          ok = true;
-          break;
         } finally {
           clearTimeout(timer);
         }
+        // 解压执行前必须校验完整性：镜像/中间人换一个包等于在本机执行任意代码
+        const got = await sha256File(zipPath);
+        if (got !== expectedSha256) {
+          rmSync(zipPath, { force: true });
+          throw new Error(`SHA256 校验失败（期望 ${expectedSha256.slice(0, 12)}…，实际 ${got.slice(0, 12)}…）`);
+        }
+        ok = true;
+        break;
       } catch (e) {
         lastErr = (e as Error).message;
         this.log.warn(`下载失败（${lastErr}），尝试下一个源…`);
       }
     }
     if (!ok) {
-      const msg = `LLBot 下载失败（${lastErr}）。可手动下载 ${asset}（releases v${version}）解压到 ${home}，确保 llbot.exe 在该目录下，然后重启内核。`;
+      const msg = `LLBot 下载失败（${lastErr}）。可手动下载 ${asset}（releases ${version}，已校验官方 SHA256）解压到 ${home}，确保 llbot.exe 在该目录下，然后重启内核。`;
       this.errors.record('error', 'adapter', msg, { notifyOwner: true });
       throw new Error(msg);
     }

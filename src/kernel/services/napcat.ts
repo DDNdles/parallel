@@ -8,6 +8,7 @@ import type { ConfigStore } from '../config.ts';
 import type { ErrorCenter } from '../errors.ts';
 import type { EndCheck, LoginQrcode, Logger, ProtocolEnd } from '../types.ts';
 import { findQqInstallPath } from './deps.ts';
+import { sha256File } from './integrity.ts';
 
 /**
  * NapCat（NapCatQQ）内嵌托管：下载 Shell 发行包 → 预写 WebUI 与 ob11 网络配置 →
@@ -284,12 +285,15 @@ export class NapCatManager implements ProtocolEnd {
   /** 下载发行包（约 117MB，自带 Node 运行时）并解压到 home */
   private async downloadAndExtract(): Promise<void> {
     const asset = ASSET_WIN;
+    // 官方 Release API 的 asset digest：升级 NAPCAT_VERSION 必须同时更新它
+    const expectedSha256 = 'fb64fa3b036ad2df1a5d7c204c482694c20e4b763978c8a4968fd3474c05b4a8';
     const rel = `https://github.com/NapNeko/NapCatQQ/releases/download/${NAPCAT_VERSION}/${asset}`;
     const home = this.homeDir();
     const zipPath = join(home, asset);
     let lastErr = '';
     let ok = false;
-    for (const url of [`https://gh-proxy.com/${rel}`, `https://ghfast.top/${rel}`, rel]) {
+    // 官方源优先；镜像只作备用
+    for (const url of [rel, `https://gh-proxy.com/${rel}`, `https://ghfast.top/${rel}`]) {
       try {
         this.log.info(`下载 NapCat ${NAPCAT_VERSION}: ${url.split('/releases/')[0]}…（约 117MB）`);
         const ctrl = new AbortController();
@@ -298,16 +302,22 @@ export class NapCatManager implements ProtocolEnd {
           const resp = await fetch(url, { redirect: 'follow', signal: ctrl.signal });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           await pipeline(Readable.fromWeb(resp.body as never), createWriteStream(zipPath));
-          ok = true;
-          break;
         } finally { clearTimeout(timer); }
+        // 解压前校验：注入用的 DLL/EXE 被换掉等于把整台机器交出去
+        const got = await sha256File(zipPath);
+        if (got !== expectedSha256) {
+          rmSync(zipPath, { force: true });
+          throw new Error(`SHA256 校验失败（期望 ${expectedSha256.slice(0, 12)}…，实际 ${got.slice(0, 12)}…）`);
+        }
+        ok = true;
+        break;
       } catch (e) {
         lastErr = (e as Error).message;
         this.log.warn(`NapCat 下载失败（${lastErr}），尝试下一个源…`);
       }
     }
     if (!ok) {
-      const msg = `NapCat 下载失败（${lastErr}）。可手动下载 ${asset}（releases ${NAPCAT_VERSION}）解压到 ${home}，然后重启内核。`;
+      const msg = `NapCat 下载失败（${lastErr}）。可手动下载 ${asset}（releases ${NAPCAT_VERSION}，已校验官方 SHA256）解压到 ${home}，然后重启内核。`;
       this.errors.record('error', 'adapter', msg, { notifyOwner: true });
       throw new Error(msg);
     }
