@@ -961,30 +961,17 @@ export class SandboxService {
     }
   }
 
-  /** TTL 清理：超期未访问的文件删除；inbox 更短；work 会话（有 work_runs 记录）用更长 TTL 保交付物 */
+  /** TTL 清理：超期未访问的文件删除。全站一档（sandbox.retentionHours，默认 72h），
+   *  收件文件、聊天临时文件、work 产物同一条线 —— 让「文件保留天数」这一个旋钮说话 */
   async sweep(): Promise<void> {
     const cfg = this.config.config.sandbox as any;
     const now = nowMs();
-    // work 会话集合：凡在 work_runs 表里出现过的会话，按 work 档 TTL（产物值得多留）
-    let workChats = new Set<string>();
-    try {
-      // 2026-10-25 任务隔离：新落库的行带 sandbox_key（private_u{userId}__t{taskId}）；
-      // 老行没有，回退用 chat_key+user_id 拼旧式按人键（group_x__uY）
-      workChats = new Set(
-        this.db.all<{ k: string }>(
-          `SELECT DISTINCT COALESCE(sandbox_key, chat_key || '__u' || user_id) AS k FROM work_runs`,
-        ).map((r) => r.k),
-      );
-    } catch { /* 表未建（旧库）时退回 chat 档 */ }
+    const ttlHours = Number(cfg.retentionHours) > 0 ? Number(cfg.retentionHours) : 72;
     const rows = this.db.all<{ chat_key: string; rel_path: string; last_access: number }>(
       'SELECT chat_key, rel_path, last_access FROM sandbox_files WHERE rel_path != ? AND last_access IS NOT NULL', '.',
     );
     for (const r of rows) {
-      const isWork = workChats.has(r.chat_key);
-      const ttl = r.rel_path.startsWith('inbox/')
-        ? (isWork ? (cfg.workInboxTtlHours ?? cfg.inboxTtlHours) : cfg.inboxTtlHours)
-        : (isWork ? (cfg.workTtlHours ?? cfg.ttlHours) : cfg.ttlHours);
-      if (now - r.last_access > ttl * 3_600_000) {
+      if (now - r.last_access > ttlHours * 3_600_000) {
         const abs = join(this.rootDir, r.chat_key, r.rel_path);
         try {
           if (existsSync(abs) && statSync(abs).isFile()) unlinkSync(abs);
@@ -1006,7 +993,6 @@ export class SandboxService {
           isDir = st.isDirectory() && !st.isSymbolicLink();
         } catch { /* 不存在 */ }
         if (!isDir) continue;
-        const isWork = workChats.has(chatKey);
         const walk = (d: string, rel: string, depth: number): void => {
           if (depth > 12) return;
           let names: string[];
@@ -1020,10 +1006,7 @@ export class SandboxService {
             if (st.isDirectory()) { walk(p, rp, depth + 1); continue; }
             if (!st.isFile()) continue;
             if (known.has(`${chatKey}\u0000${rp}`)) continue;
-            const ttl = rp.startsWith('inbox/')
-              ? (isWork ? (cfg.workInboxTtlHours ?? cfg.inboxTtlHours) : cfg.inboxTtlHours)
-              : (isWork ? (cfg.workTtlHours ?? cfg.ttlHours) : cfg.ttlHours);
-            if (now - st.mtimeMs > ttl * 3_600_000) {
+            if (now - st.mtimeMs > ttlHours * 3_600_000) {
               try { unlinkSync(p); } catch { /* 下一轮再试 */ }
             }
           }

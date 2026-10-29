@@ -68,8 +68,8 @@ interface Config {
   llm: { failoverThreshold: number };
   /** 每会话历史条数与上下文时间窗在 storage 段；旧内核没这个段，可选 */
   storage?: { historyLimit: number; contextMinutes?: number };
-  /** 收件文件保留天数：内核存的是小时，界面按天给 */
-  sandbox?: { inboxKeepDays: number };
+  /** 文件保留天数：收件/临时/work 产物同一条线；内核存的是小时，界面按天给 */
+  sandbox?: { keepDays: number };
   work: Work;
   persona: {
     /** 自动记忆提炼：攒够几轮、静默多久才发那一发；结果只落库，不进上下文 */
@@ -440,9 +440,9 @@ export default function SettingsPage() {
 
           {sec === 'sandbox' && (!c.sandbox ? <div className="mset-empty">内核尚未重启，这个分节还读不到：重启内核后出现。</div> : (
             <div className="set-grid">
-              <Num label="收件文件保留天数"
-                value={c.sandbox.inboxKeepDays}
-                onChange={(v) => { patch({ sandbox: { inboxKeepDays: v } }); autoSave('sandbox', 600, { sandbox: { inboxKeepDays: v } }); }} />
+              <Num label="文件保留天数"
+                value={c.sandbox.keepDays}
+                onChange={(v) => { patch({ sandbox: { keepDays: v } }); autoSave('sandbox', 600, { sandbox: { keepDays: v } }); }} />
             </div>
           ))}
 

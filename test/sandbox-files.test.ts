@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 
@@ -24,6 +24,35 @@ function mk() {
   return new SandboxService(dir, db, config, errors);
 }
 const chat = { platform: 'qq', type: 'group' as const, chatId: '77' };
+
+test('TTL：保留期全站一档（retentionHours），按最后访问时间删，未登记文件按 mtime', async () => {
+  const dir = mkdtempSync(tmpdir() + '/psb-');
+  const db = new Db(dir);
+  const bus = new Bus();
+  const errors = new ErrorCenter(bus, { dataDir: dir });
+  const config = new ConfigStore(dir, bus, errors);
+  const sb = new SandboxService(dir, db, config, errors);
+  config.config.sandbox.retentionHours = 72;   // 3 天
+
+  const now = Date.now();
+  sb.write(chat, 'fresh.md', '刚写的');
+  sb.write(chat, 'stale.md', '三天没碰');
+  db.run('UPDATE sandbox_files SET last_access=? WHERE rel_path=?', now - 100 * 3600_000, 'stale.md');
+
+  // 未登记的产物（run_bash / 容器直写不会进 sandbox_files）：按 mtime 走同一档
+  const root = sb.root(chat);
+  const old = join(root, 'raw-old.txt');
+  const fresh = join(root, 'raw-new.txt');
+  writeFileSync(old, '老产物');
+  writeFileSync(fresh, '新产物');
+  const stamp = new Date(now - 100 * 3600_000);
+  utimesSync(old, stamp, stamp);
+
+  await sb.sweep();
+
+  assert.deepEqual(sb.list(chat).filter((e) => e.type === 'file').map((e) => e.name).sort(), ['fresh.md', 'raw-new.txt']);
+  assert.equal(db.all<{ n: number }>('SELECT count(*) AS n FROM sandbox_files WHERE rel_path=?', 'stale.md')[0].n, 0);
+});
 
 test('列目录：文件与子目录分开，可逐层进入', () => {
   const sb = mk();

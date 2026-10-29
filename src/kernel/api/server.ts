@@ -1055,7 +1055,7 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       }
       if (b === 'config' && req.method === 'POST') {
         const s = kernel.config.config.sandbox as any;
-        for (const k of ['ttlHours', 'inboxTtlHours', 'maxFileBytes', 'maxSessionBytes', 'execTimeoutPythonMs', 'execTimeoutJsMs', 'maxRunsPerMin']) {
+        for (const k of ['maxFileBytes', 'maxSessionBytes', 'execTimeoutPythonMs', 'execTimeoutJsMs', 'maxRunsPerMin']) {
           if (typeof body[k] === 'number') s[k] = body[k];
         }
         // work 容器联网开关（chat 档不在此列：它永远断网）
@@ -1078,8 +1078,8 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
           // work 子代理（pi 内核那套）：agent 定义 / 子代理目录 / 嵌套上限 / 上下文压缩
           work: kernel.config.config.work,
           storage: kernel.config.config.storage,
-          // 收件文件保留：内核按小时存（sweep 用），界面按天给
-          sandbox: { inboxKeepDays: Math.max(1, Math.round(kernel.config.config.sandbox.inboxTtlHours / 24)) },
+          // 文件保留天数：内核按小时存（sweep 用），界面按天给
+          sandbox: { keepDays: Math.max(1, Math.round(kernel.config.config.sandbox.retentionHours / 24)) },
         });
       }
       if (!b && req.method === 'POST') {
@@ -1172,16 +1172,15 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
             cfg.storage.contextMinutes = Math.min(720, Math.max(1, Math.round(n)));
           }
         }
-        // sandbox 段：只放收件文件保留天数（内核存小时，sweep 每 10 分钟读一次配置，存完即生效）；
-        // 其余限额（单文件/会话上限、执行超时等）仍走沙箱页「限额与清理」弹窗
+        // sandbox 段：只放文件保留天数（内核存小时，sweep 每 10 分钟读一次配置，存完即生效）；
+        // 收件文件、聊天临时文件、work 产物共用这一档；其余限额（单文件/会话上限、执行超时等）
+        // 仍走沙箱页「限额与清理」弹窗
         if (body.sandbox && typeof body.sandbox === 'object') {
           const s = body.sandbox as Record<string, unknown>;
-          if (s.inboxKeepDays !== undefined) {
-            const n = Number(s.inboxKeepDays);
-            if (!Number.isInteger(n) || n < 1 || n > 90) return send({ error: '收件文件保留天数需要是 1~90 的整数' }, 400);
-            cfg.sandbox.inboxTtlHours = n * 24;
-            // work 档的收件文件跟着同一天数：一个旋钮说"收进来的文件留 N 天"，就别让另一档悄悄更早删
-            cfg.sandbox.workInboxTtlHours = n * 24;
+          if (s.keepDays !== undefined) {
+            const n = Number(s.keepDays);
+            if (!Number.isInteger(n) || n < 1 || n > 90) return send({ error: '文件保留天数需要是 1~90 的整数' }, 400);
+            cfg.sandbox.retentionHours = n * 24;
           }
         }
         // humanlike 段：逐字段白名单 + 范围钳制（页面控件的取值范围在服务端也要成立）

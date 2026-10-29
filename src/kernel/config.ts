@@ -252,10 +252,9 @@ export const DEFAULT_CONFIG = {
     dockerImageNodeWork: 'parallel-sandbox-python:latest',
     // work 的 bash 与一次性 Python 同镜像：debian:12-slim 里连 python3 都没有（实测）
     dockerImageBash: 'parallel-sandbox-python:latest',
-    ttlHours: 24,                         // chat 临时文件 TTL（最后一次访问起算）
-    inboxTtlHours: 360,                   // 聊天收件文件 TTL（15 天：图片要能回看，设置页「沙箱」按天调）
-    workTtlHours: 168,                    // work 产物 TTL（7 天：交付物值得多留）
-    workInboxTtlHours: 360,               // work 会话的收件文件 TTL（与 chat 档一致，别悄悄更早删图）
+    // 沙箱文件保留期（小时，最后一次访问起算）：收件文件、聊天临时文件、work 产物统一一档，
+    // 设置页「沙箱」按天调（默认 3 天）。以前分 chat/work、收件/产物四档，2026-10-29 按用户要求并成一档
+    retentionHours: 72,
     maxFileBytes: 10 * 1024 * 1024,       // 单文件上限
     maxSessionBytes: 200 * 1024 * 1024,   // 单会话总占用上限
     execTimeoutPythonMs: 20000,
@@ -375,6 +374,14 @@ export class ConfigStore {
     }
     this.migrateModelChains();
     this.migrateModelReasoning();
+    // 沙箱保留期并成一档（2026-10-29 用户定：一个「文件保留天数」，所有文件都按它删）：
+    // 旧配置里 chat/work、收件/产物四个小时键并进 retentionHours 后清掉，别留死配置。
+    // 取值认「收件文件」那个键 —— 它是设置页真正暴露给用户调过的旋钮
+    const sb = this.config.sandbox as any;
+    const legacyInbox = Number(sb.inboxTtlHours);
+    if (Number.isFinite(legacyInbox) && legacyInbox > 0) sb.retentionHours = legacyInbox;
+    if (!(Number(sb.retentionHours) > 0)) sb.retentionHours = 72;
+    for (const k of ['inboxTtlHours', 'workInboxTtlHours', 'ttlHours', 'workTtlHours'] as const) delete sb[k];
     // 上下文时间窗（contextMinutes）2026-10-23 恢复：与 historyLimit 条数上限同时生效。
     // 旧配置文件里没有这个键时由 deepMerge 补默认值（10 分钟），这里不做删除。
     // 迁移：风控里的「随机抖动」与「唤醒方式/唤醒词」已并入拟人化（回复前的等待归打字节奏，

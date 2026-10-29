@@ -15,8 +15,7 @@ interface Entry { name: string; relPath: string; size: number; mtime: number }
 interface View { name: string; kind: 'text' | 'image'; text: string; truncated: boolean }
 
 const NUM_FIELDS: { k: string; t: string; size?: 'bytes' | 'ms' | 'h' }[] = [
-  { k: 'ttlHours', t: '文件 TTL（小时）', size: 'h' },
-  // 收件文件的保留期在设置页「沙箱」按天调，这里不再放第二个旋钮（同一个键两处改会互相打脸）
+  // 文件保留期只有一个旋钮，在设置页「沙箱」按天调（收件/临时/work 产物同一档），这里不再放第二个
   { k: 'maxFileBytes', t: '单文件上限（字节）', size: 'bytes' },
   { k: 'maxSessionBytes', t: '单会话上限（字节）', size: 'bytes' },
   { k: 'execTimeoutPythonMs', t: 'Python 超时（毫秒）', size: 'ms' },
