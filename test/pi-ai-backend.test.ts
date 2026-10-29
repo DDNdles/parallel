@@ -255,7 +255,11 @@ test('gemini 的 baseUrl 归一：带不带 /models、带不带版本段都收�
   assert.equal(geminiApiBase(`${V}/models`), V, '照 Google 文档填的 …/v1beta/models 要摘掉尾巴，否则拼成 /models/models');
   assert.equal(geminiApiBase(`${V}/models/`), V);
   assert.equal(geminiApiBase('https://generativelanguage.googleapis.com'), V, '光秃秃的域名补上默认版本段');
-  assert.equal(geminiApiBase('https://proxy.example.com/v1'), 'https://proxy.example.com/v1', '已经带版本段的别乱补');
+  // 2026-10-29：末段是 /v1 时归到 v1beta。Gemini 的 REST 只有 v1beta / v1alpha，/v1 是照 OpenAI
+  // 习惯抄的写法，SDK 会拼成 /v1/models/<id>:streamGenerateContent —— 本地网关实测直接 405
+  assert.equal(geminiApiBase('https://proxy.example.com/v1'), 'https://proxy.example.com/v1beta', '/v1 要归到 v1beta，否则 /v1/models/... 405');
+  assert.equal(geminiApiBase('https://proxy.example.com/v1/models'), 'https://proxy.example.com/v1beta', '先摘 /models 再归版本段');
+  assert.equal(geminiApiBase('https://proxy.example.com/v1alpha'), 'https://proxy.example.com/v1alpha', '别的版本段原样保留');
   // 其余几档原样透传：不许顺手把别人填的路径改了
   assert.equal(providerBaseUrl('openai-compatible', 'https://x/v1/'), 'https://x/v1/');
   assert.equal(providerBaseUrl('anthropic', 'https://x/api/anthropic/'), 'https://x/api/anthropic/');

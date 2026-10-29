@@ -68,11 +68,18 @@ export function isPiProtocol(proto: string): proto is PiProtocol {
 
 /** Gemini 的 Base URL 归一：模型页里填 `…/v1beta` 或 `…/v1beta/models` 都行（Google 文档两种都写），
  *  但 SDK 只会往后拼 `/models/<id>:streamGenerateContent`，所以尾部那段 models 必须摘掉、
- *  版本段缺失时补上默认的 v1beta。 */
+ *  版本段缺失时补上默认的 v1beta。
+ *
+ *  特例：末段是 `v1` 时改成 `v1beta`。Gemini 的 REST 版本段只有 v1beta / v1alpha，`/v1` 是照
+ *  OpenAI 习惯抄过来的写法 —— 实测本地网关（Antigravity）只认 `/v1beta/models/...`，
+ *  `/v1/models/...` 直接 405，整条 gemini 档就这么炸掉。v1beta 是 Google 的通用版本段，
+ *  真正只开 `/v1` 的代理极少见（那种情况请改填 openai-compatible）。 */
 export function geminiApiBase(raw: string): string {
   let s = (raw ?? '').trim().replace(/\/+$/, '');
   if (/\/models$/i.test(s)) s = s.slice(0, -'/models'.length).replace(/\/+$/, '');
-  if (!/^v\d/i.test(s.split('/').pop() ?? '')) s += '/v1beta';
+  const last = s.split('/').pop() ?? '';
+  if (/^v1$/i.test(last)) return s.slice(0, s.length - last.length) + 'v1beta';
+  if (!/^v\d/i.test(last)) s += '/v1beta';
   return s;
 }
 
