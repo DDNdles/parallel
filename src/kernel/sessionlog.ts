@@ -140,6 +140,17 @@ function filesOfEntry(e: SessionLogEntry): { name: string; rel: string }[] {
   return out;
 }
 
+/** 落账用的记录瘦身版：附件只留 name/rel/sandboxPath/size。
+ *  那份临时 URL 带 rkey、几小时就过期，不该躺在会话日志里；正文与节点顺序原样保留。 */
+function storedForward(f: ForwardRecord): ForwardRecord {
+  return {
+    ...f,
+    nodes: f.nodes.map((n) => (n.files
+      ? { ...n, files: n.files.map((x) => ({ name: x.name, rel: x.rel, sandboxPath: x.sandboxPath, size: x.size })) }
+      : n)),
+  };
+}
+
 /**
  * 落账文件（`data.files` / 记录节点的 `files`）→ 可重放的附件。
  *
@@ -493,19 +504,17 @@ export class SessionLog {
         segments: event.segments.length ? event.segments : undefined,
         // 存协议端消息号：引用段只带这个号，下次有人引用时按它查回原文（见 findByMessageId）
         messageId: event.messageId,
-        replyTo: event.replyTo,
+        // 被引用的记录同样要瘦身落盘（只看正文；附件里的 url 不进来）
+        replyTo: event.replyTo && {
+          ...event.replyTo,
+          forward: event.replyTo.forward && storedForward(event.replyTo.forward),
+        },
         // 存 rel 而不是只有名字：重名落盘会加 _1，名字对不上真实文件，桌面端就没法取图。
         // sandboxPath 也一起存：重启后重建历史要靠它把窗口内的图/语音/视频交回模型
         //（url 带 rkey 且几小时过期，不能存；记录节点那份早就这么存了，这里对齐）
         files: event.files?.map((f) => ({ name: f.name, rel: f.rel, sandboxPath: f.sandboxPath, size: f.size })),
         // 聊天记录（合并转发）：段里只有 resId，节点是适配器现取回来的，不存就只有一行占位。
-        // 附件只留 name/rel/size：那份临时 URL 带 rkey 且几小时就过期，不该躺在会话日志里。
-        forward: event.forward && {
-          ...event.forward,
-          nodes: event.forward.nodes.map((n) => (n.files
-            ? { ...n, files: n.files.map((f) => ({ name: f.name, rel: f.rel, sandboxPath: f.sandboxPath, size: f.size })) }
-            : n)),
-        },
+        forward: event.forward && storedForward(event.forward),
       },
     });
   }

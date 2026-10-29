@@ -127,6 +127,37 @@ test('会话日志回读历史时走同一套净化（重启后那份记录仍�
   }
 });
 
+test('引用记录的落账：节点正文存下来，带 rkey 的临时 URL 不落盘', () => {
+  const d = dir();
+  try {
+    const log = new SessionLog(d, new Bus());
+    const fwd = {
+      id: 'r7', title: '', dropped: 0, failed: false,
+      nodes: [{
+        nickname: '月亮', userId: '2', text: '活动延期了', ts: 0,
+        files: [{
+          name: 'p.png', rel: 'inbox/p.png', sandboxPath: 'C:/sb/inbox/p.png', size: 3,
+          url: 'https://multimedia.example/p.png?rkey=abc',
+        }],
+      }],
+    };
+    log.logInbound({
+      id: 'ev1', platform: 'qq', type: 'group', chatId: '100', userId: '9', nickname: '阿甘',
+      senderRole: 'member', segments: [{ type: 'reply', data: { id: '1' } }], text: '[回复:1]如何评价',
+      isAtMe: true, isReplyToMe: false, messageId: '777', raw: {}, ts: Date.now(),
+      replyTo: { userId: '2', nickname: '甘愿.', text: '[聊天记录]', forward: fwd },
+    } as never);
+    const line = log.tail('100', 'group', 10).at(-1)!;
+    const stored = (line.data as { replyTo?: { forward?: { nodes?: { text: string; files?: { rel: string }[] }[] } } }).replyTo?.forward;
+    assert.equal(stored?.nodes?.[0].text, '活动延期了', '引用的记录正文要落账（重启后回读历史还得靠它）');
+    assert.equal(stored?.nodes?.[0].files?.[0].rel, 'inbox/p.png', '附件只留沙箱内相对路径');
+    const rawLine = JSON.stringify(line);
+    assert.ok(!rawLine.includes('rkey'), `临时 URL 不该进会话日志：${rawLine.slice(0, 300)}`);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test('inboundModelText：消息号只是落账字段，不进模型正文（引用回复已改程序自动锚定）', () => {
   // 引用锚点由内核在发送时从事件上取，模型侧不再需要 [#编号] 地址
   assert.equal(inboundModelText({ text: '收一下', nickname: '小明' }), '小明：收一下');
