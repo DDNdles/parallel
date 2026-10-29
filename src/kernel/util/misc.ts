@@ -48,12 +48,13 @@ export function deepMerge<T extends Record<string, unknown>>(target: T, source: 
   return target;
 }
 
-/** 依据默认值骨架浅校验/补齐（类型不一致时回落默认值） */
+/** 依据默认值骨架浅校验/补齐（类型不一致时回落默认值），默认值里没有的键原样保留 */
 export function coerceLike<T extends Record<string, unknown>>(defaults: T, input: unknown): T {
   const out: Record<string, unknown> = structuredClone(defaults);
-  if (!input || typeof input !== 'object') return out as T;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return out as T;
+  const src = input as Record<string, unknown>;
   for (const [k, dv] of Object.entries(defaults)) {
-    const iv = (input as Record<string, unknown>)[k];
+    const iv = src[k];
     if (iv === undefined) continue;
     if (dv === null || dv === undefined) { out[k] = iv; continue; }
     if (typeof dv === 'number' && typeof iv === 'number') out[k] = iv;
@@ -63,6 +64,12 @@ export function coerceLike<T extends Record<string, unknown>>(defaults: T, input
     else if (typeof dv === 'object' && !Array.isArray(dv) && typeof iv === 'object' && !Array.isArray(iv)) {
       out[k] = coerceLike(dv as Record<string, unknown>, iv);
     }
+  }
+  // 默认值里没有的键照原样留：providers / llm.modelByProvider / ui.chatPrefs 这些是「按 id 装条目」
+  // 的字典，用户自己加的键不在骨架里。只按骨架裁剪等于每次启动把它们全删掉（2026-10-28 的回归）
+  for (const [k, iv] of Object.entries(src)) {
+    if (Object.hasOwn(defaults, k) || iv === undefined) continue;
+    out[k] = structuredClone(iv);
   }
   return out as T;
 }
