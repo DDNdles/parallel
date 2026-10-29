@@ -212,39 +212,10 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .init-title { font-size: 22px; font-weight: 600; margin: 0 0 6px; font-family: var(--serif-display); letter-spacing: .02em; }
 .init-sub { margin: 0; font-size: 12.5px; color: var(--faint); }
 /* 进度条：已完成步数 / 总步数；宽度用 transition 慢慢走，不做数字跳动 */
-/* 进度条：整体刻进面板的凹槽（深色槽底 + 顶部内阴影 + 下缘一道 1px 亮边托住），
-   填充用正文色——暗色主题是白条、亮色主题是黑条（--text 恰好就是这个语义）。
-   填充比槽窄一圈（padding 2px），再压一道下沿暗线，看着像嵌在槽里而不是浮在槽上。 */
-.init-bar {
-  position: relative;
-  flex: none;
-  height: 8px;
-  margin: 0 2px 12px;
-  padding: 2px;
-  border-radius: 999px;
-  background: var(--bg);
-  box-shadow:
-    inset 0 2px 3px rgba(0, 0, 0, .62),
-    inset 0 -1px 0 rgba(255, 255, 255, .06),
-    0 1px 0 rgba(255, 255, 255, .04);
-  overflow: hidden;
-}
-.init-bar span {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--text);
-  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .28);
-  transition: width var(--dur-moderate) var(--ease-out);
-}
-/* 亮色主题：白底上的内阴影要收浅（0.62 会脏成一条黑缝），槽底用浅灰、下缘靠白色高光提住 */
-:root[data-theme="light"] .init-bar {
-  background: #ececee;
-  box-shadow:
-    inset 0 2px 3px rgba(0, 0, 0, .18),
-    inset 0 -1px 0 rgba(255, 255, 255, .95),
-    0 1px 0 rgba(0, 0, 0, .03);
-}
+/* 进度条：纯扁平——没有凹槽、内阴影、高光；填充用正文色，暗色主题是白条、亮色主题是黑条。
+   槽用正文色的 12% 透明档，两个主题自动反相，不用再单独覆盖。 */
+.init-bar { flex: none; height: 4px; margin: 0 2px 12px; border-radius: 999px; background: color-mix(in srgb, var(--text) 12%, transparent); overflow: hidden; }
+.init-bar span { display: block; height: 100%; border-radius: inherit; background: var(--text); transition: width var(--dur-moderate) var(--ease-out); }
 /* 只有清单滚动：标题、进度条与主按钮永远在视野里（首屏看不到主按钮是硬伤） */
 .init-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .init-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: var(--radius-panel); background: var(--bg); flex: none; transition: box-shadow var(--dur-base) var(--ease-out); }
