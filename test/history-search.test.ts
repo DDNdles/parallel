@@ -126,6 +126,30 @@ test('search_history：命中消息里的图片一起返回（读不动的跳过
   assert.match(plain, /你看不到图片本身/);
 });
 
+test('search_history：聊天记录里的正文也能搜到（e.text 只有占位）', async () => {
+  const G = 414;
+  kernel.container.setGroupState('chat', String(G), true, String(MASTER));
+  kernel.sessionLog.append(String(G), 'group', {
+    type: 'message_in', role: 'user', userId: '10003', nickname: '甘愿.', text: '[聊天记录]',
+    data: {
+      forward: {
+        id: 'r-search', title: '', dropped: 0, failed: false,
+        nodes: [
+          { nickname: '月亮', userId: '2', text: '美丽邂逅活动延期了', ts: 0 },
+          { nickname: '阿甘', userId: '3', text: '新档期待定', ts: 0 },
+        ],
+      },
+    },
+  } as never);
+  const ctx = { chat: { platform: 'qq', type: 'group' as const, chatId: String(G) },
+    event: { userId: String(MEMBER), chatId: String(G), type: 'group', platform: 'qq', id: 'turn-rec-1', ts: Date.now() },
+    role: 'member' } as never;
+  const def = kernel.container.toolsForChat({ platform: 'qq', type: 'group', chatId: String(G) }, 'member').find((t) => t.name === 'search_history')!;
+  const out = String(def.handler({ query: '美丽邂逅' }, ctx));
+  assert.match(out, /找到 1 条/, out);
+  assert.ok(out.includes('美丽邂逅活动延期了'), `记录节点正文要出现在命中里：${out}`);
+});
+
 test('search_history：只翻窗口之外——模型眼前就有的那几条不该还回去', async () => {
   const G = 412;
   kernel.container.setGroupState('chat', String(G), true, String(MASTER));

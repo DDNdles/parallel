@@ -1,4 +1,4 @@
-import type { ChatEvent, ChatRef, ChatMessage, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
+import type { ChatEvent, ChatRef, ChatMessage, ForwardRecord, LLMRequestContext, MessageAttachment, Role, SystemSection } from './types.ts';
 import { composeSystem } from './types.ts';
 import type { PluginContainer } from './container.ts';
 import type { AgentLoop, HistoryStore } from './agentloop.ts';
@@ -514,11 +514,18 @@ export class Pipeline {
         : { name: String((f as { name?: unknown })?.name ?? ''), rel: String((f as { rel?: unknown })?.rel ?? '') }))
       .filter((f) => f.rel);
     const fromBot = src.type === 'message_out';
+    // 被引用的可能是一份「聊天记录」：正文在 data.forward 里，text 只有 `[聊天记录]` 占位。
+    // 不带过来，模型就只能看见这四个字、回一句"点不开"（2026-10-29 用户实测）。
+    const srcData = src.data as { forward?: ForwardRecord } | undefined;
+    const forward = srcData?.forward && !srcData.forward.failed && srcData.forward.nodes.length
+      ? srcData.forward
+      : undefined;
     event.replyTo = {
       userId: fromBot ? this.selfId() : (src.userId ?? ''),
       nickname: fromBot ? (this.selfNickname() || this.selfId()) : (src.nickname ?? ''),
       text: src.text ?? '',
       files: files.length ? files : undefined,
+      forward,
     };
   }
 
@@ -543,7 +550,13 @@ export class Pipeline {
     const seen = new Set<string>();
     const root = this.sandbox.root(chat);
     for (const e of events) {
-      for (const f of e.replyTo?.files ?? []) {
+      // 被引用的是普通消息看 files；被引用的是一份「聊天记录」时，图在各节点上
+      //（引用回来的是记录里那张图本身，不是又一句"[图片]"）。
+      const cands: { name?: unknown; rel?: unknown }[] = [
+        ...(e.replyTo?.files ?? []),
+        ...(e.replyTo?.forward?.nodes ?? []).flatMap((n) => n.files ?? []),
+      ];
+      for (const f of cands) {
         const rel = String(f.rel ?? '').trim();
         if (!rel) continue;
         const mime = mimeOf(rel);
@@ -551,7 +564,7 @@ export class Pipeline {
         const abs = isAbsolute(rel) ? rel : join(root, rel);
         if (seen.has(abs) || !existsSync(abs)) continue;
         seen.add(abs);
-        out.push({ kind: 'image', path: abs, name: f.name || rel.split('/').pop(), mime });
+        out.push({ kind: 'image', path: abs, name: String(f.name ?? '') || rel.split('/').pop(), mime });
         if (out.length >= 3) return out;
       }
     }

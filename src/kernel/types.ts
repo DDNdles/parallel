@@ -37,8 +37,16 @@ export interface ChatEvent {
   isReplyToMe: boolean;
   messageId?: string;
   /** 引用链快照：适配器给出 reply 段的原消息 id，内核在落账前把它查出来钉在这（桌面端画气泡内的引用块）。
-   *  files 一起带上：被引用的常常是一张图，只给 text="[图片]" 桌面端就没法出预览。 */
-  replyTo?: { userId: string; nickname: string; text: string; files?: { name: string; rel: string }[] };
+   *  files 一起带上：被引用的常常是一张图，只给 text="[图片]" 桌面端就没法出预览。
+   *  forward 同理：被引用的常常是一份「聊天记录」，text 只剩 `[聊天记录]` 四个字，
+   *  不带正文模型只能回一句"点不开"。 */
+  replyTo?: {
+    userId: string;
+    nickname: string;
+    text: string;
+    files?: { name: string; rel: string }[];
+    forward?: ForwardRecord;
+  };
   files?: IncomingFile[];    // 消息内文件/图片（由适配器落盘到沙箱 inbox 后挂上来）
   /** 消息里的「聊天记录」合集（合并转发）：段里只有一个 resId，正文靠适配器向协议端现取 */
   forward?: ForwardRecord;

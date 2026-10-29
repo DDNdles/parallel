@@ -165,6 +165,70 @@ test('引用一张图：那张图作为附件进本轮请求，模型真的看�
   }
 });
 
+// 2026-10-29 用户实测：群友发来一份「聊天记录」，过几分钟有人引用它问"如何评价"，
+// bot 只回一句"合并转发点不开"。根因是 attachReply 只搬了 text（= `[聊天记录]` 占位），
+// 记录的节点正文在 data.forward 里没跟着走。这里钉住：引用的记录必须连同节点一起进请求。
+test('引用一份聊天记录：节点正文要跟着进本轮请求', async () => {
+  const { Kernel } = await import('../src/kernel/kernel.ts');
+  const dataDir = mkdtempSync(join(tmpdir(), 'parallel-reply-fwd-'));
+  const kernel = new Kernel({ dataDir, noApi: true });
+  const cfg = kernel.config.config as any;
+  cfg.onebot.port = 30000 + (process.pid % 20000);
+  cfg.providers.mock = {
+    label: 'Mock', model: 'mock-1', enabled: true, baseUrl: '', protocol: 'mock',
+    models: [{ id: 'mock-1', enabled: true }],
+  };
+  cfg.llm.activeProvider = 'mock';
+  cfg.llm.chatChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.llm.workChain = [{ provider: 'mock', model: 'mock-1' }];
+  cfg.risk.replyRatePerMin = 10_000;
+  cfg.masterIds = ['10009'];
+  Object.assign(cfg.humanlike.outgoing, {
+    typingBaseDelaySeconds: 0, typingMaxDelaySeconds: 0, typingJitterRatio: 0,
+  });
+  await kernel.boot();
+  const groupId = '9602';
+  kernel.container.setGroupState('chat', groupId, true, '10009');
+  const mock = new MockOneBot(`ws://127.0.0.1:${cfg.onebot.port}/onebot`, kernel.config.secrets.onebotAccessToken);
+  await mock.connect();
+  try {
+    await until(() => String((kernel.adapter as any).status?.()?.selfId ?? ''), 5000, '协议端登录');
+    // 那份记录（正文只在 data.forward 里；text 是占位，与真实落账一致）
+    kernel.sessionLog.append(groupId, 'group', {
+      type: 'message_in', role: 'user', userId: '10009', nickname: '甘愿.', text: '[聊天记录]',
+      data: {
+        messageId: '555001',
+        segments: [{ type: 'forward', data: { id: 'res-555' } }],
+        forward: {
+          id: 'res-555', title: '', dropped: 0, failed: false,
+          nodes: [
+            { nickname: '月亮', userId: '2', text: '社团活动延期到下周', ts: 0 },
+            { nickname: '阿甘', userId: '3', text: '那还去不去', ts: 0 },
+          ],
+        },
+      },
+    } as any);
+
+    const provider = (kernel.llm as any).providers.get('mock');
+    mock.sendGroupMessage({
+      groupId: Number(groupId), userId: 10009, text: '如何评价', atMe: true,
+      extraSegments: [{ type: 'reply', data: { id: '555001' } }],
+    });
+    const call = await until(
+      () => provider.calls.find((c: any) => String(c.usersJoined ?? '').includes('如何评价')),
+      8000, '本轮请求',
+    );
+    const joined = String(call.usersJoined);
+    assert.ok(joined.includes('社团活动延期到下周'), `引用的记录节点要进请求：${joined}`);
+    assert.ok(joined.includes('那还去不去'), joined);
+    assert.ok(joined.includes('发来的聊天记录'), `要说明这是引用回来的记录：${joined}`);
+  } finally {
+    mock.close();
+    await kernel.shutdown();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 // 出站引用「引错消息」的根因：frequency 一轮通常合并 6～10 条，回复是对整批说的，
 // 程序却把最后一条当锚点。多消息合批、汇报轮/主动轮、纯 @ 都不该挂引用。
 test('出站引用只在单条实质消息的轮次挂', () => {

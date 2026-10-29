@@ -60,6 +60,28 @@ test('inboundModelText：群聊带昵称前缀（模型的群里身份感知来�
   );
 });
 
+test('inboundModelText：引用的是一份聊天记录时，正文一起展开（不能只剩 [聊天记录]）', () => {
+  const fwd = {
+    id: 'r9', title: '', dropped: 0, failed: false,
+    nodes: [
+      { nickname: '月亮', userId: '1', text: '活动延期了', ts: 0 },
+      { nickname: '阿甘', userId: '2', text: '那还去不去', ts: 0 },
+    ],
+  };
+  const out = inboundModelText({
+    text: '[回复:1039783197]如何评价', nickname: '阿甘',
+    replyTo: { nickname: '甘愿.', text: '[聊天记录]', forward: fwd },
+  });
+  assert.ok(out.includes('引用「甘愿.」发来的聊天记录'), out);
+  assert.ok(out.includes('月亮：活动延期了') && out.includes('阿甘：那还去不去'), `记录节点要进来：${out}`);
+  assert.ok(!out.includes('[聊天记录]'), out);
+  // 取不到正文的记录（failed / 旧日志没存）：保持原来的占位口径，不编内容
+  const miss = inboundModelText({
+    text: '[回复:7]看看', replyTo: { nickname: '甘愿.', text: '[聊天记录]', forward: { ...fwd, failed: true } },
+  });
+  assert.equal(miss, '（引用「甘愿.」：[聊天记录]）看看');
+});
+
 test('inboundModelText：QQ 表情编号换成中文名（模型读得懂）', () => {
   assert.equal(inboundModelText({ text: '[表情:32]' }), '[表情:疑问]');
   assert.equal(inboundModelText({ text: '不理你[表情:14]', nickname: '小明' }), '小明：不理你[表情:微笑]');

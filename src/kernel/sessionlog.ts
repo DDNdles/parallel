@@ -111,18 +111,31 @@ function mimeOf(hint: string): string | undefined {
 }
 
 /**
- * 落账条目里的文件清单（`data.files`）→ `{name, rel}`。
+ * 落账条目里的文件清单（`data.files` + 记录节点里的 `files`）→ `{name, rel}`。
  * 检索命中要能把"这条消息当时带了哪张图"带回去（有无图片由调用方按扩展名判断）。
+ * 一份「聊天记录」命中时，图在各自的节点上——不带回来，模型就只能说"我看不到记录里的图"。
  */
 function filesOfEntry(e: SessionLogEntry): { name: string; rel: string }[] {
-  const raw = (e.data as { files?: unknown } | undefined)?.files;
-  if (!Array.isArray(raw)) return [];
+  const d = e.data as { files?: unknown; forward?: { nodes?: { files?: unknown }[] } } | undefined;
+  const raw: unknown[] = [];
+  if (Array.isArray(d?.files)) raw.push(...d.files);
+  for (const n of d?.forward?.nodes ?? []) if (Array.isArray(n?.files)) raw.push(...n.files);
   const out: { name: string; rel: string }[] = [];
+  const seen = new Set<string>();
   for (const f of raw) {
-    if (typeof f === 'string') { if (f.trim()) out.push({ name: f, rel: `inbox/${f}` }); continue; }
-    const o = f as { name?: unknown; rel?: unknown } | null;
-    const rel = String(o?.rel ?? '').trim();
-    if (rel) out.push({ name: String(o?.name ?? rel.split('/').pop() ?? ''), rel });
+    let name: string, rel: string;
+    if (typeof f === 'string') {
+      const t = f.trim();
+      if (!t) continue;
+      name = t; rel = `inbox/${t}`;
+    } else {
+      const o = f as { name?: unknown; rel?: unknown } | null;
+      rel = String(o?.rel ?? '').trim();
+      name = String(o?.name ?? rel.split('/').pop() ?? '');
+    }
+    if (!rel || seen.has(rel)) continue;
+    seen.add(rel);
+    out.push({ name, rel });
   }
   return out;
 }
@@ -277,7 +290,11 @@ export class SessionLog {
         // 落账的 text 是"给人看"的（界面靠它 + data 画引用块与记录卡），给模型要现净化一遍。
         // 群聊再把说话人拼进正文（昵称优先，无昵称给 QQ 号）——与 pipeline 的当前轮同一口径；
         // 私聊不带名，对面是谁 system 里已写明。
-        const d = e.data as { replyTo?: { nickname?: string; text?: string }; forward?: ForwardRecord; files?: unknown[] } | undefined;
+        const d = e.data as {
+          replyTo?: { nickname?: string; text?: string; forward?: ForwardRecord };
+          forward?: ForwardRecord;
+          files?: unknown[];
+        } | undefined;
         const m: { role: 'user'; content: string; ts?: number; attachments?: MessageAttachment[] } = {
           role: 'user',
         content: inboundModelText({
@@ -416,8 +433,20 @@ export class SessionLog {
         const isUser = e.type === 'message_in' && e.role === 'user';
         const isAssistant = e.type === 'message_out' && e.role === 'assistant';
         if (!isUser && !isAssistant) continue;
-        const text = String(e.text ?? '');
-        if (!text || !text.toLowerCase().includes(q)) continue;
+        const raw = String(e.text ?? '');
+        let text = raw;
+        // 「聊天记录」与被引用的记录：正文不在 e.text 里（那儿只有 `[聊天记录]` 占位），
+        // 按模型看到的同一套口径展开再匹配——否则搜记录里的任何词都搜不到。
+        // 只有在原文没命中时才展开：绝大多数行不涉及记录，不该为了一次检索把整份日志渲染一遍。
+        if (!raw || !raw.toLowerCase().includes(q)) {
+          const d = e.data as {
+            forward?: ForwardRecord;
+            replyTo?: { nickname?: string; userId?: string; text?: string; forward?: ForwardRecord };
+          } | undefined;
+          if (!d?.forward && !d?.replyTo?.forward) continue;
+          text = inboundModelText({ text: raw, forward: d.forward, replyTo: d.replyTo });
+          if (!text.toLowerCase().includes(q)) continue;
+        }
         hits.push({ ts: e.ts, role: isUser ? 'user' : 'assistant', nickname: e.nickname, text, files: filesOfEntry(e) });
         if (hits.length >= limit) break;
       }
