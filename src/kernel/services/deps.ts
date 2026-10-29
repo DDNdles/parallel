@@ -125,19 +125,50 @@ export function dockerBinCandidates(): string[] {
     : ['docker'];
 }
 
+/** 问注册表要 QQ.exe：先卸载项（机器/用户 × 32/64 位三种视图），再 App Paths。
+ *  QQNT 的卸载项通常落在 WOW6432Node，但按用户安装/绿色版会换地方——只认一条会误判「没装」。 */
+async function qqFromRegistry(): Promise<string> {
+  const keys: { key: string; value?: string }[] = [
+    { key: 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', value: 'UninstallString' },
+    { key: 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', value: 'UninstallString' },
+    { key: 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', value: 'UninstallString' },
+    { key: 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\QQ.exe' },
+    { key: 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\QQ.exe' },
+  ];
+  for (const { key, value } of keys) {
+    const out = await new Promise<string>((resolveP) => {
+      execFile('reg', ['query', key, ...(value ? ['/v', value] : [])],
+        { timeout: 8000, windowsHide: true }, (e, stdout) => resolveP(e ? '' : String(stdout)));
+    });
+    const line = out.split('\n').find((l) => /REG_SZ/.test(l));
+    if (!line) continue;
+    const raw = line.replace(/.*REG_SZ\s*/, '').trim();
+    // 卸载项给的是 Uninstall.exe（同一目录推 QQ.exe）；App Paths 的默认值直接就是 QQ.exe
+    const exe = value ? qqPathFromUninstallString(raw) : raw.replace(/^"|"$/g, '');
+    if (exe && existsSync(exe)) return exe;
+  }
+  return '';
+}
+
+/** 最后一个兜底：正在跑的 QQ 进程路径（番茄/绿色版常见；有头模式下 QQ 本来就开着） */
+async function qqFromRunningProcess(): Promise<string> {
+  if (process.platform !== 'win32') return '';
+  const script = `Get-CimInstance Win32_Process -Filter "Name='QQ.exe'" | Select-Object -First 1 -ExpandProperty ExecutablePath`;
+  const out = await new Promise<string>((resolveP) => {
+    execFile('powershell', ['-NoProfile', '-Command', script],
+      { timeout: 8000, windowsHide: true }, (e, stdout) => resolveP(e ? '' : String(stdout)));
+  });
+  const p = out.trim().split('\n')[0]?.trim() ?? '';
+  return p && /QQ\.exe$/i.test(p) && existsSync(p) ? p : '';
+}
+
 export async function findQqInstallPath(cfgPath = ''): Promise<string> {
   if (cfgPath) return existsSync(cfgPath) ? cfgPath : '';
   if (process.platform !== 'win32') return QQ_DEFAULT_PATHS.find(existsSync) ?? '';
-  const fromRegistry = await new Promise<string>((resolveP) => {
-    execFile('reg', ['query',
-      'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', '/v', 'UninstallString'],
-      { timeout: 8000, windowsHide: true }, (e, stdout) => {
-        if (e) return resolveP('');
-        const line = String(stdout).split('\n').find((l) => /REG_SZ/.test(l));
-        resolveP(qqPathFromUninstallString((line ?? '').replace(/.*REG_SZ\s*/, '').trim()));
-      });
-  });
-  if (fromRegistry && existsSync(fromRegistry)) return fromRegistry;
+  const fromRegistry = await qqFromRegistry();
+  if (fromRegistry) return fromRegistry;
+  const fromProcess = await qqFromRunningProcess();
+  if (fromProcess) return fromProcess;
   return QQ_DEFAULT_PATHS.find(existsSync) ?? '';
 }
 
