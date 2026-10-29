@@ -1,8 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn } from 'node:child_process';
 import { createReadStream, existsSync, statSync, readdirSync, readFileSync } from 'node:fs';
-import { join, normalize, extname, dirname, relative, isAbsolute } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, normalize, extname, relative, isAbsolute } from 'node:path';
 import { WebSocketServer } from 'ws';
 import type { Kernel } from '../kernel.ts';
 import { REASONING_LEVELS, type ModelRef, type ProviderModelCfg } from '../config.ts';
@@ -17,7 +16,7 @@ import { LLBotManager } from '../services/llbot.ts';
 import { busEvents } from '../bus.ts';
 import type { ChatEvent, ChatRef, Role } from '../types.ts';
 import { findSkill, scanSkills, skillStateKey, SKILL_PLUGIN_ID } from '../skills.ts';
-import { ACTIVE_ROOT } from '../paths.ts';
+import { PACKAGE_ROOT, ACTIVE_ROOT } from '../paths.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -25,8 +24,10 @@ const MIME: Record<string, string> = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
 };
 
-const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const UI_ROOT = join(PROJECT_ROOT, 'ui');
+/** 包根统一来自 paths.ts（向上找 package.json）：本文件在 src/kernel/api 与 dist/src/kernel/api
+ *  两种布局下层级不同，自己数 `..` 会在编译形态把根算成 <包根>/dist，ui/ 就找不到了 */
+const PROJECT_ROOT = PACKAGE_ROOT;
+const UI_ROOT = join(PACKAGE_ROOT, 'ui');
 
 /** 项目内路径用相对写法给人看（data 目录被 --data-dir 指到别处时退回绝对路径） */
 function projectLabel(p: string): string {

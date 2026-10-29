@@ -18,12 +18,20 @@ if (!(major >= 24)) {
 
 // --use-system-ca：用操作系统信任库校验证书（Node 自带 CA 缺不少国内站点的中间证书，
 // 例如中科大一〇七平台的 SCOW 门户链就缺；插件经 HTTPS 调它时否则 UNABLE_TO_VERIFY_LEAF_SIGNATURE）
-// 入口选择：node_modules 里必须跑编译产物（dist/src），目录直跑（开发/zip）跑 src 的 TS。
+// 入口选择：有 src 就跑源码（开发目录 / zip 发布包），没有 src 才跑编译产物（npm 包只发 dist）。
+// node_modules 里 Node 拒绝类型剥离，无论如何都得用 dist。以前只要 dist 存在就用 dist，
+// 结果开发目录留了一份 dist 之后，启动的是旧编译产物，连 ui/ 都被算到了 dist/ 底下。
 const pkg = resolve(here, '..');
 const compiledMain = resolve(pkg, 'dist', 'src', 'kernel', 'main.js');
 const tsMain = resolve(pkg, 'src', 'kernel', 'main.ts');
-const useCompiled = existsSync(compiledMain);
+const inNodeModules = pkg.split(/[\\/]/).includes('node_modules');
+const hasSrc = existsSync(tsMain);
+const useCompiled = existsSync(compiledMain) && (inNodeModules || !hasSrc);
 const mainFile = useCompiled ? compiledMain : tsMain;
+if (!existsSync(mainFile)) {
+  console.error(`[parallel] 找不到入口：既没有 ${tsMain}，也没有 ${compiledMain}。\n安装包不完整，请重新下载或 npm ci。`);
+  process.exit(1);
+}
 const requiredFlags = ['--no-warnings', '--use-system-ca', ...(useCompiled ? [] : ['--experimental-transform-types'])];
 const missing = requiredFlags.filter((f) => !process.execArgv.includes(f));
 if (missing.length) {
