@@ -4,19 +4,13 @@
  *
  * 背景沿用登录页那张 mesh，但面板**不加 backdrop-filter**——这页是给人读字的，不做透底模糊。
  *
- * 缺失项的两条出路：协议端发行包由内核自己下载（POST /api/setup/install，后台跑，页面轮询进度），
- * 其余第三方软件只给官方下载页链接——parallel 不替人装软件。
+ * 首次安装（setupDoneAt = 0）走 InitWizard：一个「立即安装」把依赖一次装好，装完这页不再出现；
+ * 之后每次开机都走这里的检查清单，缺东西就拦（2026-10-29 用户要求）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { get, post } from '@/lib/api';
 import { Icon } from '@/components/Icon';
-
-interface DepItem {
-  id: string; label: string; required: boolean;
-  state: 'ok' | 'idle' | 'missing'; detail: string; download?: string;
-  install?: 'llbot' | 'docker' | 'ffmpeg'; launch?: 'docker';
-}
-interface DepsResp { items: DepItem[]; ready: boolean; setupDoneAt: number; managesEnd: boolean }
+import InitWizard, { type DepItem, type DepsResp } from '@/components/InitWizard';
 
 const POLL_MS = 3000;
 
@@ -45,7 +39,21 @@ export default function SetupGate({ onPass, onToggleTheme }: {
   const [note, setNote] = useState('');
   const passedRef = useRef(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** 手动预览初始化页（?init=1）：已装好的机器也能重看这一屏，不影响 setupDoneAt 的判定 */
+  const [forceInit, setForceInit] = useState(false);
+  const forceRef = useRef(false);
   const stopPoll = () => { if (pollRef.current) clearInterval(pollRef.current); pollRef.current = null; };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const q = new URLSearchParams(location.search);
+    if (q.get('init') !== '1') return;
+    forceRef.current = true;
+    setForceInit(true);
+    q.delete('init');
+    const s = q.toString();
+    history.replaceState(null, '', location.pathname + (s ? `?${s}` : '') + location.hash);
+  }, []);
 
   const pass = useCallback(() => {
     if (passedRef.current) return;
@@ -62,8 +70,10 @@ export default function SetupGate({ onPass, onToggleTheme }: {
       setErr('');
       // 必备项齐了就放行：拦截只在「真缺东西」时发生。2026-10-29 用户要求每次启动都重新拦，
       // 所以不再看 setupDoneAt（走过一次就再也不挡）；开机时 Docker 还没起来也不会卡死 ——
-      // 这页在等的时候每 3 秒重探一次，一旦转成全绿就自己进去
-      if (d.ready) pass();
+      // 这页在等的时候每 3 秒重探一次，一旦转成全绿就自己进去。
+      // 两种情况例外：首次安装（让 InitWizard 先露一次脸）、?init=1 手动预览。
+      const firstRun = d.setupDoneAt === 0 || forceRef.current;
+      if (d.ready && !firstRun) pass();
       return d;
     } catch (e) {
       setErr(`读不到环境状态：${(e as Error).message}`);
@@ -73,12 +83,14 @@ export default function SetupGate({ onPass, onToggleTheme }: {
     }
   }, [pass]);
 
-  // 被拦住期间持续重探：用户去装东西 / 等 Docker Desktop 起来，齐了就不用人再点一下
+  // 被拦住期间持续重探：用户去装东西 / 等 Docker Desktop 起来，齐了就不用人再点一下。
+  // 初始化页自己轮一键安装的任务，这里不另开一条。
+  const showWizard = forceInit || (!!data && data.setupDoneAt === 0);
   useEffect(() => {
-    if (waitingId) return;   // 代下载/启动那条路由 runOnKernel 自己轮，别开两条
+    if (waitingId || showWizard) return;   // 代下载/启动那条路由 runOnKernel 自己轮，别开两条
     const t = setInterval(() => { void load(true); }, POLL_MS);
     return () => clearInterval(t);
-  }, [load, waitingId]);
+  }, [load, waitingId, showWizard]);
 
   useEffect(() => { void load(false); return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, [load]);
 
@@ -131,6 +143,19 @@ export default function SetupGate({ onPass, onToggleTheme }: {
 
   const items = data?.items ?? [];
   const ready = !!data?.ready;
+
+  // 首次安装：走一键初始化。装完/跳过都会记 setupDoneAt，之后每次开机回到下面的检查清单。
+  if (showWizard && data) {
+    return (
+      <InitWizard
+        deps={data}
+        onRefresh={() => load(true)}
+        onFinish={next}
+        onSkip={next}
+        onToggleTheme={onToggleTheme}
+      />
+    );
+  }
 
   return (
     <div className="login-overlay">

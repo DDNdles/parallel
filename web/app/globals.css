@@ -200,6 +200,48 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .setup-panel button.icon-chip { width: auto; min-width: 44px; background: var(--surface-input); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; display: inline-flex; color: var(--dim); }
 .setup-panel button.icon-chip:hover { border-color: var(--brand); color: var(--text); background: var(--surface-input); }
 
+/* ============ 首次安装 · 初始化 ============
+   与检查页同一张 mesh 底、同一套胶囊按钮；区别只在内容：这里是「一键装完」的进度单，
+   每行一条依赖，左边序号 + 状态图标，右边一枚状态小签。 */
+.init-panel { position: relative; z-index: 1; width: min(640px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; padding: 22px 24px 18px; border: 1px solid var(--border-strong); border-radius: var(--radius-card); background: var(--surface-2); box-shadow: var(--shadow-float); animation: pop-in var(--dur-moderate) var(--ease-out) both; }
+/* 品牌行与主题钮仍复用 setup 那套（同一屏两页，位置不能跳） */
+.init-panel .setup-brand { margin-bottom: 10px; }
+.init-panel button.icon-chip { width: auto; min-width: 44px; background: var(--surface-input); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; display: inline-flex; color: var(--dim); }
+.init-panel button.icon-chip:hover { border-color: var(--brand); color: var(--text); background: var(--surface-input); }
+.init-head { padding: 0 2px 12px; flex: none; }
+.init-title { font-size: 22px; font-weight: 600; margin: 0 0 6px; font-family: var(--serif-display); letter-spacing: .02em; }
+.init-sub { margin: 0; font-size: 12.5px; color: var(--faint); }
+/* 进度条：已完成步数 / 总步数；宽度用 transition 慢慢走，不做数字跳动 */
+.init-bar { flex: none; height: 3px; margin: 0 2px 12px; border-radius: 999px; background: var(--surface-input); overflow: hidden; }
+.init-bar span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width var(--dur-moderate) var(--ease-out); }
+/* 只有清单滚动：标题、进度条与主按钮永远在视野里（首屏看不到主按钮是硬伤） */
+.init-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.init-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: var(--radius-panel); background: var(--bg); flex: none; transition: box-shadow var(--dur-base) var(--ease-out); }
+/* 当前步骤：左侧一条品牌色竖线（固定行高的行用 inset 描边，不占布局） */
+.init-row.is-running, .init-row.is-waiting { box-shadow: inset 2px 0 0 var(--brand); }
+.init-idx { flex: none; width: 20px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); letter-spacing: .04em; }
+.init-mark { flex: none; display: inline-flex; color: var(--faint); }
+.init-row.is-ok .init-mark { color: var(--ok); }
+.init-row.is-running .init-mark { color: var(--brand); }
+.init-row.is-waiting .init-mark { color: var(--warn); }
+.init-row.is-failed .init-mark { color: var(--err); }
+.init-row.is-manual .init-mark { color: var(--dim); }
+.init-row.is-skipped .init-mark { color: var(--faint); }
+.init-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.init-name { display: flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 600; }
+.init-req { flex: none; font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: .06em; color: var(--faint); padding: 1px 5px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--border-strong); }
+.init-detail { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.init-row.is-failed .init-detail { color: var(--err); }
+.init-row.is-manual .init-detail { color: var(--warn); }
+.init-right { flex: none; display: flex; align-items: center; gap: 8px; }
+.init-pct { font-family: var(--mono); font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.init-tag { font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: .06em; color: var(--faint); padding: 2px 6px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--border-strong); }
+.init-tag.t-ok { color: var(--ok); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 55%, transparent); }
+.init-tag.t-failed { color: var(--err); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 55%, transparent); }
+.init-tag.t-running, .init-tag.t-waiting { color: var(--brand); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand) 55%, transparent); }
+.init-tag.t-manual { color: var(--warn); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 55%, transparent); }
+.init-panel .setup-foot { margin-top: auto; }
+
 /* ---------------- 布局 ---------------- */
 .app { display: flex; height: 100vh; }
 /* 侧栏永久常驻不可折叠；宽度由内联 style 驱动（拖拽 57px「只留图标」~ 视口 30%），这里只是首帧兜底 */

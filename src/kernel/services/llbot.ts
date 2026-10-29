@@ -227,6 +227,19 @@ export class LLBotManager implements ProtocolEnd {
     return `http://127.0.0.1:${port}`;
   }
 
+  /** 只补发行包（下载 + 解包），**不拉起进程**：首次初始化的「一键安装」用它。
+   *  start() 之后还要过「预期账号」与 PMHQ 前置检查，那些属于登录阶段，不该由安装步骤来满足。 */
+  async ensureInstalled(): Promise<void> {
+    if (existsSync(this.exePath())) return;
+    if (process.platform !== 'win32') {
+      throw new Error('LLBot 发行包只有 win-x64：其它平台请自行运行 OneBot 11 协议端');
+    }
+    const home = this.homeDir();
+    mkdirSync(home, { recursive: true });
+    mkdirSync(this.llbotDataDir(), { recursive: true });
+    await this.downloadAndExtract(home);
+  }
+
   /** 启动托管：准备目录/配置/token/发行包后拉起。幂等。 */
   async start(): Promise<void> {
     if (this.running()) return;

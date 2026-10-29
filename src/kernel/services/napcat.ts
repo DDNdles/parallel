@@ -186,6 +186,15 @@ export class NapCatManager implements ProtocolEnd {
     return { online: s.connected, uin: s.selfId, nick: s.nickname };
   }
 
+  /** 只补发行包（下载 + 解包），不拉起 QQ：首次初始化的「一键安装」用它 */
+  async ensureInstalled(): Promise<void> {
+    if (this.downloaded()) return;
+    if (process.platform !== 'win32') throw new Error('NapCat 托管只支持 Windows（注入本机 QQNT）');
+    mkdirSync(this.configDir(), { recursive: true });
+    await this.downloadAndExtract();
+    if (!this.downloaded()) throw new Error('NapCat 解压后仍找不到引导文件：发行包不完整');
+  }
+
   /** 启动托管：备好目录/发行包/配置后注入拉起。幂等。 */
   async start(): Promise<void> {
     if (this.running()) return;

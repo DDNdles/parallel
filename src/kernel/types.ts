@@ -651,6 +651,9 @@ export interface ProtocolEnd {
   status(): Record<string, unknown>;
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** 只补发行包（下载 + 解包），不拉起进程、不碰 QQ：首次初始化的「一键安装」用它。
+   *  start() 会顺带拉起进程并做登录前置检查（预期账号/QQ 路径），初始化阶段这些前置还不该成立。 */
+  ensureInstalled?(): Promise<void>;
   /** 完整性与可用性逐项检查（发行包在不在、QQ 探到没探到、进程、控制台可达…） */
   check(): Promise<EndCheck[]>;
   webuiUrl(): string;

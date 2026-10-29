@@ -8,7 +8,7 @@
  * 能拖到超时，别每帧都探。
  */
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { bundledFfmpeg } from './downloads.ts';
 
@@ -76,6 +76,26 @@ async function resolveOnPath(name: string): Promise<string> {
   if (name.includes('\\') || name.includes('/')) return name;
   const r = await run(process.platform === 'win32' ? 'where' : 'which', [name], 3000);
   return r.ok ? (r.out.split('\n')[0] || '').trim() || name : name;
+}
+
+/** 常见安装位置（winget 刚装完时**当前进程的 PATH 不会更新**，别让用户为此重启内核）：
+ *  只看 Python3xx 这一级目录，不递归全盘扫。 */
+function pythonCandidates(): string[] {
+  const out: string[] = [];
+  const roots = [
+    join(process.env['LOCALAPPDATA'] ?? '', 'Programs', 'Python'),
+    process.env['ProgramFiles'] ?? 'C:\\Program Files',
+  ];
+  for (const root of roots) {
+    if (!root || !existsSync(root)) continue;
+    try {
+      for (const d of readdirSync(root)) {
+        if (/^Python3\d+$/i.test(d)) out.push(join(root, d, 'python.exe'));
+      }
+    } catch { /* 目录没权限/正好被删：跳过 */ }
+  }
+  out.push('C:\\Python313\\python.exe', 'C:\\Python312\\python.exe');
+  return out;
 }
 
 /** QQNT 安装位置：配置显式路径 → 注册表卸载项 → 常见默认目录（有头模式与 NapCat 注入共用） */
@@ -207,6 +227,14 @@ async function probeOne(id: string, ctx: DepProbe): Promise<DepItem> {
           return { id, label: 'Python', required: true, state: 'ok', detail: `${ver[1]}（${await resolveOnPath(bin)}）` };
         }
       }
+      // 刚用 winget 装完的 Python 不会出现在当前进程的 PATH 里（环境变量是启动时的快照）：
+      // 直接去常见安装目录找 exe，装完这一轮就能判就绪，不用让用户重启内核。
+      for (const exe of pythonCandidates()) {
+        if (!existsSync(exe)) continue;
+        const r = await run(exe, ['--version'], 3000);
+        const ver = /([Pp]ython\s+\d+\.\d+(?:\.\d+)?)/.exec(r.out);
+        if (ver) return { id, label: 'Python', required: true, state: 'ok', detail: `${ver[1]}（${exe}）` };
+      }
       return {
         id, label: 'Python', required: true,
         state: 'missing', detail: '未安装', download: 'https://www.python.org/downloads/',
@@ -250,6 +278,11 @@ async function probeOne(id: string, ctx: DepProbe): Promise<DepItem> {
 }
 
 const DEP_IDS = ['node', 'data', 'qq', 'llbot', 'docker', 'python', 'bash', 'ffmpeg'];
+
+/** 单探一项：一键安装每走完一步只重探这一步，别把 docker info 又白打一遍 */
+export function probeDep(id: string, ctx: DepProbe): Promise<DepItem> {
+  return probeOne(id, ctx);
+}
 
 /** 并行探完全部依赖；同一份结果缓存 10 分钟，fresh=true 强制重探 */
 export async function probeDeps(ctx: DepProbe, fresh = false): Promise<DepItem[]> {

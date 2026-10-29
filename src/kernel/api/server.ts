@@ -11,6 +11,7 @@ import { collectRecentArtifacts, workScopeOf, sandboxRefOfKey } from '../service
 import { isDeliverableArtifact } from '../services/artifacts.ts';
 import { depsReady, dockerDesktopExe, invalidateDepCache, probeDeps, type DepProbe } from '../services/deps.ts';
 import { DEP_FETCHES, fetchState, startDepFetch } from '../services/downloads.ts';
+import { installJobView, startInstallAll } from '../services/installer.ts';
 import { geminiApiBase } from '../services/pi-ai.ts';
 import { LLBotManager } from '../services/llbot.ts';
 import { busEvents } from '../bus.ts';
@@ -343,6 +344,24 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       }
       if (b === 'fetch' && req.method === 'GET') {
         return send({ state: fetchState(String(url.searchParams.get('id') ?? '')) });
+      }
+      // 首装一键初始化：把能自动装的依赖一次装完（后台跑，前端轮 GET 看每一步状态）。
+      // 只对回环 + 同源开放（与 /api/setup/* 同一道闸）；安装包/命令全在内核白名单里，body 不参与拼命令。
+      if (b === 'install-all') {
+        if (req.method === 'POST') {
+          const end = kernel.protocolEnd();
+          return send({
+            ok: true,
+            job: startInstallAll({
+              dataDir: kernel.dataDir,
+              probeCtx: ctx,
+              ensureEnd: kernel.managesEnd() && end.ensureInstalled
+                ? () => end.ensureInstalled!()
+                : undefined,
+            }),
+          });
+        }
+        return send({ job: installJobView() });
       }
       // 协议端使用授权（LLBot 的签名 Auth Token）：状态 + 录入。这页排在登录之前，所以跟着 /api/setup/* 免 token；
       // 它只报"授权到哪一步了"，不回 token 内容（日志同理）。NapCat 那一档没有这套机制 → supported:false。
