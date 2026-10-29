@@ -60,9 +60,10 @@ export default function SetupGate({ onPass, onToggleTheme }: {
       const d = (await get(`/api/setup/deps${fresh ? '?fresh=1' : ''}`)) as DepsResp;
       setData(d);
       setErr('');
-      // 已经走过这一页：不再重复拦截。以前还要求「当前环境全绿」，于是某次开机
-      // Docker Desktop 没先起来就又把人挡回去——环境问题在控制台/报错中心可见，不该堵登录。
-      if (!fresh && d.setupDoneAt > 0) pass();
+      // 必备项齐了就放行：拦截只在「真缺东西」时发生。2026-10-29 用户要求每次启动都重新拦，
+      // 所以不再看 setupDoneAt（走过一次就再也不挡）；开机时 Docker 还没起来也不会卡死 ——
+      // 这页在等的时候每 3 秒重探一次，一旦转成全绿就自己进去
+      if (d.ready) pass();
       return d;
     } catch (e) {
       setErr(`读不到环境状态：${(e as Error).message}`);
@@ -71,6 +72,13 @@ export default function SetupGate({ onPass, onToggleTheme }: {
       setRechecking(false);
     }
   }, [pass]);
+
+  // 被拦住期间持续重探：用户去装东西 / 等 Docker Desktop 起来，齐了就不用人再点一下
+  useEffect(() => {
+    if (waitingId) return;   // 代下载/启动那条路由 runOnKernel 自己轮，别开两条
+    const t = setInterval(() => { void load(true); }, POLL_MS);
+    return () => clearInterval(t);
+  }, [load, waitingId]);
 
   useEffect(() => { void load(false); return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, [load]);
 
@@ -116,7 +124,8 @@ export default function SetupGate({ onPass, onToggleTheme }: {
   };
 
   const next = async () => {
-    try { await post('/api/setup/done', {}); } catch { /* 记不上时间戳也要让人进去，下次再看一眼这页而已 */ }
+    // setupDoneAt 只作记录（不再用来跳过这一页）：点过继续就记一笔时间
+    try { await post('/api/setup/done', {}); } catch { /* 记不上时间戳也要让人进去 */ }
     pass();
   };
 
