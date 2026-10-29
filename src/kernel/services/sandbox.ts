@@ -258,7 +258,8 @@ export class SandboxService {
       if (s.isSymbolicLink()) continue;
       const rel = join(relPath, name).replace(/\\/g, '/');
       out.push({ name, relPath: rel, type: s.isDirectory() ? 'dir' : 'file', size: s.size, mtime: s.mtimeMs });
-      if (s.isFile()) this.touchFile(chat, rel, s.size);
+      // 列目录不算访问：以前这里刷 last_access，结果打开沙箱页/看一眼目录就把整批文件的
+      // 保留期重置了，TTL 永远到不了（2026-10-29 用户问「自动删除了吗」时查出来的）
     }
     return out.sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
   }
@@ -294,20 +295,21 @@ export class SandboxService {
         }
         if (!s.isFile()) continue;
         files.push({ name, relPath: relP, type: 'file', size: s.size, mtime: s.mtimeMs });
-        this.touchFile(chat, relP, s.size);
+        // 同上：glob/grep 扫一遍不算访问，否则模型每轮扫一次沙箱就能让文件永不回收
       }
     };
     walk(startAbs, startRel, 0);
     return { files, truncated };
   }
 
-  read(chat: ChatRef, relPath: string): string {
+  /** 读文本。`touch:false` 给内核自己的簿记用（执行前后快照），不算用户访问、不续保留期 */
+  read(chat: ChatRef, relPath: string, opts: { touch?: boolean } = {}): string {
     const abs = this.resolveInside(chat, relPath);
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new SandboxError(`文件不存在: ${relPath}`);
     const st = statSync(abs);
     const cap = this.config.config.sandbox.maxFileBytes;
     if (st.size > cap) throw new SandboxError(`文件过大（${st.size} > ${cap} 字节），拒绝读取`);
-    this.touchFile(chat, relPath, st.size);
+    if (opts.touch !== false) this.touchFile(chat, relPath, st.size);
     return readFileSync(abs, 'utf-8');
   }
 
@@ -537,7 +539,8 @@ export class SandboxService {
       if (f.type !== 'file' || f.size > 256 * 1024) continue;
       if (bytes + f.size > 8 * 1024 * 1024) break;
       try {
-        const text = this.read(chat, f.relPath);
+        // 快照是内核自己的簿记，不算用户访问：否则 work 每跑一轮就把整个沙箱的保留期重置
+        const text = this.read(chat, f.relPath, { touch: false });
         if (text.includes('\0')) continue;   // 二进制（图片/压缩包）不算行数
         out.set(f.relPath, text);
         bytes += f.size;

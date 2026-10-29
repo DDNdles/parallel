@@ -23,15 +23,19 @@ function mk() {
   const config = new ConfigStore(dir, bus, errors);
   return new SandboxService(dir, db, config, errors);
 }
-const chat = { platform: 'qq', type: 'group' as const, chatId: '77' };
-
-test('TTL：保留期全站一档（retentionHours），按最后访问时间删，未登记文件按 mtime', async () => {
+/** 带句柄的版本：TTL 相关用例要直接翻 last_access */
+function mkEnv() {
   const dir = mkdtempSync(tmpdir() + '/psb-');
   const db = new Db(dir);
   const bus = new Bus();
   const errors = new ErrorCenter(bus, { dataDir: dir });
   const config = new ConfigStore(dir, bus, errors);
-  const sb = new SandboxService(dir, db, config, errors);
+  return { sb: new SandboxService(dir, db, config, errors), db, config };
+}
+const chat = { platform: 'qq', type: 'group' as const, chatId: '77' };
+
+test('TTL：保留期全站一档（retentionHours），按最后访问时间删，未登记文件按 mtime', async () => {
+  const { sb, db, config } = mkEnv();
   config.config.sandbox.retentionHours = 72;   // 3 天
 
   const now = Date.now();
@@ -52,6 +56,29 @@ test('TTL：保留期全站一档（retentionHours），按最后访问时间删
 
   assert.deepEqual(sb.list(chat).filter((e) => e.type === 'file').map((e) => e.name).sort(), ['fresh.md', 'raw-new.txt']);
   assert.equal(db.all<{ n: number }>('SELECT count(*) AS n FROM sandbox_files WHERE rel_path=?', 'stale.md')[0].n, 0);
+});
+
+test('TTL：列目录/grep 扫一遍不算访问，只有真读写才续保留期', async () => {
+  const { sb, db, config } = mkEnv();
+  config.config.sandbox.retentionHours = 72;
+  const old = Date.now() - 100 * 3_600_000;
+  const lastOf = (rel: string) => db.all<{ last_access: number }>('SELECT last_access FROM sandbox_files WHERE rel_path=?', rel)[0]?.last_access;
+
+  sb.write(chat, 'listed.md', '只被列出来过');
+  sb.write(chat, 'touched.md', '被真读过一次');
+  db.run('UPDATE sandbox_files SET last_access=? WHERE rel_path IN (?,?)', old, 'listed.md', 'touched.md');
+
+  // 桌面端打开沙箱页 = list；模型 glob/grep = walkFiles（work 执行前后的文本快照也走这条）
+  sb.list(chat);
+  sb.walkFiles(chat);
+  assert.equal(lastOf('listed.md'), old, 'list/walkFiles 刷新了 last_access，TTL 就永远到不了');
+  assert.equal(lastOf('touched.md'), old);
+
+  sb.read(chat, 'touched.md');
+  assert.ok((lastOf('touched.md') ?? 0) > old, '真读一次应该续期');
+
+  await sb.sweep();
+  assert.deepEqual(sb.list(chat).filter((e) => e.type === 'file').map((e) => e.name).sort(), ['touched.md']);
 });
 
 test('列目录：文件与子目录分开，可逐层进入', () => {
