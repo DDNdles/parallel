@@ -155,7 +155,6 @@ export default function InitWizard({ deps, onRefresh, onFinish, onSkip, onToggle
 
         <div className="init-head">
           <h1 className="init-title">初始化</h1>
-          <p className="init-sub">首次运行，把运行环境一次装好。装完这一页不会再出现。</p>
         </div>
 
         <div className="init-bar" aria-hidden><span style={{ width: `${pct}%` }} /></div>

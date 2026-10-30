@@ -209,8 +209,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .init-panel button.icon-chip { width: auto; min-width: 44px; background: var(--surface-input); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; display: inline-flex; color: var(--dim); }
 .init-panel button.icon-chip:hover { border-color: var(--brand); color: var(--text); background: var(--surface-input); }
 .init-head { padding: 0 2px 12px; flex: none; }
-.init-title { font-size: 22px; font-weight: 600; margin: 0 0 6px; font-family: var(--serif-display); letter-spacing: .02em; }
-.init-sub { margin: 0; font-size: 12.5px; color: var(--faint); }
+.init-title { font-size: 22px; font-weight: 600; margin: 0; font-family: var(--serif-display); letter-spacing: .02em; }
 /* 进度条：已完成步数 / 总步数；宽度用 transition 慢慢走，不做数字跳动 */
 /* 进度条：纯扁平——没有凹槽、内阴影、高光；填充用正文色，暗色主题是白条、亮色主题是黑条。
    槽用正文色的 12% 透明档，两个主题自动反相，不用再单独覆盖。 */
