@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 (2026-10-31)
+
+分发形态全面铺开的版本：npm 直装、零依赖绿色版、一键安装、winget。
+
+- **npm registry**：包转公开（`private: false`），`npm i -g @ddnoodles/parallel` 直装；Release CI 在配好 `NPM_TOKEN` 后自动 publish。
+- **零依赖绿色版**：发布 zip 内置 win-x64 Node 运行时（`runtime/node.exe`，nodejs.org 官方源 + SHA256 校验后入包）与完整 node_modules——不再要求目标机装过 Node；`parallel.cmd` 优先用包内运行时。修复两处 zip 老坑：CI（ubuntu GNU tar）把 `.zip` 打成裸 tar；本地（Git 的 GNU tar 命中后掉进 Compress-Archive 兜底）丢顶层目录。现在压缩后硬校验 PK 魔数与首条目前缀。
+- **一键安装**：`scripts/install.ps1`——解析最新 Release、下载解压到 `%LOCALAPPDATA%\Programs\parallel`、加用户 PATH、建开始菜单快捷键；`irm ... | iex` 即用。
+- **winget**：`scripts/winget-manifest.mjs` 按版本生成 manifest 三件套（提交官方源走 fork + PR）。
+- **其他**：会话页删掉「打断当前回复」按钮；README 截图区精简为拟人化 / 工作真机演示 + 桌面活动流，致谢区 MaiBot / AstrBot 补上链接；仓库 topics 上齐。
+
+## 0.2.1 (2026-10-31)
+
+- **发布包剔除私人插件 cover**（npm files 负 pattern + zip FORBIDDEN 双管），仓库与开发目录保留；插件缺席时 supervisor 不启动、UI 走现成「插件未启用」兜底。
+- 修复 CI zip 实为裸 tar（魔数 `para` 非 `PK`）——v0.2.0 的 zip 即此问题，撤回重发。
+
 ## 0.2.0 (2026-10-29)
 
 两轮全量审查（131 + 105 条发现）落地后的首个打包版本。
