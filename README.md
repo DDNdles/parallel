@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logos/parallel-logo-final.svg" width="72" alt="parallel logo" />
+<img src="logos/parallel-logo-final.svg" width="128" alt="parallel logo" />
 
 # parallel —— harness 形态的 QQ 机器人
 
@@ -67,20 +67,10 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 
 ## 🖼️ 截图
 
-<table>
-  <tr>
-    <td align="center" width="50%"><img src="docs/screenshots/sessions.png" alt="会话页" /><br/><b>会话</b> — 群聊/私聊分组、事件流、以 bot 身份发言</td>
-    <td align="center" width="50%"><img src="docs/screenshots/work-activity.png" alt="工作活动流" /><br/><b>工作</b> — work 任务活动流：思考/工具/终端逐行动作，按发起人分栏</td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/screenshots/models.png" alt="模型页" /><br/><b>模型</b> — 供应商登记 + 聊天/工作两条独立优先链</td>
-    <td align="center"><img src="docs/screenshots/sandbox.png" alt="沙箱页" /><br/><b>沙箱</b> — 按会话的目录树、配额与保留期</td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/screenshots/login.png" alt="登录卡" /><br/><b>登录</b> — QQ 登录态与协议端在线状态一屏看清</td>
-    <td align="center"><img src="docs/screenshots/chat-threads.png" alt="会话分组" /><br/><b>会话列表</b> — 置顶/分组/隐藏，按 bot 登录号记忆偏好</td>
-  </tr>
-</table>
+<div align="center">
+  <img src="docs/screenshots/work-activity.png" alt="工作活动流" /><br/>
+  <b>工作</b> — work 任务活动流：思考/工具/终端逐行动作，按发起人分栏
+</div>
 
 ## 🔌 已支持的协议端与模型供应商
 
