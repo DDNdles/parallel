@@ -32,15 +32,15 @@
   "files": [
     "bin",
     "dist",
-    "!dist/src/plugins/cover",
-    "!docker/cover",
-    "!scripts/cover",
     "ui",
     "docker",
     "scripts",
     "parallel.cmd",
     "parallel.sh",
-    "THIRD-PARTY-NOTICES.md"
+    "THIRD-PARTY-NOTICES.md",
+    "!dist/src/plugins/cover",
+    "!docker/cover",
+    "!scripts/cover"
   ],
   "repository": {
     "type": "git",
