@@ -215,11 +215,14 @@ if (hits.length) {
 // ---------- 压缩 ----------
 const zip = join(release, `${name}.zip`);
 if (process.platform === 'win32') {
-  // Windows 自带 bsdtar：-a 按扩展名出真 zip
+  // execSync 裸写 tar 会先命中 Git 自带的 GNU tar（不认 -a 的 .zip 后缀，会掉进
+  // Compress-Archive 兜底并丢掉顶层目录），所以显式用 System32 的 bsdtar。
+  const sysTar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
   try {
-    execSync(`tar -a -c -f "${zip}" -C "${join(release, 'stage')}" "${name}"`, { stdio: 'pipe' });
+    execSync(`"${sysTar}" -a -c -f "${zip}" -C "${join(release, 'stage')}" "${name}"`, { stdio: 'pipe' });
   } catch {
-    execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(release, 'stage', name)}\\*' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
+    // 兜底必须打目录本身（dir\* 会丢掉顶层文件夹，解压撒一地）
+    execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(release, 'stage', name)}' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
   }
 } else {
   // linux 的 GNU tar 不认 .zip 后缀（-a 会静默打成裸 tar，v0.2.0/0.2.1 首打就栽在这）：
@@ -232,10 +235,20 @@ if (process.platform === 'win32') {
 }
 rmSync(join(release, 'stage'), { recursive: true, force: true });
 
-// 打出来必须是真 zip（PK 魔数）：GNU tar 事故的后手，别再把 .zip 的 tar 发出门
-if (readFileSync(zip).subarray(0, 2).toString('binary') !== 'PK') {
-  console.error('[pack] 产物不是有效 zip（魔数不对），已中止。');
-  process.exit(1);
+// 打出来必须是真 zip（PK 魔数）且带顶层目录前缀：GNU tar / Compress-Archive 两次事故的后手
+{
+  const buf = readFileSync(zip);
+  if (buf.subarray(0, 2).toString('binary') !== 'PK') {
+    console.error('[pack] 产物不是有效 zip（魔数不对），已中止。');
+    process.exit(1);
+  }
+  // 首个本地文件头：偏移 26/28 是文件名/扩展字段长度（LE16），随后是名字
+  const nameLen = buf.readUInt16LE(26);
+  const first = buf.subarray(30, 30 + nameLen).toString('utf8');
+  if (!first.startsWith(`${name}/`)) {
+    console.error(`[pack] zip 首条目是 "${first}"，缺顶层目录 ${name}/（解压会撒一地），已中止。`);
+    process.exit(1);
+  }
 }
 
 const size = statSync(zip).size;
