@@ -67,9 +67,16 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 
 ## 🖼️ 截图
 
+<table>
+  <tr>
+    <td align="center" width="62%"><img src="docs/screenshots/humanlike-chat.jpg" alt="拟人化私聊" width="500" /><br/><b>拟人化</b> — 私聊里像个真人：分段气泡、接梗抬杠，认错鱼了会被纠正</td>
+    <td align="center" width="38%"><img src="docs/screenshots/work-dispatch.jpg" alt="群里派活" width="225" /><br/><b>工作</b> — 群里 @ 一句就派活：应下、写完，HTML 文件直接发回群里</td>
+  </tr>
+</table>
+
 <div align="center">
   <img src="docs/screenshots/work-activity.png" alt="工作活动流" /><br/>
-  <b>工作</b> — work 任务活动流：思考/工具/终端逐行动作，按发起人分栏
+  <b>工作活动流</b> — 桌面端看思考/工具/终端逐行动作，按发起人分栏
 </div>
 
 ## 🔌 已支持的协议端与模型供应商
