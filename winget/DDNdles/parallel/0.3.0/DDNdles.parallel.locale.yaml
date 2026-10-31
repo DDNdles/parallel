@@ -1,0 +1,26 @@
+PackageIdentifier: DDNdles.parallel
+PackageVersion: 0.3.0
+PackageLocale: en-US
+Publisher: DDNdles
+PublisherUrl: https://github.com/DDNdles
+PackageName: parallel
+PackageUrl: https://github.com/DDNdles/parallel
+License: AGPL-3.0-only
+LicenseUrl: https://github.com/DDNdles/parallel/blob/main/LICENSE
+ShortDescription: Harness-style QQ bot with a pi agent runtime, plugin kernel and a humanlike chat layer
+Description: >-
+  parallel is a self-hosted QQ bot harness: an agent-loop kernel (pi) with
+  everything-as-plugins, a frequency-based humanlike chat layer, work sub-agents
+  in Docker sandboxes, and a local desktop console for full control.
+  The Windows release embeds its own Node runtime; it hosts the LuckyLilliaBot
+  OneBot 11 protocol end against a local QQNT client.
+Moniker: parallel
+Tags:
+  - qq-bot
+  - onebot
+  - chatbot
+  - agent
+  - llm
+ReleaseNotesUrl: https://github.com/DDNdles/parallel/releases/tag/v0.3.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,13 @@
+PackageIdentifier: DDNdles.parallel
+PackageVersion: 0.3.0
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/DDNdles/parallel/releases/download/v0.3.0/parallel-v0.3.0.zip
+    InstallerSha256: 779695dd2d30c2f8e8de80b9ee5b441748e6145dacf52a8a1602ab956ea0b3e2
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: parallel.cmd
+        PortableCommandAlias: parallel
+ManifestType: installer
+ManifestVersion: 1.6.0
