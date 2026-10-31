@@ -15,7 +15,7 @@ QQ 接入只是它的一种通道：协议适配本身也是插件形态，将�
 
 </div>
 
-> **一切皆插件**：角色化聊天、沙箱、搜索、翻唱……全部是热插拔插件；内核只保留 agent loop、Pipeline、服务容器与插件运行时（dsh 式组织，zcode 式四贡献面清单）。
+> **一切皆插件**：角色化聊天、沙箱、搜索、表情包……全部是热插拔插件；内核只保留 agent loop、Pipeline、服务容器与插件运行时
 
 ---
 
@@ -42,31 +42,27 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 启动后打开桌面端 <http://127.0.0.1:3080>——令牌不用手填，内核启动时自动打开浏览器并带上 `#token=<uiToken>`。
 
 - **第一次跑会先停在「环境检查」页**：探测 Node / 数据目录可写 / QQNT / 协议端发行包 / Docker / Python / Bash / ffmpeg。第三方软件只给官方下载页链接——parallel 不替人装软件；协议端发行包是唯一点一下就能由内核自己下的（官方源优先，下载后校验官方 SHA256）。Docker/Python/Bash 缺失只影响 work 模式，只聊天可以点「跳过」直接进
-- **不插真 QQ 号也能验证**：桌面端「会话」页可以以 bot 身份发言，走完整 Pipeline / AgentLoop / 插件链路；测试套件用模拟协议端（`npm test`）
 
 ### 接入真机
 
-1. 选协议端：改 `data/config.json` 的 `onebot.flavor`（`llbot` / `napcat`），重启内核。**内嵌托管只支持 Windows**（自动下载发行包、预写反向 WS 配置、拉起并守护）；macOS/Linux 上内核本身可跑，但请自行运行 OneBot 11 协议端并指向内核
-2. 在弹出的 QQ 窗口扫码登录**专用小号**。LLBot 有头模式要先填「账号」（bot 的 QQ 号），否则拒绝启动，免得顶掉你本机登录的号
-3. 用你自己起的协议端也行：在其 WebUI 添加反向 WS 客户端 `ws://127.0.0.1:3001/onebot` + accessToken（`data/secrets.json` 里的 `onebotAccessToken`）
-4. 在桌面端「用户」页的权限名单里配置主人 QQ（`masterIds`）；`chat` 是 core 插件、默认生效，其余插件默认按群开启，可在「插件」页的开关矩阵里逐群调整
+1. 选协议端：默认使用llbot，无需其他操作。**内嵌托管只支持 Windows**（自动下载发行包、预写反向 WS 配置、拉起并守护）；macOS/Linux 上内核本身可跑，但请自行运行 OneBot 11 协议端并指向内核
+2. 在弹出的 QQ 窗口扫码登录账号
+4. 在桌面端「用户」页的权限名单里配置主人 QQ（`masterIds`）
 
 ## ✨ 特性
 
-- **🔌 一切皆插件** — 热插拔（不重启进程）、三类来源、四贡献面（tools / userConfig / mcpServers / hooks）、声明式权限门控、崩溃隔离（同错 3 次自动停用并私聊报告主人）、MCP stdio 客户端
-- **🧠 agent loop 交给 pi** — 轮次推进、工具调度、事件流、上下文压缩全部来自 [`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi)；chat 轮最多两轮（第二轮摘掉工具，防工具面自嗨），work 轮不设上限
-- **🤖 模型层交给 pi-ai** — Chat Completions / OpenAI Responses / Anthropic Messages 三种连接方式与 Gemini 原生协议全部由 `@earendil-works/pi-ai` 实现；每个模型单独配思考强度
-- **⛓️ 双优先链自动降级** — 聊天 / 工作各一条独立的「供应商+模型」有序链，连续失败到达阈值自动切下一个；只有全链失败才进报错中心
-- **🎭 人格系统** — `canon.json` 一份装 Canon（主角记号/世界/配角/语言）/ Perspective（价值观）/ Voice（语气样例）/ Lore（关键词命中的世界事实）；运行时演化出的稳定变化落 Overlay 层，不动 Canon。内置唯一人格 **CETACEA_MOLI**（鲸鱼娘）
-- **🗣️ 拟人化层（内核自有，不是插件）** — 开口侧：条数门槛 + 空窗补偿 + 连续不理人指数退避 + 昼夜节奏；出站侧：纯程序按句分条（硬上限 100 字 / 6 条）、气泡期可被插话打断（剩余气泡不发也不进历史）、跟屏复读、重复惩罚与口癖词
-- **🛠️ work 子代理** — chat 面 `work_dispatch` 派活（纯转发，模型不能改写任务）；work 模型在隔离上下文里跑（常驻 Python / 浏览器 / shell / 文件 / 联网），`work_finish` 交回结构化结论，产物由系统直接逐条发文件；还能用 `delegate` 再派专职子代理（并行上限 4、嵌套深度可配）
+- **🔌 一切皆插件** — 热插拔、三类来源、四贡献面（tools / userConfig / mcpServers / hooks）、声明式权限门控、崩溃隔离、MCP stdio 客户端
+- **🧠 agent loop 交给 pi** — 轮次推进、工具调度、事件流、上下文压缩全部来自 [`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi)
+- **🤖 模型层交给 pi-ai** — Chat Completions / OpenAI Responses / Anthropic Messages / Gemini 四种协议全部由 `@earendil-works/pi-ai` 实现；每个模型可单独配思考强度
+- **⛓️ 双优先链自动降级** — 聊天 / 工作各一条独立的「供应商+模型」有序链，连续失败到达阈值自动切下一个
+- **🎭 人格系统** — `canon.json` 一份装 Canon（主角记号/世界/配角/语言）/ Perspective（价值观）/ Voice（语气样例）/ Lore（关键词命中的世界事实）；运行时演化出的稳定变化落 Overlay 层，不动 Canon。内置唯一人格 **鲸鱼娘**
+- **🗣️ 拟人化层** — 开口侧：条数门槛 + 空窗补偿 + 连续不理人指数退避 + 昼夜节奏；出站侧：纯程序按句分条（硬上限 100 字 / 6 条）、气泡期可被插话打断（剩余气泡不发也不进历史）、跟屏复读、重复惩罚与口癖词
+- **🛠️ work 子代理** — chat 面 `work_dispatch` 派活；work 模型在隔离上下文里跑（常驻 Python / 浏览器 / shell / 文件 / 联网），`work_finish` 交回结构化结论，产物由系统直接逐条发文件；还能用 `delegate` 再派专职子代理
 - **📦 Docker 沙箱** — 每会话独立目录（字面 + realpath 双重越界校验、chatKey 消毒）、Python/JS/bash 执行（超时/输出截断/并发帽/频率配额）、TTL 扫盘清理；chat 档断网，work 档联网可开关
 - **💾 记忆** — SQLite + FTS5：按 QQ 号存昵称/事实/拉黑；`search_history` 检索窗口外聊天记录；表达学习只学本群说法
 - **🖥️ 桌面端管控 UI** — Next.js 15 静态导出、内核自托管：黑白双主题、会话流 + 工作抽屉 + 日轨回看、打断按钮、全站品牌光标；14 个页面覆盖全部操控面，与 QQ 侧共享同一份状态（REST + WebSocket）
 - **😀 QQ 表情全链路** — 入站表情图转 WebP 喂模型、出站 `[表情/微笑]` 发真 face 段、贴表情回应（react）、戳一戳（poke）；版权表情图不随仓库分发，运行时从本机协议端发行包转码生成
-- **🔎 内置插件 9 个** — bilibili / chat / cover / imagegen / sandbox / skills / sticker / web-search / work（其中 5 个为底座、不在插件页显示）
-- **🎤 翻唱** — 网易云点歌 → 人声分离 → RVC 换声 → 混伴奏，桌面翻唱页异步 job 进度
-- **🧪 免真号验证** — 模拟协议端 E2E + 桌面端以 bot 身份发言双通道，无需真实 QQ 号跑通全链路
+- **🔎 内置插件 9 个** — bilibili / chat / imagegen / sandbox / skills / sticker / web-search / work（其中 5 个为底座、不在插件页显示）
 - **🔒 本地优先** — 无遥测、无云同步，全部数据在你手边的 `data/` 目录（见[隐私](#隐私)）
 
 ## 🖼️ 截图
@@ -93,7 +89,6 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 | 协议端 | 接入方式 | 内核托管 | 说明 |
 |--------|----------|----------|------|
 | **LuckyLilliaBot** | 有头 PMHQ 注入本机 QQNT | ✅ Windows 自动下载 + 守护 | 官方文档明示无头模式有掉线风险，有头是稳的那条路；账号守卫防顶号 |
-| **NapCat** | 注入本机 QQNT 客户端 | ✅ Windows 自动下载 + 守护 | 生态最广的 OneBot11 实现之一 |
 | 任意 OneBot 11 端 | 反向 WS 指向 `ws://127.0.0.1:3001/onebot` | — | macOS / Linux 或自带协议端的场景，accessToken 强制鉴权 |
 
 ### 模型连接方式（全部由 pi-ai 实现，内核只做配置与降级）
@@ -111,13 +106,12 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 
 | 插件 | 能力 | 形态 |
 |------|------|------|
-| chat | 角色化聊天、人格、表达学习、贴表情/戳一戳、说唱彩蛋 | core（永远生效） |
+| chat | 角色化聊天、人格、表达学习、贴表情/戳一戳 | core |
 | work | work 派活/进度/交付的 chat 面工具 | core |
 | sandbox | 沙箱文件工具面（读/写/编辑/检索/执行） | core |
 | skills | 目录式技能库（只给 work 入口） | core |
 | web-search | Tavily 搜索 + `web_fetch`（拦内网/环回/元数据地址） | core |
 | bilibili | B 站视频搜索与链接解析 | 可开关、分群 |
-| cover | 网易云点歌 → 分离 → RVC 换声 → 混伴奏 | 可开关、分群 |
 | imagegen | 文生图 / 参考图生图，产物落会话沙箱 | 可开关、分群 |
 | sticker | 表情包收录与检索（收录时模型看图打 desc/tags） | 可开关、分群 |
 
@@ -127,7 +121,7 @@ npm start          # = node bin/parallel.js（内核直接运行 TS 源码，要
 
 | 维度 | 命令式 bot 框架 | 拟人化群 bot | **parallel** |
 |------|----------------|--------------|--------------|
-| 核心形态 | 指令/事件注册分发 | LLM 聊天为主 | **agent loop 内核 + 一切皆插件**（harness） |
+| 核心形态 | 指令/事件注册分发 | LLM 聊天为主 | **agent loop 内核 + 一切皆插件** |
 | 桌面端管控 | 无或仅日志页 | 简单配置页 | **14 页全操控面**：会话流、工作抽屉、日轨回看、报错中心 |
 | 复杂任务 | 自己写插件 | 少数带工具 | **work 子代理**：Docker 沙箱、可再派子代理、结构化交付、产物直接发文件 |
 | 拟人化 | 无 | 有（多为打分/剧本） | frequency 门槛 + 空窗补偿 + 退避；**出站纯程序分条、可被打断** |
@@ -149,7 +143,7 @@ flowchart TB
     UI["桌面端 UI 127.0.0.1:3080"] -- "REST + WebSocket（同一份状态）" --> PIPE
 ```
 
-1. **入站**：协议端把 QQ 消息经反向 WS 推给内核，Pipeline 先过拉黑闸（拉黑用户完全不收：不落账、不记用量、不打断）与限速
+1. **入站**：协议端把 QQ 消息经反向 WS 推给内核，Pipeline 先过拉黑闸与限速
 2. **开口判定**：拟人层按 frequency 决定这一批要不要理——攒够 `pendingThreshold` 条、或空窗补偿、或被 @ 必回；连续不理人则指数退避
 3. **组装上下文**：人格 canon + Overlay 演化层 + 插件分节 + 工具自带规则进 system；历史按「10 分钟时间窗 + 条数上限」双约束投影，超窗交给 pi 的压缩
 4. **跑 agent loop**：pi-agent-core 推进轮次、调度工具；chat 轮最多两轮，重工具（`surface:'work'`）在 chat 工具列表里根本不存在；work 任务另起隔离上下文，可 `delegate` 子代理
@@ -227,14 +221,13 @@ data/                  运行时数据（不入库）
 - **「浏览器令牌与内核不匹配」**：重启一次内核，让它重新带 `#token=` 打开浏览器；令牌在 `data/secrets.json` 的 `uiToken`
 - **环境检查页一直拦**：缺必备项就挡在登录门前，这是预期行为；Docker / Python / Bash 只影响 work 模式，只聊天点「跳过」。被拦期间每 3 秒重新探测，装齐自动放行
 - **端口被占**：桌面端 3080、反向 WS 3001，改 `data/config.json` 后重启
-- **语音（silk）发不出**：需要本机安装 ffmpeg 并在 PATH 里
 
 </details>
 
 <details>
 <summary><b>协议端 / QQ 登录</b></summary>
 
-- **有头模式拒绝启动/拒绝代发**：LLBot 有头模式要求填「账号」（bot 的 QQ 号）做账号守卫——协议端寄生在本机 QQNT 上，登错号会顶掉你本机登录的号
+- **有头模式拒绝启动/拒绝代发**：LLBot 有头模式要求填「账号」做账号守卫——协议端寄生在本机 QQNT 上，登错号会顶掉你本机登录的号
 - **登录被踢（state=168）**：腾讯风控踢会话，parallel 用设备身份钉住 + 看门狗自动重连；频繁掉线请用小号、避免多端互顶
 - **macOS / Linux 连不上协议端**：内嵌托管是 Windows-only（发行包 win-x64、NapCat 要注入本机 QQNT）；其他系统请自行运行任意 OneBot 11 协议端，反向 WS 指向 `ws://127.0.0.1:3001/onebot` 并填 accessToken
 - **QQ 表情图不显示**：表情美术图不随仓库分发（版权），首次运行由内核从本机协议端发行包转码生成到 `data/face/`，缺协议端发行包时该能力缺席
@@ -244,10 +237,9 @@ data/                  运行时数据（不入库）
 <details>
 <summary><b>模型 / work</b></summary>
 
-- **群里一个字都不发**：没接模型 / 额度耗尽 / 空输出时内核彻底静默（刻意设计，不托词）；错误细节进桌面端「报错中心」
+- **群里一个字都不发**：没接模型 / 额度耗尽 / 空输出时内核彻底静默；错误细节进桌面端「报错中心」
 - **模型频繁降级**：看 `llm.failoverThreshold`（默认连续掉线 2 次就切链上下一个）；全链失败才记 error
 - **work 里 pip 装的库下次没了**：一次性容器只有 `/ws` 持久——要装库就在同一条命令里装完即用，或装进 `/ws/.venv`，或用常驻 compute 会话
-- **qwen 系模型说看不到图**：模型页该模型要勾「视觉」，否则内核会把图片替换成 `(image omitted)` 以省 token
 
 </details>
 

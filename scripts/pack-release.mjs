@@ -69,6 +69,9 @@ const FORBIDDEN = [
   // dist 里只允许编译产物：历史残留的 stage/tgz 绝不能进包
   /^dist[\\/]stage([\\/]|$)/,
   /\.tgz$/,
+  // 翻唱（cover）是私人插件：跑自部署服务与个人音色，不随发布包出门（仓库/开发目录保留，npm 包 files 里同步剔除）
+  /^src[\\/]plugins[\\/]cover([\\/]|$)/,
+  /^dist[\\/]src[\\/]plugins[\\/]cover([\\/]|$)/,
 ];
 
 if (!existsSync(join(root, 'ui', 'index.html'))) {
