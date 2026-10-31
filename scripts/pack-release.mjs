@@ -177,12 +177,29 @@ if (hits.length) {
 
 // ---------- 压缩 ----------
 const zip = join(release, `${name}.zip`);
-try {
-  execSync(`tar -a -c -f "${zip}" -C "${join(release, 'stage')}" "${name}"`, { stdio: 'pipe' });
-} catch {
-  execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(release, 'stage', name)}\\*' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
+if (process.platform === 'win32') {
+  // Windows 自带 bsdtar：-a 按扩展名出真 zip
+  try {
+    execSync(`tar -a -c -f "${zip}" -C "${join(release, 'stage')}" "${name}"`, { stdio: 'pipe' });
+  } catch {
+    execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${join(release, 'stage', name)}\\*' -DestinationPath '${zip}' -Force"`, { stdio: 'pipe' });
+  }
+} else {
+  // linux 的 GNU tar 不认 .zip 后缀（-a 会静默打成裸 tar，v0.2.0/0.2.1 首打就栽在这）：
+  // 优先 zip CLI，没有就用 python3 的 zipfile 模块
+  try {
+    execSync(`zip -r -q "${zip}" "${name}"`, { cwd: join(release, 'stage'), stdio: 'pipe' });
+  } catch {
+    execSync(`python3 -m zipfile -c "${zip}" "${name}"`, { cwd: join(release, 'stage'), stdio: 'pipe' });
+  }
 }
 rmSync(join(release, 'stage'), { recursive: true, force: true });
+
+// 打出来必须是真 zip（PK 魔数）：GNU tar 事故的后手，别再把 .zip 的 tar 发出门
+if (readFileSync(zip).subarray(0, 2).toString('binary') !== 'PK') {
+  console.error('[pack] 产物不是有效 zip（魔数不对），已中止。');
+  process.exit(1);
+}
 
 const size = statSync(zip).size;
 console.log(`[pack] 完成: ${relative(root, zip)}`);
