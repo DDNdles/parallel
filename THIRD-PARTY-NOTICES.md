@@ -21,6 +21,8 @@ AGPL 对你的实际影响：自己用、改了自己用不需要做任何事；
 | `@earendil-works/pi-ai` | MIT | 模型层唯一引擎（三种连接方式） |
 | `@earendil-works/pi-agent-core` | MIT | agent loop（轮次/工具调度/事件流/压缩） |
 | `ws` | MIT | WebSocket（桌面端事件流与 OneBot 反向 WS） |
+| `playwright-core` | Apache-2.0 | 107 平台登录自动化的浏览器驱动（系统 Edge） |
+| Node.js 运行时（绿色版 `runtime/node.exe`） | MIT | 零依赖 zip 内置的 win-x64 官方运行时，来自 [nodejs.org](https://nodejs.org/dist/)，入包前校验官方 SHA256 |
 
 上述 npm 包若未在包内附带 LICENSE 原文，以各包 `package.json` 的 `license` 字段与上游仓库为准。
 

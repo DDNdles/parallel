@@ -12,12 +12,16 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # NPM_TOKEN 在仓库 Secrets 里配好才发 npm；没配就只出 GitHub 资产，publish 步骤自动跳过
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
+          registry-url: 'https://registry.npmjs.org'
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       # 构建桌面端到 ui/（npm pack 与 zip 都要它）
@@ -26,8 +30,8 @@ jobs:
       - run: npm run build:pkg
       # 发行物统一进 release/（dist/ 只放编译产物）
       - run: mkdir -p release && npm pack --pack-destination release
-      # zip：双击 parallel.cmd 的路线（slim，不带 node_modules）
-      - run: node scripts/pack-release.mjs --slim
+      # zip：零依赖绿色版（node_modules + 内置 Node 运行时，解压双击即用）
+      - run: node scripts/pack-release.mjs
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -37,3 +41,9 @@ jobs:
           FILES=$(find release -maxdepth 1 -type f | tr '\n' ' ')
           echo "assets: $FILES"
           gh release create "$TAG" --title "parallel $TAG" --generate-notes $FILES
+      # npm 直装路线：npm i -g @ddnoodles/parallel（scoped 包要显式 --access public）
+      - name: Publish to npm
+        if: env.NPM_TOKEN != ''
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

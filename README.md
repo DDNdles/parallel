@@ -21,18 +21,22 @@ QQ 接入只是它的一种通道：协议适配本身也是插件形态，将�
 
 ## ⚡ 快速开始
 
-三种安装路线，任选其一（npm 包与 zip 自带构建好的桌面端，装完即用；克隆开发才需要自己 build）：
+四种安装路线，任选其一（npm 包与 zip 自带构建好的桌面端，装完即用；克隆开发才需要自己 build）：
 
 ```bash
-# ── 方式一：npm 包（推荐）──────────────────────────────
-# 从 GitHub Releases 下载 .tgz（如 ddnoodles-parallel-0.2.0.tgz）后：
-npm install -g ddnoodles-parallel-0.2.0.tgz   # 依赖（ws / pi agent runtime）自动装
-parallel                                       # 在任意目录启动；数据落在当前目录 ./data
+# ── 方式一：npm 直装（推荐；需自备 Node ≥ 24）─────────
+npm i -g @ddnoodles/parallel
+parallel              # 在任意目录启动；数据落在当前目录 ./data
 
-# ── 方式二：zip（不熟 npm 的话）────────────────────────
+# ── 方式二：PowerShell 一键安装（零依赖）───────────────
+# 自带 Node 运行时，装到 %LOCALAPPDATA%\Programs\parallel 并加入用户 PATH + 开始菜单：
+irm https://raw.githubusercontent.com/DDNdles/parallel/main/scripts/install.ps1 | iex
+
+# ── 方式三：绿色版 zip（零依赖，不想碰命令行就走这条）──
 # 从 Releases 下载 parallel-vX.Y.Z.zip，解压后双击 parallel.cmd
+# （包内自带 node_modules 与 Node 运行时，解压即用，无任何前置）
 
-# ── 方式三：克隆开发 ───────────────────────────────────
+# ── 方式四：克隆开发 ───────────────────────────────────
 git clone https://github.com/DDNdles/parallel.git && cd parallel
 npm install        # 运行时依赖只有 ws + pi 的 agent runtime
 npm run build      # 桌面端：Next 静态导出到 ui/（克隆后要先构建一次）

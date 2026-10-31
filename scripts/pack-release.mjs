@@ -7,15 +7,21 @@
  *  - 打包前对每个入包文件做私钥自检：secrets.json 里的真实值逐个比对 + 通用 key 形态扫描，
  *    命中即列出文件行号并**中止打包**（宁可不发，不带 key 出门）。
  *
- * 用法：node scripts/pack-release.mjs [--slim]（--slim 不带 node_modules，目标机自行 npm ci）
+ * 用法：node scripts/pack-release.mjs [--slim] [--no-node]
+ *  默认 = 零依赖绿色版：node_modules + 内置 win-x64 Node 运行时（runtime/node.exe），
+ *  解压双击就能跑，不要求目标机装过 Node。
+ *  --slim   不带 node_modules / 运行时（开发自测用，目标机自行 npm ci）
+ *  --no-node 带 node_modules 但不带 Node 运行时
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { join, relative, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const slim = process.argv.includes('--slim');
+const withNode = !slim && !process.argv.includes('--no-node');
 const allowDirty = process.argv.includes('--allow-dirty');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 const name = `parallel-v${pkg.version}`;
@@ -113,6 +119,37 @@ for (const f of INCLUDE_FILES) {
   files++;
 }
 if (!slim && existsSync(join(root, 'node_modules'))) copyTop('node_modules');
+
+// ---------- 零依赖：内置 Node 运行时 ----------
+// 双击路线不该要求用户先装 Node ≥ 24。官方 win-x64 node.exe 进包（runtime/node.exe），
+// SHA256 对 nodejs.org 的 SHASUMS256.txt 核对后才入包；parallel.cmd 会优先用它。
+// 版本与开发/CI 同代（Node 24），升级这里要顺手跟着升。下载缓存在 release/cache/。
+if (withNode) {
+  const NODE_VERSION = 'v24.18.0';
+  const cacheDir = join(release, 'cache');
+  const exeCache = join(cacheDir, `node-${NODE_VERSION}-win-x64.exe`);
+  mkdirSync(cacheDir, { recursive: true });
+  if (!existsSync(exeCache)) {
+    console.log(`[pack] 下载 Node 运行时 ${NODE_VERSION}（win-x64）…`);
+    const url = `https://nodejs.org/dist/${NODE_VERSION}/win-x64/node.exe`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error(`[pack] node.exe 下载失败：HTTP ${res.status}`);
+      process.exit(1);
+    }
+    writeFileSync(exeCache, Buffer.from(await res.arrayBuffer()));
+  }
+  const sums = await (await fetch(`https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt`)).text();
+  const want = sums.split('\n').find((l) => l.endsWith('win-x64/node.exe'))?.split(/\s+/)[0];
+  const got = createHash('sha256').update(readFileSync(exeCache)).digest('hex');
+  if (!want || want !== got) {
+    console.error(`[pack] node.exe SHA256 不符（期望 ${want ?? '未找到'}，实际 ${got}），已中止`);
+    process.exit(1);
+  }
+  mkdirSync(join(stage, 'runtime'), { recursive: true });
+  cpSync(exeCache, join(stage, 'runtime', 'node.exe'));
+  files++;
+}
 
 // ---------- 发布包瘦身 + 脚本对齐 ----------
 // devDependencies（typescript 几十 MB）不必随包；随包 package.json 里的 build/typecheck
