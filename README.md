@@ -24,8 +24,9 @@ QQ 接入只是它的一种通道：协议适配本身也是插件形态，将�
 四种安装路线，任选其一（npm 包与 zip 自带构建好的桌面端，装完即用；克隆开发才需要自己 build）：
 
 ```bash
-# ── 方式一：npm 直装（推荐；需自备 Node ≥ 24）─────────
-npm i -g @ddnoodles/parallel
+# ── 方式一：npm 装 tgz（推荐；需自备 Node ≥ 24）────────
+# 到 Releases 复制 ddnoodles-parallel-vX.Y.Z.tgz 的下载地址后：
+npm i -g https://github.com/DDNdles/parallel/releases/download/v0.3.0/ddnoodles-parallel-0.3.0.tgz
 parallel              # 在任意目录启动；数据落在当前目录 ./data
 
 # ── 方式二：PowerShell 一键安装（零依赖）───────────────
