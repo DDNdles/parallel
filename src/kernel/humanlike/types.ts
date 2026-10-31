@@ -98,7 +98,7 @@ export interface HumanlikeConfig {
     fireDelayMaxMs: number;
   };
   backoff: BackoffConfig;
-  /** 真正的「没人说话也开口」——默认关（风控红线：主动发言要显式开启） */
+  /** 真正的「没人说话也开口」——默认开：静默满 idleSeconds 才起话头 */
   proactive: {
     enable: boolean;
     /** 群里静默超过这么久，且自己也很久没说话，才起话头 */
@@ -125,21 +125,21 @@ export const DEFAULT_HUMANLIKE: HumanlikeConfig = {
   },
   expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
   repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3, windowSec: 120 },
-  poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
-  reaction: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
+  poke: { enable: true, minIntervalSeconds: 5, maxPerHour: 0 },
+  reaction: { enable: true, minIntervalSeconds: 5, maxPerHour: 0 },
   timing: {
-    pendingThreshold: 12,
+    pendingThreshold: 15,
     talkValue: 1,
     privateTalkValue: 1,
-    mentionedBotReply: false,
+    mentionedBotReply: true,
     onlyReplyWhenAt: false,
     focusMode: false,
   },
   outgoing: { ...DEFAULT_OUTGOING },
-  interrupt: { enable: true, probability: 0.8 },
-  merge: { enable: true, windowMs: 2000, maxWaitMs: 6000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },
-  backoff: { baseSeconds: 15, capSeconds: 300, startCount: 2, bypassPendingCount: 6 },
-  proactive: { enable: false, idleSeconds: 3600 },
+  interrupt: { enable: true, probability: 0.1 },
+  merge: { enable: true, windowMs: 1000, maxWaitMs: 60_000, bufferTtlMs: 120_000, fireDelayMinMs: 500, fireDelayMaxMs: 2000 },
+  backoff: { baseSeconds: 15, capSeconds: 300, startCount: 1, bypassPendingCount: 6 },
+  proactive: { enable: true, idleSeconds: 36000 },
   rhythm: { ...DEFAULT_RHYTHM },
   agency: { ...DEFAULT_AGENCY },
   schedule: { ...DEFAULT_SCHEDULE },

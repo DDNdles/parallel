@@ -84,7 +84,7 @@ export const DEFAULT_CONFIG = {
     workChain: [] as ModelRef[],          // 工作链独立于聊天链（不跟随）；空 = /work 没有可用模型
     /** 每个模型单独的思考强度：键 = `${provider}|${model}`，值 = 该模型声明过的档位；空/缺省 = 默认 */
     modelReasoning: {} as Record<string, string>,
-    failoverThreshold: 2,                 // 同一条链上连续掉线 N 次才切到下一个模型
+    failoverThreshold: 1,                 // 同一条链上连续掉线 N 次才切到下一个模型
   },
   // work 子代理（/work 链路）。定义与压缩口径都放在这里，改配置即可调整，不必改代码。
   work: {
@@ -122,31 +122,31 @@ export const DEFAULT_CONFIG = {
     expression: { enable: true, minMessages: 20, idleSeconds: 120, maxPerChat: 24, injectMax: 4 },
     // 跟屏复读（humanlike/repeat.ts）：>=N 位群友在时间窗内接连说同一句就完整跟一条；纯程序不走模型
     repeat: { enable: true, minPeople: 4, delayMaxSec: 4, cooldownMin: 3, windowSec: 120 },
-    // 戳一戳（chat 工具）：模型在有明确指向/犯贱时调用；冷却与小时上限是硬护栏
-    poke: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
-    // 贴表情（chat 工具）：在别人的群消息下面贴 QQ 表情回应；冷却与小时上限是硬护栏
-    reaction: { enable: true, minIntervalSeconds: 30, maxPerHour: 6 },
+    // 戳一戳（chat 工具）：模型在有明确指向/犯贱时调用；冷却与小时上限是硬护栏（小时上限 0 = 不限次）
+    poke: { enable: true, minIntervalSeconds: 5, maxPerHour: 0 },
+    // 贴表情（chat 工具）：在别人的群消息下面贴 QQ 表情回应；冷却与小时上限是硬护栏（小时上限 0 = 不限次）
+    reaction: { enable: true, minIntervalSeconds: 5, maxPerHour: 0 },
     // ① 出站投递（纯程序）：按句分条 + 句边截断 + 打字节奏 + 单条长度上限
     outgoing: {
       splitReplyMessages: true,           // 是否把回复按换行/句子拆成多条 QQ 消息
       replyMaxCharacters: 100,            // 回复总长硬上限（提示里推荐 50）：超了在最后一个句末标点处截断
       maxReplyTokens: 400,                // chat 轮单次请求的输出 token 硬顶（<=0 = 不设）
-      bubbleSoftMaxCharacters: 24,        // 单条气泡目标字数：超了在逗号/顿号处补切
+      bubbleSoftMaxCharacters: 10,        // 单条气泡目标字数：超了在逗号/顿号处补切
       maxBubbles: 6,                      // 最大气泡数：程序分条的硬上限（超出会被合并）
-      bubbleWeights: [] as number[],      // 气泡数概率自定义权重（索引对 1..N 条；空 = 自动三角分布）
+      bubbleWeights: [45, 30, 20, 2, 2, 1] as number[], // 气泡数概率自定义权重（索引对 1..N 条；空 = 自动三角分布）
       typingEnabled: false,               // 默认不模拟打字停顿（气泡之间立即发）
       typingBaseDelaySeconds: 1,          // 第二条及后续气泡前的基础打字等待（秒）
       typingCharactersPerSecond: 8,       // 模拟打字速度（字符/秒），越小长消息等得越久
       typingMaxDelaySeconds: 12,          // 单条后续气泡的最长打字等待（秒）
       typingJitterRatio: 0.3,             // 打字延迟随机浮动比例（0 = 固定）；整体下限固定 250ms
-      maxMessageCharacters: 2000,         // 单条可见消息最大字符数（平台硬上限的安全垫）
+      maxMessageCharacters: 24,           // 单条可见消息最大字符数（平台硬上限的安全垫）
     },
     // ② 什么时候开口（frequency：攒够积压条数就进一轮）
     timing: {
-      pendingThreshold: 12,               // 攒够几条消息才进模型（开口门槛）
+      pendingThreshold: 15,               // 攒够几条消息才进模型（开口门槛）
       talkValue: 1,                       // 群聊频率开关：0 = 静默；>0 不改变条数门槛
       privateTalkValue: 1,
-      mentionedBotReply: false,           // 提到名字就更想回（默认关；仅 @ 模式下不生效）
+      mentionedBotReply: true,            // 提到名字就更想回（默认开；仅 @ 模式下不生效）
       onlyReplyWhenAt: false,             // 仅 @ 后才回复：群聊普通消息不开口（默认关）
       focusMode: false,                   // 专注模式：只认强相关，不参与群聊激活度
     },
@@ -154,14 +154,14 @@ export const DEFAULT_CONFIG = {
     //    按概率把剩下的气泡砍掉；模型还在生成时则直接 abort 这一轮。
     interrupt: {
       enable: true,
-      probability: 0.8,                   // 插话打断概率（0~1）
+      probability: 0.1,                   // 插话打断概率（0~1）
     },
     // ④ 消息防抖合并（关窗后按随机延时起跳，见 service.ts）。
     //    群聊与私聊共用这把尺子：私聊不打分（必回），但同样攒批 —— 对面连发几句是一个请求。
     merge: {
       enable: true,
-      windowMs: 2000,                     // 静默这么久就把攒着的消息一起处理
-      maxWaitMs: 6000,                    // 刷屏/连发时的兜底上限（群聊与私聊同一把尺子）
+      windowMs: 1000,                     // 静默这么久就把攒着的消息一起处理
+      maxWaitMs: 60000,                   // 刷屏/连发时的兜底上限（群聊与私聊同一把尺子）
       bufferTtlMs: 120000,                // 攒着的消息超过 2 分钟就丢掉（老话不值得再接）
       fireDelayMinMs: 500,                // 关窗后的随机起跳延时下限
       fireDelayMaxMs: 2000,               // 关窗后的随机起跳延时上限（0/0 = 关掉随机延时）
@@ -170,13 +170,13 @@ export const DEFAULT_CONFIG = {
     backoff: {
       baseSeconds: 15,
       capSeconds: 300,
-      startCount: 2,
+      startCount: 1,
       bypassPendingCount: 6,
     },
-    // ⑥ 真正的主动发言：没人说话也起话头。默认关（主动发言属于主动推送，要显式开启）
+    // ⑥ 真正的主动发言：没人说话也起话头（默认开：静默满 idleSeconds 才起，出厂 10 小时）
     proactive: {
-      enable: false,
-      idleSeconds: 3600,
+      enable: true,
+      idleSeconds: 36000,
     },
     // ⑦ 聊天节奏反定型（HDSI ChatRhythm）：回复结构定型时，以角色视角注入纠偏
     rhythm: {

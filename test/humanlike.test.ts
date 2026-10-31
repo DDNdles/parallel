@@ -330,7 +330,7 @@ test('服务：私聊关掉合批时仍逐条直通（与旧行为一致）', ()
 });
 
 test('服务：提到名字走提及档位，mentionedBotReply 关时仍进缓冲', () => {
-  const off = makeService();
+  const off = makeService({ timing: { ...DEFAULT_HUMANLIKE.timing, mentionedBotReply: false } });
   assert.equal(off.svc.ingest(ev('麦麦 早')).action, 'handled');
   off.svc.dispose();
 
@@ -516,8 +516,8 @@ test('配置：DEFAULT_CONFIG.humanlike 与 DEFAULT_HUMANLIKE 逐字段一致（
   const a = JSON.parse(JSON.stringify(DEFAULT_CONFIG.humanlike));
   const b = JSON.parse(JSON.stringify(DEFAULT_HUMANLIKE));
   assert.deepEqual(a, b);
-  assert.equal(DEFAULT_CONFIG.humanlike.timing.pendingThreshold, 12, '默认攒够 12 条才进一轮');
-  assert.equal(DEFAULT_CONFIG.humanlike.proactive.enable, false, '主动发言默认关（风控）');
+  assert.equal(DEFAULT_CONFIG.humanlike.timing.pendingThreshold, 15, '默认攒够 15 条才进一轮');
+  assert.equal(DEFAULT_CONFIG.humanlike.proactive.enable, true, '主动发言默认开（静默 10 小时才起话头）');
   assert.equal(DEFAULT_CONFIG.humanlike.outgoing.typingCharactersPerSecond, 8);
 });
 

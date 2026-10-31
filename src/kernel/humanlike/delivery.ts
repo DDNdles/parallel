@@ -43,15 +43,15 @@ export const DEFAULT_OUTGOING: OutgoingConfig = {
   splitReplyMessages: true,
   replyMaxCharacters: 100,
   maxReplyTokens: 400,
-  bubbleSoftMaxCharacters: 24,
+  bubbleSoftMaxCharacters: 10,
   maxBubbles: 6,
-  bubbleWeights: [],
+  bubbleWeights: [45, 30, 20, 2, 2, 1],
   typingEnabled: false,
   typingBaseDelaySeconds: 1,
   typingCharactersPerSecond: 8,
   typingMaxDelaySeconds: 12,
   typingJitterRatio: 0.3,
-  maxMessageCharacters: 2000,
+  maxMessageCharacters: 24,
 };
 
 /** 气泡数硬上限的缺省值（设置页「最大气泡数」没配时的回落；程序读 outgoing.maxBubbles） */
