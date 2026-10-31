@@ -723,10 +723,7 @@ tr:hover td { background: var(--row-hover); }
 .send-btn svg { width: 16px; height: 16px; stroke-width: 2.9; }   /* 箭头加粗 */
 .send-btn:hover { background: var(--cta-bg-hover); }
 .send-btn:disabled { background: var(--bg-active); color: var(--faint); cursor: not-allowed; }
-/* 打断按钮：同尺寸但弱化，别和发送抢注意力 */
-.send-btn.stop { background: var(--bg-active); color: var(--text); }
-.send-btn.stop:hover { background: var(--bg-hover); }
-/* 发送失败/打断回执就地红字（toast 全站禁用，失败必须看得见） */
+/* 发送失败就地红字（toast 全站禁用，失败必须看得见） */
 .composer-err { max-width: 52rem; margin: 0 auto 6px; padding: 0 2px; font-size: 12px; color: var(--faint); }
 .composer-err.bad { color: var(--err); }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; }

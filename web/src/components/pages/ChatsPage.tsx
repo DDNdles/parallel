@@ -580,7 +580,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
   // 发送 = 以 bot 身份发言（限速与会话日志照常，历史里也是它自己的回合）。
   // 测试用户注入（/inject）保留在后端作调试接口，页面不再用。
   const [sendErr, setSendErr] = useState('');
-  const [abortNote, setAbortNote] = useState('');
   const send = async () => {
     const text = input.trim();
     if (!text || !current) return;
@@ -594,19 +593,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
       // 恢复草稿，但不覆盖用户失败后新敲的内容
       setInput((cur) => (cur ? cur : text));
     }
-  };
-
-  /** 桌面端打断：后端 /abort 一直在，缺的就是这个入口 */
-  const abortTurn = async () => {
-    if (!current) return;
-    setAbortNote('');
-    try {
-      await post(`/api/chats/${current.key}/abort`);
-      setAbortNote('已请求打断本轮回复');
-    } catch (e) {
-      setAbortNote(`打断失败：${(e as Error).message}`);
-    }
-    setTimeout(() => setAbortNote(''), 4000);
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -753,8 +739,8 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
               <div className="conv-fade" aria-hidden />
             </div>
             <div className="composer-wrap">
-              {(sendErr || abortNote) && (
-                <div className={'composer-err' + (sendErr ? ' bad' : '')}>{sendErr || abortNote}</div>
+              {sendErr && (
+                <div className="composer-err bad">{sendErr}</div>
               )}
               <div className="composer-inner">
                 <div className="composer-box">
@@ -784,10 +770,6 @@ export default function ChatsPage({ botId, workOpen, onCloseWork, narrow, listOp
                   </div>
                   <div className="composer-bar">
                     <span className="flex" />
-                    <button className="send-btn stop" aria-label="打断当前回复" title="打断当前回复"
-                      disabled={!current} onClick={abortTurn}>
-                      <Icon name="stop" />
-                    </button>
                     <button className="send-btn" aria-label="发送消息" onClick={send}>
                       <Icon name="send" />
                     </button>
