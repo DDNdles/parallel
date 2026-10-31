@@ -274,7 +274,7 @@ data/                  运行时数据（不入库）
 
 - [**pi**](https://github.com/earendil-works/pi)（Pi Agent Harness）— agent loop 与模型层的唯一引擎，本项目的设计蓝本
 - [**HDS-Interlude**](https://github.com/aliao0124/HDS-Interlude) — 拟人层的节奏反定型与行动容量判定判据来源（AGPL-3.0，逐行移植部分见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)）
-- **MaiBot / AstrBot** — 拟人化开口参数的实测基线与参考
+- [**MaiBot**](https://github.com/MaiM-with-u/MaiBot) / [**AstrBot**](https://github.com/AstrBotDevs/AstrBot) — 拟人化开口参数的实测基线与参考
 - [**LuckyLilliaBot**](https://github.com/LuckyLilliaTeam/LLBot) 与 [**NapCat**](https://github.com/NapNeko/NapCat) — QQ 协议端
 - [**Next.js**](https://nextjs.org/) — 桌面端框架；[**Tavily**](https://tavily.com/) — 网络搜索
 
