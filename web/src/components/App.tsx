@@ -117,6 +117,8 @@ export default function App() {
   const [errBadge, setErrBadge] = useState(0);
   /** 磁盘上的 ui/ 比本页加载的那份新：顶栏亮一颗「界面已更新」，由用户点 */
   const [staleBuild, setStaleBuild] = useState(false);
+  /** GitHub 有比运行版本新的 release：顶栏亮「有新版」，点一下跳 release 页（内核静默检查，这里只读结果） */
+  const [update, setUpdate] = useState<{ latest: string; url: string } | null>(null);
   const buildRef = useRef(typeof window === 'undefined' ? '' : String((window as { __UI_BUILD__?: number }).__UI_BUILD__ ?? ''));
   const bootedRef = useRef(false);
   const draggingRef = useRef(false);
@@ -175,6 +177,13 @@ export default function App() {
       if (buildRef.current && b && b !== buildRef.current) setStaleBuild(true);
     } catch { /* ignore */ }
   }, []);
+  /** 更新检查：内核每 6 小时查一次 GitHub latest，这里只读结果；进应用查一次 + 每半小时复核 */
+  const checkUpdate = useCallback(async () => {
+    try {
+      const r = await get('/api/update/check') as { update: { latest: string; url: string } | null };
+      setUpdate(r.update);
+    } catch { /* ignore：更新提示是锦上添花 */ }
+  }, []);
 
   const enterApp = useCallback(() => {
     if (bootedRef.current) return;
@@ -187,9 +196,11 @@ export default function App() {
       intervalsRef.current = true;
       setInterval(refreshStatus, 10000);
       setInterval(updateErrBadge, 30000);
+      setInterval(checkUpdate, 30 * 60_000);
       onEvent('error.recorded', updateErrBadge);
+      void checkUpdate();
     }
-  }, [refreshStatus, updateErrBadge]);
+  }, [refreshStatus, updateErrBadge, checkUpdate]);
 
 
   // 会话被弹回令牌恢复卡（401）后再进主壳时，恢复各轮询（interval 句柄只建一次）
@@ -315,6 +326,12 @@ export default function App() {
           {staleBuild && (
             <button className="chip" id="btn-reload" title="界面已重新构建（站内换页不会重新下载 JS），点这里刷新才拿到新版"
               onClick={() => location.reload()}>界面已更新</button>
+          )}
+          {update && (
+            <button className="chip" id="btn-update" title={`当前版本落后了，点这里打开 ${update.latest} 的发布页下载`}
+              onClick={() => window.open(update.url, '_blank', 'noopener')}>
+              <Icon name="download" size={13} /> 有新版 {update.latest}
+            </button>
           )}
           {page === 'chats' && narrow && (
             <button

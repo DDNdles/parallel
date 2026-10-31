@@ -24,6 +24,7 @@ import { NapCatManager } from './services/napcat.ts';
 import { ensureFaces } from './services/faces.ts';
 import { PluginContainer } from './container.ts';
 import { CoverSupervisor, planCoverSupervisor } from './cover-supervisor.ts';
+import { UpdateService } from './services/update.ts';
 import { AgentLoop, HistoryStore } from './agentloop.ts';
 import { Pipeline, roleAtLeastRole } from './pipeline.ts';
 import { HumanlikeService } from './humanlike/index.ts';
@@ -119,6 +120,8 @@ export class Kernel {
   napcat: NapCatManager;
   container: PluginContainer;
   coverSupervisor: CoverSupervisor;
+  /** 应用内更新检查：启动与每 6 小时对照 GitHub latest release（静默失败，纯提示） */
+  updateCheck: UpdateService;
   /** 守护进程健康检查：60s 一次，崩溃/被杀后自愈 */
   private coverSupervisorTimer?: NodeJS.Timeout;
   private coverPlanKey = '';
@@ -218,6 +221,7 @@ export class Kernel {
       log: makeLogger('cover-supervisor'),
     });
     this.history = new HistoryStore(this.sessionLog, this.config.config.storage.historyLimit);
+    this.updateCheck = new UpdateService({ log: makeLogger('update-check') });
     // 圈内黑话（表达学习）：侧端反事实判定走 chat 链，失败就当没这回事
     this.jargon = new JargonService({
       db: this.db,
@@ -406,6 +410,8 @@ export class Kernel {
     }
     if (!this.opts.noApi) {
       this.apiServer = await startApiServer(this);
+      // 更新检查只属于带桌面端的内核；noApi（测试/服务模式）不打 GitHub
+      this.updateCheck.start();
       // API 起来后再评估：supervisor 的第一轮就要读写插件配置
       this.ensureCoverSupervisor('内核启动');
       // supervisor 可能崩溃/被手动杀：每分钟按配置重新评估一次（活着时是无操作）
@@ -532,6 +538,7 @@ export class Kernel {
     this.scheduler.dispose();
     this.humanlike.dispose();
     this.repeat?.dispose();
+    this.updateCheck.stop();
     await this.adapter.stop();
     await this.llbot.stop().catch(() => {});
     await this.napcat.stop().catch(() => {});

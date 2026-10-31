@@ -424,6 +424,11 @@ async function handle(kernel: Kernel, uiRoot: string, req: IncomingMessage, res:
       });
     }
 
+    // ================= 更新检查（应用内提示：有新版 → 顶栏 chip → 跳 release 页） =================
+    if (area === 'api' && a === 'update' && b === 'check' && req.method === 'GET') {
+      return send({ ok: true, current: kernel.updateCheck.current, update: kernel.updateCheck.get() });
+    }
+
     // ================= 用量（桌面端「用量」页：整份报表，前端按指标/时间窗切片） =================
     if (area === 'api' && a === 'usage' && !b && req.method === 'GET') {
       return send(usageReport(kernel.db));

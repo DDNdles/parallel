@@ -4,7 +4,7 @@
 
 # parallel —— harness 形态的 QQ 机器人
 
-**一个可接入 LLM 的 agent loop 内核，通过它掌控一个 QQ 账号**——在群聊和私信里像个真人一样活着。
+**一个可接入 LLM 的 agent loop 内核，通过它掌控一个 QQ 账号，不只聊天**——在群聊和私信里像个真人一样活着。
 QQ 接入只是它的一种通道：协议适配本身也是插件形态，将来可以同一内核换接其他通道。
 
 [![CI](https://github.com/DDNdles/parallel/actions/workflows/ci.yml/badge.svg)](https://github.com/DDNdles/parallel/actions/workflows/ci.yml)
@@ -16,6 +16,8 @@ QQ 接入只是它的一种通道：协议适配本身也是插件形态，将�
 </div>
 
 > **一切皆插件**：角色化聊天、沙箱、搜索、表情包……全部是热插拔插件；内核只保留 agent loop、Pipeline、服务容器与插件运行时
+>
+> **不只聊天**：除了基本的聊天功能，parallel还提供了工作能力，可以在沙箱进行自动化编码或agent任务
 
 ---
 
