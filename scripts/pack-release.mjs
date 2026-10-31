@@ -76,8 +76,11 @@ const FORBIDDEN = [
   /^dist[\\/]stage([\\/]|$)/,
   /\.tgz$/,
   // 翻唱（cover）是私人插件：跑自部署服务与个人音色，不随发布包出门（仓库/开发目录保留，npm 包 files 里同步剔除）
+  // 同栈的 docker/cover（107 服务镜像）与 scripts/cover（107 运维脚本）一并剔除
   /^src[\\/]plugins[\\/]cover([\\/]|$)/,
   /^dist[\\/]src[\\/]plugins[\\/]cover([\\/]|$)/,
+  /^docker[\\/]cover([\\/]|$)/,
+  /^scripts[\\/]cover([\\/]|$)/,
 ];
 
 if (!existsSync(join(root, 'ui', 'index.html'))) {

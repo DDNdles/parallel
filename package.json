@@ -33,6 +33,8 @@
     "bin",
     "dist",
     "!dist/src/plugins/cover",
+    "!docker/cover",
+    "!scripts/cover",
     "ui",
     "docker",
     "scripts",
