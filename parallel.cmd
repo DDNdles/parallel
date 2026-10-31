@@ -9,12 +9,17 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 chcp 65001 >nul
-where node >nul 2>nul
-if errorlevel 1 (
-  echo [parallel] Node.js not found. Please install Node 24 or newer from https://nodejs.org
-  pause
-  exit /b 1
+rem Prefer the bundled runtime (release zip): no system Node required.
+if exist "runtime\node.exe" (
+  "runtime\node.exe" bin\parallel.js %*
+) else (
+  where node >nul 2>nul
+  if errorlevel 1 (
+    echo [parallel] Node.js not found. Please install Node 24 or newer from https://nodejs.org
+    pause
+    exit /b 1
+  )
+  node bin\parallel.js %*
 )
-node bin\parallel.js %*
 if errorlevel 1 pause
 endlocal
