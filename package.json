@@ -1,6 +1,6 @@
 {
   "name": "@ddnoodles/parallel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "通用 harness 形态的 QQ 机器人 —— pi（Pi Agent Harness）的 agent runtime + 一切皆插件 + 桌面端管控 UI",
   "type": "module",
   "private": true,
